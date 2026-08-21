@@ -20,6 +20,14 @@ pub struct Config {
     /// PulseVM gateway, and how the swap is health-checked.
     #[serde(default)]
     pub flip: Option<Flip>,
+    /// hyperion mode = api mode + this section: /v2 history continuity.
+    /// hyperion-rs is stood up against the new chain's SHiP after IGNITED,
+    /// hydration is gated on its /v2/health, and the FLIP stage additionally
+    /// swaps the public /v2 to the federating history router (pre-cut rows
+    /// keep coming from the legacy Hyperion, post-cut from hyperion-rs —
+    /// "your endpoint keeps its memory").
+    #[serde(default)]
+    pub hyperion: Option<Hyperion>,
     /// loop-harness settings (`pulse-cutover loop`).
     #[serde(default)]
     pub r#loop: Option<LoopCfg>,
@@ -135,6 +143,15 @@ pub struct Source {
     /// only abort left after stop is a post-stop public health failure).
     #[serde(default)]
     pub start_cmd: Option<String>,
+    /// producer mode, optional: runs immediately after the producer pause,
+    /// before the quiescence window. In a REAL multi-BP ceremony every
+    /// producer pauses, so no new blocks arrive and quiescence passes on its
+    /// own. A single-node stand-in rehearsing the producer ceremony against
+    /// a live-syncing replica must emulate "everyone paused" by also
+    /// severing p2p — this hook is where that happens. Journaled; a failure
+    /// aborts (an un-quiesced head would otherwise poison the cut pin).
+    #[serde(default)]
+    pub quiesce_cmd: Option<String>,
 }
 
 /// api mode: the /v1 URL swap. `cmd` performs the swap (e.g. rewrite the
@@ -206,6 +223,55 @@ pub struct Snapshot {
     /// pre-published set. Mutually exclusive with `golden_roots`.
     #[serde(default)]
     pub capture_roots: Option<PathBuf>,
+    /// Host directory where nodeos writes its snapshots (`schedule_at_h`
+    /// only): the scheduled snapshot lands here as
+    /// `snapshot-<block_id_at_H>.bin` once H is irreversible, and the agent
+    /// picks it up by that exact name — the schedule pins the cut to H, the
+    /// filename pins it to H's block id.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+}
+
+/// hyperion mode (api mode + `[hyperion]`): /v2 history continuity across
+/// the cut. Post-IGNITED, hyperion-rs indexes the new chain from its SHiP;
+/// once hydrated, the flip stage swaps the public /v2 to the federating
+/// router, which merges pre-cut history (legacy Hyperion — either the public
+/// source-chain archive, or the operator's own old ES) with post-cut history
+/// (local hyperion-rs) at the ceremony's cut block.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hyperion {
+    /// Stands up hyperion-rs (indexer + api) against the new chain. Runs
+    /// once, right after IGNITED. Optional: leave unset if the services are
+    /// already running (they will simply start indexing when SHiP appears).
+    #[serde(default)]
+    pub start_cmd: Option<String>,
+    /// Local hyperion-rs /v2/health. The hydration gate requires every
+    /// service OK and the Indexer caught up (last_indexed_block against the
+    /// RPC head / the cut) before the flip may proceed.
+    pub health_url: String,
+    #[serde(default = "default_hydration_timeout")]
+    pub hydration_timeout_secs: u64,
+    /// Indexer lag (blocks) tolerated by the hydration gate.
+    #[serde(default)]
+    pub max_lag_blocks: u64,
+    /// Where the agent writes the ceremony boundary facts for the federating
+    /// router ({cut_block, cut_time, cut_block_id, chain_id}): the router
+    /// re-reads this file, so the cut discovered mid-ceremony configures the
+    /// history boundary without a restart.
+    #[serde(default)]
+    pub boundary_path: Option<PathBuf>,
+    /// Swaps the public /v2 upstream to the federating router. Runs in the
+    /// flip stage, right after the /v1 flip command.
+    pub flip_cmd: String,
+    /// Reverts the /v2 swap on abort (mirror of flip.revert_cmd).
+    #[serde(default)]
+    pub revert_cmd: Option<String>,
+    /// PUBLIC /v2/health through the flipped edge. The FLIPPED gate requires
+    /// it to answer with `federation.local.ok == true` (the router is live
+    /// AND its post-cut source is the hydrated hyperion-rs).
+    #[serde(default)]
+    pub public_health_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -283,6 +349,9 @@ fn default_quiescence_polls() -> u32 {
 fn default_snapshot_timeout() -> u64 {
     600
 }
+fn default_hydration_timeout() -> u64 {
+    900
+}
 fn default_live_blocks() -> u64 {
     1
 }
@@ -327,6 +396,19 @@ impl Config {
         if config.ceremony.simulate_freeze && config.ceremony.mode != Mode::Api {
             return Err("simulate_freeze is only meaningful in api mode (a producer freezes \
                         the chain for real)"
+                .into());
+        }
+        if config.hyperion.is_some() && config.ceremony.mode != Mode::Api {
+            return Err("[hyperion] composes with api mode (mode = \"api\"): /v2 continuity \
+                        is an API-provider concern — the flip is the user-visible act"
+                .into());
+        }
+        if config.ceremony.freeze_strategy == FreezeStrategy::ScheduleAtH
+            && config.ceremony.mode == Mode::Producer
+            && config.snapshot.dir.is_none()
+        {
+            return Err("freeze_strategy = \"schedule_at_h\" requires snapshot.dir (the host \
+                        directory where the scheduled snapshot-<block_id>.bin lands)"
                 .into());
         }
         Ok(config)

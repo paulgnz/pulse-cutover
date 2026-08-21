@@ -41,8 +41,42 @@ pub struct Machine<'a, O: ChainOps> {
     pub last_source_block_time: Option<String>,
     /// api mode rollback bookkeeping: did the flip command already run?
     flip_ran: bool,
+    /// hyperion rollback bookkeeping: did the /v2 flip command already run?
+    hyperion_flip_ran: bool,
     /// api mode rollback bookkeeping: did source.stop_cmd already run?
     source_stopped: bool,
+    /// producer mode: did schedule_snapshot(H) succeed at ARM? (If not, the
+    /// FROZEN step falls back to an immediate create_snapshot.)
+    scheduled: bool,
+}
+
+/// Hydration predicate over a hyperion-rs /v2/health document. Hydrated when
+/// every reported service is OK AND the Indexer has caught up: its
+/// last_indexed_block within `max_lag` of the RPC head, or at/past the cut,
+/// or nothing post-cut exists to index yet (rpc head <= cut — the chain is
+/// idle at the cut and SHiP has streamed nothing).
+pub fn hyperion_hydrated(health: &serde_json::Value, cut: u64, max_lag: u64) -> Option<serde_json::Value> {
+    let services = health.get("health")?.as_array()?;
+    if services.is_empty() || !services.iter().all(|s| s.get("status").and_then(|v| v.as_str()) == Some("OK")) {
+        return None;
+    }
+    let field = |service: &str, key: &str| -> Option<u64> {
+        services
+            .iter()
+            .find(|s| s.get("service").and_then(|v| v.as_str()) == Some(service))
+            .and_then(|s| s.get("service_data")?.get(key)?.as_u64())
+    };
+    let last_indexed = field("Indexer", "last_indexed_block")?;
+    let rpc_head = field("PulseVM-RPC", "head_block_num").unwrap_or(cut);
+    let caught_up =
+        last_indexed + max_lag >= rpc_head || last_indexed >= cut || rpc_head <= cut;
+    caught_up.then(|| {
+        json!({
+            "last_indexed_block": last_indexed,
+            "rpc_head": rpc_head,
+            "cut_height": cut,
+        })
+    })
 }
 
 impl<'a, O: ChainOps> Machine<'a, O> {
@@ -70,7 +104,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             frozen_ts_ms: recovered.frozen_ts_ms,
             last_source_block_time: recovered.last_source_block_time,
             flip_ran,
+            hyperion_flip_ran: flip_ran,
             source_stopped: false,
+            scheduled: false,
         }
     }
 
@@ -234,6 +270,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                             rollback["source_stopped_no_start_cmd"] = json!(true);
                         }
                     }
+                    if self.hyperion_flip_ran {
+                        if let Some(cmd) =
+                            self.cfg.hyperion.as_ref().and_then(|h| h.revert_cmd.clone())
+                        {
+                            match self.ops.run_hook(&cmd) {
+                                Ok(o) => rollback["hyperion_flip_reverted"] = json!(o),
+                                Err(e) => rollback["hyperion_flip_revert_error"] = json!(e),
+                            }
+                        }
+                    }
                     if self.flip_ran {
                         if let Some(cmd) =
                             self.cfg.flip.as_ref().and_then(|f| f.revert_cmd.clone())
@@ -272,11 +318,20 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // Multi-BP mode: pin the snapshot to exactly H up front; nodeos
             // writes it when H becomes irreversible. (Falls back to the
             // immediate create_snapshot path if the scheduler is missing.)
-            if let Err(e) = self.ops.schedule_snapshot(self.h()) {
-                self.journal.evidence(
-                    State::Armed,
-                    json!({"schedule_snapshot_unavailable": e, "fallback": "pause_at_h"}),
-                )?;
+            match self.ops.schedule_snapshot(self.h()) {
+                Ok(()) => {
+                    self.scheduled = true;
+                    self.journal.evidence(
+                        State::Armed,
+                        json!({"snapshot_scheduled_at": self.h()}),
+                    )?;
+                }
+                Err(e) => {
+                    self.journal.evidence(
+                        State::Armed,
+                        json!({"schedule_snapshot_unavailable": e, "fallback": "pause_at_h"}),
+                    )?;
+                }
             }
         }
         let mut last_heartbeat = 0u64;
@@ -447,6 +502,71 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Ok(())
     }
 
+    /// `schedule_at_h` (producer mode): the snapshot was scheduled at ARM to
+    /// land at exactly H. Wait for H to finalize (LIB >= H — empty blocks
+    /// keep coming per R1), pin H's block id from the chain, and pick up the
+    /// file nodeos writes as `snapshot-<block_id_at_H>.bin` in snapshot.dir.
+    /// Returns Ok(None) after aborting (deadline expiry).
+    fn await_scheduled_snapshot(&mut self) -> Result<Option<crate::ops::SnapshotResult>, String> {
+        let h = self.h();
+        let deadline = self.ops.now_ms() + self.cfg.source.snapshot_timeout_secs * 1000;
+        let mut last_heartbeat = 0u64;
+        loop {
+            let info = self.ops.source_info()?;
+            if info.last_irreversible_block_num >= h {
+                break;
+            }
+            let now = self.ops.now_ms();
+            if now > deadline {
+                self.abort(
+                    "scheduled snapshot: H did not finalize before snapshot_timeout",
+                    json!({"h": h, "lib": info.last_irreversible_block_num}),
+                )?;
+                return Ok(None);
+            }
+            if now.saturating_sub(last_heartbeat) >= 30_000 {
+                self.journal.evidence(
+                    State::Frozen,
+                    json!({"awaiting_h_final": h, "lib": info.last_irreversible_block_num}),
+                )?;
+                last_heartbeat = now;
+            }
+            self.ops.sleep_ms(self.cfg.poll_ms);
+        }
+        let (id_h, _ts) = self.ops.source_block_id(h)?;
+        let dir = self
+            .cfg
+            .snapshot
+            .dir
+            .clone()
+            .expect("schedule_at_h validated snapshot.dir");
+        let expected = dir.join(format!("snapshot-{id_h}.bin"));
+        let waited_from = self.ops.now_ms();
+        while !expected.exists() {
+            if self.ops.now_ms() > deadline {
+                self.abort(
+                    "scheduled snapshot file did not appear before snapshot_timeout",
+                    json!({"expected": expected.display().to_string()}),
+                )?;
+                return Ok(None);
+            }
+            self.ops.sleep_ms(self.cfg.poll_ms);
+        }
+        self.journal.evidence(
+            State::Frozen,
+            json!({
+                "scheduled_snapshot_file": expected.display().to_string(),
+                "file_wait_ms": self.ops.now_ms() - waited_from,
+                "pinned_to_h": h,
+            }),
+        )?;
+        Ok(Some(crate::ops::SnapshotResult {
+            snapshot_name: expected.display().to_string(),
+            head_block_num: h,
+            head_block_id: id_h,
+        }))
+    }
+
     /// FROZEN: snapshot while still producing (nodeos writes it when the cut
     /// block finalizes), THEN pause, then quiescence, then pin + audit.
     fn step_frozen(&mut self) -> Result<(), String> {
@@ -464,11 +584,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             )?;
         }
         let started = self.ops.now_ms();
-        let snap = match self.ops.create_snapshot() {
-            Ok(s) => s,
-            Err(e) => {
-                self.abort("create_snapshot failed", json!({"error": e}))?;
-                return Ok(());
+        let snap = if self.scheduled {
+            match self.await_scheduled_snapshot()? {
+                Some(s) => s,
+                None => return Ok(()), // aborted inside, with evidence
+            }
+        } else {
+            match self.ops.create_snapshot() {
+                Ok(s) => s,
+                Err(e) => {
+                    self.abort("create_snapshot failed", json!({"error": e}))?;
+                    return Ok(());
+                }
             }
         };
         let snapshot_wall_ms = self.ops.now_ms() - started;
@@ -479,6 +606,19 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if !self.ops.producer_paused()? {
             self.abort("pause did not take effect", json!({}))?;
             return Ok(());
+        }
+        // Stand-in rehearsals: emulate "every producer paused" (e.g. sever
+        // p2p on a live-syncing replica) so the quiescence window can pass.
+        if let Some(cmd) = &self.cfg.source.quiesce_cmd {
+            match self.ops.run_hook(cmd) {
+                Ok(o) => self
+                    .journal
+                    .evidence(State::Frozen, json!({"quiesce_cmd": o}))?,
+                Err(e) => {
+                    self.abort("quiesce_cmd failed", json!({"error": e}))?;
+                    return Ok(());
+                }
+            }
         }
         let mut stable = 0u32;
         let mut head = 0u64;
@@ -786,6 +926,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 json!({"post_ignite_hook": format!("{result:?}")}),
             )?;
         }
+        // hyperion mode: stand up hyperion-rs against the new chain's SHiP,
+        // stage the history boundary for the federating router, and gate on
+        // hydration BEFORE anything user-visible flips. All of this is
+        // abortable — the ratchet (nothing public before FLIPPED) holds.
+        if self.cfg.hyperion.is_some() && !self.hyperion_hydrate()? {
+            return Ok(()); // aborted inside, with evidence
+        }
         let started = self.ops.now_ms();
         let flip_cmd = self.cfg.flip.as_ref().expect("validated").cmd.clone();
         self.flip_ran = true; // even a failing cmd may have half-applied
@@ -796,14 +943,38 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(());
             }
         };
+        // hyperion mode: the SAME flip stage also swaps /v2 to the
+        // federating router — one user-visible moment for both surfaces.
+        let mut v2_flip_out = serde_json::Value::Null;
+        if let Some(hyp) = self.cfg.hyperion.clone() {
+            self.hyperion_flip_ran = true;
+            match self.ops.run_hook(&hyp.flip_cmd) {
+                Ok(o) => v2_flip_out = json!(o),
+                Err(e) => {
+                    self.abort("hyperion /v2 flip command failed", json!({"error": e}))?;
+                    return Ok(());
+                }
+            }
+        }
         match self.public_serves_target()? {
             Some(evidence) => {
+                // /v2 public gate: the flipped edge must serve the federating
+                // router with a live local (post-cut) source behind it.
+                let v2_health = match self.hyperion_public_gate()? {
+                    Ok(h) => h,
+                    Err(reason) => {
+                        self.abort(&reason, json!({}))?;
+                        return Ok(());
+                    }
+                };
                 self.state = State::Flipped;
                 self.journal.transition(
                     State::Flipped,
                     json!({
                         "flip_cmd_output": flip_out,
+                        "hyperion_flip_cmd_output": v2_flip_out,
                         "health": evidence,
+                        "v2_health": v2_health,
                         "flip_wall_ms": self.ops.now_ms() - started,
                         "note": "public /v1 now serves PulseVM; source nodeos still running (reads never gapped)",
                     }),
@@ -817,6 +988,113 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
         Ok(())
+    }
+
+    /// hyperion mode, post-IGNITED: start hyperion-rs, write the boundary
+    /// file, and hold until the indexer is hydrated against the new chain.
+    /// Returns Ok(false) after aborting (start failure / hydration timeout).
+    fn hyperion_hydrate(&mut self) -> Result<bool, String> {
+        let hyp = self.cfg.hyperion.clone().expect("caller checked");
+        if let Some(cmd) = &hyp.start_cmd {
+            match self.ops.run_hook(cmd) {
+                Ok(o) => self
+                    .journal
+                    .evidence(State::Ignited, json!({"hyperion_start": o}))?,
+                Err(e) => {
+                    self.abort("hyperion start_cmd failed", json!({"error": e}))?;
+                    return Ok(false);
+                }
+            }
+        }
+        if let Some(path) = &hyp.boundary_path {
+            let boundary = json!({
+                "cut_block": self.cut_height,
+                "cut_block_id": self.cut_block_id,
+                "cut_time": self.last_source_block_time,
+                "chain_id": self.chain_id,
+                "written_at_ms": self.ops.now_ms(),
+            });
+            if let Err(e) = std::fs::write(
+                path,
+                serde_json::to_string_pretty(&boundary).expect("boundary json"),
+            ) {
+                self.abort(
+                    "could not write history boundary file",
+                    json!({"path": path.display().to_string(), "error": e.to_string()}),
+                )?;
+                return Ok(false);
+            }
+            self.journal.evidence(
+                State::Ignited,
+                json!({"hyperion_boundary_staged": path.display().to_string(), "boundary": boundary}),
+            )?;
+        }
+        let cut = self.cut_height.expect("cut pinned");
+        let started = self.ops.now_ms();
+        let deadline = started + hyp.hydration_timeout_secs * 1000;
+        let mut last_heartbeat = 0u64;
+        loop {
+            let now = self.ops.now_ms();
+            if now > deadline {
+                self.abort(
+                    "hyperion did not hydrate before hydration_timeout",
+                    json!({"health_url": hyp.health_url,
+                           "hydration_timeout_secs": hyp.hydration_timeout_secs}),
+                )?;
+                return Ok(false);
+            }
+            if let Some(health) = self.ops.get_json(&hyp.health_url)? {
+                if let Some(evidence) = hyperion_hydrated(&health, cut, hyp.max_lag_blocks) {
+                    self.journal.evidence(
+                        State::Ignited,
+                        json!({"hyperion_hydrated": evidence, "hydration_wall_ms": now - started}),
+                    )?;
+                    return Ok(true);
+                }
+                if now.saturating_sub(last_heartbeat) >= 30_000 {
+                    self.journal.evidence(
+                        State::Ignited,
+                        json!({"hyperion_hydrating":
+                            health.get("health").cloned().unwrap_or(serde_json::Value::Null)}),
+                    )?;
+                    last_heartbeat = now;
+                }
+            }
+            self.ops.sleep_ms(self.cfg.poll_ms);
+        }
+    }
+
+    /// The /v2 side of the FLIPPED health gate: the PUBLIC /v2/health must
+    /// answer through the flipped edge with `federation.local.ok == true`.
+    /// Ok(Ok(health)) on success; Ok(Err(reason)) when the gate fails.
+    #[allow(clippy::type_complexity)]
+    fn hyperion_public_gate(&mut self) -> Result<Result<serde_json::Value, String>, String> {
+        let Some(hyp) = self.cfg.hyperion.clone() else {
+            return Ok(Ok(serde_json::Value::Null));
+        };
+        let Some(url) = hyp.public_health_url.clone() else {
+            return Ok(Ok(serde_json::Value::Null));
+        };
+        let timeout = self.cfg.flip.as_ref().expect("validated").health_timeout_secs;
+        let deadline = self.ops.now_ms() + timeout * 1000;
+        loop {
+            if self.ops.now_ms() > deadline {
+                return Ok(Err(format!(
+                    "public /v2 did not serve the federating router with a live \
+                     local source after flip (health timeout; url {url})"
+                )));
+            }
+            if let Some(health) = self.ops.get_json(&url)? {
+                let local_ok = health
+                    .pointer("/federation/local/ok")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if local_ok {
+                    return Ok(Ok(health));
+                }
+            }
+            self.ops.sleep_ms(self.cfg.poll_ms);
+        }
     }
 
     /// FLIPPED (api mode only): traffic is on PulseVM; NOW stop the source
@@ -848,6 +1126,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(());
             }
         };
+        // hyperion mode: /v2 must also have survived the source's death (the
+        // federator's legacy upstream is remote — nodeos going away must not
+        // matter — but the gate PROVES it rather than assuming).
+        let v2_health = match self.hyperion_public_gate()? {
+            Ok(h) => h,
+            Err(reason) => {
+                self.abort(&reason, json!({"source_stop_output": stop_out}))?;
+                return Ok(());
+            }
+        };
         let live_ts = self.ops.now_ms();
         let write_gap_ms = self.frozen_ts_ms.map(|f| live_ts - f);
         self.state = State::Live;
@@ -857,6 +1145,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "source_stop_output": stop_out,
                 "stop_wall_ms": self.ops.now_ms() - started,
                 "public_health": health,
+                "v2_health": v2_health,
                 "cut_height": self.cut_height,
                 "last_source_block_time": self.last_source_block_time,
                 "ceremony_gap_ms_wallclock": write_gap_ms,

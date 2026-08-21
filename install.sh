@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # pulse-cutover installer — one command prepares a node for the cutover ceremony.
 #
-#   ./install.sh --mode api --manifest ceremony.json     # API provider (nodeos serving /v1)
-#   ./install.sh --mode bp  --manifest ceremony.json     # block producer (co-located nodeos)
+#   ./install.sh --mode api      --manifest ceremony.json  # API provider (nodeos serving /v1)
+#   ./install.sh --mode bp       --manifest ceremony.json  # block producer (co-located nodeos)
+#   ./install.sh --mode hyperion --manifest ceremony.json  # API provider + /v2 history continuity
+#                                                          # (api mode + hyperion-rs + federating router)
 #
 # Discipline (modeled on the proven BP installer, wiki/36):
 #   - everything determinism-critical is PINNED in the manifest + sha256-verified, fail-closed;
@@ -26,8 +28,11 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1"; exit 2;;
   esac
 done
-[ -n "$MODE" ] || { echo "usage: ./install.sh --mode api|bp --manifest ceremony.json"; exit 2; }
-[ "$MODE" = "api" ] || [ "$MODE" = "bp" ] || { echo "ABORT: --mode must be api or bp"; exit 2; }
+[ -n "$MODE" ] || { echo "usage: ./install.sh --mode api|bp|hyperion --manifest ceremony.json"; exit 2; }
+[ "$MODE" = "api" ] || [ "$MODE" = "bp" ] || [ "$MODE" = "hyperion" ] || { echo "ABORT: --mode must be api, bp or hyperion"; exit 2; }
+# hyperion mode IS api mode (same /v1 machinery) + the /v2 history stack.
+API_LIKE=false
+if [ "$MODE" = "api" ] || [ "$MODE" = "hyperion" ]; then API_LIKE=true; fi
 MANIFEST="${MANIFEST:-ceremony.json}"
 [ -f "$MANIFEST" ] || { echo "ABORT: manifest $MANIFEST not found"; exit 2; }
 [ "$(id -u)" = 0 ] || { echo "ABORT: run as root"; exit 2; }
@@ -57,14 +62,14 @@ problems=()
 case "${VERSION_ID:-}" in 22.04|24.04) ;; *) problems+=("Ubuntu 22.04/24.04 required (found ${PRETTY_NAME:-unknown})");; esac
 RAM_GB=$(free -g | awk '/Mem:/{print $2}')
 DISK_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-MIN_RAM=$([ "$MODE" = api ] && echo 8 || echo 16)
+MIN_RAM=16; [ "$MODE" = "api" ] && MIN_RAM=8  # hyperion needs headroom for ES
 [ "${RAM_GB:-0}" -ge "$MIN_RAM" ] || problems+=("need >=${MIN_RAM}GB RAM for $MODE mode (found ${RAM_GB}GB)")
 [ "${DISK_GB:-0}" -ge 50 ] || problems+=("need >=50GB free disk (found ${DISK_GB}GB)")
 
 # The source nodeos is YOURS — we detect it, we never install or touch it.
 SRC_INFO=$(curl -s -m5 "$SRC_RPC/v1/chain/get_info" || true)
 if [ -z "$SRC_INFO" ]; then
-  problems+=("no nodeos answering at $SRC_RPC — an existing, synced $([ "$MODE" = api ] && echo 'API node' || echo 'producer node') is a prerequisite")
+  problems+=("no nodeos answering at $SRC_RPC — an existing, synced $($API_LIKE && echo 'API node' || echo 'producer node') is a prerequisite")
 else
   GOT_CHAIN=$(echo "$SRC_INFO" | jq -r '.chain_id // empty')
   [ "$GOT_CHAIN" = "$CHAIN_ID" ] || problems+=("nodeos at $SRC_RPC serves chain_id ${GOT_CHAIN:-none}, manifest expects $CHAIN_ID")
@@ -172,7 +177,7 @@ systemctl daemon-reload
 systemctl enable --now metalgo-pulse >/dev/null 2>&1
 
 # ---------- api mode: REST gateway + nginx flip machinery ----------
-if [ "$MODE" = "api" ]; then
+if $API_LIKE; then
   command -v node >/dev/null || { apt-get install -y -qq nodejs >/dev/null; }
   command -v nginx >/dev/null || { apt-get install -y -qq nginx >/dev/null; }
   mkdir -p /opt/pulse-gateway
@@ -237,6 +242,157 @@ FLIP
   chmod +x /opt/pulse-cutover/flip-*.sh
 fi
 
+# ---------- hyperion mode: /v2 history stack (ES + hyperion-rs + federator) ----------
+if [ "$MODE" = "hyperion" ]; then
+  command -v docker >/dev/null || problems_hyp="docker is required for the Elasticsearch container (install docker.io / docker-ce first)"
+  [ -z "${problems_hyp:-}" ] || { echo "ABORT: $problems_hyp"; exit 1; }
+  LEGACY_URL=$(mget '.hyperion.legacy_url')
+  ES_HEAP=$(mget_opt '.hyperion.es_heap'); ES_HEAP=${ES_HEAP:-2g}
+  ES_IMAGE=$(mget_opt '.hyperion.es_image'); ES_IMAGE=${ES_IMAGE:-docker.elastic.co/elasticsearch/elasticsearch:8.17.4}
+  SHIP_WS=$(mget_opt '.hyperion.ship_ws'); SHIP_WS=${SHIP_WS:-ws://127.0.0.1:9090}
+
+  # Elasticsearch: single-node container, heap capped (16 GB box budget:
+  # nodeos + metalgo + dual-import verify + ES must coexist through the
+  # ceremony; nodeos retires at the end).
+  if ! docker inspect pulse-es >/dev/null 2>&1; then
+    docker run -d --name pulse-es --restart unless-stopped \
+      -p 127.0.0.1:9200:9200 \
+      -e discovery.type=single-node -e xpack.security.enabled=false \
+      -e "ES_JAVA_OPTS=-Xms$ES_HEAP -Xmx$ES_HEAP" \
+      -v pulse-esdata:/usr/share/elasticsearch/data \
+      "$ES_IMAGE" >/dev/null
+    echo "  started: pulse-es ($ES_IMAGE, heap $ES_HEAP)"
+  else
+    docker start pulse-es >/dev/null 2>&1 || true
+    echo "  ok (present): pulse-es"
+  fi
+
+  # hyperion-rs (pinned binary) + config against the NEW chain's RPC + SHiP.
+  mkdir -p /opt/hyperion /etc/hyperion
+  fetch_verify "$(mget '.artifacts.hyperion.url')" "$(mget '.artifacts.hyperion.sha256')" /opt/hyperion/hyperion
+  chmod +x /opt/hyperion/hyperion
+  cat > /etc/hyperion/config.toml <<HYP
+# hyperion-rs against the post-cut PulseVM chain (staged by install.sh)
+[chain]
+name = "xpr"
+http = "http://127.0.0.1:9650/ext/bc/$BID/rpc"
+ship = "$SHIP_WS"
+api = "pulsevm"
+system_account = "eosio"
+
+[indexer]
+start_block = 0
+stop_block = 0
+fetch_block = true
+fetch_traces = true
+fetch_deltas = true
+max_messages_in_flight = 128
+batch_size = 200
+flush_interval_ms = 500
+skip_actions = []
+
+[elasticsearch]
+url = "http://127.0.0.1:9200"
+user = ""
+pass = ""
+shards = 1
+replicas = 0
+
+[api]
+listen = "127.0.0.1:7000"
+max_limit = 1000
+HYP
+  for svc in indexer api; do
+    cat > /etc/systemd/system/hyperion-$svc.service <<UNIT
+[Unit]
+Description=hyperion-rs $svc (post-cut PulseVM history)
+After=network-online.target docker.service
+[Service]
+ExecStart=/opt/hyperion/hyperion $svc -c /etc/hyperion/config.toml
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+UNIT
+  done
+  # NOT enabled/started here: the ceremony's [hyperion].start_cmd starts them
+  # after IGNITED, when the new chain's SHiP exists.
+
+  # Federating history router (+ legacy passthrough for the pre-flip /v2).
+  mkdir -p /opt/hyperion-federator
+  fetch_verify "$(mget '.artifacts.federator.url')" "$(mget '.artifacts.federator.sha256')" /opt/hyperion-federator/server.js
+  cat > /etc/systemd/system/hyperion-federator.service <<UNIT
+[Unit]
+Description=hyperion federating history router (/v2 boundary: legacy pre-cut, hyperion-rs post-cut)
+After=network.target
+[Service]
+Environment=LOCAL=http://127.0.0.1:7000
+Environment=LEGACY=$LEGACY_URL
+Environment=BOUNDARY_FILE=/etc/pulse-cutover/boundary.json
+Environment=PORT=7010
+Environment=PASSTHROUGH_PORT=7019
+ExecStart=$(command -v node) /opt/hyperion-federator/server.js
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now hyperion-federator >/dev/null 2>&1
+
+  # nginx: add the public /v2 surface. Pre-flip upstream = the legacy
+  # passthrough ("the /v2 you already had" — point it at your own old
+  # Hyperion instead if you kept one); the ceremony's v2 flip swaps it to
+  # the federating router.
+  cat > /etc/nginx/conf.d/pulse-cutover-v2-upstream.conf <<CONF
+# Managed by pulse-cutover. The ceremony's /v2 flip swaps this single line.
+upstream pulse_v2_backend { server 127.0.0.1:7019; }
+CONF
+  cat > /etc/nginx/sites-available/pulse-v1 <<'CONF'
+server {
+    listen 80 default_server;
+    server_name _;
+    location /v1/chain/ {
+        proxy_pass http://pulse_v1_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host localhost;
+        proxy_read_timeout 30s;
+    }
+    location /v2/ {
+        proxy_pass http://pulse_v2_backend;
+        proxy_http_version 1.1;
+        proxy_read_timeout 30s;
+    }
+    location /v1/history/ {
+        proxy_pass http://pulse_v2_backend;
+        proxy_http_version 1.1;
+        proxy_read_timeout 30s;
+    }
+    location / { return 404 '{"error":"only /v1/chain, /v1/history and /v2 are served here"}'; }
+}
+CONF
+  nginx -t >/dev/null && systemctl reload nginx
+
+  cat > /opt/pulse-cutover/flip-v2.sh <<'FLIP'
+#!/usr/bin/env bash
+# The /v2 half of the flip stage: public history moves to the federating
+# router (pre-cut = legacy, post-cut = local hyperion-rs). Same single-line
+# upstream swap discipline as /v1.
+set -e
+sed -i 's|server 127.0.0.1:7019;|server 127.0.0.1:7010;|' /etc/nginx/conf.d/pulse-cutover-v2-upstream.conf
+nginx -t && nginx -s reload
+echo flipped-v2-to-federator
+FLIP
+  cat > /opt/pulse-cutover/flip-v2-revert.sh <<'FLIP'
+#!/usr/bin/env bash
+set -e
+sed -i 's|server 127.0.0.1:7010;|server 127.0.0.1:7019;|' /etc/nginx/conf.d/pulse-cutover-v2-upstream.conf
+nginx -t && nginx -s reload
+echo reverted-v2-to-passthrough
+FLIP
+  chmod +x /opt/pulse-cutover/flip-v2*.sh
+fi
+
 # ---------- ceremony.toml (the agent's manifest) ----------
 FH=$(mget '.ceremony.freeze_height')
 FM=$(mget_opt '.ceremony.freeze_margin')
@@ -250,7 +406,7 @@ EXPECTED_SHA=$(mget_opt '.snapshot.expected_sha256')
   echo 'poll_ms = 250'
   echo ''
   echo '[ceremony]'
-  echo "mode = \"$([ "$MODE" = api ] && echo api || echo producer)\""
+  echo "mode = \"$($API_LIKE && echo api || echo producer)\""
   echo "freeze_height = $FH"
   [ -n "$FM" ] && echo "freeze_margin = $FM"
   [ "$SIM" = "true" ] && echo 'simulate_freeze = true'
@@ -276,12 +432,23 @@ EXPECTED_SHA=$(mget_opt '.snapshot.expected_sha256')
   echo "rpc_url = \"http://127.0.0.1:9650/ext/bc/$BID/rpc\""
   echo 'quorum_timeout_secs = 900'
   echo 'auto_rollback = true'
-  if [ "$MODE" = "api" ]; then
+  if $API_LIKE; then
     echo ''
     echo '[flip]'
     echo 'cmd = "/opt/pulse-cutover/flip-to-pulsevm.sh"'
     echo "public_url = \"http://$(mget '.flip.public_host')\""
     echo 'revert_cmd = "/opt/pulse-cutover/flip-revert.sh"'
+  fi
+  if [ "$MODE" = "hyperion" ]; then
+    echo ''
+    echo '[hyperion]'
+    echo 'start_cmd = "systemctl start hyperion-indexer hyperion-api"'
+    echo 'health_url = "http://127.0.0.1:7000/v2/health"'
+    echo 'hydration_timeout_secs = 900'
+    echo 'boundary_path = "/etc/pulse-cutover/boundary.json"'
+    echo 'flip_cmd = "/opt/pulse-cutover/flip-v2.sh"'
+    echo 'revert_cmd = "/opt/pulse-cutover/flip-v2-revert.sh"'
+    echo "public_health_url = \"http://$(mget '.flip.public_host')/v2/health\""
   fi
 } > /etc/pulse-cutover/ceremony.toml
 cp "$MANIFEST" /etc/pulse-cutover/ceremony.json
@@ -296,14 +463,21 @@ echo " Target:  metalgo-pulse tracking subnet $SUBNET"
 echo "          NodeID $NODEID"
 echo "          chain $BID: waiting for the verified snapshot at"
 echo "          $STAGED (absent by design — R12)"
-[ "$MODE" = api ] && echo " Public:  nginx /v1/chain -> nodeos:${NODEOS_PORT:-8888} (flip staged, NOT flipped)"
+$API_LIKE && echo " Public:  nginx /v1/chain -> nodeos:${NODEOS_PORT:-8888} (flip staged, NOT flipped)"
+[ "$MODE" = "hyperion" ] && echo " History: nginx /v2 -> legacy passthrough ($(mget '.hyperion.legacy_url')); federator + hyperion-rs staged"
 echo ""
 echo " What happens at H (run: ./cutover.sh --manifest ceremony.json):"
 echo "   1. agent watches the source chain to the freeze height"
 echo "   2. snapshot via your nodeos producer_api at ~finality"
 echo "   3. sha256 + dual-import 19-table fingerprint verification"
 echo "   4. PulseVM ignites from the verified snapshot (same chain_id)"
-if [ "$MODE" = api ]; then
+if [ "$MODE" = "hyperion" ]; then
+  echo "   5. hyperion-rs starts + hydrates against the new chain's SHiP"
+  echo "   6. /v1 flips to PulseVM AND /v2 flips to the federating router"
+  echo "      + health checks on both                <- only visible step"
+  echo "   7. YOUR stop command retires nodeos (reads never gapped;"
+  echo "      /v2 keeps its memory — pre-cut rows from the legacy Hyperion)"
+elif $API_LIKE; then
   echo "   5. /v1 URL flips to PulseVM + health check   <- only visible step"
   echo "   6. YOUR stop command retires nodeos (reads never gapped)"
 else

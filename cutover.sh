@@ -25,8 +25,11 @@ case "$CMD" in
     pkill -f 'pulse-cutover run' || echo "  (no running agent)"
     MODE=$(tomlget mode); MODE=${MODE:-producer}
     if [ "$MODE" = "api" ]; then
-      REVERT=$(tomlget revert_cmd)
-      if [ -n "$REVERT" ]; then echo "  reverting public /v1 to nodeos: $REVERT"; sh -c "$REVERT" || true; fi
+      # Revert EVERY staged flip ([flip].revert_cmd and, in hyperion mode,
+      # [hyperion].revert_cmd — the /v2 swap back to the pre-cut upstream).
+      { grep -E '^revert_cmd *= *' "$CONFIG" || true; } | sed -E 's/^[^=]+= *"?([^"]*)"?.*/\1/' | while IFS= read -r REVERT; do
+        [ -n "$REVERT" ] && { echo "  reverting: $REVERT"; sh -c "$REVERT" || true; }
+      done
       echo "  source nodeos was never paused by the agent; if your stop command already ran, restart it:"
       echo "    $(tomlget start_cmd)"
     else

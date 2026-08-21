@@ -73,6 +73,19 @@ struct MockOps {
     /// Fault injection: flip cmd succeeds but the public URL never serves
     /// the target (nginx swap to a dead upstream).
     flip_breaks_public: Cell<bool>,
+    // --- hyperion-mode world ---
+    /// Set when the "hyperion-start" hook runs (start_cmd).
+    hyperion_started: Cell<bool>,
+    /// Local /v2/health polls seen so far.
+    hyperion_polls: Cell<u32>,
+    /// Indexer catches up after this many health polls (u32::MAX = never).
+    hyperion_ready_after: Cell<u32>,
+    /// Set when the "flip-v2" hook runs: public /v2 routes to the federator.
+    flipped_v2: Cell<bool>,
+    // --- producer schedule_at_h world ---
+    /// schedule_snapshot succeeds and stages the scheduled file.
+    schedule_ok: Cell<bool>,
+    scheduled_h: Cell<u64>,
 }
 
 impl MockOps {
@@ -93,6 +106,12 @@ impl MockOps {
             flipped: Cell::new(false),
             stopped: Cell::new(false),
             flip_breaks_public: Cell::new(false),
+            hyperion_started: Cell::new(false),
+            hyperion_polls: Cell::new(0),
+            hyperion_ready_after: Cell::new(0),
+            flipped_v2: Cell::new(false),
+            schedule_ok: Cell::new(false),
+            scheduled_h: Cell::new(0),
         }
     }
 
@@ -172,8 +191,19 @@ impl ChainOps for MockOps {
         })
     }
 
-    fn schedule_snapshot(&self, _height: u64) -> Result<(), String> {
-        Err("snapshot scheduler unavailable".into())
+    fn schedule_snapshot(&self, height: u64) -> Result<(), String> {
+        if !self.schedule_ok.get() {
+            return Err("snapshot scheduler unavailable".into());
+        }
+        // The scheduler will write snapshot-<block_id_at_H>.bin once H is
+        // irreversible; the mock stages it up front (the machine only looks
+        // after LIB >= H) and the staged target chain presents the cut.
+        let m = mini(height as u32);
+        let file = self.dir.join(format!("snapshot-{}.bin", hex::encode(m.head_id())));
+        std::fs::write(&file, m.build()).map_err(|e| e.to_string())?;
+        self.scheduled_h.set(height);
+        self.target_head.set(height);
+        Ok(())
     }
 
     fn target_info(&self) -> Result<Option<ChainInfo>, String> {
@@ -229,7 +259,57 @@ impl ChainOps for MockOps {
         if cmd.contains("stop-nodeos") {
             self.stopped.set(true);
         }
+        if cmd.contains("hyperion-start") {
+            self.hyperion_started.set(true);
+        }
+        if cmd.contains("flip-v2") {
+            self.flipped_v2.set(true);
+        }
+        if cmd.contains("revert-v2") {
+            self.flipped_v2.set(false);
+        }
         Ok(format!("ran: {cmd}"))
+    }
+
+    fn get_json(&self, url: &str) -> Result<Option<serde_json::Value>, String> {
+        // Local hyperion-rs /v2/health (the .95-observed shape).
+        if url.contains("hyperion-local") {
+            if !self.hyperion_started.get() {
+                return Ok(None); // service not yet started
+            }
+            let polls = self.hyperion_polls.get() + 1;
+            self.hyperion_polls.set(polls);
+            let cut = self.target_head.get();
+            let ready = polls >= self.hyperion_ready_after.get();
+            // Until hydrated: services OK but the indexer visibly behind a
+            // SHiP head that is past the cut — the predicate must WAIT.
+            let (last_indexed, rpc_head) =
+                if ready { (cut + 5, cut + 5) } else { (0, cut + 5) };
+            return Ok(Some(serde_json::json!({
+                "chain": "xpr",
+                "version": "0.1.0",
+                "health": [
+                    {"service": "Elasticsearch", "status": "OK"},
+                    {"service": "PulseVM-RPC", "status": "OK",
+                     "service_data": {"chain_id": hex::encode(CHAIN_ID), "head_block_num": rpc_head}},
+                    {"service": "Indexer", "status": "OK",
+                     "service_data": {"head_block_num": rpc_head, "last_indexed_block": last_indexed}}
+                ]
+            })));
+        }
+        // Public /v2/health through the flipped edge (federating router).
+        if url.contains("v2-public") {
+            let local_ok = self.flipped_v2.get()
+                && self.hyperion_polls.get() >= self.hyperion_ready_after.get();
+            return Ok(Some(serde_json::json!({
+                "federation": {
+                    "boundary": {"cut_block": self.target_head.get()},
+                    "local": {"ok": local_ok},
+                    "legacy": {"ok": true}
+                }
+            })));
+        }
+        Ok(None)
     }
 
     fn now_ms(&self) -> u64 {
@@ -623,4 +703,201 @@ fn api_mode_flip_health_failure_aborts_without_stopping_source() {
     assert!(text.contains("flip_reverted"));
     // Reads still served by nodeos after the abort.
     assert!(ops.public_info("http://mock-public").unwrap().is_some());
+}
+
+/// hyperion-mode ceremony config: api mode + [hyperion] — /v2 history
+/// continuity rides the same ceremony, one flip stage for both surfaces.
+fn hyperion_test_config(dir: &std::path::Path, freeze_height: u64) -> Config {
+    let toml_text = format!(
+        r#"
+journal_path = "{dir}/journal.jsonl"
+poll_ms = 1
+
+[ceremony]
+mode = "api"
+freeze_height = {freeze_height}
+simulate_freeze = true
+
+[source]
+rpc_url = "http://mock"
+producer_api_url = "http://mock"
+stop_cmd = "stop-nodeos"
+
+[snapshot]
+staged_path = "{dir}/staged.bin"
+capture_roots = "{dir}/captured-roots.txt"
+
+[target]
+metalgo_unit = "mock.service"
+rpc_url = "http://mock"
+quorum_timeout_secs = 60
+
+[flip]
+cmd = "flip-nginx"
+public_url = "http://mock-public"
+revert_cmd = "revert-nginx"
+health_polls = 2
+head_tolerance = 2
+health_timeout_secs = 5
+
+[hyperion]
+start_cmd = "hyperion-start"
+health_url = "http://hyperion-local/v2/health"
+hydration_timeout_secs = 30
+boundary_path = "{dir}/boundary.json"
+flip_cmd = "flip-v2"
+revert_cmd = "revert-v2"
+public_health_url = "http://v2-public/v2/health"
+
+[hooks]
+on_freeze = "freeze-writes"
+on_live = "announce-live"
+"#,
+        dir = dir.display(),
+    );
+    let path = dir.join("ceremony-hyperion.toml");
+    std::fs::write(&path, toml_text).unwrap();
+    Config::load(&path).unwrap()
+}
+
+#[test]
+fn hyperion_mode_hydrates_then_flips_both_surfaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = hyperion_test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.drift.set(5);
+    ops.hyperion_ready_after.set(3); // hydration takes a few health polls
+
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Live);
+
+    // Order of user-visible acts: hyperion stood up + hydrated BEFORE any
+    // flip; /v1 flip then /v2 flip in the same stage; source stop last.
+    let hooks = ops.hooks.borrow();
+    let pos = |name: &str| hooks.iter().position(|h| h == name).unwrap();
+    assert!(pos("hyperion-start") < pos("flip-nginx"));
+    assert!(pos("flip-nginx") < pos("flip-v2"));
+    assert!(pos("flip-v2") < pos("stop-nodeos"));
+    assert!(pos("stop-nodeos") < pos("announce-live"));
+
+    // The boundary file carries the ceremony's cut for the federator.
+    let boundary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("boundary.json")).unwrap())
+            .unwrap();
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let snapped: serde_json::Value = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .find(|v: &serde_json::Value| v["state"] == "SNAPSHOTTED" && v["kind"] == "transition")
+        .unwrap();
+    assert_eq!(boundary["cut_block"], snapped["data"]["cut_height"]);
+    assert_eq!(boundary["chain_id"], serde_json::json!(hex::encode(CHAIN_ID)));
+
+    // Hydration is journaled evidence; FLIPPED and LIVE both carry v2 health.
+    assert!(text.contains("hyperion_hydrated"));
+    let flipped: serde_json::Value = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .find(|v: &serde_json::Value| v["state"] == "FLIPPED" && v["kind"] == "transition")
+        .unwrap();
+    assert_eq!(flipped["data"]["v2_health"]["federation"]["local"]["ok"], serde_json::json!(true));
+    let live: serde_json::Value = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .find(|v: &serde_json::Value| v["state"] == "LIVE" && v["kind"] == "transition")
+        .unwrap();
+    assert_eq!(live["data"]["v2_health"]["federation"]["local"]["ok"], serde_json::json!(true));
+}
+
+#[test]
+fn hyperion_hydration_timeout_aborts_before_any_flip() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = hyperion_test_config(dir.path(), 120);
+    if let Some(h) = cfg.hyperion.as_mut() {
+        h.hydration_timeout_secs = 1; // mock clock ticks 25ms per now_ms()
+    }
+    let ops = MockOps::new(dir.path(), 110);
+    ops.drift.set(5);
+    ops.hyperion_ready_after.set(u32::MAX); // indexer never catches up
+
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Aborted);
+
+    // The ratchet held: hyperion was started, but NOTHING user-visible
+    // happened — no /v1 flip, no /v2 flip, source still serving.
+    let hooks = ops.hooks.borrow();
+    assert!(hooks.iter().any(|h| h == "hyperion-start"));
+    assert!(!hooks.iter().any(|h| h == "flip-nginx"));
+    assert!(!hooks.iter().any(|h| h == "flip-v2"));
+    assert!(!hooks.iter().any(|h| h == "stop-nodeos"));
+    assert!(!ops.stopped.get());
+    assert!(ops.public_info("http://mock-public").unwrap().is_some());
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("hyperion did not hydrate"));
+}
+
+#[test]
+fn producer_schedule_at_h_pins_cut_to_exactly_h() {
+    let dir = tempfile::tempdir().unwrap();
+    // Rebuild the producer config with schedule_at_h + snapshot.dir + a
+    // quiesce hook (the stand-in for "every producer paused").
+    let toml_text = format!(
+        r#"
+journal_path = "{dir}/journal.jsonl"
+poll_ms = 1
+
+[ceremony]
+freeze_height = 120
+freeze_strategy = "schedule_at_h"
+quiescence_polls = 3
+
+[source]
+rpc_url = "http://mock"
+producer_api_url = "http://mock"
+quiesce_cmd = "quiesce-p2p"
+
+[snapshot]
+staged_path = "{dir}/staged.bin"
+capture_roots = "{dir}/captured-roots.txt"
+dir = "{dir}"
+
+[target]
+metalgo_unit = "mock.service"
+rpc_url = "http://mock"
+quorum_timeout_secs = 60
+
+[hooks]
+on_freeze = "freeze-writes"
+post_ignite = "resume-traffic"
+on_live = "flip-gateway"
+"#,
+        dir = dir.path().display(),
+    );
+    let path = dir.path().join("ceremony-sched.toml");
+    std::fs::write(&path, toml_text).unwrap();
+    let cfg = Config::load(&path).unwrap();
+
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Live);
+    assert_eq!(ops.scheduled_h.get(), 120, "snapshot scheduled at exactly H");
+
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("snapshot_scheduled_at"));
+    assert!(text.contains("scheduled_snapshot_file"));
+    // The cut is EXACTLY H (not "whenever create_snapshot ran"), and the
+    // quiesce hook ran after the pause.
+    let snapped: serde_json::Value = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .find(|v: &serde_json::Value| v["state"] == "SNAPSHOTTED" && v["kind"] == "transition")
+        .unwrap();
+    assert_eq!(snapped["data"]["cut_height"].as_u64().unwrap(), 120);
+    assert!(text.contains("quiesce_cmd"));
+    let hooks = ops.hooks.borrow();
+    assert!(hooks.iter().any(|h| h == "quiesce-p2p"));
+    // Head ran past H while waiting for finality: burn-off blocks audited.
+    assert!(snapped["data"]["burnoff_blocks"].as_u64().unwrap() >= 1);
 }

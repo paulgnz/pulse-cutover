@@ -50,6 +50,10 @@ pub trait ChainOps {
     fn public_info(&self, public_url: &str) -> Result<Option<ChainInfo>, String>;
     fn ignite(&self) -> Result<String, String>;
     fn run_hook(&self, cmd: &str) -> Result<String, String>;
+    /// GET a JSON document (hyperion /v2/health, local or public).
+    /// Ok(None) while unreachable / non-JSON — health gates treat that as a
+    /// transient bounded by their own timeout.
+    fn get_json(&self, url: &str) -> Result<Option<Value>, String>;
     fn now_ms(&self) -> u64;
     fn sleep_ms(&self, ms: u64);
 }
@@ -261,6 +265,13 @@ impl ChainOps for HttpOps {
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
         run_shell(cmd)
+    }
+
+    fn get_json(&self, url: &str) -> Result<Option<Value>, String> {
+        match self.agent.get(url).call() {
+            Ok(r) => Ok(r.into_json::<Value>().ok()),
+            Err(_) => Ok(None),
+        }
     }
 
     fn now_ms(&self) -> u64 {

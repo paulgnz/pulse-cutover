@@ -1,0 +1,66 @@
+# hyperion-mode ceremony: api mode + [hyperion] — /v1 continuity AND /v2
+# history continuity through one ceremony, one flip stage.
+#
+#   ARMED -> FROZEN -> SNAPSHOTTED -> VERIFIED -> IGNITED
+#         -> (hyperion-rs up + hydrated, boundary staged)     <- still abortable
+#         -> FLIPPED (/v1 -> gateway, /v2 -> federating router)
+#         -> LIVE (source stopped LAST; both gates re-checked)
+#
+# The federating router (federator/server.js) serves pre-cut history from the
+# legacy Hyperion and post-cut from the local hyperion-rs — the public /v2
+# URL "keeps its memory" across the engine swap.
+
+journal_path = "/root/api-cutover/hyperion/journal.jsonl"
+poll_ms = 250
+
+[ceremony]
+mode = "api"                     # hyperion mode IS api mode + [hyperion]
+freeze_height = 0
+freeze_margin = 240
+simulate_freeze = true           # rehearsal against a live source chain
+chain_id = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
+import_cpu_scale = 143
+
+[source]
+rpc_url = "http://127.0.0.1:8888"
+producer_api_url = "http://127.0.0.1:8888"
+snapshot_timeout_secs = 900
+stop_cmd = "systemctl stop nodeos"
+start_cmd = "systemctl start nodeos"
+
+[snapshot]
+staged_path = "/root/api-cutover/hyperion/snapshot-cut.bin"
+path_map_from = "/data/snapshots"
+path_map_to = "/root/nodeos/data/snapshots"
+capture_roots = "/root/api-cutover/hyperion/captured-roots.txt"
+
+[target]
+metalgo_unit = "metalgo-pulse"
+rpc_url = "http://127.0.0.1:9650/ext/bc/<blockchainID>/rpc"
+quorum_timeout_secs = 900
+auto_rollback = true
+
+[flip]
+cmd = "/opt/pulse-cutover/flip-to-pulsevm.sh"
+public_url = "http://<public-ip-or-domain>"
+revert_cmd = "/opt/pulse-cutover/flip-revert.sh"
+health_polls = 4
+head_tolerance = 8
+health_timeout_secs = 180
+
+[hyperion]
+# Stood up AFTER IGNITED (the new chain's SHiP exists from ignition); the
+# ceremony holds until /v2/health reports the Indexer caught up.
+start_cmd = "systemctl start hyperion-indexer hyperion-api"
+health_url = "http://127.0.0.1:7000/v2/health"
+hydration_timeout_secs = 900
+max_lag_blocks = 0
+# The agent writes the discovered cut here; the federating router re-reads it
+# (no restart) — this is how the history boundary is configured by the
+# ceremony itself.
+boundary_path = "/etc/pulse-cutover/boundary.json"
+# Same flip stage as /v1: swap the public /v2 upstream from "the Hyperion you
+# already had" (or the legacy passthrough) to the federating router.
+flip_cmd = "/opt/pulse-cutover/flip-v2.sh"
+revert_cmd = "/opt/pulse-cutover/flip-v2-revert.sh"
+public_health_url = "http://<public-ip-or-domain>/v2/health"
