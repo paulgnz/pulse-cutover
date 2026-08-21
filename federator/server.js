@@ -83,6 +83,20 @@ async function fetchJson(base, path, timeoutMs) {
 const localGet = (path) => fetchJson(LOCAL, path, LOCAL_TIMEOUT_MS);
 const legacyGet = (path) => fetchJson(LEGACY, path, LEGACY_TIMEOUT_MS);
 
+// Legacy /v2/health cache: the legacy archive is a REMOTE public service that
+// rate-limits (observed live: eosusa 429s under a 4 Hz hammer through the
+// passthrough). Health checks must not spend its request budget — the
+// per-request signal that matters is the LOCAL side anyway.
+const HEALTH_CACHE_MS = Number(process.env.LEGACY_HEALTH_CACHE_MS || 5000);
+let _legacyHealth = { at: 0, value: null };
+async function legacyHealthCached() {
+  const now = Date.now();
+  if (_legacyHealth.value && now - _legacyHealth.at < HEALTH_CACHE_MS) return _legacyHealth.value;
+  const r = await legacyGet('/v2/health');
+  _legacyHealth = { at: now, value: r };
+  return r;
+}
+
 const qs = (params) => new URLSearchParams(params).toString();
 
 // ---- federated endpoints -------------------------------------------------
@@ -136,15 +150,26 @@ async function getActions(params) {
   }
 
   if (!local.ok && !legacy.ok) return { status: 502, body: errBody('both history sources unreachable', local, legacy) };
+  // Partial-answer honesty: if one source failed (observed live: legacy 429
+  // under load), the page may be missing that source's rows — say so, and
+  // mark the total as a lower bound so clients don't treat it as complete.
+  const partial = !local.ok || !legacy.ok;
   return {
     status: 200,
     body: {
       actions: [...localActs, ...legacyActs],
-      total: { value: localTotal + legacyTotal, relation: 'eq' },
+      total: { value: localTotal + legacyTotal, relation: partial ? 'gte' : 'eq' },
       local_total: localTotal,
       legacy_total: legacyTotal,
       lib: local.ok ? local.json?.lib : undefined,
       federated: true,
+      ...(partial ? {
+        partial: true,
+        source_errors: {
+          ...(local.ok ? {} : { local: { status: local.status, error: local.error || local.text } }),
+          ...(legacy.ok ? {} : { legacy: { status: legacy.status, error: legacy.error || legacy.text } }),
+        },
+      } : {}),
       boundary: pubBoundary(b),
     },
   };
@@ -182,7 +207,7 @@ async function getKeyAccounts(params, path) {
 // so the boundary's pre-cut half is monitored through the same URL.
 async function health() {
   const b = boundary();
-  const [local, legacy] = await Promise.all([localGet('/v2/health'), legacyGet('/v2/health')]);
+  const [local, legacy] = await Promise.all([localGet('/v2/health'), legacyHealthCached()]);
   const localServices = (local.ok && local.json?.health) || [];
   const lastIndexed = localServices.find((s) => s.service === 'Indexer')?.service_data?.last_indexed_block;
   const rpcHead = localServices.find((s) => s.service === 'PulseVM-RPC')?.service_data?.head_block_num;
