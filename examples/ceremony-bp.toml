@@ -1,4 +1,8 @@
-# bp-mode (producer) ceremony — the Appendix-A order, on real-chain state:
+# bp-mode (producer) ceremony
+#
+# NOTE freeze_margin: producer mode arms against HEAD (a producer freezes at
+# head >= H) while H := LIB-at-arm + margin — on a chain whose head runs
+# ~330 blocks past LIB (XPR testnet) the margin must exceed that lag. — the Appendix-A order, on real-chain state:
 #
 #   ARMED (snapshot scheduled at exactly H)
 #   -> FROZEN  (writes frozen at the API edge; blocks keep coming so H can
@@ -22,7 +26,7 @@ poll_ms = 250
 [ceremony]
 mode = "producer"
 freeze_height = 0
-freeze_margin = 240
+freeze_margin = 420
 freeze_strategy = "schedule_at_h"
 quiescence_polls = 8
 chain_id = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
