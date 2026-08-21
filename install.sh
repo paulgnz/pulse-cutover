@@ -196,7 +196,10 @@ RestartSec=3
 WantedBy=multi-user.target
 UNIT
   systemctl daemon-reload
-  systemctl enable --now pulse-gateway >/dev/null 2>&1
+  # restart (not just enable --now): a re-run may have changed the unit's
+  # UPSTREAM (new target chain) and a running service would keep the old env.
+  systemctl enable pulse-gateway >/dev/null 2>&1
+  systemctl restart pulse-gateway
 
   # nginx: ONLY /v1/chain is public (the producer_api must never be — R10).
   # The upstream indirection file is what the flip swaps: 8888 (nodeos) -> 8899 (gateway).
@@ -338,7 +341,8 @@ RestartSec=3
 WantedBy=multi-user.target
 UNIT
   systemctl daemon-reload
-  systemctl enable --now hyperion-federator >/dev/null 2>&1
+  systemctl enable hyperion-federator >/dev/null 2>&1
+  systemctl restart hyperion-federator  # env (LEGACY/ports) may have changed on re-run
 
   # nginx: add the public /v2 surface. Pre-flip upstream = the legacy
   # passthrough ("the /v2 you already had" — point it at your own old
