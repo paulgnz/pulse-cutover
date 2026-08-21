@@ -50,16 +50,30 @@ pub struct Machine<'a, O: ChainOps> {
     scheduled: bool,
 }
 
-/// Hydration predicate over a hyperion-rs /v2/health document. Hydrated when
-/// every reported service is OK AND the Indexer has caught up: its
-/// last_indexed_block within `max_lag` of the RPC head, or at/past the cut,
-/// or nothing post-cut exists to index yet (rpc head <= cut — the chain is
-/// idle at the cut and SHiP has streamed nothing).
+/// Hydration predicate over a hyperion-rs /v2/health document. Two ways in:
+///
+/// 1. Every service OK and the Indexer caught up (last_indexed_block within
+///    `max_lag` of the RPC head, or at/past the cut).
+/// 2. **Idle at the cut**: the chain presents head <= cut and nothing has
+///    streamed yet — hyperion-rs then reports `Indexer: Warning` with
+///    `last_indexed_block: 0` (observed live on an idle imported chain: an
+///    all-OK gate deadlocks). With zero post-cut blocks the indexer is
+///    caught up by definition; every NON-indexer service must still be OK.
+///    Honest caveat: this arm cannot distinguish "nothing to index" from a
+///    broken SHiP connection — the post-LIVE continuity proof (first write
+///    appearing in /v2) is the definitive check, and a real migration has
+///    traffic immediately.
 pub fn hyperion_hydrated(health: &serde_json::Value, cut: u64, max_lag: u64) -> Option<serde_json::Value> {
     let services = health.get("health")?.as_array()?;
-    if services.is_empty() || !services.iter().all(|s| s.get("status").and_then(|v| v.as_str()) == Some("OK")) {
+    if services.is_empty() {
         return None;
     }
+    let status_ok = |s: &&serde_json::Value| s.get("status").and_then(|v| v.as_str()) == Some("OK");
+    let all_ok = services.iter().all(|s| status_ok(&s));
+    let non_indexer_ok = services
+        .iter()
+        .filter(|s| s.get("service").and_then(|v| v.as_str()) != Some("Indexer"))
+        .all(|s| status_ok(&s));
     let field = |service: &str, key: &str| -> Option<u64> {
         services
             .iter()
@@ -68,13 +82,14 @@ pub fn hyperion_hydrated(health: &serde_json::Value, cut: u64, max_lag: u64) -> 
     };
     let last_indexed = field("Indexer", "last_indexed_block")?;
     let rpc_head = field("PulseVM-RPC", "head_block_num").unwrap_or(cut);
-    let caught_up =
-        last_indexed + max_lag >= rpc_head || last_indexed >= cut || rpc_head <= cut;
-    caught_up.then(|| {
+    let caught_up = all_ok && (last_indexed + max_lag >= rpc_head || last_indexed >= cut);
+    let idle_at_cut = non_indexer_ok && rpc_head <= cut && last_indexed == 0;
+    (caught_up || idle_at_cut).then(|| {
         json!({
             "last_indexed_block": last_indexed,
             "rpc_head": rpc_head,
             "cut_height": cut,
+            "idle_at_cut": idle_at_cut && !caught_up,
         })
     })
 }

@@ -901,3 +901,38 @@ on_live = "flip-gateway"
     // Head ran past H while waiting for finality: burn-off blocks audited.
     assert!(snapped["data"]["burnoff_blocks"].as_u64().unwrap() >= 1);
 }
+
+#[test]
+fn hydration_predicate_accepts_idle_at_cut_indexer_warning() {
+    // Observed live (idle imported chain): Indexer reports Warning with
+    // last_indexed_block: 0 because zero post-cut blocks exist — hydration
+    // must pass (idle_at_cut), an all-OK gate would deadlock.
+    use pulse_cutover::machine::hyperion_hydrated;
+    let idle = serde_json::json!({"health": [
+        {"service": "Elasticsearch", "status": "OK"},
+        {"service": "PulseVM-RPC", "status": "OK",
+         "service_data": {"head_block_num": 401579371, "last_irreversible_block": 401579371}},
+        {"service": "Indexer", "status": "Warning",
+         "service_data": {"head_block_num": 401579371, "last_indexed_block": 0}}
+    ]});
+    let ev = hyperion_hydrated(&idle, 401579371, 0).expect("idle-at-cut hydrates");
+    assert_eq!(ev["idle_at_cut"], serde_json::json!(true));
+
+    // But a Warning indexer BEHIND a moving head must NOT pass...
+    let behind = serde_json::json!({"health": [
+        {"service": "Elasticsearch", "status": "OK"},
+        {"service": "PulseVM-RPC", "status": "OK", "service_data": {"head_block_num": 401579400}},
+        {"service": "Indexer", "status": "Warning",
+         "service_data": {"head_block_num": 401579400, "last_indexed_block": 0}}
+    ]});
+    assert!(hyperion_hydrated(&behind, 401579371, 0).is_none());
+
+    // ...and a broken Elasticsearch blocks hydration even when idle.
+    let es_down = serde_json::json!({"health": [
+        {"service": "Elasticsearch", "status": "DOWN"},
+        {"service": "PulseVM-RPC", "status": "OK", "service_data": {"head_block_num": 401579371}},
+        {"service": "Indexer", "status": "Warning",
+         "service_data": {"head_block_num": 401579371, "last_indexed_block": 0}}
+    ]});
+    assert!(hyperion_hydrated(&es_down, 401579371, 0).is_none());
+}
