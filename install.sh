@@ -398,6 +398,20 @@ nginx -t && nginx -s reload
 echo reverted-v2-to-passthrough
 FLIP
   chmod +x /opt/pulse-cutover/flip-v2*.sh
+
+  cat > /opt/pulse-cutover/hyperion-start.sh <<'HYPSTART'
+#!/usr/bin/env bash
+# Started by the ceremony with the FIRST POST-CUT BLOCK as $1. hyperion-rs on
+# an imported chain must index from cut+1: start_block=0 requests the SHiP
+# stream from block 1, which this chain cannot serve (no pre-cut blocks), and
+# the stream stays silent forever while health looks merely idle (R21).
+set -e
+FIRST=${1:?usage: hyperion-start.sh <first-post-cut-block>}
+sed -i "s/^start_block = .*/start_block = $FIRST/" /etc/hyperion/config.toml
+systemctl restart hyperion-indexer hyperion-api
+echo "hyperion-rs indexing from $FIRST"
+HYPSTART
+  chmod +x /opt/pulse-cutover/hyperion-start.sh
 fi
 
 # ---------- ceremony.toml (the agent's manifest) ----------
@@ -449,7 +463,7 @@ EXPECTED_SHA=$(mget_opt '.snapshot.expected_sha256')
   if [ "$MODE" = "hyperion" ]; then
     echo ''
     echo '[hyperion]'
-    echo 'start_cmd = "systemctl start hyperion-indexer hyperion-api"'
+    echo 'start_cmd = "/opt/pulse-cutover/hyperion-start.sh {first_post_cut_block}"'
     echo 'health_url = "http://127.0.0.1:7000/v2/health"'
     echo 'hydration_timeout_secs = 900'
     echo 'boundary_path = "/etc/pulse-cutover/boundary.json"'

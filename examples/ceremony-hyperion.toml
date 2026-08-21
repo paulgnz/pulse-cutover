@@ -50,8 +50,12 @@ health_timeout_secs = 180
 
 [hyperion]
 # Stood up AFTER IGNITED (the new chain's SHiP exists from ignition); the
-# ceremony holds until /v2/health reports the Indexer caught up.
-start_cmd = "systemctl start hyperion-indexer hyperion-api"
+# ceremony holds until /v2/health reports the Indexer caught up (or the
+# chain is provably idle at the cut). {first_post_cut_block} is substituted
+# by the agent: hyperion-rs on an imported chain MUST index from cut+1 —
+# start_block=0 asks SHiP for block 1, which cannot exist, and the stream
+# stays silent forever (R21).
+start_cmd = "/opt/pulse-cutover/hyperion-start.sh {first_post_cut_block}"
 health_url = "http://127.0.0.1:7000/v2/health"
 hydration_timeout_secs = 900
 max_lag_blocks = 0

@@ -1010,17 +1010,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// Returns Ok(false) after aborting (start failure / hydration timeout).
     fn hyperion_hydrate(&mut self) -> Result<bool, String> {
         let hyp = self.cfg.hyperion.clone().expect("caller checked");
-        if let Some(cmd) = &hyp.start_cmd {
-            match self.ops.run_hook(cmd) {
-                Ok(o) => self
-                    .journal
-                    .evidence(State::Ignited, json!({"hyperion_start": o}))?,
-                Err(e) => {
-                    self.abort("hyperion start_cmd failed", json!({"error": e}))?;
-                    return Ok(false);
-                }
-            }
-        }
+        let cut = self.cut_height.expect("cut pinned");
+        // Boundary FIRST (the router must know the cut before its local
+        // source comes alive), then start.
         if let Some(path) = &hyp.boundary_path {
             let boundary = json!({
                 "cut_block": self.cut_height,
@@ -1044,7 +1036,27 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 json!({"hyperion_boundary_staged": path.display().to_string(), "boundary": boundary}),
             )?;
         }
-        let cut = self.cut_height.expect("cut pinned");
+        if let Some(cmd) = &hyp.start_cmd {
+            // Placeholder substitution: the ceremony discovers the cut, and
+            // hyperion-rs on an imported chain MUST index from the first
+            // post-cut block. `start_block = 0` asks SHiP for the stream
+            // from block 1 — which this chain cannot serve (no pre-cut
+            // blocks exist) — and the stream stays SILENT forever while
+            // /v2/health shows the same signature as a healthy idle chain
+            // (found live: hyperion rehearsal run 2, R21).
+            let cmd = cmd
+                .replace("{first_post_cut_block}", &(cut + 1).to_string())
+                .replace("{cut_height}", &cut.to_string());
+            match self.ops.run_hook(&cmd) {
+                Ok(o) => self
+                    .journal
+                    .evidence(State::Ignited, json!({"hyperion_start": o, "cmd": cmd}))?,
+                Err(e) => {
+                    self.abort("hyperion start_cmd failed", json!({"error": e}))?;
+                    return Ok(false);
+                }
+            }
+        }
         let started = self.ops.now_ms();
         let deadline = started + hyp.hydration_timeout_secs * 1000;
         let mut last_heartbeat = 0u64;
