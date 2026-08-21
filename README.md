@@ -69,6 +69,9 @@ pulse-cutover run    --config ceremony.toml
 pulse-cutover loop   --config ceremony.toml --runs N
 pulse-cutover status --config ceremony.toml
 pulse-cutover verify --snapshot snap.bin [--cpu-scale 143] [--golden g.txt | --capture g.txt]
+pulse-cutover doctor [--json]                       # read-only environment survey + verdicts
+pulse-cutover scan-contracts snap.bin [--json]      # stubbed-intrinsic exposure (advisory)
+pulse-cutover report [--paranoid] [--out f.tar.gz]  # sanitized feedback bundle
 ```
 
 See `examples/ceremony.toml` for the config format, and Appendix A of
@@ -142,6 +145,104 @@ single-node rehearsals against a live-syncing replica (sever p2p to emulate
 burn-off audit journals every transaction between the cut and the pause head —
 in a real freeze those blocks are empty and the audit proves it.
 
+## `pulse-cutover doctor` — detect, don't assume
+
+The 22 recorded ceremonies ran on boxes we built. Your box is not that box —
+so the tooling **detects** instead of assuming. `doctor` is a strictly
+read-only survey (no restarts, no writes, no flips):
+
+```sh
+pulse-cutover doctor          # human table
+pulse-cutover doctor --json   # machine JSON (what install.sh consumes)
+```
+
+What it detects:
+
+- **host** — OS/version/arch/kernel, RAM, CPU, free disk per relevant mount,
+  systemd/docker presence, virtualization;
+- **nodeos** — native binary or docker container (both work), the systemd
+  unit(s) that exec or docker-wrap it, chain API address, version
+  (`server_version_string`), chain_id + head, whether the producer_api
+  answers (`/v1/producer/paused` probe: 200 = enabled, 404 = missing plugin,
+  401/403 = restricted), state-history plugin on/off;
+- **web edge** — nginx, apache or caddy; for nginx the full
+  `server_name -> location -> proxy_pass/upstream` map from `nginx -T`
+  (this is what the flip templater uses), plus TLS cert paths and expiry;
+- **history stack** — legacy Hyperion under pm2 or systemd, its /v2 health;
+  Elasticsearch version + heap;
+- **PulseVM target** — metalgo binary/node, plugins dir, staged
+  pulse-cutover services;
+- **ports** — the ceremony's port plan (9650/9651/8899/80/9200/7000/7010/7019)
+  vs what is actually listening, and who owns the conflict.
+
+It ends with a per-mode verdict: **READY**, **NEEDS** (a precise list — e.g.
+"producer_api_plugin (localhost-bound)"), or **UNSUPPORTED** (a precise
+reason — e.g. caddy on the public edge, kube-managed nodeos) plus a pointer
+at `pulse-cutover report` so unsupported setups become supported ones.
+
+### Supported setups matrix
+
+| dimension | detected & handled | detected, NOT yet handled (UNSUPPORTED + explain) |
+|---|---|---|
+| nodeos runtime | native (systemd unit or bare pid) · docker container | kubernetes-managed |
+| nodeos stop/start | manifest `stop_cmd` · derived `systemctl stop <unit>` · derived `docker stop <container>` | bare-pid nodeos in api mode without a manifest `stop_cmd` (NEEDS) |
+| public edge | nginx (any layout: named upstreams, direct proxy_pass, TLS server blocks, multiple domains) · no web server (managed layout staged) | apache · caddy |
+| nginx flip | templated byte-exact from the detected `server_name -> proxy_pass` map; refuses if no /v1 route points at your nodeos | hand-minified configs may degrade to fewer detected routes — doctor shows what it saw |
+| history | legacy Hyperion (pm2 or systemd) noted; hyperion mode flips the detected /v2 route | no detectable /v2 route in hyperion mode (refuses with reason) |
+| OS | Ubuntu 22.04 / 24.04 | anything else (UNSUPPORTED — tell us via `report`) |
+
+## `pulse-cutover report` — the feedback loop
+
+**Testing with us? Run `report`, share the bundle.** One command produces a
+sanitized tar.gz with everything we need to debug your rehearsal or add
+support for your setup:
+
+```sh
+pulse-cutover report              # bundle + printed sha256
+pulse-cutover report --paranoid   # additionally placeholder hostnames/IPs
+```
+
+Collected: doctor JSON + table, ceremony journal(s) and loop metrics, the
+staged manifest/config, the last ~200 lines of every relevant service log it
+detects (nodeos — native or docker —, metalgo-pulse, pulse-gateway,
+hyperion-rs units, federator), the stubbed-intrinsic scan table, agent
+version.
+
+**Sanitization is non-negotiable and always on**: private keys
+(`PVT_K1_...`, `PVT_R1_...`, legacy WIF), bearer/authorization tokens,
+passwords (config values, `user:pass@` URLs, ES credentials) and labeled hex
+secrets are replaced with `[REDACTED-<type>]` before anything is written
+into the bundle. Chain ids, block ids and sha256 digests are kept — they are
+the evidence. The command ends by printing exactly what was redacted and the
+full file list so you can review before sharing (`tar -tzf`). Hostnames/IPs
+stay by default (so we can talk about your box); `--paranoid` placeholders
+them too. The sanitizer is covered by dedicated unit tests with planted fake
+secrets — that test suite is the review gate for this repo.
+
+Share it: attach to a [rehearsal-feedback issue](.github/ISSUE_TEMPLATE/rehearsal-feedback.md)
+(quote the printed sha256) or post in the community Telegram.
+
+## `pulse-cutover scan-contracts` — stubbed-intrinsic preflight
+
+Since PulseVM's arena-import branch, a contract importing an unserved host
+function **loads** (the import gets a stub) but **traps if it ever calls
+it**. The exposure is exactly enumerable from the snapshot:
+
+```sh
+pulse-cutover scan-contracts snapshot.bin          # at-risk table
+pulse-cutover scan-contracts snapshot.bin --json   # machine-readable
+```
+
+Parses every code object's wasm import section (wasmparser) and diffs `env`
+function imports against the served host-function table (169 names, embedded;
+`--served file` to override). **Advisory, never a gate** — a referenced
+import is a real code path but not necessarily a reachable one (the
+`send_deferred` cluster on XPR testnet is the canonical example: 20+ legacy
+contracts reference it, few can still reach it). The ceremony runs this scan
+automatically on the **actual cut snapshot** after verification and journals
+the table; declare `snapshot.prescan_path` (manifest `.snapshot.prescan_path`)
+to additionally scan a staged rehearsal snapshot at ARM time.
+
 ## Two-command operator story
 
 For a BP or API provider who has never seen PulseVM:
@@ -154,13 +255,27 @@ For a BP or API provider who has never seen PulseVM:
 ./cutover.sh --manifest ceremony.json
 ```
 
-`install.sh` refuses politely (with reasons) if the box isn't ready; installs
-the agent, PulseVM plugin, metalgo, and (api mode) the /v1 REST gateway — all
-**pinned + sha256-verified, fail-closed**; extracts any tarball safely
-(`--no-same-owner`, staging dir); stages the metalgo/chain/nginx configs with
-the manifest's values; enforces R12 (no stale staged snapshot); and ends with
-an ARMED-READY print of exactly what will happen at H. Idempotent — re-run it
-freely. It never touches your running nodeos and never flips traffic.
+`install.sh` now runs **doctor first** and consumes its JSON:
+
+- refuses per the doctor verdict — UNSUPPORTED prints the precise reason and
+  points at `report`; NEEDS prints the exact missing list;
+- templates the flip/revert scripts from the **detected** nginx map
+  (domain -> upstream), byte-exact against your own config files — your
+  nginx is untouched until the ceremony's flip stage. Only on a box with no
+  /v1 routes at all does it stage the managed layout from the recorded runs.
+  If nginx has routes but none reach your nodeos, it refuses and says so;
+- defaults `source.stop_cmd`/`start_cmd` from the detected systemd unit or
+  docker container when the manifest doesn't declare them;
+- runs the stubbed-intrinsic scan (advisory) when a prescan snapshot is
+  staged.
+
+Beyond that it installs the agent, PulseVM plugin, metalgo, and (api mode)
+the /v1 REST gateway — all **pinned + sha256-verified, fail-closed**;
+extracts any tarball safely (`--no-same-owner`, staging dir); stages the
+metalgo/chain configs with the manifest's values; enforces R12 (no stale
+staged snapshot); and ends with an ARMED-READY print of exactly what will
+happen at H. Idempotent — re-run it freely. It never touches your running
+nodeos and never flips traffic.
 
 `cutover.sh` validates the manifest against the live chain, runs the agent,
 and streams each state transition in plain language. Exit 0 = LIVE; anything
