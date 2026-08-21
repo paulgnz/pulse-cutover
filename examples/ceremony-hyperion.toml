@@ -1,70 +1,87 @@
-# hyperion-mode ceremony: api mode + [hyperion] — /v1 continuity AND /v2
-# history continuity through one ceremony, one flip stage.
+# =============================================================================
+# HYPERION mode rehearsal config — api mode + the [hyperion] block.
 #
+# Who this is for: an API provider who ALSO serves /v2 history (Hyperion).
+# Everything the api ceremony does, plus: your public /v2 URL keeps answering
+# across the migration — old rows from the legacy archive, new rows from a
+# local indexer on the new chain, merged behind the same URL ("the URL keeps
+# its memory"). /v1 and /v2 flip together, in one user-visible moment.
+#
+# Ceremony order:
 #   ARMED -> FROZEN -> SNAPSHOTTED -> VERIFIED -> IGNITED
-#         -> (hyperion-rs up + hydrated, boundary staged)     <- still abortable
-#         -> FLIPPED (/v1 -> gateway, /v2 -> federating router)
-#         -> LIVE (source stopped LAST; both gates re-checked)
+#         -> (new-chain indexer up + caught up, boundary written)  <- still abortable
+#         -> FLIPPED (/v1 -> PulseVM gateway, /v2 -> federating router)
+#         -> LIVE (your nodeos stopped LAST; both public gates re-checked)
 #
-# The federating router (federator/server.js) serves pre-cut history from the
-# legacy Hyperion and post-cut from the local hyperion-rs — the public /v2
-# URL "keeps its memory" across the engine swap.
+# Only the [hyperion] block is new — every other field is documented in
+# examples/ceremony-api.toml. Jargon → README glossary.
+# =============================================================================
 
-journal_path = "/root/api-cutover/hyperion/journal.jsonl"
-poll_ms = 250
+journal_path = "/root/api-cutover/hyperion/journal.jsonl"   # [CHANGE to your work dir]
+poll_ms = 250                                               # [LEAVE]
 
 [ceremony]
-mode = "api"                     # hyperion mode IS api mode + [hyperion]
-freeze_height = 0
-freeze_margin = 240
-simulate_freeze = true           # rehearsal against a live source chain
-chain_id = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
-import_cpu_scale = 143
+mode = "api"                     # hyperion mode IS api mode + [hyperion]      [LEAVE]
+freeze_height = 0                # real event: coordinator's H                 [CHANGE per event]
+freeze_margin = 240              # rehearsal H = last-final + 240              [LEAVE for rehearsals]
+simulate_freeze = true           # rehearsing against a live chain             [LEAVE for rehearsals]
+chain_id = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"  # [CHANGE to your chain]
+import_cpu_scale = 143           # coordinator-set, same for everyone          [LEAVE]
 
 [source]
-rpc_url = "http://127.0.0.1:8888"
-producer_api_url = "http://127.0.0.1:8888"
-snapshot_timeout_secs = 900
-stop_cmd = "systemctl stop nodeos"
-start_cmd = "systemctl start nodeos"
+rpc_url = "http://127.0.0.1:8888"            # [CHANGE if not :8888]
+producer_api_url = "http://127.0.0.1:8888"   # 127.0.0.1 ONLY — never public   [CHANGE if not :8888]
+snapshot_timeout_secs = 900                  # [LEAVE unless huge state]
+stop_cmd = "systemctl stop nodeos"           # YOUR stop command, runs LAST    [CHANGE to your command]
+start_cmd = "systemctl start nodeos"         # rollback path                   [CHANGE to your command]
 
 [snapshot]
-staged_path = "/root/api-cutover/hyperion/snapshot-cut.bin"
-path_map_from = "/data/snapshots"
+staged_path = "/root/api-cutover/hyperion/snapshot-cut.bin"     # must NOT pre-exist  [LEAVE]
+path_map_from = "/data/snapshots"                               # docker nodeos path map
 path_map_to = "/root/nodeos/data/snapshots"
-capture_roots = "/root/api-cutover/hyperion/captured-roots.txt"
+capture_roots = "/root/api-cutover/hyperion/captured-roots.txt" # rehearsal: capture; real event: golden_roots  [CHANGE per event]
 
 [target]
-metalgo_unit = "metalgo-pulse"
-rpc_url = "http://127.0.0.1:9650/ext/bc/<blockchainID>/rpc"
-quorum_timeout_secs = 900
-auto_rollback = true
+metalgo_unit = "metalgo-pulse"                                  # [LEAVE]
+rpc_url = "http://127.0.0.1:9650/ext/bc/<blockchainID>/rpc"     # [installer fills this]
+quorum_timeout_secs = 900                                       # [LEAVE]
+auto_rollback = true                                            # [LEAVE]
 
 [flip]
-cmd = "/opt/pulse-cutover/flip-to-pulsevm.sh"
-public_url = "http://<public-ip-or-domain>"
-revert_cmd = "/opt/pulse-cutover/flip-revert.sh"
-health_polls = 4
-head_tolerance = 8
-health_timeout_secs = 180
+cmd = "/opt/pulse-cutover/flip-to-pulsevm.sh"      # generated from YOUR nginx  [LEAVE]
+public_url = "http://<public-ip-or-domain>"        # what users call            [CHANGE]
+revert_cmd = "/opt/pulse-cutover/flip-revert.sh"   # the undo                   [LEAVE]
+health_polls = 4                                   # [LEAVE]
+head_tolerance = 8                                 # [LEAVE]
+health_timeout_secs = 180                          # [LEAVE]
 
+# ---------------------------------------------------------------------------
+# [hyperion] — the /v2 history half. The pieces (hyperion-rs indexer,
+# Elasticsearch, federating router) are staged by install.sh; the ceremony
+# starts the indexer only AFTER the new chain exists.
+# ---------------------------------------------------------------------------
 [hyperion]
-# Stood up AFTER IGNITED (the new chain's SHiP exists from ignition); the
-# ceremony holds until /v2/health reports the Indexer caught up (or the
-# chain is provably idle at the cut). {first_post_cut_block} is substituted
-# by the agent: hyperion-rs on an imported chain MUST index from cut+1 —
-# start_block=0 asks SHiP for block 1, which cannot exist, and the stream
-# stays silent forever (R21).
+# Started after IGNITED. The agent substitutes {first_post_cut_block} — the
+# indexer on a migrated chain MUST start at cut+1: asking for block 1 would
+# wait forever for blocks the new chain doesn't have.                          [LEAVE]
 start_cmd = "/opt/pulse-cutover/hyperion-start.sh {first_post_cut_block}"
+
+# Local health endpoint of the new-chain indexer. The ceremony holds here
+# until it reports caught-up (a chain with zero post-cut blocks counts as
+# caught up by definition).                                                    [LEAVE]
 health_url = "http://127.0.0.1:7000/v2/health"
-hydration_timeout_secs = 900
-max_lag_blocks = 0
-# The agent writes the discovered cut here; the federating router re-reads it
-# (no restart) — this is how the history boundary is configured by the
-# ceremony itself.
+hydration_timeout_secs = 900     # indexer not caught up in time -> abort      [LEAVE]
+max_lag_blocks = 0               # how far the indexer may trail the head      [LEAVE]
+
+# The agent writes the cut (block, time, id, chain) here; the federating
+# router re-reads it live — this file IS the old/new history boundary.         [LEAVE]
 boundary_path = "/etc/pulse-cutover/boundary.json"
-# Same flip stage as /v1: swap the public /v2 upstream from "the Hyperion you
-# already had" (or the legacy passthrough) to the federating router.
+
+# The /v2 half of the flip: swap the public /v2 from your existing Hyperion
+# to the federating router. Generated by install.sh from YOUR nginx.           [LEAVE]
 flip_cmd = "/opt/pulse-cutover/flip-v2.sh"
 revert_cmd = "/opt/pulse-cutover/flip-v2-revert.sh"
+
+# Public /v2 health URL — checked AFTER the flip, before your nodeos may be
+# stopped.                                                                     [CHANGE]
 public_health_url = "http://<public-ip-or-domain>/v2/health"

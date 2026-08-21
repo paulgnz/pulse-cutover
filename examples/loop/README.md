@@ -1,5 +1,13 @@
 # Loop-harness reference deployment (api-cutover rehearsal, 2026-08-21)
 
+**You do not need this directory for a normal rehearsal** — the README
+walkthrough (`doctor` → `install.sh` → `cutover.sh`) is the operator path.
+This is the reference deployment behind the recorded 22-run loop series: the
+exact scripts that let `pulse-cutover loop` run the same ceremony N times on
+one box (a fresh target chain per iteration), plus the gotchas we hit. Read
+it to run your own repeated loops or reproduce our numbers. It is
+deliberately technical.
+
 The exact scripts used for the N-run repeatable rehearsal on the api-cutover-test box:
 
 - `setup.sh` — one-time: metalgo-local unit (LOCAL network 12345, sybil protection off

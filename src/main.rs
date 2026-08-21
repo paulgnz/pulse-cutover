@@ -25,6 +25,136 @@ use pulse_cutover::{
     verify,
 };
 
+const USAGE: &str = "\
+pulse-cutover — drives an Antelope -> PulseVM cutover ceremony: same URL,
+same chain_id, same state, zero read downtime. Operator walkthrough: README.md.
+
+usage: pulse-cutover <command> [options]   (pulse-cutover <command> --help for examples)
+
+read-only, safe anywhere (including production):
+  doctor          survey this box (nodeos, nginx, disk, ports) + per-mode verdicts
+  status          how far the ceremony got, from the journal
+  scan-contracts  list contracts that reference host functions PulseVM stubs (advisory)
+  report          build a sanitized tar.gz to share (keys/tokens auto-redacted)
+  verify          hash + dual-import fingerprint a snapshot (heavy but touches nothing)
+
+mutating (normally driven by install.sh / cutover.sh):
+  run             run the ceremony to LIVE (exit 0) or ABORTED (exit 1)
+  loop            run N ceremonies back to back with a reset between (rehearsal boxes)";
+
+const HELP_RUN: &str = "\
+pulse-cutover run --config ceremony.toml
+
+Runs the cutover ceremony described by the config, journaling every step:
+ARMED -> FROZEN -> SNAPSHOTTED -> VERIFIED -> IGNITED [-> FLIPPED] -> LIVE.
+Nothing user-visible changes before FLIPPED; an abort at any point is safe
+and rolls back automatically. Most operators run ./cutover.sh instead, which
+wraps this with preflight checks and plain-language output.
+
+Exit codes: 0 = LIVE, 1 = did not reach LIVE (journal has the reason).
+If the process dies, re-run the same command — it resumes from the journal.
+
+EXAMPLES
+  pulse-cutover run --config /etc/pulse-cutover/ceremony.toml
+  ./cutover.sh --manifest ceremony.json     # the friendly wrapper";
+
+const HELP_LOOP: &str = "\
+pulse-cutover loop --config ceremony.toml --runs N
+
+Runs N full ceremonies back to back on a rehearsal box: [loop].reset_cmd
+returns both sides to a pre-arm state between runs. Failures don't stop the
+loop — they are counted and categorized in the final summary. Per-run
+metrics go to [loop].metrics_path (JSONL).
+
+EXAMPLES
+  pulse-cutover loop --config ceremony.toml --runs 22
+  # reference reset harness: examples/loop/ in the repo";
+
+const HELP_STATUS: &str = "\
+pulse-cutover status --config ceremony.toml
+
+Read-only. Replays the journal and prints the current state plus the pinned
+facts (cut block, snapshot hash...). 'no journal' means the ceremony was
+never started on this config.
+
+EXAMPLES
+  pulse-cutover status --config /etc/pulse-cutover/ceremony.toml";
+
+const HELP_VERIFY: &str = "\
+pulse-cutover verify --snapshot file.bin [--cpu-scale N]
+                     [--golden roots.txt | --capture roots.txt]
+
+Read-only for the box (CPU/RAM heavy): hashes the snapshot and imports it
+TWICE through the exact code path a PulseVM node boots with, printing the
+per-table state fingerprints. --golden checks them against a published
+golden file (exit non-zero on any difference); --capture writes them out
+for others to check against. --cpu-scale must match the ceremony's
+import_cpu_scale (fingerprints depend on it).
+
+EXAMPLES
+  pulse-cutover verify --snapshot snapshot-cut.bin --cpu-scale 143 --capture roots.txt
+  pulse-cutover verify --snapshot snapshot-cut.bin --cpu-scale 143 --golden golden-roots.txt";
+
+const HELP_DOCTOR: &str = "\
+pulse-cutover doctor [--json] [--mode bp|api|hyperion]
+
+Strictly read-only survey of this box: how nodeos runs (native/docker),
+what nginx serves, history stack, metalgo, disk, ports. Ends with a
+verdict per mode: READY, NEEDS (precise list of what's missing and how to
+fix it), or UNSUPPORTED (precise reason — run 'pulse-cutover report' and
+share the bundle so we can add support). Safe to run anywhere, including
+production.
+
+--json prints the machine-readable survey (schema: AGENTS.md).
+--mode makes the exit code reflect that mode's verdict (0 = READY, 3 =
+not ready) — this is what install.sh uses.
+
+EXAMPLES
+  pulse-cutover doctor
+  pulse-cutover doctor --json | jq '.verdicts.api'";
+
+const HELP_SCAN: &str = "\
+pulse-cutover scan-contracts <snapshot.bin> [--served served.txt] [--json]
+
+Read-only. Lists deployed contracts that reference host functions PulseVM
+stubs: such a contract still loads, but traps if it ever CALLS the missing
+function. Advisory, never a gate — a referenced function is not necessarily
+a reachable one. The ceremony runs this automatically on the actual cut
+snapshot and journals the table.
+
+EXAMPLES
+  pulse-cutover scan-contracts snapshot-cut.bin
+  pulse-cutover scan-contracts snapshot-cut.bin --json | jq '.at_risk'";
+
+const HELP_REPORT: &str = "\
+pulse-cutover report [--config ceremony.toml] [--out bundle.tar.gz] [--paranoid]
+
+Read-only survey + one sanitized tar.gz: doctor output, ceremony journal,
+staged config, recent service logs. Private keys, tokens and passwords are
+ALWAYS redacted ([REDACTED-<type>]); chain/block ids and hashes are kept
+(they're the evidence). Prints the redaction summary and full file list so
+you can review before sharing. --paranoid also placeholders hostnames/IPs.
+
+Share the bundle (plus its printed sha256) in the testing Telegram group or
+a rehearsal-feedback GitHub issue — see TESTING.md.
+
+EXAMPLES
+  pulse-cutover report
+  pulse-cutover report --paranoid --out /tmp/bundle.tar.gz";
+
+fn help_for(cmd: &str) -> Option<&'static str> {
+    match cmd {
+        "run" => Some(HELP_RUN),
+        "loop" => Some(HELP_LOOP),
+        "status" => Some(HELP_STATUS),
+        "verify" => Some(HELP_VERIFY),
+        "doctor" => Some(HELP_DOCTOR),
+        "scan-contracts" => Some(HELP_SCAN),
+        "report" => Some(HELP_REPORT),
+        _ => None,
+    }
+}
+
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
@@ -38,6 +168,21 @@ fn flag(args: &[String], name: &str) -> bool {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("");
+    // `pulse-cutover help [command]` and `pulse-cutover <command> --help|-h`.
+    if command == "help" || command == "--help" || command == "-h" {
+        match args.get(1).and_then(|c| help_for(c)) {
+            Some(h) => println!("{h}"),
+            None => println!("{USAGE}"),
+        }
+        return;
+    }
+    if flag(&args, "--help") || flag(&args, "-h") {
+        match help_for(command) {
+            Some(h) => println!("{h}"),
+            None => println!("{USAGE}"),
+        }
+        return;
+    }
     let result = match command {
         "run" => cmd_run(&args),
         "loop" => cmd_loop(&args),
@@ -47,14 +192,7 @@ fn main() {
         "scan-contracts" => cmd_scan(&args),
         "report" => cmd_report(&args),
         _ => {
-            eprintln!(
-                "usage: pulse-cutover <run|loop|status|verify> --config ceremony.toml\n       \
-                 pulse-cutover loop --config ceremony.toml --runs N\n       \
-                 pulse-cutover verify --snapshot file.bin [--cpu-scale N] [--golden g.txt | --capture g.txt]\n       \
-                 pulse-cutover doctor [--json]\n       \
-                 pulse-cutover scan-contracts snapshot.bin [--served served.txt] [--json]\n       \
-                 pulse-cutover report [--config ceremony.toml] [--out bundle.tar.gz] [--paranoid]"
-            );
+            eprintln!("{USAGE}");
             std::process::exit(2);
         }
     };
@@ -155,7 +293,12 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     if terminal == state::State::Live {
         Ok(())
     } else {
-        Err(format!("ceremony ended in {terminal} (see journal)"))
+        Err(format!(
+            "ceremony ended in {terminal} — it stopped safely and rolled back; the source \
+             chain is still authoritative. The reason is the last 'error' line in {}. \
+             'pulse-cutover report' packs it (keys redacted) for sharing.",
+            cfg.journal_path.display()
+        ))
     }
 }
 

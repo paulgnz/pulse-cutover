@@ -5,10 +5,16 @@ title: "[rehearsal] <your operator name / box role>"
 labels: rehearsal-feedback
 ---
 
+<!-- Prefer chat? The same bundle is welcome in the testing Telegram group:
+     https://t.me/+N1mAvoUDbtVmNTBh — this issue template is the on-the-record
+     version. What testing involves: TESTING.md in the repo. -->
+
 ## What happened
 
 <!-- One or two sentences: which mode (bp / api / hyperion), how far the
-     ceremony got (last state printed), and what surprised you. -->
+     ceremony got (last state printed), and what surprised you.
+     "doctor said UNSUPPORTED and I never got further" is a complete answer
+     — that's the exact feedback we want. -->
 
 ## The bundle
 

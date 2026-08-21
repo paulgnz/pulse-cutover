@@ -28,14 +28,26 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1"; exit 2;;
   esac
 done
-[ -n "$MODE" ] || { echo "usage: ./install.sh --mode api|bp|hyperion --manifest ceremony.json"; exit 2; }
-[ "$MODE" = "api" ] || [ "$MODE" = "bp" ] || [ "$MODE" = "hyperion" ] || { echo "ABORT: --mode must be api, bp or hyperion"; exit 2; }
+[ -n "$MODE" ] || {
+  echo "usage: ./install.sh --mode api|bp|hyperion --manifest ceremony.json"
+  echo "  --mode bp        you are a block producer"
+  echo "  --mode api       you serve a public /v1 RPC URL"
+  echo "  --mode hyperion  you serve /v1 AND /v2 history (Hyperion)"
+  echo "  (unsure? see 'Which mode am I?' in the README)"
+  exit 2
+}
+[ "$MODE" = "api" ] || [ "$MODE" = "bp" ] || [ "$MODE" = "hyperion" ] || { echo "ABORT: --mode must be api, bp or hyperion (got '$MODE')"; exit 2; }
 # hyperion mode IS api mode (same /v1 machinery) + the /v2 history stack.
 API_LIKE=false
 if [ "$MODE" = "api" ] || [ "$MODE" = "hyperion" ]; then API_LIKE=true; fi
 MANIFEST="${MANIFEST:-ceremony.json}"
-[ -f "$MANIFEST" ] || { echo "ABORT: manifest $MANIFEST not found"; exit 2; }
-[ "$(id -u)" = 0 ] || { echo "ABORT: run as root"; exit 2; }
+[ -f "$MANIFEST" ] || {
+  echo "ABORT: manifest '$MANIFEST' not found. The manifest is the ceremony.json describing"
+  echo "       the event — in a real event the coordinator publishes it; for a rehearsal ask"
+  echo "       in the Telegram group for the current bundle, or see examples/ in the repo."
+  exit 2
+}
+[ "$(id -u)" = 0 ] || { echo "ABORT: this installer stages system services, so it must run as root: sudo ./install.sh --mode $MODE --manifest $MANIFEST"; exit 2; }
 
 echo "== pulse-cutover installer (mode: $MODE) =="
 export DEBIAN_FRONTEND=noninteractive
@@ -64,7 +76,12 @@ fetch_verify(){ # url sha dest
   fi
   echo "  fetch $(basename "$dest") ..."
   curl -fsSL "$url" -o "$dest.tmp"
-  echo "$sha  $dest.tmp" | sha256sum -c - >/dev/null || { echo "ABORT: SHA256 mismatch on $dest (fail-closed)"; rm -f "$dest.tmp"; exit 1; }
+  echo "$sha  $dest.tmp" | sha256sum -c - >/dev/null || {
+    echo "ABORT: the downloaded $(basename "$dest") does not match the sha256 pinned in the manifest."
+    echo "       Nothing was installed. Do NOT fetch it from anywhere else — tell the ceremony"
+    echo "       coordinator (bad mirror, stale manifest, or tampering)."
+    rm -f "$dest.tmp"; exit 1
+  }
   mv "$dest.tmp" "$dest"
   echo "  verified: $(basename "$dest")"
 }
@@ -125,13 +142,13 @@ problems=()
 # The source nodeos is YOURS — we detect it, we never install or touch it.
 SRC_INFO=$(curl -s -m5 "$SRC_RPC/v1/chain/get_info" || true)
 if [ -z "$SRC_INFO" ]; then
-  problems+=("no nodeos answering at $SRC_RPC — an existing, synced $($API_LIKE && echo 'API node' || echo 'producer node') is a prerequisite")
+  problems+=("no nodeos answering at $SRC_RPC — is it running? (systemctl status <your-unit> / docker ps). If it listens on another address, set source.rpc_url in $MANIFEST")
 else
   GOT_CHAIN=$(echo "$SRC_INFO" | jq -r '.chain_id // empty')
   [ "$GOT_CHAIN" = "$CHAIN_ID" ] || problems+=("nodeos at $SRC_RPC serves chain_id ${GOT_CHAIN:-none}, manifest expects $CHAIN_ID")
 fi
 PAUSED=$(curl -s -m5 -X POST "$SRC_PROD/v1/producer/paused" || true)
-case "$PAUSED" in true|false) ;; *) problems+=("producer_api not reachable at $SRC_PROD (needed for create_snapshot; enable eosio::producer_api_plugin, localhost-bound — R10)");; esac
+case "$PAUSED" in true|false) ;; *) problems+=("producer_api not answering at $SRC_PROD — the ceremony takes its snapshot through it. Fix: add 'plugin = eosio::producer_api_plugin' to your nodeos config and restart nodeos. Keep it bound to 127.0.0.1 — it can pause your chain (R10)");; esac
 # R10: the producer_api must NOT be public.
 if [ -n "$PAUSED" ]; then
   PUB_IP=$(curl -fsSL -m5 https://api.ipify.org 2>/dev/null || true)
@@ -148,6 +165,8 @@ if [ ${#problems[@]} -gt 0 ]; then
   echo ""
   echo "This box is not ready. Nothing was installed. Reasons:"
   for p in "${problems[@]}"; do echo "  - $p"; done
+  echo ""
+  echo "Fix the above and re-run this installer (re-running is always safe)."
   exit 1
 fi
 echo "preflight: ok (nodeos serving $CHAIN_ID, producer_api localhost-only)"
@@ -667,7 +686,8 @@ echo " Source:  nodeos at $SRC_RPC serving $CHAIN_ID (untouched)"
 echo " Target:  metalgo-pulse tracking subnet $SUBNET"
 echo "          NodeID $NODEID"
 echo "          chain $BID: waiting for the verified snapshot at"
-echo "          $STAGED (absent by design — R12)"
+echo "          $STAGED"
+echo "          (absent by design until VERIFIED — a stale file would pin the wrong cut, R12)"
 $API_LIKE && echo " Public:  nginx /v1/chain -> nodeos:${NODEOS_PORT:-8888} (flip staged, NOT flipped)"
 [ "$MODE" = "hyperion" ] && echo " History: nginx /v2 -> legacy passthrough ($(mget '.hyperion.legacy_url')); federator + hyperion-rs staged"
 echo ""

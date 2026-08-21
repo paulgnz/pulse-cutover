@@ -1,59 +1,91 @@
-# bp-mode (producer) ceremony
+# =============================================================================
+# BP (block-producer) mode rehearsal config
 #
-# NOTE freeze_margin: producer mode arms against HEAD (a producer freezes at
-# head >= H) while H := LIB-at-arm + margin — on a chain whose head runs
-# ~330 blocks past LIB (XPR testnet) the margin must exceed that lag. — the Appendix-A order, on real-chain state:
+# Who this is for: a producer who helps FREEZE the chain at the agreed block
+# and becomes a producer/validator of the migrated chain. Nothing public
+# flips in this mode — your job is the freeze, the snapshot at exactly H,
+# and igniting the new chain.
 #
-#   ARMED (snapshot scheduled at exactly H)
-#   -> FROZEN  (writes frozen at the API edge; blocks keep coming so H can
-#               finalize — R1; snapshot lands as snapshot-<id(H)>.bin)
-#   -> SNAPSHOTTED (pause + quiesce + quiescence window; cut pinned to H)
-#   -> VERIFIED -> IGNITED -> LIVE (this node now PRODUCES the new chain)
+# The ceremony order in this mode:
+#   ARMED        watch the chain approach H (snapshot pre-scheduled at exactly H)
+#   FROZEN       writes are frozen at the API edge; empty blocks carry the
+#                chain until H is final; nodeos writes snapshot-<id-of-H>.bin
+#   SNAPSHOTTED  producer paused, chain quiet, cut pinned to H by block id
+#   VERIFIED     snapshot hashed + imported twice, fingerprints checked
+#   IGNITED      PulseVM boots the same chain at the cut
+#   LIVE         the new chain is producing past the cut
 #
-# Single-node stand-in notes (rehearsing against a live-syncing replica):
-# - freeze_strategy = "schedule_at_h": on a chain this node does not produce,
-#   H finalizes on its own; a real BP freeze produces empty blocks to the
-#   same effect (R1/R17 — same finality wait either way).
-# - quiesce_cmd emulates "every producer paused" by severing p2p; a real
-#   multi-BP ceremony needs no such hook (nobody produces after the pause).
-# - burn-off audit over (H, head-at-pause] will show REAL transactions here
-#   (the live chain kept going); in a real freeze those blocks are empty and
-#   the audit proves it.
+# Jargon (H, the cut, goldens, quiescence...) → README glossary:
+# https://github.com/paulgnz/pulse-cutover#glossary
+#
+# SINGLE-NODE REHEARSAL NOTES (this file rehearses against a live-syncing
+# replica of a chain you do NOT control, which is why some knobs look odd):
+# - freeze_margin must exceed the chain's head-to-final lag (~330 blocks on
+#   XPR testnet), because a producer freezes at head >= H while H itself is
+#   derived from the last FINAL block — hence 420 here.
+# - quiesce_cmd cuts the replica's p2p to fake "every producer paused"; a
+#   real multi-BP ceremony does not need it (nobody produces after the pause).
+# - the burn-off audit (transactions between the cut and the pause) will show
+#   REAL transactions here because the live chain kept going; in a real
+#   freeze those blocks are empty and the audit proves it.
+# =============================================================================
 
-journal_path = "/root/bp-cutover/journal.jsonl"
-poll_ms = 250
+journal_path = "/root/bp-cutover/journal.jsonl"   # evidence log; resumable   [CHANGE to your work dir]
+poll_ms = 250                                     # poll interval, ms          [LEAVE]
 
 [ceremony]
-mode = "producer"
-freeze_height = 0
-freeze_margin = 420
+mode = "producer"            # you are a BP                                    [LEAVE]
+freeze_height = 0            # real event: the coordinator's published H       [CHANGE per event]
+freeze_margin = 420          # rehearsal H = last-final + 420 (see note above) [LEAVE for rehearsals]
+
+# "schedule_at_h" = tell nodeos IN ADVANCE to write the snapshot the moment
+# block H becomes final — the multi-BP discipline (everyone cuts the exact
+# same block). "pause_at_h" = pause first, snapshot after (single-node).      [LEAVE]
 freeze_strategy = "schedule_at_h"
+
+# After pausing, the chain's head must hold still for this many consecutive
+# polls before the cut is trusted (catches stragglers/late blocks).           [LEAVE]
 quiescence_polls = 8
-chain_id = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
-import_cpu_scale = 143
+
+chain_id = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"  # XPR testnet  [CHANGE to your chain]
+import_cpu_scale = 143       # same number for every operator — coordinator sets it  [LEAVE]
 
 [source]
-rpc_url = "http://127.0.0.1:8888"
-producer_api_url = "http://127.0.0.1:8888"
-snapshot_timeout_secs = 900
+rpc_url = "http://127.0.0.1:8888"            # your nodeos chain API           [CHANGE if not :8888]
+producer_api_url = "http://127.0.0.1:8888"   # pause/snapshot API — 127.0.0.1 ONLY, never public  [CHANGE if not :8888]
+snapshot_timeout_secs = 900                  # max wait for snapshot write     [LEAVE unless huge state]
+
+# Rehearsal-only stand-in for "every other producer also paused": severs the
+# replica's p2p so the head actually stops. Real multi-BP event: delete.      [LEAVE for rehearsals]
 quiesce_cmd = "/root/bp-cutover/quiesce.sh"
 
 [snapshot]
-# Local-network target substrate (same as the loop harness): the fresh local
-# chain's config points at the loop's staged path.
+# Where the VERIFIED snapshot is staged for PulseVM (must match the PulseVM
+# chain config's snapshot_path; must NOT pre-exist).                          [LEAVE]
 staged_path = "/root/api-cutover/loop/snapshot-cut.bin"
+
+# Where nodeos writes its scheduled snapshot files (schedule_at_h picks up
+# snapshot-<block-id-of-H>.bin from here by exact name).                      [CHANGE to your nodeos snapshots dir]
 dir = "/root/nodeos/data/snapshots"
+
+# docker nodeos: container path -> host path for the same directory.
 path_map_from = "/data/snapshots"
 path_map_to = "/root/nodeos/data/snapshots"
+
+# Rehearsal: write the computed state fingerprints here. Real event: use
+# golden_roots = "<published golden file>" instead — verify, don't capture.   [CHANGE per event]
 capture_roots = "/root/bp-cutover/captured-roots.txt"
 
 [target]
-metalgo_unit = "metalgo-local"
-rpc_url = "http://127.0.0.1:9657/"
-live_blocks = 1
-quorum_timeout_secs = 900
-auto_rollback = true
+metalgo_unit = "metalgo-local"        # the PulseVM node's systemd unit        [LEAVE — installer sets it]
+rpc_url = "http://127.0.0.1:9657/"    # the new chain's local RPC              [installer fills this]
+live_blocks = 1                       # LIVE = head at least this far past the cut (proof the new chain really produces)  [LEAVE]
+quorum_timeout_secs = 900             # new chain not up in time -> abort + rollback  [LEAVE]
+auto_rollback = true                  # on abort: resume the source producer automatically  [LEAVE]
 
 [hooks]
+# on_freeze runs the moment the freeze begins — in a real event this is where
+# YOUR API edge starts rejecting writes (R2: reads continue, writes reject).
 on_freeze = "echo bp-write-freeze-marker"
+# on_abort: undo anything on_freeze/quiesce did (here: restore the replica's p2p).
 on_abort = "/root/bp-cutover/unquiesce.sh"

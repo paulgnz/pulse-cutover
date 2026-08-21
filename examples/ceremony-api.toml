@@ -1,52 +1,143 @@
-# pulse-cutover ceremony manifest — API-PROVIDER mode.
-# The api-node ceremony: nodeos serving the public /v1 URL -> PulseVM serving
-# the SAME URL, zero read downtime. State order: the source nodeos OUTLIVES
-# ignition; the /v1 flip (FLIPPED) is the only user-visible step and the
-# source stop runs after it.
+# =============================================================================
+# API-PROVIDER mode rehearsal config (pulse-cutover run/loop --config this)
+#
+# Who this is for: an RPC/API operator whose job is keeping the public /v1
+# URL answering — nodeos serving it today, PulseVM serving the SAME URL after
+# the ceremony, with zero read downtime. Your nodeos is only stopped at the
+# very end, AFTER the new engine is verified, serving, and flipped in.
+#
+# NOTE: if you used install.sh (the normal path), it GENERATES this file at
+# /etc/pulse-cutover/ceremony.toml from your ceremony.json — you don't edit
+# this by hand. This example exists so you can read every knob, and for
+# advanced/manual runs. Jargon (H, the cut, goldens...) is defined in the
+# README glossary: https://github.com/paulgnz/pulse-cutover#glossary
+# =============================================================================
 
+# Where the agent writes its step-by-step evidence log. Any path you can
+# write to. If a run crashes, re-running resumes from this file.  [CHANGE to your work dir]
 journal_path = "/root/api-cutover/journal.jsonl"
+
+# How often (milliseconds) the agent polls the chains. 250 is fine.  [LEAVE]
 poll_ms = 250
 
+# ---------------------------------------------------------------------------
+# [ceremony] — WHAT is being migrated and WHEN. In a real event every value
+# here comes from the coordinator's published manifest; in a rehearsal you
+# pick them yourself.
+# ---------------------------------------------------------------------------
 [ceremony]
-mode = "api"
-freeze_height = 0            # 0 = derive H from freeze_margin at ARM
-freeze_margin = 240          # H := LIB-at-ARM + 240 (rehearsal / loop mode)
-simulate_freeze = true       # live source won't freeze: proceed at LIB >= H
+mode = "api"                 # you are an API provider (producers use "producer")  [LEAVE]
+
+# The block number where the old chain stops accepting writes ("H").
+# Real event: the coordinator publishes this number — paste it here.
+# Rehearsal: leave 0 and set freeze_margin instead.                   [CHANGE per event]
+freeze_height = 0
+
+# Rehearsal-only H: "freeze N blocks from now". At start the agent takes the
+# last final block and adds this. 240 blocks ≈ 2 minutes on XPR.      [LEAVE for rehearsals]
+freeze_margin = 240
+
+# Rehearsal-only: a live chain you don't control will NOT actually freeze,
+# so proceed once H is final. Real event: remove this line.           [LEAVE for rehearsals]
+simulate_freeze = true
+
+# The chain being migrated. The agent refuses to run if the node at
+# source.rpc_url serves a different chain — this prevents cutting the wrong
+# chain. This value = XPR testnet.                                    [CHANGE to your chain]
 chain_id = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
-import_cpu_scale = 143       # chain identity — must equal the staged pulsevm config
 
+# CPU-billing conversion factor between the engines. Part of chain identity:
+# every operator in a ceremony MUST use the same number, and it must equal
+# the one in the staged PulseVM chain config. The coordinator sets it.  [LEAVE]
+import_cpu_scale = 143
+
+# ---------------------------------------------------------------------------
+# [source] — YOUR existing nodeos. The agent only ever reads from it, takes
+# one snapshot through it, and (at the very end) runs YOUR stop command.
+# ---------------------------------------------------------------------------
 [source]
-rpc_url = "http://127.0.0.1:8888"
-producer_api_url = "http://127.0.0.1:8888"   # localhost ONLY (R10)
+rpc_url = "http://127.0.0.1:8888"            # where nodeos answers /v1/chain/get_info  [CHANGE if not :8888]
+
+# The producer-API side of the same node (usually the same address). Needed
+# for create_snapshot. SECURITY: this API can pause a chain — it must only
+# listen on 127.0.0.1, never on a public interface.                    [CHANGE if not :8888]
+producer_api_url = "http://127.0.0.1:8888"
+
+# How long to wait for nodeos to finish writing the snapshot before giving
+# up (seconds). Mainnet-sized state needs more than testnet.           [LEAVE unless huge state]
 snapshot_timeout_secs = 900
-stop_cmd = "systemctl stop nodeos"           # the operator's own stop script
-start_cmd = "systemctl start nodeos"         # rollback if aborting after stop
 
+# How to stop and restart YOUR nodeos. Used exactly once each way: stop after
+# the public URL has flipped to PulseVM; start only if a late abort needs to
+# roll back. install.sh derives these from your systemd unit or docker
+# container if you leave them out of ceremony.json.                    [CHANGE to your commands]
+stop_cmd = "systemctl stop nodeos"
+start_cmd = "systemctl start nodeos"
+
+# ---------------------------------------------------------------------------
+# [snapshot] — where the state export lands and how it is checked.
+# ---------------------------------------------------------------------------
 [snapshot]
+# Where the VERIFIED snapshot is placed for PulseVM to boot from. Must match
+# snapshot_path in the staged PulseVM chain config (install.sh guarantees
+# this). The file must NOT exist before the ceremony — a stale one would pin
+# the new chain to an old cut, so preflight refuses.                   [LEAVE]
 staged_path = "/root/api-cutover/snapshot-cut.bin"
+
+# Rehearsal / first-node mode: WRITE the computed state fingerprints here
+# (with provenance), instead of checking against published ones.       [LEAVE for rehearsals]
 capture_roots = "/root/api-cutover/captured-roots.txt"
-# multi-node ceremony: golden_roots = "/root/api-cutover/golden-roots.txt"
 
+# Real multi-operator event: CHECK fingerprints against the published golden
+# file instead — everyone must compute identical state or their ceremony
+# aborts. Swap capture_roots for this.                                 [CHANGE per event]
+# golden_roots = "/root/api-cutover/golden-roots.txt"
+
+# If your nodeos runs in docker, it reports the snapshot at its container
+# path; map it to where that file appears on the host:
+# path_map_from = "/data/snapshots"
+# path_map_to   = "/root/nodeos-data/snapshots"
+
+# ---------------------------------------------------------------------------
+# [target] — the PulseVM side (staged by install.sh; the chain sits idle
+# waiting for the verified snapshot).
+# ---------------------------------------------------------------------------
 [target]
-metalgo_unit = "metalgo-pulse"
-rpc_url = "http://127.0.0.1:9650/ext/bc/BLOCKCHAIN_ID_HERE/rpc"
+metalgo_unit = "metalgo-pulse"     # systemd unit install.sh created           [LEAVE]
+
+# The new chain's local RPC. install.sh fills in the real blockchain ID.
+rpc_url = "http://127.0.0.1:9650/ext/bc/BLOCKCHAIN_ID_HERE/rpc"        # [installer fills this]
+
+# If the new chain hasn't come up serving the SAME chain_id at the cut block
+# within this many seconds, abort (and roll back automatically).       [LEAVE]
 quorum_timeout_secs = 900
-auto_rollback = true
+auto_rollback = true               # on any abort: revert whatever was changed  [LEAVE]
 
+# ---------------------------------------------------------------------------
+# [flip] — THE one user-visible moment: your public /v1 URL switches from
+# nodeos to PulseVM. Health-checked; instantly revertible.
+# ---------------------------------------------------------------------------
 [flip]
-cmd = "/opt/pulse-cutover/flip-to-pulsevm.sh"    # nginx upstream swap
-public_url = "http://PUBLIC_IP_OR_DOMAIN"        # what clients actually hit
-revert_cmd = "/opt/pulse-cutover/flip-revert.sh"
-health_polls = 4             # consecutive OK reads required
-head_tolerance = 8           # public head must agree with target RPC within this
-health_timeout_secs = 120
+cmd = "/opt/pulse-cutover/flip-to-pulsevm.sh"    # generated by install.sh from YOUR nginx config  [LEAVE]
+public_url = "http://PUBLIC_IP_OR_DOMAIN"        # what your users actually call — the health check hits this  [CHANGE]
+revert_cmd = "/opt/pulse-cutover/flip-revert.sh" # the undo, staged before it's ever needed  [LEAVE]
+health_polls = 4             # this many consecutive good answers required after the flip  [LEAVE]
+head_tolerance = 8           # public head may lag the local target head by at most this many blocks  [LEAVE]
+health_timeout_secs = 120    # health not green in time -> abort + auto-revert  [LEAVE]
 
-# loop harness: pulse-cutover loop --config this.toml --runs N
+# ---------------------------------------------------------------------------
+# [loop] — optional rehearsal harness: run N full ceremonies back to back
+# with a reset between (pulse-cutover loop --config this.toml --runs N).
+# Rehearsal boxes only. See examples/loop/ for the reference reset script.
+# ---------------------------------------------------------------------------
 # [loop]
 # reset_cmd = "/root/api-cutover/loop-reset.sh"
 # settle_secs = 5
 # metrics_path = "/root/api-cutover/loop-metrics.jsonl"
 
+# ---------------------------------------------------------------------------
+# [hooks] — optional shell commands at key moments (notifications etc.).
+# ---------------------------------------------------------------------------
 [hooks]
 on_live = "echo 'same URL, same chain_id, new engine'"
 on_abort = "echo 'page the operator'"

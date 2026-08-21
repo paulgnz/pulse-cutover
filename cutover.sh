@@ -43,14 +43,17 @@ case "$CMD" in
   ""|--manifest)
     ;;
   *)
-    echo "usage: ./cutover.sh [--manifest ceremony.json] | status | abort"; exit 2;;
+    echo "usage: ./cutover.sh [--manifest ceremony.json]   run the ceremony (exit 0 = LIVE)"
+    echo "       ./cutover.sh status                       show how far the ceremony got"
+    echo "       ./cutover.sh abort                        stop safely + undo any public change"
+    exit 2;;
 esac
 
 MANIFEST="ceremony.json"
 [ "$CMD" = "--manifest" ] && MANIFEST="${2:-ceremony.json}"
-[ -f "$CONFIG" ] || { echo "ABORT: $CONFIG missing — run ./install.sh first"; exit 1; }
-command -v jq >/dev/null || { echo "ABORT: jq missing"; exit 1; }
-command -v pulse-cutover >/dev/null || { echo "ABORT: pulse-cutover not installed — run ./install.sh"; exit 1; }
+[ -f "$CONFIG" ] || { echo "NOT starting: $CONFIG is missing — this box was never staged. Run ./install.sh first (see the README walkthrough, Step 3)."; exit 1; }
+command -v jq >/dev/null || { echo "NOT starting: jq is not installed. Fix: apt-get install -y jq"; exit 1; }
+command -v pulse-cutover >/dev/null || { echo "NOT starting: the pulse-cutover binary is not installed. Run ./install.sh first."; exit 1; }
 
 # ---------- validate the manifest against the live world ----------
 problems=()
@@ -82,27 +85,35 @@ STAGED=$(tomlget staged_path)
 GOLDENS=$(tomlget golden_roots)
 [ -n "$GOLDENS" ] && [ ! -f "$GOLDENS" ] && problems+=("golden_roots $GOLDENS missing")
 if [ ${#problems[@]} -gt 0 ]; then
-  echo "NOT starting the ceremony:"
+  echo "NOT starting the ceremony — nothing has run. Problems found:"
   for p in "${problems[@]}"; do echo "  - $p"; done
+  echo "Fix the above and run this again. Unsure? 'pulse-cutover doctor' surveys the box;"
+  echo "'pulse-cutover report' builds a bundle you can share with us."
   exit 1
 fi
 
+MODE=$(tomlget mode); MODE=${MODE:-producer}
 JOURNAL=$(tomlget journal_path)
 echo "ceremony starting — journal: $JOURNAL"
 echo "(the source chain stays authoritative until the last step; ^C + './cutover.sh abort' is always safe before FLIPPED)"
 
 # ---------- run, translating journal lines to plain language ----------
+if [ "$MODE" = "api" ]; then
+  FROZEN_MSG="the freeze height is final on the source chain — taking the state snapshot next."
+else
+  FROZEN_MSG="freeze height reached — production paused, writes are over (reads keep serving)."
+fi
 set +e
 pulse-cutover run --config "$CONFIG" 2>&1 | while IFS= read -r line; do
   case "$line" in
-    *"-> ARMED"*)       echo "[ARMED]       watching the source chain; preflight passed. $line" ;;
-    *"-> FROZEN"*)      echo "[FROZEN]      H reached — writes rejected at the API edge (source keeps serving reads)." ;;
-    *"-> SNAPSHOTTED"*) echo "[SNAPSHOTTED] state snapshot cut + pinned by block id." ;;
-    *"-> VERIFIED"*)    echo "[VERIFIED]    sha256 + dual-import fingerprints check out; snapshot staged for PulseVM." ;;
-    *"-> IGNITED"*)     echo "[IGNITED]     PulseVM is up, serving the SAME chain_id at the cut height." ;;
+    *"-> ARMED"*)       echo "[ARMED]       watching the source chain; preflight passed." ;;
+    *"-> FROZEN"*)      echo "[FROZEN]      $FROZEN_MSG" ;;
+    *"-> SNAPSHOTTED"*) echo "[SNAPSHOTTED] state snapshot cut + pinned to one exact block." ;;
+    *"-> VERIFIED"*)    echo "[VERIFIED]    snapshot hash + state fingerprints check out; staged for PulseVM." ;;
+    *"-> IGNITED"*)     echo "[IGNITED]     PulseVM is up, serving the SAME chain_id, continuing at the cut block." ;;
     *"-> FLIPPED"*)     echo "[FLIPPED]     public /v1 now answered by PulseVM — this was the only user-visible change." ;;
     *"-> LIVE"*)        echo "[LIVE]        ceremony complete. Source retired. Same URL, same chain, new engine." ;;
-    *"-> ABORTED"*)     echo "[ABORTED]     ceremony rolled back — source chain remains authoritative. See journal." ;;
+    *"-> ABORTED"*)     echo "[ABORTED]     ceremony stopped safely and rolled back — the source chain is still the real one. The journal has the reason." ;;
     *) echo "  $line" ;;
   esac
 done
@@ -113,8 +124,10 @@ if [ "$RC" = 0 ]; then
   echo "LIVE. Evidence journal: $JOURNAL"
 else
   echo ""
-  echo "Ceremony did NOT reach LIVE (exit $RC). Journal with full evidence: $JOURNAL"
-  echo "Rehearsing with us? 'pulse-cutover report' builds a sanitized bundle (journal +"
-  echo "doctor survey + service logs, keys redacted) — attach it to a GitHub issue."
+  echo "Ceremony did NOT reach LIVE (exit $RC) — it stopped safely; your source chain is untouched"
+  echo "unless FLIPPED printed above (and an abort at FLIPPED reverts the swap automatically)."
+  echo "Full evidence: $JOURNAL"
+  echo "Next: run 'pulse-cutover report' — it builds a sanitized bundle (journal + doctor survey +"
+  echo "service logs, keys auto-redacted) to attach to a GitHub issue or post in the Telegram group."
 fi
 exit "$RC"

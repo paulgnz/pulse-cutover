@@ -1,22 +1,29 @@
 # hyperion-federator
 
-The /v2 history boundary router for a PulseVM cutover: after the cut, the
-SAME public /v2 URL answers with pre-cut history from the **legacy** Hyperion
-and post-cut history from the **local** hyperion-rs indexing the PulseVM
-chain. "Your endpoint keeps its memory."
+**What this is, in one paragraph:** when a chain migrates to PulseVM, the
+history *before* the migration lives in the old Hyperion archive and the
+history *after* it lives in a fresh indexer on the new chain. Users don't
+care — they call one `/v2` URL and expect all of it. This small Node server
+sits behind that URL and answers with both: old rows from the **legacy**
+archive, new rows from the **local** indexer, merged into one seamless
+timeline. "Your endpoint keeps its memory." It is staged automatically by
+`install.sh --mode hyperion`; you only need this README if you're curious or
+running it by hand. (Terms: [README glossary](../README.md#glossary).)
 
-Server-side port of the pulse-explorer federation (`lib/hyperion.ts`), which
-proved the merge semantics client-side on the 1:1 chain: PulseVM continues the
-source chain's block numbering, so every post-cut block number > cut > every
-pre-cut block number — one descending timeline paginates cleanly across the
-seam.
+Why the merge is clean: PulseVM continues the source chain's block numbering,
+so every post-cut block number > cut > every pre-cut block number — one
+descending timeline paginates cleanly across the seam. (This is a server-side
+port of the pulse-explorer federation, `lib/hyperion.ts`, which proved the
+semantics client-side on the 1:1 chain.)
 
-## The two legacy patterns (one knob)
+## Where does the OLD history come from? (one knob: `LEGACY=`)
 
-- **No local full history** (most providers): `LEGACY=https://test.proton.eosusa.io`
-  — pre-cut queries go to the source chain's public archive.
-- **Local old ES** (providers who kept full history): `LEGACY=http://127.0.0.1:<old-hyperion>`
-  — same code path, pre-cut queries stay on the box.
+- **You did not keep full history yourself** (most providers): point
+  `LEGACY=` at the source chain's public archive, e.g.
+  `LEGACY=https://test.proton.eosusa.io` — pre-cut queries are proxied there.
+- **You kept your own full-history Elasticsearch**: point `LEGACY=` at your
+  old local Hyperion, e.g. `LEGACY=http://127.0.0.1:<old-hyperion-port>` —
+  same code path, pre-cut queries never leave the box.
 
 ## Federated surface
 
@@ -29,12 +36,13 @@ seam.
 | other `/v2/*` | local first, legacy fallback (`get_creator` etc. live pre-cut) |
 | `/v1/history/*` | local hyperion-rs shim only — v1 pos/offset pagination is NOT federated (per-source seq positions differ; /v2 is the federated surface) |
 
-## Boundary
+## Boundary — how the router knows where "old" ends and "new" begins
 
 `BOUNDARY_FILE` (default `/etc/pulse-cutover/boundary.json`) is written by the
-cutover agent when the cut is pinned (`{cut_block, cut_time, cut_block_id,
-chain_id}`) and re-read on change. Absent file = legacy-only degradation
-(pre-ceremony state; never a wrong answer).
+cutover agent the moment the cut is pinned (`{cut_block, cut_time,
+cut_block_id, chain_id}`) and re-read whenever it changes — no restart. If
+the file doesn't exist yet (pre-ceremony), the router simply serves
+legacy-only: never a wrong answer, just no new rows yet.
 
 ## Ports
 
