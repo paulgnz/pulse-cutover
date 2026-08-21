@@ -12,7 +12,9 @@ set -euo pipefail
 CONFIG=/etc/pulse-cutover/ceremony.toml
 CMD="${1:-}"
 
-tomlget(){ grep -E "^$1 *= *" "$CONFIG" | head -1 | sed -E 's/^[^=]+= *"?([^"]*)"?.*/\1/'; }
+# Read a key from the staged toml; empty (not a failure) when absent — this
+# runs under set -euo pipefail, and an optional key must not kill the script.
+tomlget(){ { grep -E "^$1 *= *" "$CONFIG" || true; } | head -1 | sed -E 's/^[^=]+= *"?([^"]*)"?.*/\1/'; }
 
 case "$CMD" in
   status)

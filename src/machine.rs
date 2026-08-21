@@ -126,10 +126,20 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     fn preflight(&mut self, info: &crate::ops::ChainInfo) -> Result<(), String> {
         let mut problems = Vec::new();
         let h = self.h();
-        if info.head_block_num >= h {
+        // "H is in the future" means different things per mode: a producer
+        // freezes at head >= H, an api node proceeds at LIB >= H (H is a
+        // FINALITY target there — on a live DPoS chain head runs ~2*21*6
+        // blocks ahead of LIB, and head being past H is normal).
+        let reference = match self.cfg.ceremony.mode {
+            Mode::Producer => info.head_block_num,
+            Mode::Api => info.last_irreversible_block_num,
+        };
+        if reference >= h {
             problems.push(format!(
-                "freeze height {} is not in the future (head {})",
-                h, info.head_block_num
+                "freeze height {} is not in the future ({} {})",
+                h,
+                if self.cfg.ceremony.mode == Mode::Api { "lib" } else { "head" },
+                reference
             ));
         }
         if let Some(expected) = &self.cfg.ceremony.chain_id {
