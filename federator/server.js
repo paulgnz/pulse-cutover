@@ -184,8 +184,18 @@ async function health() {
   const b = boundary();
   const [local, legacy] = await Promise.all([localGet('/v2/health'), legacyGet('/v2/health')]);
   const localServices = (local.ok && local.json?.health) || [];
-  const localOk = local.ok && localServices.length > 0 && localServices.every((s) => s.status === 'OK');
   const lastIndexed = localServices.find((s) => s.service === 'Indexer')?.service_data?.last_indexed_block;
+  const rpcHead = localServices.find((s) => s.service === 'PulseVM-RPC')?.service_data?.head_block_num;
+  // local.ok mirrors the agent's hydration predicate: all services OK, with
+  // the IDLE-AT-CUT allowance — hyperion-rs reports `Indexer: Warning,
+  // last_indexed_block: 0` when zero post-cut blocks exist (observed live;
+  // an all-OK requirement wedges the flip gate on an idle chain).
+  const nonIndexerOk = localServices.length > 0
+    && localServices.filter((s) => s.service !== 'Indexer').every((s) => s.status === 'OK');
+  const allOk = localServices.length > 0 && localServices.every((s) => s.status === 'OK');
+  const idleAtCut = nonIndexerOk && (lastIndexed ?? 0) === 0
+    && typeof rpcHead === 'number' && rpcHead <= b.cut_block;
+  const localOk = local.ok && (allOk || idleAtCut);
   const legacyOk = legacy.ok && Array.isArray(legacy.json?.health);
   return {
     status: 200,
@@ -195,7 +205,7 @@ async function health() {
       health: localServices,
       federation: {
         boundary: pubBoundary(b),
-        local: { url: LOCAL, ok: localOk, last_indexed_block: lastIndexed },
+        local: { url: LOCAL, ok: localOk, last_indexed_block: lastIndexed, idle_at_cut: idleAtCut || undefined },
         legacy: { url: LEGACY, ok: legacyOk },
       },
     },
