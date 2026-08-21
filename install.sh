@@ -60,10 +60,13 @@ STAGED="$WORK/snapshot-cut.bin"
 problems=()
 . /etc/os-release || true
 case "${VERSION_ID:-}" in 22.04|24.04) ;; *) problems+=("Ubuntu 22.04/24.04 required (found ${PRETTY_NAME:-unknown})");; esac
-RAM_GB=$(free -g | awk '/Mem:/{print $2}')
+RAM_MB=$(free -m | awk '/Mem:/{print $2}')
+RAM_GB=$(( (RAM_MB + 512) / 1024 ))
 DISK_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-MIN_RAM=16; [ "$MODE" = "api" ] && MIN_RAM=8  # hyperion needs headroom for ES
-[ "${RAM_GB:-0}" -ge "$MIN_RAM" ] || problems+=("need >=${MIN_RAM}GB RAM for $MODE mode (found ${RAM_GB}GB)")
+# MB-based check: a "16 GB" box reports ~15.6 GB usable — free -g rounding
+# must not fail it (dogfood finding on the cpx42 rehearsal box).
+MIN_RAM_MB=15000; [ "$MODE" = "api" ] && MIN_RAM_MB=7500  # hyperion/bp need headroom (ES / chainbase)
+[ "${RAM_MB:-0}" -ge "$MIN_RAM_MB" ] || problems+=("need >=$((MIN_RAM_MB/1000))GB RAM for $MODE mode (found ${RAM_GB}GB)")
 [ "${DISK_GB:-0}" -ge 50 ] || problems+=("need >=50GB free disk (found ${DISK_GB}GB)")
 
 # The source nodeos is YOURS — we detect it, we never install or touch it.
