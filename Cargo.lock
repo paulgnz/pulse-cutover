@@ -977,6 +977,11 @@ name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+dependencies = [
+ "foldhash",
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "hashbrown"
@@ -1267,6 +1272,8 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -1835,19 +1842,21 @@ dependencies = [
 
 [[package]]
 name = "pulse-cutover"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "hex",
  "pulsevm_chaindb",
  "pulsevm_snapshot",
  "pulsevm_snapshot_import",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "toml",
  "ureq",
+ "wasmparser 0.245.1",
 ]
 
 [[package]]
@@ -3264,6 +3273,19 @@ dependencies = [
  "thiserror 2.0.20",
  "wasmer-types",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.245.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f08c9adee0428b7bddf3890fc27e015ac4b761cc608c822667102b8bfd6995e"
+dependencies = [
+ "bitflags 2.13.1",
+ "hashbrown 0.16.1",
+ "indexmap",
+ "semver",
+ "serde",
 ]
 
 [[package]]

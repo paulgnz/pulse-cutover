@@ -903,6 +903,67 @@ on_live = "flip-gateway"
 }
 
 #[test]
+fn ceremony_journals_advisory_stubbed_intrinsic_scan() {
+    // The VERIFIED step scans the ACTUAL cut snapshot for unserved env
+    // imports and journals the result — advisory evidence, never a gate.
+    // MiniSnapshot carries zero code objects, so the scan must report clean
+    // and the ceremony must still reach LIVE.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Live);
+
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let scan_line: serde_json::Value = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .find(|v: &serde_json::Value| v["data"]["stubbed_intrinsic_scan"].is_object())
+        .expect("scan evidence journaled");
+    let scan = &scan_line["data"]["stubbed_intrinsic_scan"];
+    assert_eq!(scan["advisory"], serde_json::json!(true));
+    assert_eq!(scan["code_objects"], serde_json::json!(0));
+    assert_eq!(scan["at_risk"], serde_json::json!(0));
+    assert_eq!(scan["served_imports"], serde_json::json!(169));
+
+    // The table is persisted beside the journal for `pulse-cutover report`.
+    let table = std::fs::read_to_string(dir.path().join("scan-contracts.txt")).unwrap();
+    assert!(table.contains("no stub-trap exposure"));
+}
+
+#[test]
+fn armed_prescan_journals_at_risk_table_before_freeze() {
+    // snapshot.prescan_path: a rehearsal snapshot staged before the ceremony
+    // gets scanned during ARMED preflight; the ceremony continues regardless.
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path(), 120);
+    let prescan = dir.path().join("rehearsal-snapshot.bin");
+    std::fs::write(&prescan, mini(50).build()).unwrap();
+    cfg.snapshot.prescan_path = Some(prescan);
+
+    let ops = MockOps::new(dir.path(), 110);
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Live);
+
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    // Two scans journaled: the ARMED prescan and the VERIFIED-step scan of
+    // the actual cut.
+    let scans = text
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v["data"]["stubbed_intrinsic_scan"].is_object())
+        .count();
+    assert_eq!(scans, 2);
+    let first: serde_json::Value = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .find(|v: &serde_json::Value| v["data"]["stubbed_intrinsic_scan"].is_object())
+        .unwrap();
+    assert_eq!(first["state"], "ARMED", "prescan runs during ARMED preflight");
+}
+
+#[test]
 fn hydration_predicate_accepts_idle_at_cut_indexer_warning() {
     // Observed live (idle imported chain): Indexer reports Warning with
     // last_indexed_block: 0 because zero post-cut blocks exist — hydration

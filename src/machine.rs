@@ -19,6 +19,7 @@ use crate::{
         Recovered,
     },
     ops::ChainOps,
+    scan,
     state::State,
     verify,
 };
@@ -253,11 +254,73 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if problems.is_empty() {
             self.journal
                 .evidence(State::Armed, json!({"preflight": "ok"}))?;
+            // Advisory stubbed-intrinsic preflight (never a gate): when the
+            // operator staged a rehearsal snapshot, put the at-risk contract
+            // table in the journal BEFORE anything freezes.
+            if let Some(prescan) = self.cfg.snapshot.prescan_path.clone() {
+                if prescan.exists() {
+                    self.advisory_scan(&prescan, State::Armed)?;
+                } else {
+                    self.journal.evidence(
+                        State::Armed,
+                        json!({"stubbed_intrinsic_prescan_skipped":
+                            format!("{} not present (advisory only)", prescan.display())}),
+                    )?;
+                }
+            }
             Ok(())
         } else {
             self.abort("preflight failed", json!({"problems": problems}))?;
             Err(format!("preflight failed: {}", problems.join("; ")))
         }
+    }
+
+    /// Run the stubbed-intrinsic contract scan over a snapshot and journal
+    /// the result. ADVISORY: prints the at-risk table, persists it beside
+    /// the journal for `pulse-cutover report`, and always continues — an
+    /// unserved import is a real code path but not necessarily a reachable
+    /// one, and gating the ceremony on it would block every chain whose
+    /// legacy contracts still reference send_deferred.
+    fn advisory_scan(&mut self, snapshot: &std::path::Path, stage: State) -> Result<(), String> {
+        let served = scan::parse_served(scan::DEFAULT_SERVED);
+        match scan::scan_snapshot_path(snapshot, &served) {
+            Ok(report) => {
+                let table = scan::format_table(&report);
+                eprint!("{table}");
+                if let Some(dir) = self.cfg.journal_path.parent() {
+                    let _ = std::fs::write(dir.join("scan-contracts.txt"), &table);
+                }
+                let rows = serde_json::to_value(
+                    report.rows.iter().take(100).collect::<Vec<_>>(),
+                )
+                .unwrap_or(serde_json::Value::Null);
+                self.journal.evidence(
+                    stage,
+                    json!({
+                        "stubbed_intrinsic_scan": {
+                            "advisory": true,
+                            "snapshot": snapshot.display().to_string(),
+                            "served_imports": report.served_count,
+                            "code_objects": report.code_objects,
+                            "clean": report.clean,
+                            "at_risk": report.at_risk,
+                            "parse_failures": report.parse_failures,
+                            "unserved_tally": report.unserved_tally,
+                            "at_risk_rows": rows,
+                        }
+                    }),
+                )?;
+            }
+            Err(e) => {
+                // Advisory means advisory: a scan failure is evidence, not
+                // an abort.
+                self.journal.evidence(
+                    stage,
+                    json!({"stubbed_intrinsic_scan_error": e, "advisory": true}),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn abort(&mut self, reason: &str, detail: serde_json::Value) -> Result<(), String> {
@@ -798,6 +861,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(());
             }
         }
+        // Advisory stubbed-intrinsic scan of the ACTUAL cut snapshot: which
+        // contracts reference host functions PulseVM stubs. Journaled table,
+        // never a gate.
+        self.advisory_scan(&path, State::Snapshotted)?;
         self.sha256 = Some(outcome.sha256.clone());
         self.state = State::Verified;
         let roots: serde_json::Map<String, serde_json::Value> = outcome

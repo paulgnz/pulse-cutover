@@ -1,6 +1,6 @@
 [package]
 name = "pulse-cutover"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Programmatic zero-read-downtime XPR -> PulseVM cutover ceremony agent"
 license = "MIT"
@@ -13,6 +13,8 @@ sha2 = "0.10"
 hex = "0.4"
 ureq = { version = "2", features = ["json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+regex = "1"
+wasmparser = "0.245"
 
 # The snapshot/fingerprint stack, straight from the arena-import workspace.
 # Convention: pulse-cutover and pulsevm-arena-import are sibling checkouts

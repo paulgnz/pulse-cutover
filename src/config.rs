@@ -223,6 +223,14 @@ pub struct Snapshot {
     /// pre-published set. Mutually exclusive with `golden_roots`.
     #[serde(default)]
     pub capture_roots: Option<PathBuf>,
+    /// Advisory stubbed-intrinsic preflight: a pre-staged/rehearsal snapshot
+    /// (NOT the ceremony's own cut — that one is scanned automatically after
+    /// verification) to run `scan-contracts` against at ARM time, so the
+    /// at-risk contract table is in the journal before anything freezes.
+    /// Never a gate: unserved imports are journaled and the ceremony
+    /// continues (referenced != reachable).
+    #[serde(default)]
+    pub prescan_path: Option<PathBuf>,
     /// Host directory where nodeos writes its snapshots (`schedule_at_h`
     /// only): the scheduled snapshot lands here as
     /// `snapshot-<block_id_at_H>.bin` once H is irreversible, and the agent

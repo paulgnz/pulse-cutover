@@ -5,6 +5,9 @@
 //!   pulse-cutover status --config ceremony.toml   # print journal state
 //!   pulse-cutover verify --snapshot file.bin [--cpu-scale N]
 //!                        [--golden roots.txt | --capture roots.txt]
+//!   pulse-cutover doctor [--json]                 # read-only environment survey
+//!   pulse-cutover scan-contracts snap.bin [--served f] [--json]
+//!   pulse-cutover report [--config f] [--out f.tar.gz] [--paranoid]
 //!
 //! See Appendix A of wiki/59-cutover-orchestration.md for the reviewed design.
 
@@ -12,9 +15,12 @@ use std::path::PathBuf;
 
 use pulse_cutover::{
     config::Config,
+    doctor,
     journal::Journal,
     machine::Machine,
     ops::HttpOps,
+    report,
+    scan,
     state,
     verify,
 };
@@ -25,6 +31,10 @@ fn arg(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
+fn flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("");
@@ -33,11 +43,17 @@ fn main() {
         "loop" => cmd_loop(&args),
         "status" => cmd_status(&args),
         "verify" => cmd_verify(&args),
+        "doctor" => cmd_doctor(&args),
+        "scan-contracts" => cmd_scan(&args),
+        "report" => cmd_report(&args),
         _ => {
             eprintln!(
                 "usage: pulse-cutover <run|loop|status|verify> --config ceremony.toml\n       \
                  pulse-cutover loop --config ceremony.toml --runs N\n       \
-                 pulse-cutover verify --snapshot file.bin [--cpu-scale N] [--golden g.txt | --capture g.txt]"
+                 pulse-cutover verify --snapshot file.bin [--cpu-scale N] [--golden g.txt | --capture g.txt]\n       \
+                 pulse-cutover doctor [--json]\n       \
+                 pulse-cutover scan-contracts snapshot.bin [--served served.txt] [--json]\n       \
+                 pulse-cutover report [--config ceremony.toml] [--out bundle.tar.gz] [--paranoid]"
             );
             std::process::exit(2);
         }
@@ -46,6 +62,68 @@ fn main() {
         eprintln!("pulse-cutover: {e}");
         std::process::exit(1);
     }
+}
+
+/// Read-only environment survey: human table by default, machine JSON with
+/// --json (stdout carries ONLY the JSON so install.sh can consume it).
+fn cmd_doctor(args: &[String]) -> Result<(), String> {
+    let survey = doctor::survey();
+    if flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&survey).map_err(|e| e.to_string())?
+        );
+    } else {
+        print!("{}", doctor::render_human(&survey));
+    }
+    // Doctor informs; it does not gate. Exit 0 unless a requested mode's
+    // verdict is UNSUPPORTED/NEEDS AND --mode was given (install.sh path).
+    if let Some(mode) = arg(args, "--mode") {
+        let verdict = survey
+            .verdicts
+            .get(&mode)
+            .ok_or(format!("unknown mode {mode} (bp|api|hyperion)"))?;
+        if verdict.status != "READY" {
+            std::process::exit(3);
+        }
+    }
+    Ok(())
+}
+
+/// Stubbed-intrinsic exposure scan over a portable snapshot. Advisory:
+/// exit 0 even with at-risk rows (referenced != reachable).
+fn cmd_scan(args: &[String]) -> Result<(), String> {
+    let snapshot = args
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .or_else(|| arg(args, "--snapshot"))
+        .ok_or("usage: pulse-cutover scan-contracts <snapshot.bin> [--served f] [--json]")?;
+    let served = match arg(args, "--served") {
+        Some(path) => scan::parse_served(
+            &std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?,
+        ),
+        None => scan::parse_served(scan::DEFAULT_SERVED),
+    };
+    let report = scan::scan_snapshot_path(&PathBuf::from(&snapshot), &served)?;
+    if flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        print!("{}", scan::format_table(&report));
+    }
+    Ok(())
+}
+
+fn cmd_report(args: &[String]) -> Result<(), String> {
+    report::run(&report::ReportOptions {
+        config_path: arg(args, "--config").map(PathBuf::from),
+        out: arg(args, "--out").map(PathBuf::from),
+        paranoid: flag(args, "--paranoid"),
+    })
 }
 
 fn load_config(args: &[String]) -> Result<Config, String> {
