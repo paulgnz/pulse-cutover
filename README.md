@@ -1,5 +1,10 @@
 # pulse-cutover
 
+[![How the cutover works — 106s explainer](https://pulsevm.dev/media/cutover-explainer.png)](https://pulsevm.dev/guide/migrate-antelope-chain)
+
+*106-second explainer + full methodology and recorded numbers: [pulsevm.dev/guide/migrate-antelope-chain](https://pulsevm.dev/guide/migrate-antelope-chain)*
+
+
 Programmatic, zero-read-downtime Antelope → PulseVM cutover ceremony agent.
 
 One binary drives the whole ceremony unattended and records everything:
