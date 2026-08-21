@@ -31,6 +31,9 @@ pub struct SnapshotResult {
 pub trait ChainOps {
     fn source_info(&self) -> Result<ChainInfo, String>;
     fn source_block_id(&self, block_num: u64) -> Result<(String, String), String>; // (id, timestamp)
+    /// Number of transactions in a source block (burn-off audit: blocks
+    /// between the cut and the pause must be empty once writes are frozen).
+    fn source_block_tx_count(&self, block_num: u64) -> Result<u64, String>;
     fn producer_paused(&self) -> Result<bool, String>;
     fn pause(&self) -> Result<(), String>;
     fn resume(&self) -> Result<(), String>;
@@ -142,6 +145,18 @@ impl ChainOps for HttpOps {
             .and_then(|x| x.as_str())
             .unwrap_or_default();
         Ok((id.to_string(), ts.to_string()))
+    }
+
+    fn source_block_tx_count(&self, block_num: u64) -> Result<u64, String> {
+        let v = self.post(
+            &format!("{}/v1/chain/get_block", self.source_rpc),
+            Some(json!({"block_num_or_id": block_num})),
+            None,
+        )?;
+        Ok(v.get("transactions")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len() as u64)
+            .unwrap_or(0))
     }
 
     fn producer_paused(&self) -> Result<bool, String> {

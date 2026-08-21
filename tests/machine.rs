@@ -53,9 +53,13 @@ struct MockOps {
     resumes: Cell<u32>,
     ignited: Cell<bool>,
     target_polls: Cell<u64>,
-    /// If true, produce one extra block AFTER pause was requested (a "late
-    /// block" — the quiescence window must absorb it).
+    /// Head of the (mock) imported chain: the cut height, set by
+    /// create_snapshot; advances only once traffic resumes.
+    target_head: Cell<u64>,
+    /// If true, produce one extra block on the SECOND poll after pause (a
+    /// late block arriving over p2p — quiescence must absorb + journal it).
     late_block: Cell<bool>,
+    paused_polls: Cell<u32>,
     hooks: RefCell<Vec<String>>,
     now: Cell<u64>,
 }
@@ -69,7 +73,9 @@ impl MockOps {
             resumes: Cell::new(0),
             ignited: Cell::new(false),
             target_polls: Cell::new(0),
+            target_head: Cell::new(0),
             late_block: Cell::new(false),
+            paused_polls: Cell::new(0),
             hooks: RefCell::new(Vec::new()),
             now: Cell::new(1_000_000),
         }
@@ -95,8 +101,12 @@ impl ChainOps for MockOps {
     fn source_info(&self) -> Result<ChainInfo, String> {
         if !self.paused.get() {
             self.head.set(self.head.get() + 1);
-        } else if self.late_block.replace(false) {
-            self.head.set(self.head.get() + 1);
+        } else {
+            let polls = self.paused_polls.get() + 1;
+            self.paused_polls.set(polls);
+            if polls == 2 && self.late_block.replace(false) {
+                self.head.set(self.head.get() + 1);
+            }
         }
         Ok(self.info(self.head.get()))
     }
@@ -104,6 +114,10 @@ impl ChainOps for MockOps {
     fn source_block_id(&self, block_num: u64) -> Result<(String, String), String> {
         let m = mini(block_num as u32);
         Ok((hex::encode(m.head_id()), "2024-01-01T00:00:00.000".into()))
+    }
+
+    fn source_block_tx_count(&self, _block_num: u64) -> Result<u64, String> {
+        Ok(0) // writes are frozen: burn-off blocks are empty
     }
 
     fn producer_paused(&self) -> Result<bool, String> {
@@ -122,12 +136,20 @@ impl ChainOps for MockOps {
     }
 
     fn create_snapshot(&self) -> Result<SnapshotResult, String> {
-        let head = self.head.get();
-        let m = mini(head as u32);
+        // R1, as verified live on Leap 5.0.3: a paused chain cannot finalize
+        // its head, so the snapshot write never completes.
+        if self.paused.get() {
+            return Err("create_snapshot timed out: paused chain never finalizes head (R1)".into());
+        }
+        let cut = self.head.get();
+        let m = mini(cut as u32);
         std::fs::write(self.snapshot_path(), m.build()).map_err(|e| e.to_string())?;
+        // Production continues; the block that finalized the cut arrives.
+        self.head.set(cut + 1);
+        self.target_head.set(cut);
         Ok(SnapshotResult {
             snapshot_name: self.snapshot_path().display().to_string(),
-            head_block_num: head,
+            head_block_num: cut,
             head_block_id: hex::encode(m.head_id()),
         })
     }
@@ -147,10 +169,12 @@ impl ChainOps for MockOps {
             .borrow()
             .iter()
             .any(|h| h.contains("resume-traffic"));
+        // The imported chain presents the cut height; it only mints past it
+        // once transactions flow again (post_ignite traffic hook).
         let head = if traffic_resumed {
-            self.head.get() + polls.min(5)
+            self.target_head.get() + polls.min(5)
         } else {
-            self.head.get()
+            self.target_head.get()
         };
         Ok(Some(self.info(head)))
     }
@@ -197,6 +221,7 @@ rpc_url = "http://mock"
 quorum_timeout_secs = 60
 
 [hooks]
+on_freeze = "freeze-writes"
 post_ignite = "resume-traffic"
 on_live = "flip-gateway"
 "#,
@@ -234,9 +259,17 @@ fn happy_path_reaches_live_with_full_evidence() {
     }
     assert!(roots.contains(&hex::encode(CHAIN_ID)));
 
-    // Hooks ran in ceremony order.
+    // Hooks ran in ceremony order: write freeze BEFORE the snapshot (R1/R2),
+    // traffic after ignition, gateway flip only at LIVE.
     let hooks = ops.hooks.borrow();
-    assert_eq!(*hooks, vec!["resume-traffic".to_string(), "flip-gateway".to_string()]);
+    assert_eq!(
+        *hooks,
+        vec![
+            "freeze-writes".to_string(),
+            "resume-traffic".to_string(),
+            "flip-gateway".to_string()
+        ]
+    );
 
     // Journal walked the full state sequence.
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
@@ -274,13 +307,16 @@ fn late_block_after_pause_is_absorbed_and_cut_repinned() {
 
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(text.contains("late_block_after_pause"));
-    // The cut settled one past the pause head and the snapshot matches it.
-    let frozen: serde_json::Value = text
+    // The cut stays pinned to the snapshot block; the straggler became an
+    // (empty) burn-off block instead of moving the cut.
+    let snapped: serde_json::Value = text
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
-        .find(|v: &serde_json::Value| v["state"] == "FROZEN" && v["kind"] == "transition")
+        .find(|v: &serde_json::Value| v["state"] == "SNAPSHOTTED" && v["kind"] == "transition")
         .unwrap();
-    assert_eq!(frozen["data"]["cut_height"].as_u64().unwrap(), 121);
+    assert_eq!(snapped["data"]["cut_height"].as_u64().unwrap(), 120);
+    assert_eq!(snapped["data"]["burnoff_blocks"].as_u64().unwrap(), 2);
+    assert_eq!(snapped["data"]["burnoff_transactions"].as_u64().unwrap(), 0);
 }
 
 #[test]
@@ -302,10 +338,10 @@ fn golden_mismatch_aborts_and_rolls_back() {
     assert_eq!(terminal, State::Aborted);
 
     // Rollback ratchet: the source producer was resumed, the target never
-    // ignited, no traffic hook ran.
+    // ignited, and no user-visible hook ran (only the write freeze did).
     assert_eq!(ops.resumes.get(), 1);
     assert!(!ops.ignited.get());
-    assert!(ops.hooks.borrow().is_empty());
+    assert_eq!(*ops.hooks.borrow(), vec!["freeze-writes".to_string()]);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(text.contains("fingerprints do not match goldens"));
     assert!(text.contains("source_producer_resumed"));
@@ -340,17 +376,18 @@ fn resume_from_snapshotted_journal_skips_freeze_and_completes() {
         serde_json::json!({"seq": 0, "ts_ms": 1, "ts": "t", "kind": "transition", "state": "ARMED",
             "data": {"chain_id": hex::encode(CHAIN_ID), "freeze_height": 120}}),
         serde_json::json!({"seq": 1, "ts_ms": 2, "ts": "t", "kind": "transition", "state": "FROZEN",
-            "data": {"cut_height": cut, "cut_block_id": hex::encode(m.head_id()),
-                     "last_source_block_time": "2024-01-01T00:00:00.000",
-                     "chain_id": hex::encode(CHAIN_ID)}}),
+            "data": {"chain_id": hex::encode(CHAIN_ID), "head_at_freeze": 120}}),
         serde_json::json!({"seq": 2, "ts_ms": 3, "ts": "t", "kind": "transition", "state": "SNAPSHOTTED",
-            "data": {"snapshot_file": snapshot_path.display().to_string(), "cut_height": cut}}),
+            "data": {"snapshot_file": snapshot_path.display().to_string(), "cut_height": cut,
+                     "cut_block_id": hex::encode(m.head_id()),
+                     "last_source_block_time": "2024-01-01T00:00:00.000"}}),
     ];
     let lines: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
     std::fs::write(&cfg.journal_path, lines.join("\n") + "\n").unwrap();
 
     let ops = MockOps::new(dir.path(), 121);
     ops.paused.set(true); // world state: producer is paused, as at crash time
+    ops.target_head.set(cut); // the staged chain will present the cut height
     let terminal = run_machine(&cfg, &ops);
     assert_eq!(terminal, State::Live);
 

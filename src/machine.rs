@@ -151,13 +151,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Ok(())
     }
 
-    /// ARMED: watch head; freeze at H per strategy; pin the cut by block id
-    /// after a quiescence window.
+    /// ARMED: watch head until H, then FREEZE WRITES (hook) — production
+    /// keeps running so the snapshot block can finalize (finding R1; a
+    /// paused chain never finalizes its head, verified empirically on Leap
+    /// 5.0.3: create_snapshot hangs). The cut is pinned in the FROZEN step.
     fn step_armed(&mut self) -> Result<(), String> {
         if self.cfg.ceremony.freeze_strategy == FreezeStrategy::ScheduleAtH {
             // Multi-BP mode: pin the snapshot to exactly H up front; nodeos
-            // writes it when H becomes irreversible. (Falls back to
-            // pause_at_h if the scheduler API is unavailable.)
+            // writes it when H becomes irreversible. (Falls back to the
+            // immediate create_snapshot path if the scheduler is missing.)
             if let Err(e) = self.ops.schedule_snapshot(self.cfg.ceremony.freeze_height) {
                 self.journal.evidence(
                     State::Armed,
@@ -183,82 +185,47 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.ops.sleep_ms(self.cfg.poll_ms);
         };
 
-        // Freeze: stop production. (In multi-BP schedule_at_h mode this
-        // happens only after LIB >= H; production of empty blocks past H is
-        // what finalizes H — review finding R1.)
-        if self.cfg.ceremony.freeze_strategy == FreezeStrategy::ScheduleAtH {
-            loop {
-                let i = self.ops.source_info()?;
-                if i.last_irreversible_block_num >= self.cfg.ceremony.freeze_height {
-                    break;
-                }
-                self.ops.sleep_ms(self.cfg.poll_ms);
+        // The write freeze — the moment the write gap starts (R2: an
+        // explicit reject at the API edge, never just a producer pause).
+        let freeze_hook = if let Some(hook) = &self.cfg.hooks.on_freeze {
+            let result = self.ops.run_hook(hook);
+            if let Err(e) = &result {
+                self.abort("write-freeze hook failed", json!({"error": e}))?;
+                return Ok(());
             }
-        }
-        let pause_requested_ms = self.ops.now_ms();
-        self.ops.pause()?;
-        if !self.ops.producer_paused()? {
-            self.abort("pause did not take effect", json!({}))?;
-            return Ok(());
-        }
-
-        // Quiescence window: head must stop moving (catches a second
-        // producer that didn't pause, or in-flight blocks — finding R4).
-        let mut stable = 0u32;
-        let mut head = info.head_block_num;
-        let cut = loop {
-            self.ops.sleep_ms(self.cfg.poll_ms);
-            let i = self.ops.source_info()?;
-            if i.head_block_num == head {
-                stable += 1;
-                if stable >= self.cfg.ceremony.quiescence_polls {
-                    break i;
-                }
-            } else {
-                stable = 0;
-                head = i.head_block_num;
-                self.journal.evidence(
-                    State::Armed,
-                    json!({"late_block_after_pause": i.head_block_num}),
-                )?;
-            }
+            format!("{result:?}")
+        } else {
+            "none configured (rehearsal traffic stops via pause visibility)".into()
         };
-
-        // Pin the cut: in schedule_at_h mode the cut is H itself; in
-        // pause_at_h mode it is wherever the head stopped (>= H).
-        let cut_height = match self.cfg.ceremony.freeze_strategy {
-            FreezeStrategy::ScheduleAtH => self.cfg.ceremony.freeze_height,
-            FreezeStrategy::PauseAtH => cut.head_block_num,
-        };
-        let (cut_block_id, cut_block_time) = self.ops.source_block_id(cut_height)?;
-        self.chain_id = Some(cut.chain_id.clone());
-        self.cut_height = Some(cut_height);
-        self.cut_block_id = Some(cut_block_id.clone());
+        self.chain_id = Some(info.chain_id.clone());
         self.frozen_ts_ms = Some(self.ops.now_ms());
-        self.last_source_block_time = Some(cut_block_time.clone());
         self.state = State::Frozen;
         self.journal.transition(
             State::Frozen,
             json!({
                 "declared_h": self.cfg.ceremony.freeze_height,
-                "cut_height": cut_height,
-                "cut_block_id": cut_block_id,
-                "last_source_block_time": cut_block_time,
-                "head_at_pause": cut.head_block_num,
-                "lib_at_pause": cut.last_irreversible_block_num,
-                "chain_id": cut.chain_id,
-                "pause_requested_ms": pause_requested_ms,
-                "quiescence_polls": self.cfg.ceremony.quiescence_polls,
+                "head_at_freeze": info.head_block_num,
+                "lib_at_freeze": info.last_irreversible_block_num,
+                "chain_id": info.chain_id,
+                "on_freeze_hook": freeze_hook,
+                "note": "writes frozen; production continues so the cut can finalize (R1)",
             }),
         )?;
         Ok(())
     }
 
-    /// FROZEN: produce the snapshot for the cut block and stage the file.
+    /// FROZEN: snapshot while still producing (nodeos writes it when the cut
+    /// block finalizes), THEN pause, then quiescence, then pin + audit.
     fn step_frozen(&mut self) -> Result<(), String> {
-        // Idempotent on resume: pause again (no-op if already paused).
-        if !self.ops.producer_paused()? {
-            self.ops.pause()?;
+        // Idempotent resume: if a crashed run left the producer paused, the
+        // chain cannot finalize a snapshot block — unpause first (writes are
+        // still frozen by the hook, so re-produced blocks stay empty).
+        if self.ops.producer_paused()? {
+            self.ops.resume()?;
+            self.journal.evidence(
+                State::Frozen,
+                json!({"resumed_production_for_snapshot": true}),
+            )?;
         }
         let started = self.ops.now_ms();
         let snap = match self.ops.create_snapshot() {
@@ -268,24 +235,66 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(());
             }
         };
-        let cut_height = self.cut_height.expect("cut pinned in FROZEN");
-        if snap.head_block_num != cut_height {
+        let snapshot_wall_ms = self.ops.now_ms() - started;
+
+        // Stop production and require quiescence (R4: catches producers that
+        // ignored the pause and late blocks arriving over p2p).
+        self.ops.pause()?;
+        if !self.ops.producer_paused()? {
+            self.abort("pause did not take effect", json!({}))?;
+            return Ok(());
+        }
+        let mut stable = 0u32;
+        let mut head = 0u64;
+        let at_pause = loop {
+            self.ops.sleep_ms(self.cfg.poll_ms);
+            let i = self.ops.source_info()?;
+            if i.head_block_num == head {
+                stable += 1;
+                if stable >= self.cfg.ceremony.quiescence_polls {
+                    break i;
+                }
+            } else {
+                if head != 0 {
+                    self.journal.evidence(
+                        State::Frozen,
+                        json!({"late_block_after_pause": i.head_block_num}),
+                    )?;
+                }
+                stable = 0;
+                head = i.head_block_num;
+            }
+        };
+
+        // Pin the cut to the snapshot's block and cross-check it against the
+        // chain's view of that height (fork-at-the-cut detection, R4).
+        let cut_height = snap.head_block_num;
+        let (chain_view_id, cut_block_time) = self.ops.source_block_id(cut_height)?;
+        if !snap.head_block_id.eq_ignore_ascii_case(&chain_view_id) {
             self.abort(
-                "snapshot height != pinned cut height",
-                json!({"snapshot_height": snap.head_block_num, "cut_height": cut_height,
-                       "snapshot_block_id": snap.head_block_id}),
+                "snapshot block id != chain block id at cut height (fork at the cut?)",
+                json!({"snapshot_block_id": snap.head_block_id, "chain_block_id": chain_view_id}),
             )?;
             return Ok(());
         }
-        if let Some(cut_id) = &self.cut_block_id {
-            if !snap.head_block_id.eq_ignore_ascii_case(cut_id) {
+        if let Some(expected) = &self.cfg.ceremony.chain_id {
+            if !at_pause.chain_id.eq_ignore_ascii_case(expected) {
                 self.abort(
-                    "snapshot block id != pinned cut block id (fork at the cut?)",
-                    json!({"snapshot_block_id": snap.head_block_id, "cut_block_id": cut_id}),
+                    "source chain_id changed mid-ceremony",
+                    json!({"seen": at_pause.chain_id, "expected": expected}),
                 )?;
                 return Ok(());
             }
         }
+
+        // Burn-off audit (R2 evidence): blocks after the cut, up to the
+        // pause head, are outside the migrated state. With writes frozen
+        // they must be empty; any transactions here are journaled loudly.
+        let mut burnoff_txs = 0u64;
+        for n in (cut_height + 1)..=at_pause.head_block_num {
+            burnoff_txs += self.ops.source_block_tx_count(n).unwrap_or(0);
+        }
+
         let host_path = self.cfg.map_snapshot_path(&snap.snapshot_name);
         if !host_path.exists() {
             self.abort(
@@ -295,6 +304,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(());
         }
         let size = std::fs::metadata(&host_path).map(|m| m.len()).unwrap_or(0);
+        self.cut_height = Some(cut_height);
+        self.cut_block_id = Some(snap.head_block_id.clone());
+        self.last_source_block_time = Some(cut_block_time.clone());
         self.snapshot_file = Some(host_path.display().to_string());
         self.state = State::Snapshotted;
         self.journal.transition(
@@ -303,9 +315,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "snapshot_file": host_path.display().to_string(),
                 "reported_name": snap.snapshot_name,
                 "size_bytes": size,
-                "snapshot_wall_ms": self.ops.now_ms() - started,
+                "snapshot_wall_ms": snapshot_wall_ms,
                 "cut_height": cut_height,
                 "cut_block_id": snap.head_block_id,
+                "last_source_block_time": cut_block_time,
+                "head_at_pause": at_pause.head_block_num,
+                "burnoff_blocks": at_pause.head_block_num - cut_height,
+                "burnoff_transactions": burnoff_txs,
+                "quiescence_polls": self.cfg.ceremony.quiescence_polls,
             }),
         )?;
         Ok(())

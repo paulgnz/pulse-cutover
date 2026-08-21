@@ -147,6 +147,14 @@ pub struct Target {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Hooks {
+    /// Runs at freeze time, BEFORE the snapshot is requested: this is the
+    /// write-freeze (review finding R2) — flip tx acceptance off / make the
+    /// gateway reject writes. Block production keeps running (finding R1:
+    /// the snapshot block can only finalize if blocks keep coming), so the
+    /// blocks between the cut and the pause stay empty instead of carrying
+    /// writes that would be silently discarded.
+    #[serde(default)]
+    pub on_freeze: Option<String>,
     /// Runs once after IGNITED (e.g. repoint the traffic generator / warm the
     /// gateway). Failures are journaled but non-fatal: the LIVE gate decides.
     #[serde(default)]
