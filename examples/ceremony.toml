@@ -1,0 +1,41 @@
+# pulse-cutover ceremony manifest (single-node / rehearsal shape).
+# In multi-BP mode the [ceremony] block is declared by msig on the source
+# chain and this file is generated from that on-chain row.
+
+journal_path = "/root/cutover-rehearsal/journal.jsonl"
+poll_ms = 250
+
+[ceremony]
+freeze_height = 12345            # H: freeze as soon as head >= H
+# chain_id = "71ee83bc..."       # pin the source chain id (discovered+journaled if omitted)
+import_cpu_scale = 143           # part of chain identity; MUST match the staged pulsevm config
+freeze_strategy = "pause_at_h"   # "schedule_at_h" for multi-BP ceremonies
+quiescence_polls = 6             # unchanged-head polls required after pause
+
+[source]
+rpc_url = "http://127.0.0.1:8888"
+producer_api_url = "http://127.0.0.1:8888"   # keep producer_api on localhost ONLY
+snapshot_timeout_secs = 600
+
+[snapshot]
+staged_path = "/root/cutover-rehearsal/snapshot-cut.bin"  # what the pulsevm chain config's snapshot_path points at
+# nodeos-in-docker: remap the container path nodeos reports to the host path
+path_map_from = "/data/snapshots"
+path_map_to = "/root/cutover-rehearsal/nodeos-data/snapshots"
+# multi-BP mode: verify against pre-published goldens
+# expected_sha256 = "..."
+# golden_roots = "/root/cutover-rehearsal/golden-roots.txt"
+# first-node / rehearsal mode: capture goldens with provenance instead
+capture_roots = "/root/cutover-rehearsal/captured-roots.txt"
+
+[target]
+metalgo_unit = "metalgo-cutover"
+rpc_url = "http://127.0.0.1:9652/ext/bc/CHAIN_ID_HERE/rpc"
+live_blocks = 1                  # LIVE gate: head must pass cut_height by this many
+quorum_timeout_secs = 600        # partial-quorum limbo timeout -> ABORT + rollback
+auto_rollback = true             # on abort, resume the source producer
+
+[hooks]
+post_ignite = "/root/cutover-rehearsal/repoint-traffic.sh"
+on_live = "echo 'flip gateway upstreams here'"
+on_abort = "echo 'page the operator'"

@@ -1,0 +1,28 @@
+[package]
+name = "pulse-cutover"
+version = "0.1.0"
+edition = "2021"
+description = "Programmatic zero-read-downtime XPR -> PulseVM cutover ceremony agent"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+ureq = { version = "2", features = ["json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# The snapshot/fingerprint stack, straight from the arena-import workspace.
+# Convention: pulse-cutover and pulsevm-arena-import are sibling checkouts
+# (~/dev/... on dev boxes, /root/... on servers).
+pulsevm_snapshot = { path = "../pulsevm-arena-import/crates/pulsevm_snapshot" }
+pulsevm_snapshot_import = { path = "../pulsevm-arena-import/crates/pulsevm_snapshot_import" }
+pulsevm_chaindb = { path = "../pulsevm-arena-import/crates/pulsevm_chaindb" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+debug = true
