@@ -56,19 +56,72 @@ NETWORK=$(mget '.target.network_id')
 WORK=$(mget '.paths.work_dir')
 STAGED="$WORK/snapshot-cut.bin"
 
-# ---------- preflight: refuse politely, with reasons ----------
-problems=()
-. /etc/os-release || true
-case "${VERSION_ID:-}" in 22.04|24.04) ;; *) problems+=("Ubuntu 22.04/24.04 required (found ${PRETTY_NAME:-unknown})");; esac
-RAM_MB=$(free -m | awk '/Mem:/{print $2}')
-RAM_GB=$(( (RAM_MB + 512) / 1024 ))
-DISK_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-# MB-based check: a "16 GB" box reports ~15.6 GB usable — free -g rounding
-# must not fail it (dogfood finding on the cpx42 rehearsal box).
-MIN_RAM_MB=15000; [ "$MODE" = "api" ] && MIN_RAM_MB=7500  # hyperion/bp need headroom (ES / chainbase)
-[ "${RAM_MB:-0}" -ge "$MIN_RAM_MB" ] || problems+=("need >=$((MIN_RAM_MB/1000))GB RAM for $MODE mode (found ${RAM_GB}GB)")
-[ "${DISK_GB:-0}" -ge 50 ] || problems+=("need >=50GB free disk (found ${DISK_GB}GB)")
+# ---------- pinned, verified artifacts (helpers) ----------
+fetch_verify(){ # url sha dest
+  local url="$1" sha="$2" dest="$3"
+  if [ -f "$dest" ] && echo "$sha  $dest" | sha256sum -c - >/dev/null 2>&1; then
+    echo "  ok (cached): $(basename "$dest")"; return
+  fi
+  echo "  fetch $(basename "$dest") ..."
+  curl -fsSL "$url" -o "$dest.tmp"
+  echo "$sha  $dest.tmp" | sha256sum -c - >/dev/null || { echo "ABORT: SHA256 mismatch on $dest (fail-closed)"; rm -f "$dest.tmp"; exit 1; }
+  mv "$dest.tmp" "$dest"
+  echo "  verified: $(basename "$dest")"
+}
+# Safe tarball extraction: NEVER extract an untrusted tarball over / or $HOME.
+# (A pulsevm release tarball carrying uid-1001 ownership once chown'd /root.)
+extract_safe(){ # tarball stagedir
+  mkdir -p "$2"
+  tar -xzf "$1" -C "$2" --no-same-owner --no-same-permissions
+}
 
+mkdir -p "$WORK" /opt/pulsevm/plugins /opt/metalgo /etc/pulse-cutover /opt/pulse-cutover
+
+# ---------- the agent first: doctor drives everything after this ----------
+echo "artifacts:"
+fetch_verify "$(mget '.artifacts.agent.url')"  "$(mget '.artifacts.agent.sha256')"  /usr/local/bin/pulse-cutover
+chmod +x /usr/local/bin/pulse-cutover
+
+# ---------- doctor: DETECT the box, never assume ----------
+# Read-only survey: how nodeos runs (native/docker + unit), the live nginx
+# server_name -> upstream map, legacy hyperion/ES, metalgo, port plan.
+# install.sh CONSUMES this JSON below: flip scripts are templated from the
+# DETECTED routes, stop/start defaults from the detected unit/container,
+# and the per-mode verdict gates the install.
+DOC="$WORK/doctor.json"
+echo "doctor: surveying this box (read-only) ..."
+pulse-cutover doctor --json > "$DOC" || { echo "ABORT: doctor survey failed"; exit 1; }
+VERDICT=$(jq -r --arg m "$MODE" '.verdicts[$m].status' "$DOC")
+if [ "$VERDICT" = "UNSUPPORTED" ]; then
+  echo ""
+  echo "This setup is not supported yet (doctor verdict: UNSUPPORTED). Nothing was staged. Reasons:"
+  jq -r --arg m "$MODE" '.verdicts[$m].unsupported[]' "$DOC" | sed 's/^/  - /'
+  echo ""
+  echo "Run 'pulse-cutover report' and share the bundle — that is exactly how setups get added."
+  exit 1
+fi
+if [ "$VERDICT" = "NEEDS" ]; then
+  # A need the manifest itself satisfies (an explicit stop_cmd) is not a gap.
+  M_STOP=$(mget_opt '.source.stop_cmd')
+  NEEDS=$(jq -r --arg m "$MODE" '.verdicts[$m].needs[]' "$DOC")
+  REMAINING=""
+  while IFS= read -r n; do
+    [ -z "$n" ] && continue
+    if [ -n "$M_STOP" ] && echo "$n" | grep -q "stop_cmd"; then continue; fi
+    REMAINING="$REMAINING  - $n\n"
+  done <<< "$NEEDS"
+  if [ -n "$REMAINING" ]; then
+    echo ""
+    echo "This box is not ready (doctor verdict: NEEDS). Nothing was staged. Missing:"
+    printf "%b" "$REMAINING"
+    echo "Full survey: $DOC (or run 'pulse-cutover doctor' for the table)"
+    exit 1
+  fi
+fi
+echo "doctor: verdict for $MODE mode is READY ($DOC)"
+
+# ---------- manifest-vs-live preflight (doctor checked the box; this checks YOUR manifest) ----------
+problems=()
 # The source nodeos is YOURS — we detect it, we never install or touch it.
 SRC_INFO=$(curl -s -m5 "$SRC_RPC/v1/chain/get_info" || true)
 if [ -z "$SRC_INFO" ]; then
@@ -97,31 +150,31 @@ if [ ${#problems[@]} -gt 0 ]; then
   for p in "${problems[@]}"; do echo "  - $p"; done
   exit 1
 fi
-echo "preflight: ok (${RAM_GB}GB RAM, ${DISK_GB}GB disk, nodeos serving $CHAIN_ID, producer_api localhost-only)"
+echo "preflight: ok (nodeos serving $CHAIN_ID, producer_api localhost-only)"
 
-# ---------- pinned, verified artifacts ----------
-fetch_verify(){ # url sha dest
-  local url="$1" sha="$2" dest="$3"
-  if [ -f "$dest" ] && echo "$sha  $dest" | sha256sum -c - >/dev/null 2>&1; then
-    echo "  ok (cached): $(basename "$dest")"; return
+# ---------- source stop/start: manifest first, else DERIVED from detection ----------
+STOP_CMD=$(mget_opt '.source.stop_cmd')
+START_CMD=$(mget_opt '.source.start_cmd')
+if $API_LIKE && [ -z "$STOP_CMD" ]; then
+  NRUNTIME=$(jq -r '.nodeos.runtime // "unknown"' "$DOC")
+  NCONTAINER=$(jq -r '.nodeos.container_name // empty' "$DOC")
+  NUNIT=$(jq -r '.nodeos.systemd_units[0] // empty' "$DOC")
+  if [ "$NRUNTIME" = "docker" ] && [ -n "$NCONTAINER" ]; then
+    STOP_CMD="docker stop $NCONTAINER"; START_CMD=${START_CMD:-"docker start $NCONTAINER"}
+    echo "source stop/start: derived from detected docker container '$NCONTAINER'"
+  elif [ -n "$NUNIT" ]; then
+    STOP_CMD="systemctl stop $NUNIT"; START_CMD=${START_CMD:-"systemctl start $NUNIT"}
+    echo "source stop/start: derived from detected systemd unit '$NUNIT'"
+  else
+    echo "ABORT: api mode retires nodeos after the flip, but the manifest has no source.stop_cmd"
+    echo "       and doctor found neither a systemd unit nor a docker container running nodeos."
+    echo "       Declare source.stop_cmd/start_cmd in the manifest."
+    exit 1
   fi
-  echo "  fetch $(basename "$dest") ..."
-  curl -fsSL "$url" -o "$dest.tmp"
-  echo "$sha  $dest.tmp" | sha256sum -c - >/dev/null || { echo "ABORT: SHA256 mismatch on $dest (fail-closed)"; rm -f "$dest.tmp"; exit 1; }
-  mv "$dest.tmp" "$dest"
-  echo "  verified: $(basename "$dest")"
-}
-# Safe tarball extraction: NEVER extract an untrusted tarball over / or $HOME.
-# (A pulsevm release tarball carrying uid-1001 ownership once chown'd /root.)
-extract_safe(){ # tarball stagedir
-  mkdir -p "$2"
-  tar -xzf "$1" -C "$2" --no-same-owner --no-same-permissions
-}
+fi
 
-mkdir -p "$WORK" /opt/pulsevm/plugins /opt/metalgo /etc/pulse-cutover /opt/pulse-cutover
-echo "artifacts:"
-fetch_verify "$(mget '.artifacts.agent.url')"  "$(mget '.artifacts.agent.sha256')"  /usr/local/bin/pulse-cutover
-chmod +x /usr/local/bin/pulse-cutover
+# ---------- remaining pinned artifacts ----------
+echo "artifacts (target stack):"
 fetch_verify "$(mget '.artifacts.plugin.url')" "$(mget '.artifacts.plugin.sha256')" "/opt/pulsevm/plugins/$VMID"
 chmod +x "/opt/pulsevm/plugins/$VMID"
 if [ ! -x /opt/metalgo/metalgo ] || ! echo "$(mget '.artifacts.metalgo.sha256')  /opt/metalgo/metalgo" | sha256sum -c - >/dev/null 2>&1; then
@@ -204,14 +257,76 @@ UNIT
   systemctl enable pulse-gateway >/dev/null 2>&1
   systemctl restart pulse-gateway
 
-  # nginx: ONLY /v1/chain is public (the producer_api must never be — R10).
-  # The upstream indirection file is what the flip swaps: 8888 (nodeos) -> 8899 (gateway).
+  # nginx flip machinery. Two layouts:
+  #   detected — the box ALREADY routes /v1 to nodeos through nginx (real API
+  #              providers): template flip/revert from the DETECTED
+  #              server_name -> proxy_pass map in doctor.json, byte-exact
+  #              against the operator's own config files. nginx is untouched
+  #              until the ceremony's flip stage.
+  #   managed  — fresh side-box with no nginx routes: stage our own site with
+  #              a single-line upstream indirection (the recorded-22-runs
+  #              layout).
   NODEOS_PORT=$(echo "$SRC_RPC" | sed -E 's|.*:([0-9]+).*|\1|')
-  cat > /etc/nginx/conf.d/pulse-cutover-upstream.conf <<CONF
+  GW="127.0.0.1:8899"
+  # Detected /v1 routes whose backend is the source nodeos port.
+  V1_MATCHES=$(jq -r --arg p ":$NODEOS_PORT" '
+    [ .web.routes[]
+      | select((.location | startswith("/v1")) or .location == "/")
+      | select(any(.backends[]?; endswith($p))) ]
+    | .[] | [ (if .upstream_name then "upstream" else "direct" end),
+              (.upstream_name // .file), .proxy_pass,
+              (.backends[0] // ""), (.server_names | join(" ")) ]
+    | @tsv' "$DOC" | sort -u)
+  ROUTE_COUNT=$(jq -r '.web.routes | length' "$DOC")
+
+  if [ -n "$V1_MATCHES" ]; then
+    LAYOUT=detected
+    FLIP=/opt/pulse-cutover/flip-to-pulsevm.sh
+    REVERT=/opt/pulse-cutover/flip-revert.sh
+    {
+      echo '#!/usr/bin/env bash'
+      echo '# GENERATED by install.sh from the DETECTED nginx map (doctor.json).'
+      echo '# The ONLY user-visible commitment of the ceremony (R5 ratchet): swap the'
+      echo '# public /v1 upstream(s) from nodeos to the PulseVM gateway. Reads never gap:'
+      echo '# nginx reload is connection-graceful and nodeos is still up behind us.'
+      echo 'set -e'
+    } > "$FLIP"
+    { echo '#!/usr/bin/env bash'; echo '# GENERATED revert: swap the public /v1 back to nodeos.'; echo 'set -e'; } > "$REVERT"
+    echo "public /v1 map DETECTED (the flip will swap exactly these, nothing else):"
+    while IFS=$'\t' read -r KIND WHERE PASS BACKEND NAMES; do
+      [ -n "$KIND" ] || continue
+      if [ "$KIND" = "upstream" ]; then
+        UPFILE=$(grep -RslE "upstream[[:space:]]+$WHERE[[:space:]]*\{" /etc/nginx 2>/dev/null | head -1)
+        [ -n "$UPFILE" ] || { echo "ABORT: route uses upstream '$WHERE' but no file in /etc/nginx defines it"; exit 1; }
+        echo "  ${NAMES:-_}: proxy_pass $PASS -> upstream $WHERE { $BACKEND } [$UPFILE]"
+        echo "sed -i 's|server $BACKEND;|server $GW;|' $UPFILE" >> "$FLIP"
+        echo "sed -i 's|server $GW;|server $BACKEND;|' $UPFILE" >> "$REVERT"
+      else
+        NEWPASS=${PASS/$BACKEND/$GW}
+        echo "  ${NAMES:-_}: $PASS -> $NEWPASS [$WHERE]"
+        echo "sed -i 's|proxy_pass $PASS;|proxy_pass $NEWPASS;|' $WHERE" >> "$FLIP"
+        echo "sed -i 's|proxy_pass $NEWPASS;|proxy_pass $PASS;|' $WHERE" >> "$REVERT"
+      fi
+    done <<< "$V1_MATCHES"
+    { echo 'nginx -t && nginx -s reload'; echo 'echo flipped-to-pulsevm'; } >> "$FLIP"
+    { echo 'nginx -t && nginx -s reload'; echo 'echo reverted-to-nodeos'; } >> "$REVERT"
+    chmod +x "$FLIP" "$REVERT"
+  elif [ "${ROUTE_COUNT:-0}" -gt 0 ]; then
+    # nginx has routes, but none proxy /v1 to the nodeos this manifest names.
+    # Guessing which domain to hijack would be worse than refusing.
+    echo "ABORT: nginx serves $ROUTE_COUNT route(s) but none proxy /v1 (or /) to the nodeos on :$NODEOS_PORT."
+    echo "       doctor's map is in $DOC (.web.routes). Either add the /v1 route nginx-side,"
+    echo "       point source.rpc_url at the nodeos your nginx actually fronts, or run"
+    echo "       'pulse-cutover report' and share the bundle so we can support this layout."
+    exit 1
+  else
+    LAYOUT=managed
+    echo "no existing /v1 routes detected — staging the managed nginx layout"
+    cat > /etc/nginx/conf.d/pulse-cutover-upstream.conf <<CONF
 # Managed by pulse-cutover. The ceremony's flip swaps this single line.
 upstream pulse_v1_backend { server 127.0.0.1:$NODEOS_PORT; }
 CONF
-  cat > /etc/nginx/sites-available/pulse-v1 <<'CONF'
+    cat > /etc/nginx/sites-available/pulse-v1 <<'CONF'
 server {
     listen 80 default_server;
     server_name _;
@@ -224,11 +339,11 @@ server {
     location / { return 404 '{"error":"only /v1/chain is served here"}'; }
 }
 CONF
-  rm -f /etc/nginx/sites-enabled/default
-  ln -sf /etc/nginx/sites-available/pulse-v1 /etc/nginx/sites-enabled/pulse-v1
-  nginx -t >/dev/null && systemctl reload nginx
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sf /etc/nginx/sites-available/pulse-v1 /etc/nginx/sites-enabled/pulse-v1
+    nginx -t >/dev/null && systemctl reload nginx
 
-  cat > /opt/pulse-cutover/flip-to-pulsevm.sh <<FLIP
+    cat > /opt/pulse-cutover/flip-to-pulsevm.sh <<FLIP
 #!/usr/bin/env bash
 # The ONLY user-visible commitment of the ceremony (R5 ratchet): swap the
 # public /v1 upstream from nodeos to the PulseVM gateway. Reads never gap:
@@ -238,14 +353,15 @@ sed -i 's|server 127.0.0.1:$NODEOS_PORT;|server 127.0.0.1:8899;|' /etc/nginx/con
 nginx -t && nginx -s reload
 echo flipped-to-pulsevm
 FLIP
-  cat > /opt/pulse-cutover/flip-revert.sh <<FLIP
+    cat > /opt/pulse-cutover/flip-revert.sh <<FLIP
 #!/usr/bin/env bash
 set -e
 sed -i 's|server 127.0.0.1:8899;|server 127.0.0.1:$NODEOS_PORT;|' /etc/nginx/conf.d/pulse-cutover-upstream.conf
 nginx -t && nginx -s reload
 echo reverted-to-nodeos
 FLIP
-  chmod +x /opt/pulse-cutover/flip-*.sh
+    chmod +x /opt/pulse-cutover/flip-*.sh
+  fi
 fi
 
 # ---------- hyperion mode: /v2 history stack (ES + hyperion-rs + federator) ----------
@@ -347,15 +463,65 @@ UNIT
   systemctl enable hyperion-federator >/dev/null 2>&1
   systemctl restart hyperion-federator  # env (LEGACY/ports) may have changed on re-run
 
-  # nginx: add the public /v2 surface. Pre-flip upstream = the legacy
-  # passthrough ("the /v2 you already had" — point it at your own old
-  # Hyperion instead if you kept one); the ceremony's v2 flip swaps it to
-  # the federating router.
-  cat > /etc/nginx/conf.d/pulse-cutover-v2-upstream.conf <<CONF
+  # nginx /v2 surface, per layout:
+  #   detected — template the /v2 flip from the DETECTED /v2 (or /v1/history)
+  #              route: whatever it proxies today (your legacy Hyperion / old
+  #              ES stack) is the pre-flip upstream, and the flip swaps it to
+  #              the federating router. Your site files stay untouched until
+  #              the flip stage.
+  #   managed  — stage our own site: pre-flip upstream = the legacy
+  #              passthrough ("the /v2 you already had"); the v2 flip swaps
+  #              the single upstream line.
+  FED="127.0.0.1:7010"
+  if [ "${LAYOUT:-managed}" = "detected" ]; then
+    V2_MATCHES=$(jq -r '
+      [ .web.routes[]
+        | select((.location | startswith("/v2")) or (.location | startswith("/v1/history"))) ]
+      | .[] | [ (if .upstream_name then "upstream" else "direct" end),
+                (.upstream_name // .file), .proxy_pass,
+                (.backends[0] // ""), (.server_names | join(" ")) ]
+      | @tsv' "$DOC" | sort -u)
+    if [ -z "$V2_MATCHES" ]; then
+      echo "ABORT: hyperion mode needs a public /v2 (or /v1/history) route to flip, but doctor"
+      echo "       found none in your nginx map ($DOC .web.routes). Add the route your users"
+      echo "       already call, or run 'pulse-cutover report' so we can support this layout."
+      exit 1
+    fi
+    FLIP2=/opt/pulse-cutover/flip-v2.sh
+    REVERT2=/opt/pulse-cutover/flip-v2-revert.sh
+    {
+      echo '#!/usr/bin/env bash'
+      echo '# GENERATED by install.sh from the DETECTED nginx map (doctor.json).'
+      echo '# The /v2 half of the flip stage: public history moves to the federating'
+      echo '# router (pre-cut = legacy, post-cut = local hyperion-rs).'
+      echo 'set -e'
+    } > "$FLIP2"
+    { echo '#!/usr/bin/env bash'; echo '# GENERATED revert: swap /v2 back to its pre-ceremony upstream.'; echo 'set -e'; } > "$REVERT2"
+    echo "public /v2 map DETECTED (the v2 flip will swap exactly these):"
+    while IFS=$'\t' read -r KIND WHERE PASS BACKEND NAMES; do
+      [ -n "$KIND" ] || continue
+      if [ "$KIND" = "upstream" ]; then
+        UPFILE=$(grep -RslE "upstream[[:space:]]+$WHERE[[:space:]]*\{" /etc/nginx 2>/dev/null | head -1)
+        [ -n "$UPFILE" ] || { echo "ABORT: route uses upstream '$WHERE' but no file in /etc/nginx defines it"; exit 1; }
+        echo "  ${NAMES:-_}: proxy_pass $PASS -> upstream $WHERE { $BACKEND } [$UPFILE]"
+        echo "sed -i 's|server $BACKEND;|server $FED;|' $UPFILE" >> "$FLIP2"
+        echo "sed -i 's|server $FED;|server $BACKEND;|' $UPFILE" >> "$REVERT2"
+      else
+        NEWPASS=${PASS/$BACKEND/$FED}
+        echo "  ${NAMES:-_}: $PASS -> $NEWPASS [$WHERE]"
+        echo "sed -i 's|proxy_pass $PASS;|proxy_pass $NEWPASS;|' $WHERE" >> "$FLIP2"
+        echo "sed -i 's|proxy_pass $NEWPASS;|proxy_pass $PASS;|' $WHERE" >> "$REVERT2"
+      fi
+    done <<< "$V2_MATCHES"
+    { echo 'nginx -t && nginx -s reload'; echo 'echo flipped-v2-to-federator'; } >> "$FLIP2"
+    { echo 'nginx -t && nginx -s reload'; echo 'echo reverted-v2'; } >> "$REVERT2"
+    chmod +x "$FLIP2" "$REVERT2"
+  else
+    cat > /etc/nginx/conf.d/pulse-cutover-v2-upstream.conf <<CONF
 # Managed by pulse-cutover. The ceremony's /v2 flip swaps this single line.
 upstream pulse_v2_backend { server 127.0.0.1:7019; }
 CONF
-  cat > /etc/nginx/sites-available/pulse-v1 <<'CONF'
+    cat > /etc/nginx/sites-available/pulse-v1 <<'CONF'
 server {
     listen 80 default_server;
     server_name _;
@@ -378,9 +544,9 @@ server {
     location / { return 404 '{"error":"only /v1/chain, /v1/history and /v2 are served here"}'; }
 }
 CONF
-  nginx -t >/dev/null && systemctl reload nginx
+    nginx -t >/dev/null && systemctl reload nginx
 
-  cat > /opt/pulse-cutover/flip-v2.sh <<'FLIP'
+    cat > /opt/pulse-cutover/flip-v2.sh <<'FLIP'
 #!/usr/bin/env bash
 # The /v2 half of the flip stage: public history moves to the federating
 # router (pre-cut = legacy, post-cut = local hyperion-rs). Same single-line
@@ -390,14 +556,15 @@ sed -i 's|server 127.0.0.1:7019;|server 127.0.0.1:7010;|' /etc/nginx/conf.d/puls
 nginx -t && nginx -s reload
 echo flipped-v2-to-federator
 FLIP
-  cat > /opt/pulse-cutover/flip-v2-revert.sh <<'FLIP'
+    cat > /opt/pulse-cutover/flip-v2-revert.sh <<'FLIP'
 #!/usr/bin/env bash
 set -e
 sed -i 's|server 127.0.0.1:7010;|server 127.0.0.1:7019;|' /etc/nginx/conf.d/pulse-cutover-v2-upstream.conf
 nginx -t && nginx -s reload
 echo reverted-v2-to-passthrough
 FLIP
-  chmod +x /opt/pulse-cutover/flip-v2*.sh
+    chmod +x /opt/pulse-cutover/flip-v2*.sh
+  fi
 
   cat > /opt/pulse-cutover/hyperion-start.sh <<'HYPSTART'
 #!/usr/bin/env bash
@@ -415,13 +582,14 @@ HYPSTART
 fi
 
 # ---------- ceremony.toml (the agent's manifest) ----------
+# STOP_CMD/START_CMD were resolved above: manifest value, else derived from
+# the doctor-detected unit/container.
 FH=$(mget '.ceremony.freeze_height')
 FM=$(mget_opt '.ceremony.freeze_margin')
 SIM=$(mget_opt '.ceremony.simulate_freeze'); SIM=${SIM:-false}
-STOP_CMD=$(mget_opt '.source.stop_cmd')
-START_CMD=$(mget_opt '.source.start_cmd')
 GOLDENS=$(mget_opt '.snapshot.golden_roots')
 EXPECTED_SHA=$(mget_opt '.snapshot.expected_sha256')
+PRESCAN=$(mget_opt '.snapshot.prescan_path')
 {
   echo "journal_path = \"$WORK/journal.jsonl\""
   echo 'poll_ms = 250'
@@ -447,6 +615,7 @@ EXPECTED_SHA=$(mget_opt '.snapshot.expected_sha256')
   [ -n "$SNAP_FROM" ] && echo "path_map_from = \"$SNAP_FROM\"" && echo "path_map_to = \"$SNAP_TO\""
   if [ -n "$GOLDENS" ]; then echo "golden_roots = \"$GOLDENS\""; else echo "capture_roots = \"$WORK/captured-roots.txt\""; fi
   [ -n "$EXPECTED_SHA" ] && echo "expected_sha256 = \"$EXPECTED_SHA\""
+  [ -n "$PRESCAN" ] && echo "prescan_path = \"$PRESCAN\""
   echo ''
   echo '[target]'
   echo 'metalgo_unit = "metalgo-pulse"'
@@ -474,11 +643,26 @@ EXPECTED_SHA=$(mget_opt '.snapshot.expected_sha256')
 } > /etc/pulse-cutover/ceremony.toml
 cp "$MANIFEST" /etc/pulse-cutover/ceremony.json
 
+# ---------- stubbed-intrinsic preflight (advisory, never a gate) ----------
+# When a rehearsal/pre-downloaded snapshot is staged, print + save the
+# at-risk contract table now: which deployed contracts reference host
+# functions PulseVM stubs (they load, but TRAP if the import is ever
+# CALLED). The agent re-runs this scan on the ACTUAL cut snapshot during the
+# ceremony and journals it either way.
+if [ -n "$PRESCAN" ] && [ -f "$PRESCAN" ]; then
+  echo ""
+  echo "== stubbed-intrinsic preflight (advisory — install continues regardless) =="
+  pulse-cutover scan-contracts "$PRESCAN" | tee "$WORK/scan-contracts.txt" || true
+fi
+
 NODEID=$(curl -s -m5 http://127.0.0.1:9650/ext/info -X POST -H 'content-type:application/json' -d '{"jsonrpc":"2.0","id":1,"method":"info.getNodeID"}' | jq -r '.result.nodeID // "(metalgo still starting)"')
 echo ""
 echo "============================================================"
 echo " ARMED-READY (mode: $MODE) — installed, verified, staged."
 echo ""
+echo " Doctor:  survey + per-mode verdicts in $WORK/doctor.json"
+$API_LIKE && echo "          flip scripts templated from the ${LAYOUT:-managed} nginx layout"
+[ -n "$STOP_CMD" ] && echo "          source stop: $STOP_CMD"
 echo " Source:  nodeos at $SRC_RPC serving $CHAIN_ID (untouched)"
 echo " Target:  metalgo-pulse tracking subnet $SUBNET"
 echo "          NodeID $NODEID"

@@ -114,5 +114,7 @@ if [ "$RC" = 0 ]; then
 else
   echo ""
   echo "Ceremony did NOT reach LIVE (exit $RC). Journal with full evidence: $JOURNAL"
+  echo "Rehearsing with us? 'pulse-cutover report' builds a sanitized bundle (journal +"
+  echo "doctor survey + service logs, keys redacted) — attach it to a GitHub issue."
 fi
 exit "$RC"
