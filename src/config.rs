@@ -16,6 +16,13 @@ pub struct Config {
     pub source: Source,
     pub snapshot: Snapshot,
     pub target: Target,
+    /// api mode only: how the public /v1 URL is swapped from nodeos to the
+    /// PulseVM gateway, and how the swap is health-checked.
+    #[serde(default)]
+    pub flip: Option<Flip>,
+    /// loop-harness settings (`pulse-cutover loop`).
+    #[serde(default)]
+    pub r#loop: Option<LoopCfg>,
     #[serde(default)]
     pub hooks: Hooks,
     /// Append-only JSONL journal — the ceremony's evidence log and the
@@ -29,10 +36,36 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ceremony {
-    /// Freeze height H: the agent freezes as soon as head >= H. The actual
-    /// cut height (>= H, exact under `schedule_at_h`, best-effort-pause under
-    /// `pause_at_h`) is recorded in the journal and pinned by block id.
+    /// Who this agent is in the ceremony:
+    /// - "producer": the node PRODUCES the source chain — freeze = stop
+    ///   writes, pause production (order per R1/R2). The rehearsed v1 path.
+    /// - "api": the node is an API provider — it does not produce and cannot
+    ///   freeze the chain; it observes the (declared or simulated) freeze,
+    ///   snapshots via its own producer_api (read-only create_snapshot works
+    ///   on non-producers), and the user-visible commitment is the /v1 URL
+    ///   flip (state FLIPPED). The source nodeos keeps serving reads until
+    ///   AFTER the flip is healthy — reads never gap — and is stopped via
+    ///   `source.stop_cmd` only then.
+    #[serde(default)]
+    pub mode: Mode,
+    /// Freeze height H: the agent freezes as soon as head >= H (producer
+    /// mode) or LIB >= H (api mode — snapshot at finality, R1). 0 = derive
+    /// from `freeze_margin` at ARM time (journaled as `resolved_h`).
+    #[serde(default)]
     pub freeze_height: u64,
+    /// If `freeze_height = 0`: H := (source LIB at ARM) + freeze_margin.
+    /// This is the loop-harness / simulated-freeze mode of declaring H; in a
+    /// real ceremony H is exact because the BPs freeze at it — api mode
+    /// trusts the declared H either way.
+    #[serde(default)]
+    pub freeze_margin: Option<u64>,
+    /// api mode against a LIVE source chain that will NOT actually freeze
+    /// (rehearsals on the real testnet): when LIB >= H the agent PROCEEDS as
+    /// if frozen — the snapshot lands at ~finality near H and the journal
+    /// records the actual cut block. In a real event the BPs stop at H and
+    /// this flag is false (the observed head simply stops moving at H).
+    #[serde(default)]
+    pub simulate_freeze: bool,
     /// Expected source chain_id (hex). Everything downstream — snapshot,
     /// import, target chain — must present exactly this id. Optional only so
     /// a rehearsal against a freshly booted dev chain can discover it at ARM
@@ -69,6 +102,14 @@ pub enum FreezeStrategy {
     ScheduleAtH,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    #[default]
+    Producer,
+    Api,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
@@ -83,6 +124,57 @@ pub struct Source {
     /// final).
     #[serde(default = "default_snapshot_timeout")]
     pub snapshot_timeout_secs: u64,
+    /// api mode: the operator's own stop script for the source nodeos
+    /// (arbitrary command — `./stop.sh`, `docker stop nodeos`, `systemctl
+    /// stop nodeos`, …). Runs ONLY after FLIPPED health-checks green: the
+    /// nodeos must outlive the flip so reads never gap.
+    #[serde(default)]
+    pub stop_cmd: Option<String>,
+    /// api mode, optional: how to bring the source nodeos BACK if the
+    /// ceremony aborts after stop_cmd already ran (defense in depth; the
+    /// only abort left after stop is a post-stop public health failure).
+    #[serde(default)]
+    pub start_cmd: Option<String>,
+}
+
+/// api mode: the /v1 URL swap. `cmd` performs the swap (e.g. rewrite the
+/// nginx upstream + reload); the agent then polls `public_url` until it
+/// serves the TARGET chain (same chain_id — that's the whole point — so the
+/// discriminator is head agreement with the target RPC within
+/// `head_tolerance` blocks, `health_polls` consecutive times).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Flip {
+    pub cmd: String,
+    /// The PUBLIC endpoint clients actually use (through nginx), e.g.
+    /// "http://<public-ip>" — the agent appends /v1/chain/get_info.
+    pub public_url: String,
+    /// Optional revert command (swap nginx back to nodeos) run on abort if
+    /// the flip already happened.
+    #[serde(default)]
+    pub revert_cmd: Option<String>,
+    #[serde(default = "default_health_polls")]
+    pub health_polls: u32,
+    #[serde(default = "default_head_tolerance")]
+    pub head_tolerance: u64,
+    #[serde(default = "default_flip_timeout")]
+    pub health_timeout_secs: u64,
+}
+
+/// `pulse-cutover loop`: run the ceremony N times against resettable source
+/// and target, aggregating per-run metrics. Requires `freeze_margin` (H is
+/// re-derived per run) and a `reset_cmd` that returns both sides to a
+/// pre-ARM state (fresh target chain dir, staged snapshot removed — R12).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoopCfg {
+    /// Shell command that resets the world for the next iteration.
+    pub reset_cmd: String,
+    /// Seconds to wait after reset before ARMing (services settling).
+    #[serde(default)]
+    pub settle_secs: u64,
+    /// Where per-run metrics JSONL lines are appended.
+    pub metrics_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -173,6 +265,15 @@ pub struct Hooks {
 fn default_poll_ms() -> u64 {
     500
 }
+fn default_health_polls() -> u32 {
+    4
+}
+fn default_head_tolerance() -> u64 {
+    8
+}
+fn default_flip_timeout() -> u64 {
+    120
+}
 fn default_cpu_scale() -> u64 {
     1
 }
@@ -205,6 +306,28 @@ impl Config {
         }
         if config.snapshot.path_map_from.is_some() != config.snapshot.path_map_to.is_some() {
             return Err("snapshot.path_map_from and path_map_to must be set together".into());
+        }
+        if config.ceremony.freeze_height == 0 && config.ceremony.freeze_margin.is_none() {
+            return Err("either ceremony.freeze_height (> 0) or ceremony.freeze_margin \
+                        (H := LIB-at-ARM + margin) must be set"
+                .into());
+        }
+        if config.ceremony.mode == Mode::Api {
+            if config.flip.is_none() {
+                return Err("api mode requires a [flip] section (cmd + public_url): the \
+                            /v1 URL swap IS the user-visible cutover"
+                    .into());
+            }
+            if config.source.stop_cmd.is_none() {
+                return Err("api mode requires source.stop_cmd (the operator's own nodeos \
+                            stop script; runs only after FLIPPED is healthy)"
+                    .into());
+            }
+        }
+        if config.ceremony.simulate_freeze && config.ceremony.mode != Mode::Api {
+            return Err("simulate_freeze is only meaningful in api mode (a producer freezes \
+                        the chain for real)"
+                .into());
         }
         Ok(config)
     }

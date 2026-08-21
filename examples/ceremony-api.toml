@@ -1,0 +1,52 @@
+# pulse-cutover ceremony manifest — API-PROVIDER mode.
+# The api-node ceremony: nodeos serving the public /v1 URL -> PulseVM serving
+# the SAME URL, zero read downtime. State order: the source nodeos OUTLIVES
+# ignition; the /v1 flip (FLIPPED) is the only user-visible step and the
+# source stop runs after it.
+
+journal_path = "/root/api-cutover/journal.jsonl"
+poll_ms = 250
+
+[ceremony]
+mode = "api"
+freeze_height = 0            # 0 = derive H from freeze_margin at ARM
+freeze_margin = 240          # H := LIB-at-ARM + 240 (rehearsal / loop mode)
+simulate_freeze = true       # live source won't freeze: proceed at LIB >= H
+chain_id = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
+import_cpu_scale = 143       # chain identity — must equal the staged pulsevm config
+
+[source]
+rpc_url = "http://127.0.0.1:8888"
+producer_api_url = "http://127.0.0.1:8888"   # localhost ONLY (R10)
+snapshot_timeout_secs = 900
+stop_cmd = "systemctl stop nodeos"           # the operator's own stop script
+start_cmd = "systemctl start nodeos"         # rollback if aborting after stop
+
+[snapshot]
+staged_path = "/root/api-cutover/snapshot-cut.bin"
+capture_roots = "/root/api-cutover/captured-roots.txt"
+# multi-node ceremony: golden_roots = "/root/api-cutover/golden-roots.txt"
+
+[target]
+metalgo_unit = "metalgo-pulse"
+rpc_url = "http://127.0.0.1:9650/ext/bc/BLOCKCHAIN_ID_HERE/rpc"
+quorum_timeout_secs = 900
+auto_rollback = true
+
+[flip]
+cmd = "/opt/pulse-cutover/flip-to-pulsevm.sh"    # nginx upstream swap
+public_url = "http://PUBLIC_IP_OR_DOMAIN"        # what clients actually hit
+revert_cmd = "/opt/pulse-cutover/flip-revert.sh"
+health_polls = 4             # consecutive OK reads required
+head_tolerance = 8           # public head must agree with target RPC within this
+health_timeout_secs = 120
+
+# loop harness: pulse-cutover loop --config this.toml --runs N
+# [loop]
+# reset_cmd = "/root/api-cutover/loop-reset.sh"
+# settle_secs = 5
+# metrics_path = "/root/api-cutover/loop-metrics.jsonl"
+
+[hooks]
+on_live = "echo 'same URL, same chain_id, new engine'"
+on_abort = "echo 'page the operator'"

@@ -30,11 +30,13 @@ fn main() {
     let command = args.first().map(String::as_str).unwrap_or("");
     let result = match command {
         "run" => cmd_run(&args),
+        "loop" => cmd_loop(&args),
         "status" => cmd_status(&args),
         "verify" => cmd_verify(&args),
         _ => {
             eprintln!(
-                "usage: pulse-cutover <run|status|verify> --config ceremony.toml\n       \
+                "usage: pulse-cutover <run|loop|status|verify> --config ceremony.toml\n       \
+                 pulse-cutover loop --config ceremony.toml --runs N\n       \
                  pulse-cutover verify --snapshot file.bin [--cpu-scale N] [--golden g.txt | --capture g.txt]"
             );
             std::process::exit(2);
@@ -77,6 +79,27 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     } else {
         Err(format!("ceremony ended in {terminal} (see journal)"))
     }
+}
+
+fn cmd_loop(args: &[String]) -> Result<(), String> {
+    let cfg = load_config(args)?;
+    let runs: u32 = arg(args, "--runs")
+        .ok_or("missing --runs")?
+        .parse()
+        .map_err(|e| format!("bad --runs: {e}"))?;
+    let ignite_cmd = cfg
+        .target
+        .ignite_cmd
+        .clone()
+        .unwrap_or_else(|| format!("systemctl restart {}", cfg.target.metalgo_unit));
+    let ops = HttpOps::new(
+        &cfg.source.rpc_url,
+        &cfg.source.producer_api_url,
+        &cfg.target.rpc_url,
+        &ignite_cmd,
+        cfg.source.snapshot_timeout_secs,
+    );
+    pulse_cutover::looper::run_loop(&cfg, &ops, runs)
 }
 
 fn cmd_status(args: &[String]) -> Result<(), String> {

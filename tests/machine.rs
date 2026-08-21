@@ -62,6 +62,17 @@ struct MockOps {
     paused_polls: Cell<u32>,
     hooks: RefCell<Vec<String>>,
     now: Cell<u64>,
+    // --- api-mode world ---
+    /// Blocks the source head advances per source_info poll (a live chain
+    /// that will NOT freeze — simulate_freeze rehearsals). Default 1.
+    drift: Cell<u64>,
+    /// Set when the "flip-nginx" hook runs: public URL now routes to target.
+    flipped: Cell<bool>,
+    /// Set when the "stop-nodeos" hook runs: source nodeos is down.
+    stopped: Cell<bool>,
+    /// Fault injection: flip cmd succeeds but the public URL never serves
+    /// the target (nginx swap to a dead upstream).
+    flip_breaks_public: Cell<bool>,
 }
 
 impl MockOps {
@@ -78,6 +89,10 @@ impl MockOps {
             paused_polls: Cell::new(0),
             hooks: RefCell::new(Vec::new()),
             now: Cell::new(1_000_000),
+            drift: Cell::new(1),
+            flipped: Cell::new(false),
+            stopped: Cell::new(false),
+            flip_breaks_public: Cell::new(false),
         }
     }
 
@@ -99,8 +114,11 @@ impl MockOps {
 
 impl ChainOps for MockOps {
     fn source_info(&self) -> Result<ChainInfo, String> {
+        if self.stopped.get() {
+            return Err("connection refused (nodeos stopped)".into());
+        }
         if !self.paused.get() {
-            self.head.set(self.head.get() + 1);
+            self.head.set(self.head.get() + self.drift.get());
         } else {
             let polls = self.paused_polls.get() + 1;
             self.paused_polls.set(polls);
@@ -179,6 +197,22 @@ impl ChainOps for MockOps {
         Ok(Some(self.info(head)))
     }
 
+    fn public_info(&self, _public_url: &str) -> Result<Option<ChainInfo>, String> {
+        if self.flipped.get() {
+            // Public URL routes to the gateway -> pulsevm target.
+            if self.flip_breaks_public.get() {
+                return Ok(None); // swapped to a dead upstream
+            }
+            return self.target_info();
+        }
+        // Public URL routes to nodeos (which may be live-drifting way past
+        // the cut under simulate_freeze, or dead if stopped prematurely).
+        if self.stopped.get() {
+            return Ok(None);
+        }
+        Ok(Some(self.info(self.head.get())))
+    }
+
     fn ignite(&self) -> Result<String, String> {
         self.ignited.set(true);
         Ok("mock metalgo restarted".into())
@@ -186,6 +220,15 @@ impl ChainOps for MockOps {
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
         self.hooks.borrow_mut().push(cmd.to_string());
+        if cmd.contains("flip-nginx") {
+            self.flipped.set(true);
+        }
+        if cmd.contains("revert-nginx") {
+            self.flipped.set(false);
+        }
+        if cmd.contains("stop-nodeos") {
+            self.stopped.set(true);
+        }
         Ok(format!("ran: {cmd}"))
     }
 
@@ -228,6 +271,53 @@ on_live = "flip-gateway"
         dir = dir.display(),
     );
     let path = dir.join("ceremony.toml");
+    std::fs::write(&path, toml_text).unwrap();
+    Config::load(&path).unwrap()
+}
+
+/// api-node ceremony config: no producer pause; the /v1 flip + source stop
+/// replace the producer-mode traffic hooks. simulate_freeze because the mock
+/// source is a live chain that will not stop at H.
+fn api_test_config(dir: &std::path::Path, freeze_height: u64) -> Config {
+    let toml_text = format!(
+        r#"
+journal_path = "{dir}/journal.jsonl"
+poll_ms = 1
+
+[ceremony]
+mode = "api"
+freeze_height = {freeze_height}
+simulate_freeze = true
+
+[source]
+rpc_url = "http://mock"
+producer_api_url = "http://mock"
+stop_cmd = "stop-nodeos"
+
+[snapshot]
+staged_path = "{dir}/staged.bin"
+capture_roots = "{dir}/captured-roots.txt"
+
+[target]
+metalgo_unit = "mock.service"
+rpc_url = "http://mock"
+quorum_timeout_secs = 60
+
+[flip]
+cmd = "flip-nginx"
+public_url = "http://mock-public"
+revert_cmd = "revert-nginx"
+health_polls = 2
+head_tolerance = 2
+health_timeout_secs = 5
+
+[hooks]
+on_freeze = "freeze-writes"
+on_live = "announce-live"
+"#,
+        dir = dir.display(),
+    );
+    let path = dir.join("ceremony-api.toml");
     std::fs::write(&path, toml_text).unwrap();
     Config::load(&path).unwrap()
 }
@@ -441,4 +531,96 @@ fn verify_snapshot_is_deterministic_and_tamper_evident() {
         }
         Err(_) => {} // structural corruption fails the parse — also detected
     }
+}
+
+#[test]
+fn api_mode_flips_before_stopping_source_and_reads_never_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = api_test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    // A live chain that keeps drifting well past H (simulate_freeze): the
+    // public URL pre-flip shows nodeos far ahead of the cut, so the flip
+    // health gate's head-agreement check is genuinely discriminating.
+    ops.drift.set(5);
+
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Live);
+
+    // State order is the api-mode order: FLIPPED sits between IGNITED and
+    // LIVE — nodeos outlives ignition, reads never gap.
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let states: Vec<String> = text
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v["kind"] == "transition")
+        .map(|v| v["state"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        states,
+        ["ARMED", "FROZEN", "SNAPSHOTTED", "VERIFIED", "IGNITED", "FLIPPED", "LIVE"]
+    );
+
+    // Ratchet order: flip strictly BEFORE the source stop; stop strictly
+    // BEFORE the on_live announcement. The producer pause was never touched.
+    let hooks = ops.hooks.borrow();
+    assert_eq!(
+        *hooks,
+        vec![
+            "freeze-writes".to_string(),
+            "flip-nginx".to_string(),
+            "stop-nodeos".to_string(),
+            "announce-live".to_string()
+        ]
+    );
+    assert!(!ops.paused.get(), "api mode must never pause the source producer");
+    assert_eq!(ops.resumes.get(), 0);
+    assert!(ops.stopped.get(), "source nodeos stopped only at the end");
+
+    // The journal's LIVE entry carries the api-mode evidence.
+    let live: serde_json::Value = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|v: &serde_json::Value| v["state"] == "LIVE" && v["kind"] == "transition")
+        .next_back()
+        .unwrap();
+    assert!(live["data"]["public_health"]["consecutive_ok_polls"].as_u64().unwrap() >= 2);
+    assert!(live["data"]["ceremony_gap_ms_wallclock"].as_u64().unwrap() > 0);
+
+    // Under simulate_freeze the cut lands at/after H — journaled honestly.
+    let snapped: serde_json::Value = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .find(|v: &serde_json::Value| v["state"] == "SNAPSHOTTED" && v["kind"] == "transition")
+        .unwrap();
+    assert!(snapped["data"]["cut_height"].as_u64().unwrap() >= 120);
+    assert!(snapped["data"]["cut_vs_declared_h"].as_i64().unwrap() >= 0);
+}
+
+#[test]
+fn api_mode_flip_health_failure_aborts_without_stopping_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = api_test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.drift.set(5);
+    ops.flip_breaks_public.set(true); // nginx swaps to a dead upstream
+
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Aborted);
+
+    // THE invariant: the source nodeos was never stopped — reads survive the
+    // failed flip; and the flip was reverted so the public URL points back
+    // at nodeos.
+    assert!(!ops.stopped.get(), "source must NOT be stopped on a failed flip");
+    let hooks = ops.hooks.borrow();
+    assert!(hooks.iter().any(|h| h == "revert-nginx"), "flip must be reverted");
+    assert!(!hooks.iter().any(|h| h == "stop-nodeos"));
+    assert!(!hooks.iter().any(|h| h == "announce-live"));
+    // Producer-mode rollback (resume) must not fire in api mode.
+    assert_eq!(ops.resumes.get(), 0);
+
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("public URL did not serve the target"));
+    assert!(text.contains("flip_reverted"));
+    // Reads still served by nodeos after the abort.
+    assert!(ops.public_info("http://mock-public").unwrap().is_some());
 }

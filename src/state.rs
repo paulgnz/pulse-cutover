@@ -1,9 +1,15 @@
 //! The ceremony state machine's states.
 //!
-//! ARMED -> FROZEN -> SNAPSHOTTED -> VERIFIED -> IGNITED -> LIVE
+//! Producer mode: ARMED -> FROZEN -> SNAPSHOTTED -> VERIFIED -> IGNITED -> LIVE
+//! API mode:      ARMED -> FROZEN -> SNAPSHOTTED -> VERIFIED -> IGNITED -> FLIPPED -> LIVE
 //! with ABORTED reachable from every non-terminal state. Transitions only
 //! move forward; a crash resumes IN the last journaled state and re-runs that
 //! state's (idempotent) step.
+//!
+//! FLIPPED exists only in api mode: the public /v1 URL has been swapped to the
+//! PulseVM gateway and health-checked; the source nodeos is stopped AFTER this
+//! state (reads must never gap — nodeos outlives ignition, unlike producer
+//! mode where the source producer pauses before the snapshot finalizes).
 
 use std::str::FromStr;
 
@@ -22,6 +28,10 @@ pub enum State {
     /// Verified snapshot staged; target metalgo (re)started; target RPC
     /// answered with the source chain_id at the cut height.
     Ignited,
+    /// (api mode only) The public /v1 endpoint has been swapped to the
+    /// PulseVM side and health-checked; the source nodeos is still serving
+    /// nothing (traffic already left it) but has NOT yet been stopped.
+    Flipped,
     /// Target head advanced past the cut height (quorum is producing).
     Live,
     /// Terminal failure; source chain remains authoritative (auto-rollback
@@ -37,6 +47,7 @@ impl State {
             State::Snapshotted => "SNAPSHOTTED",
             State::Verified => "VERIFIED",
             State::Ignited => "IGNITED",
+            State::Flipped => "FLIPPED",
             State::Live => "LIVE",
             State::Aborted => "ABORTED",
         }
@@ -58,6 +69,7 @@ impl FromStr for State {
             "SNAPSHOTTED" => State::Snapshotted,
             "VERIFIED" => State::Verified,
             "IGNITED" => State::Ignited,
+            "FLIPPED" => State::Flipped,
             "LIVE" => State::Live,
             "ABORTED" => State::Aborted,
             other => return Err(format!("unknown state in journal: {other}")),

@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod journal;
+pub mod looper;
 pub mod machine;
 pub mod ops;
 pub mod state;

@@ -12,6 +12,7 @@ use crate::{
     config::{
         Config,
         FreezeStrategy,
+        Mode,
     },
     journal::{
         Journal,
@@ -30,18 +31,26 @@ pub struct Machine<'a, O: ChainOps> {
     resumed: bool,
     // Ceremony facts (journal-recovered on resume).
     pub chain_id: Option<String>,
+    /// H as resolved at ARM (explicit freeze_height or LIB + freeze_margin).
+    pub resolved_h: Option<u64>,
     pub cut_height: Option<u64>,
     pub cut_block_id: Option<String>,
     pub snapshot_file: Option<String>,
     pub sha256: Option<String>,
     pub frozen_ts_ms: Option<u64>,
     pub last_source_block_time: Option<String>,
+    /// api mode rollback bookkeeping: did the flip command already run?
+    flip_ran: bool,
+    /// api mode rollback bookkeeping: did source.stop_cmd already run?
+    source_stopped: bool,
 }
 
 impl<'a, O: ChainOps> Machine<'a, O> {
     pub fn new(cfg: &'a Config, ops: &'a O, journal: Journal, recovered: Recovered) -> Self {
         let resumed = recovered.state.is_some();
         let state = recovered.state.unwrap_or(State::Armed);
+        // A resumed agent in/past FLIPPED must assume the flip command ran.
+        let flip_ran = matches!(state, State::Flipped | State::Live);
         Machine {
             cfg,
             ops,
@@ -49,13 +58,25 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             state,
             resumed,
             chain_id: recovered.chain_id.or_else(|| cfg.ceremony.chain_id.clone()),
+            resolved_h: recovered.resolved_h.or(if cfg.ceremony.freeze_height > 0 {
+                Some(cfg.ceremony.freeze_height)
+            } else {
+                None
+            }),
             cut_height: recovered.cut_height,
             cut_block_id: recovered.cut_block_id,
             snapshot_file: recovered.snapshot_file,
             sha256: recovered.sha256,
             frozen_ts_ms: recovered.frozen_ts_ms,
             last_source_block_time: recovered.last_source_block_time,
+            flip_ran,
+            source_stopped: false,
         }
+    }
+
+    fn h(&self) -> u64 {
+        self.resolved_h
+            .expect("H resolved at ARM (freeze_height or LIB + freeze_margin)")
     }
 
     /// Drive the ceremony to a terminal state. Returns the terminal state.
@@ -64,10 +85,22 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // Fresh ceremony: journal the arming evidence once.
             let info = self.ops.source_info()?;
             self.chain_id = Some(info.chain_id.clone());
+            // Resolve H: explicit, or LIB-at-ARM + margin (simulated freeze /
+            // loop harness — in a real event H is exact because BPs freeze).
+            let resolved_h = if self.cfg.ceremony.freeze_height > 0 {
+                self.cfg.ceremony.freeze_height
+            } else {
+                info.last_irreversible_block_num
+                    + self.cfg.ceremony.freeze_margin.unwrap_or(0)
+            };
+            self.resolved_h = Some(resolved_h);
             self.journal.transition(
                 State::Armed,
                 json!({
+                    "mode": format!("{:?}", self.cfg.ceremony.mode),
                     "freeze_height": self.cfg.ceremony.freeze_height,
+                    "resolved_h": resolved_h,
+                    "simulate_freeze": self.cfg.ceremony.simulate_freeze,
                     "chain_id": info.chain_id,
                     "head_at_arm": info.head_block_num,
                     "lib_at_arm": info.last_irreversible_block_num,
@@ -84,6 +117,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 State::Snapshotted => self.step_snapshotted()?,
                 State::Verified => self.step_verified()?,
                 State::Ignited => self.step_ignited()?,
+                State::Flipped => self.step_flipped()?,
                 State::Live | State::Aborted => return Ok(self.state),
             }
         }
@@ -91,10 +125,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
 
     fn preflight(&mut self, info: &crate::ops::ChainInfo) -> Result<(), String> {
         let mut problems = Vec::new();
-        if info.head_block_num >= self.cfg.ceremony.freeze_height {
+        let h = self.h();
+        if info.head_block_num >= h {
             problems.push(format!(
-                "freeze_height {} is not in the future (head {})",
-                self.cfg.ceremony.freeze_height, info.head_block_num
+                "freeze height {} is not in the future (head {})",
+                h, info.head_block_num
             ));
         }
         if let Some(expected) = &self.cfg.ceremony.chain_id {
@@ -106,9 +141,30 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
         match self.ops.producer_paused() {
-            Ok(false) => {}
-            Ok(true) => problems.push("producer already paused at arm time".into()),
+            // api mode: this node does not produce; we only need producer_api
+            // reachable for create_snapshot — its paused flag is irrelevant.
+            Ok(paused) => {
+                if paused && self.cfg.ceremony.mode == Mode::Producer {
+                    problems.push("producer already paused at arm time".into());
+                }
+            }
             Err(e) => problems.push(format!("producer_api unreachable: {e}")),
+        }
+        // api mode: the public URL must be serving the SOURCE chain now —
+        // proves the nginx -> nodeos path the ceremony will flip actually
+        // works before anything is committed.
+        if let Some(flip) = &self.cfg.flip {
+            match self.ops.public_info(&flip.public_url) {
+                Ok(Some(pubinfo)) if pubinfo.chain_id == info.chain_id => {}
+                Ok(Some(pubinfo)) => problems.push(format!(
+                    "public_url serves chain_id {} != source {}",
+                    pubinfo.chain_id, info.chain_id
+                )),
+                Ok(None) | Err(_) => problems.push(format!(
+                    "public_url {} not serving get_info at ARM time",
+                    flip.public_url
+                )),
+            }
         }
         if let Some(dir) = self.cfg.snapshot.staged_path.parent() {
             if !dir.exists() {
@@ -147,9 +203,39 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.journal.error(self.state, reason, detail)?;
         let mut rollback = json!({"reason": reason, "auto_rollback": self.cfg.target.auto_rollback});
         if self.cfg.target.auto_rollback {
-            match self.ops.resume() {
-                Ok(()) => rollback["source_producer_resumed"] = json!(true),
-                Err(e) => rollback["source_producer_resume_error"] = json!(e),
+            match self.cfg.ceremony.mode {
+                // Producer mode: un-pausing nodeos IS the entire rollback.
+                Mode::Producer => match self.ops.resume() {
+                    Ok(()) => rollback["source_producer_resumed"] = json!(true),
+                    Err(e) => rollback["source_producer_resume_error"] = json!(e),
+                },
+                // api mode: nodeos was never paused (it isn't ours to pause).
+                // Undo whatever user-visible steps already happened, in
+                // reverse order: restart the source if we stopped it, then
+                // swap the public URL back to it.
+                Mode::Api => {
+                    if self.source_stopped {
+                        if let Some(cmd) = &self.cfg.source.start_cmd {
+                            match self.ops.run_hook(cmd) {
+                                Ok(o) => rollback["source_restarted"] = json!(o),
+                                Err(e) => rollback["source_restart_error"] = json!(e),
+                            }
+                        } else {
+                            rollback["source_stopped_no_start_cmd"] = json!(true);
+                        }
+                    }
+                    if self.flip_ran {
+                        if let Some(cmd) =
+                            self.cfg.flip.as_ref().and_then(|f| f.revert_cmd.clone())
+                        {
+                            match self.ops.run_hook(&cmd) {
+                                Ok(o) => rollback["flip_reverted"] = json!(o),
+                                Err(e) => rollback["flip_revert_error"] = json!(e),
+                            }
+                        }
+                    }
+                    rollback["source_chain_untouched"] = json!(!self.source_stopped);
+                }
             }
         }
         self.state = State::Aborted;
@@ -169,11 +255,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// paused chain never finalizes its head, verified empirically on Leap
     /// 5.0.3: create_snapshot hangs). The cut is pinned in the FROZEN step.
     fn step_armed(&mut self) -> Result<(), String> {
+        if self.cfg.ceremony.mode == Mode::Api {
+            return self.step_armed_api();
+        }
         if self.cfg.ceremony.freeze_strategy == FreezeStrategy::ScheduleAtH {
             // Multi-BP mode: pin the snapshot to exactly H up front; nodeos
             // writes it when H becomes irreversible. (Falls back to the
             // immediate create_snapshot path if the scheduler is missing.)
-            if let Err(e) = self.ops.schedule_snapshot(self.cfg.ceremony.freeze_height) {
+            if let Err(e) = self.ops.schedule_snapshot(self.h()) {
                 self.journal.evidence(
                     State::Armed,
                     json!({"schedule_snapshot_unavailable": e, "fallback": "pause_at_h"}),
@@ -183,7 +272,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let mut last_heartbeat = 0u64;
         let info = loop {
             let info = self.ops.source_info()?;
-            if info.head_block_num >= self.cfg.ceremony.freeze_height {
+            if info.head_block_num >= self.h() {
                 break info;
             }
             let now = self.ops.now_ms();
@@ -191,7 +280,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.journal.evidence(
                     State::Armed,
                     json!({"head": info.head_block_num, "lib": info.last_irreversible_block_num,
-                           "blocks_to_h": self.cfg.ceremony.freeze_height - info.head_block_num}),
+                           "blocks_to_h": self.h() - info.head_block_num}),
                 )?;
                 last_heartbeat = now;
             }
@@ -216,7 +305,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.journal.transition(
             State::Frozen,
             json!({
-                "declared_h": self.cfg.ceremony.freeze_height,
+                "declared_h": self.h(),
                 "head_at_freeze": info.head_block_num,
                 "lib_at_freeze": info.last_irreversible_block_num,
                 "chain_id": info.chain_id,
@@ -227,9 +316,133 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Ok(())
     }
 
+    /// ARMED (api mode): this node cannot freeze the chain — it observes the
+    /// declared H. Gate on LIB >= H (snapshot-at-finality, R1): in a real
+    /// ceremony the BPs produce empty blocks through H until it finalizes and
+    /// LIB reaches H; under `simulate_freeze` the live chain simply advances
+    /// past H and we proceed as if frozen, journaling the actual cut later.
+    fn step_armed_api(&mut self) -> Result<(), String> {
+        let mut last_heartbeat = 0u64;
+        let info = loop {
+            let info = self.ops.source_info()?;
+            if info.last_irreversible_block_num >= self.h() {
+                break info;
+            }
+            let now = self.ops.now_ms();
+            if now.saturating_sub(last_heartbeat) >= 30_000 {
+                self.journal.evidence(
+                    State::Armed,
+                    json!({"head": info.head_block_num, "lib": info.last_irreversible_block_num,
+                           "blocks_to_h_final": self.h().saturating_sub(info.last_irreversible_block_num)}),
+                )?;
+                last_heartbeat = now;
+            }
+            self.ops.sleep_ms(self.cfg.poll_ms);
+        };
+        // Optional write-freeze hook (e.g. a local gateway starts rejecting
+        // writes with a clear "cutover in progress" error — R2). An API node
+        // cannot freeze the network's writes; that happened (or is simulated
+        // to have happened) at the BP edge.
+        let freeze_hook = if let Some(hook) = &self.cfg.hooks.on_freeze {
+            format!("{:?}", self.ops.run_hook(hook))
+        } else {
+            "none configured".into()
+        };
+        self.chain_id = Some(info.chain_id.clone());
+        self.frozen_ts_ms = Some(self.ops.now_ms());
+        self.state = State::Frozen;
+        self.journal.transition(
+            State::Frozen,
+            json!({
+                "declared_h": self.h(),
+                "simulate_freeze": self.cfg.ceremony.simulate_freeze,
+                "head_at_freeze": info.head_block_num,
+                "lib_at_freeze": info.last_irreversible_block_num,
+                "chain_id": info.chain_id,
+                "on_freeze_hook": freeze_hook,
+                "note": if self.cfg.ceremony.simulate_freeze {
+                    "SIMULATED freeze: live chain keeps advancing; cut lands at ~finality near H"
+                } else {
+                    "observed freeze: H final on the source chain (BP-side freeze)"
+                },
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// FROZEN (api mode): snapshot via this node's own producer_api —
+    /// create_snapshot works read-only on non-producers; Leap returns once
+    /// the snapshot block is irreversible (live chain => LIB advances on its
+    /// own). No pause, no quiescence: the chain is not ours to stop. The cut
+    /// is pinned by the snapshot's own block id, cross-checked against the
+    /// chain's view of that height.
+    fn step_frozen_api(&mut self) -> Result<(), String> {
+        let started = self.ops.now_ms();
+        let snap = match self.ops.create_snapshot() {
+            Ok(s) => s,
+            Err(e) => {
+                self.abort("create_snapshot failed", json!({"error": e}))?;
+                return Ok(());
+            }
+        };
+        let snapshot_wall_ms = self.ops.now_ms() - started;
+        let cut_height = snap.head_block_num;
+        let (chain_view_id, cut_block_time) = self.ops.source_block_id(cut_height)?;
+        if !snap.head_block_id.eq_ignore_ascii_case(&chain_view_id) {
+            self.abort(
+                "snapshot block id != chain block id at cut height (fork at the cut?)",
+                json!({"snapshot_block_id": snap.head_block_id, "chain_block_id": chain_view_id}),
+            )?;
+            return Ok(());
+        }
+        let info = self.ops.source_info()?;
+        if let Some(expected) = &self.cfg.ceremony.chain_id {
+            if !info.chain_id.eq_ignore_ascii_case(expected) {
+                self.abort(
+                    "source chain_id changed mid-ceremony",
+                    json!({"seen": info.chain_id, "expected": expected}),
+                )?;
+                return Ok(());
+            }
+        }
+        let host_path = self.cfg.map_snapshot_path(&snap.snapshot_name);
+        if !host_path.exists() {
+            self.abort(
+                "snapshot file not found on host",
+                json!({"reported": snap.snapshot_name, "mapped": host_path.display().to_string()}),
+            )?;
+            return Ok(());
+        }
+        let size = std::fs::metadata(&host_path).map(|m| m.len()).unwrap_or(0);
+        self.cut_height = Some(cut_height);
+        self.cut_block_id = Some(snap.head_block_id.clone());
+        self.last_source_block_time = Some(cut_block_time.clone());
+        self.snapshot_file = Some(host_path.display().to_string());
+        self.state = State::Snapshotted;
+        self.journal.transition(
+            State::Snapshotted,
+            json!({
+                "snapshot_file": host_path.display().to_string(),
+                "reported_name": snap.snapshot_name,
+                "size_bytes": size,
+                "snapshot_wall_ms": snapshot_wall_ms,
+                "cut_height": cut_height,
+                "cut_block_id": snap.head_block_id,
+                "cut_vs_declared_h": cut_height as i64 - self.h() as i64,
+                "last_source_block_time": cut_block_time,
+                "head_after_snapshot": info.head_block_num,
+                "note": "api mode: cut pinned by the snapshot's own finalized block; source keeps serving reads",
+            }),
+        )?;
+        Ok(())
+    }
+
     /// FROZEN: snapshot while still producing (nodeos writes it when the cut
     /// block finalizes), THEN pause, then quiescence, then pin + audit.
     fn step_frozen(&mut self) -> Result<(), String> {
+        if self.cfg.ceremony.mode == Mode::Api {
+            return self.step_frozen_api();
+        }
         // Idempotent resume: if a crashed run left the producer paused, the
         // chain cannot finalize a snapshot block — unpause first (writes are
         // still frozen by the hook, so re-produced blocks stay empty).
@@ -505,9 +718,155 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Ok(())
     }
 
+    /// Poll the PUBLIC URL until it demonstrably serves the TARGET chain:
+    /// same chain_id (that is the migration's whole point, so it cannot
+    /// discriminate) AND head agreeing with the target RPC within
+    /// `head_tolerance`, `health_polls` consecutive times. Under
+    /// simulate_freeze the still-running nodeos head is far past the cut, so
+    /// head-agreement-with-target is the discriminator that proves the swap.
+    fn public_serves_target(&mut self) -> Result<Option<serde_json::Value>, String> {
+        let flip = self.cfg.flip.clone().expect("api mode validated flip");
+        let deadline = self.ops.now_ms() + flip.health_timeout_secs * 1000;
+        let mut consecutive = 0u32;
+        loop {
+            if self.ops.now_ms() > deadline {
+                return Ok(None);
+            }
+            let target = self.ops.target_info()?;
+            let public = self.ops.public_info(&flip.public_url)?;
+            let ok = match (&target, &public) {
+                (Some(t), Some(p)) => {
+                    let chain_ok = self
+                        .chain_id
+                        .as_ref()
+                        .map(|c| p.chain_id.eq_ignore_ascii_case(c))
+                        .unwrap_or(false);
+                    let diff = t.head_block_num.abs_diff(p.head_block_num);
+                    chain_ok && diff <= flip.head_tolerance
+                }
+                _ => false,
+            };
+            if ok {
+                consecutive += 1;
+                if consecutive >= flip.health_polls {
+                    let (t, p) = (target.unwrap(), public.unwrap());
+                    return Ok(Some(json!({
+                        "public_head": p.head_block_num,
+                        "public_chain_id": p.chain_id,
+                        "target_head": t.head_block_num,
+                        "consecutive_ok_polls": consecutive,
+                    })));
+                }
+            } else {
+                consecutive = 0;
+            }
+            self.ops.sleep_ms(self.cfg.poll_ms);
+        }
+    }
+
+    /// IGNITED (api mode): swap the public /v1 URL from nodeos to the
+    /// PulseVM gateway (`flip.cmd`), health-check that the public URL now
+    /// serves the target, and only then move to FLIPPED. The source nodeos
+    /// is STILL RUNNING — reads never gap; it stops in the FLIPPED step.
+    fn step_ignited_api(&mut self) -> Result<(), String> {
+        if let Some(hook) = &self.cfg.hooks.post_ignite {
+            let result = self.ops.run_hook(hook);
+            self.journal.evidence(
+                State::Ignited,
+                json!({"post_ignite_hook": format!("{result:?}")}),
+            )?;
+        }
+        let started = self.ops.now_ms();
+        let flip_cmd = self.cfg.flip.as_ref().expect("validated").cmd.clone();
+        self.flip_ran = true; // even a failing cmd may have half-applied
+        let flip_out = match self.ops.run_hook(&flip_cmd) {
+            Ok(o) => o,
+            Err(e) => {
+                self.abort("flip command failed", json!({"error": e}))?;
+                return Ok(());
+            }
+        };
+        match self.public_serves_target()? {
+            Some(evidence) => {
+                self.state = State::Flipped;
+                self.journal.transition(
+                    State::Flipped,
+                    json!({
+                        "flip_cmd_output": flip_out,
+                        "health": evidence,
+                        "flip_wall_ms": self.ops.now_ms() - started,
+                        "note": "public /v1 now serves PulseVM; source nodeos still running (reads never gapped)",
+                    }),
+                )?;
+            }
+            None => {
+                self.abort(
+                    "public URL did not serve the target after flip (health timeout)",
+                    json!({"timeout_secs": self.cfg.flip.as_ref().unwrap().health_timeout_secs}),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// FLIPPED (api mode only): traffic is on PulseVM; NOW stop the source
+    /// nodeos via the operator's own stop command, re-verify the public URL
+    /// is still healthy, and declare LIVE.
+    fn step_flipped(&mut self) -> Result<(), String> {
+        if self.cfg.ceremony.mode != Mode::Api {
+            return Err("FLIPPED state reached in producer mode (journal corrupt?)".into());
+        }
+        let stop_cmd = self.cfg.source.stop_cmd.clone().expect("validated");
+        let started = self.ops.now_ms();
+        self.source_stopped = true; // even a failing stop may have half-applied
+        let stop_out = match self.ops.run_hook(&stop_cmd) {
+            Ok(o) => o,
+            Err(e) => {
+                self.abort("source stop command failed", json!({"error": e}))?;
+                return Ok(());
+            }
+        };
+        // The reads must have survived the source's death: re-run the same
+        // public health gate before declaring LIVE.
+        let health = match self.public_serves_target()? {
+            Some(h) => h,
+            None => {
+                self.abort(
+                    "public URL unhealthy after source stop",
+                    json!({"source_stop_output": stop_out}),
+                )?;
+                return Ok(());
+            }
+        };
+        let live_ts = self.ops.now_ms();
+        let write_gap_ms = self.frozen_ts_ms.map(|f| live_ts - f);
+        self.state = State::Live;
+        self.journal.transition(
+            State::Live,
+            json!({
+                "source_stop_output": stop_out,
+                "stop_wall_ms": self.ops.now_ms() - started,
+                "public_health": health,
+                "cut_height": self.cut_height,
+                "last_source_block_time": self.last_source_block_time,
+                "ceremony_gap_ms_wallclock": write_gap_ms,
+                "note": "api-node cutover complete: same URL, same chain_id, PulseVM serving; nodeos stopped LAST",
+            }),
+        )?;
+        if let Some(hook) = &self.cfg.hooks.on_live {
+            let result = self.ops.run_hook(hook);
+            self.journal
+                .evidence(State::Live, json!({"on_live_hook": format!("{result:?}")}))?;
+        }
+        Ok(())
+    }
+
     /// IGNITED: run the traffic hook, then hold at the LIVE gate until the
     /// target head advances past the cut (quorum is actually producing).
     fn step_ignited(&mut self) -> Result<(), String> {
+        if self.cfg.ceremony.mode == Mode::Api {
+            return self.step_ignited_api();
+        }
         if let Some(hook) = &self.cfg.hooks.post_ignite {
             let result = self.ops.run_hook(hook);
             self.journal.evidence(

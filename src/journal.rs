@@ -54,6 +54,8 @@ pub struct Journal {
 pub struct Recovered {
     pub state: Option<State>,
     pub chain_id: Option<String>,
+    /// H as resolved at ARM time (explicit freeze_height, or LIB + margin).
+    pub resolved_h: Option<u64>,
     pub cut_height: Option<u64>,
     pub cut_block_id: Option<String>,
     pub snapshot_file: Option<String>,
@@ -174,6 +176,9 @@ impl Journal {
             }
             if let Some(v) = entry.data.get("cut_height").and_then(|v| v.as_u64()) {
                 out.cut_height = Some(v);
+            }
+            if let Some(v) = entry.data.get("resolved_h").and_then(|v| v.as_u64()) {
+                out.resolved_h = Some(v);
             }
         }
         Ok(out)

@@ -44,10 +44,31 @@ pub trait ChainOps {
     /// getInfo against the target pulsevm chain; Ok(None) while unreachable
     /// (still bootstrapping / chain not yet initialized).
     fn target_info(&self) -> Result<Option<ChainInfo>, String>;
+    /// get_info via the PUBLIC /v1 endpoint (api mode: through nginx + the
+    /// REST gateway). Ok(None) while unreachable/mid-reload — the flip
+    /// health check treats that as a transient, bounded by its timeout.
+    fn public_info(&self, public_url: &str) -> Result<Option<ChainInfo>, String>;
     fn ignite(&self) -> Result<String, String>;
     fn run_hook(&self, cmd: &str) -> Result<String, String>;
     fn now_ms(&self) -> u64;
     fn sleep_ms(&self, ms: u64);
+}
+
+/// Run a shell command, returning trimmed stdout (or stderr if stdout is
+/// empty) on success. Shared by hooks, ignition, and the loop harness reset.
+pub fn run_shell(cmd: &str) -> Result<String, String> {
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .map_err(|e| format!("spawn `{cmd}`: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if out.status.success() {
+        Ok(if stdout.is_empty() { stderr } else { stdout })
+    } else {
+        Err(format!("`{cmd}` exited {}: {stderr} {stdout}", out.status))
+    }
 }
 
 pub struct HttpOps {
@@ -226,23 +247,20 @@ impl ChainOps for HttpOps {
         }
     }
 
+    fn public_info(&self, public_url: &str) -> Result<Option<ChainInfo>, String> {
+        let url = format!("{}/v1/chain/get_info", public_url.trim_end_matches('/'));
+        match self.post(&url, None, None) {
+            Ok(v) => Ok(Self::parse_info(&v).ok()),
+            Err(_) => Ok(None),
+        }
+    }
+
     fn ignite(&self) -> Result<String, String> {
         self.run_hook(&self.ignite_cmd)
     }
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .output()
-            .map_err(|e| format!("spawn `{cmd}`: {e}"))?;
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if out.status.success() {
-            Ok(if stdout.is_empty() { stderr } else { stdout })
-        } else {
-            Err(format!("`{cmd}` exited {}: {stderr} {stdout}", out.status))
-        }
+        run_shell(cmd)
     }
 
     fn now_ms(&self) -> u64 {
