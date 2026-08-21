@@ -79,7 +79,7 @@ mkdir -p "/etc/metalgo-local/chains/$BID"
 cat > "/etc/metalgo-local/chains/$BID/config.json" <<JSON
 {
   "producer_name": "eosio",
-  "producer_key": "PVT_K1_N1QDFU7C5RSgwDeBV9QQRwTSo2v76GAhE5qcPTLihGjpZqy57",
+  "producer_key": "PVT_K1_<dev-producer-key-pairing-with-genesis-initial_key>",
   "snapshot_path": "$L/snapshot-cut.bin",
   "import_cpu_scale": 143
 }

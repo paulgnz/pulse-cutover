@@ -6,7 +6,7 @@
 //   - GET  {BASE}/v2/history/get_actions?account=...&limit=1  every 1 s
 // One JSONL line per probe: {ts, ep, ok, status, ms, head, note}.
 //
-//   node hammer-v1v2.mjs http://178.105.197.65 protonnz hammer-hyp.jsonl
+//   node hammer-v1v2.mjs http://<public-ip-or-domain> <account> hammer.jsonl
 import fs from 'fs';
 
 const BASE = (process.argv[2] || 'http://127.0.0.1').replace(/\/$/, '');
