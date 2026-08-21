@@ -3,14 +3,15 @@
 //! The 22 recorded ceremonies ran on boxes we built; real BPs have
 //! heterogeneous setups. Doctor DETECTS rather than assumes: how nodeos runs
 //! (native vs docker, which systemd unit), where the public /v1 actually
-//! routes (the live nginx server_name -> proxy_pass map), what else is on the
-//! box (legacy Hyperion, Elasticsearch, metalgo), and which ports the
-//! ceremony needs are already spoken for. It emits BOTH a human table and
-//! machine JSON (`--json`) — install.sh consumes the JSON to template the
-//! flip scripts from the DETECTED layout instead of assuming one.
+//! routes (the live nginx server_name -> proxy_pass map AND/OR the haproxy
+//! frontend -> backend map), what else is on the box (legacy Hyperion,
+//! Elasticsearch, metalgo), and which ports the ceremony needs are already
+//! spoken for. It emits BOTH a human table and machine JSON (`--json`) —
+//! install.sh consumes the JSON to template the flip scripts from the
+//! DETECTED layout instead of assuming one.
 //!
 //! Refusal philosophy: precise reasons, never guesses. A detectable-but-
-//! exotic setup (caddy instead of nginx, nodeos under kubernetes) is
+//! exotic setup (caddy instead of nginx/haproxy, nodeos under kubernetes) is
 //! UNSUPPORTED-with-explanation, and the explanation points at
 //! `pulse-cutover report` so we learn what to support next.
 //!
@@ -112,6 +113,81 @@ pub struct WebInfo {
     pub dump_failed: bool,
 }
 
+/// One `server` line inside a haproxy backend (or listen) block.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HaproxyServer {
+    pub name: String,
+    /// addr:port exactly as written (may be a hostname).
+    pub addr: String,
+    /// `check` flag present (health-checked by haproxy).
+    pub check: bool,
+    /// `backup` flag present (only takes traffic when the others are down —
+    /// still counts as an active server for drain-strategy purposes).
+    pub backup: bool,
+    /// `disabled` flag present (starts in maintenance; takes no traffic).
+    pub disabled: bool,
+}
+
+/// One public-surface -> backend edge in the haproxy config: a frontend (or
+/// listen) block's use_backend/default_backend target, with the backend's
+/// servers resolved — the same route-map shape doctor builds for nginx.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HaproxyRoute {
+    /// The frontend (or listen) block name.
+    pub frontend: String,
+    /// Every `bind` address in the block, as written (":443", "*:80", ...).
+    pub binds: Vec<String>,
+    /// Any bind in the block carries `ssl` (TLS terminates here).
+    pub tls: bool,
+    /// Why traffic reaches this backend: "default" (default_backend), or the
+    /// use_backend condition with named ACLs expanded, e.g. "if path_beg /v1".
+    pub rule: String,
+    pub backend: String,
+    /// The backend's `server` lines (empty if the backend block wasn't found).
+    pub servers: Vec<HaproxyServer>,
+}
+
+/// A `stats socket` line from the global section. `level admin` on a UNIX
+/// socket is what makes the zero-reload runtime flip possible.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StatsSocket {
+    pub path: String,
+    pub level: Option<String>,
+    pub admin: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HaproxyInfo {
+    /// Any signal at all: process, systemd unit, container, or config file.
+    pub detected: bool,
+    /// Actually running (process / active unit / container) — the verdicts
+    /// only reason about a RUNNING haproxy.
+    pub running: bool,
+    pub version: Option<String>,
+    /// "native" | "docker" | "unknown"
+    pub runtime: String,
+    pub systemd_unit: Option<String>,
+    pub container_name: Option<String>,
+    /// The config file as readable on THIS host.
+    pub cfg_path: Option<String>,
+    /// The `-f` path as the (containerized) process sees it, when that path
+    /// is not readable on the host (install.sh validates through the
+    /// container with this).
+    pub container_cfg_path: Option<String>,
+    /// Public surface -> backend servers (same shape as the nginx routes).
+    pub routes: Vec<HaproxyRoute>,
+    /// Backend name -> its server lines (includes `listen` blocks' own).
+    pub backends: BTreeMap<String, Vec<HaproxyServer>>,
+    pub stats_sockets: Vec<StatsSocket>,
+    /// First admin-level UNIX stats socket — presence selects the preferred
+    /// flip strategy (transactional enable/disable, zero reload).
+    pub admin_socket: Option<String>,
+    /// "socat" | "nc" if installed — what a socket flip would talk through.
+    pub socket_tool: Option<String>,
+    /// haproxy detected but no readable config — routes unknown.
+    pub parse_failed: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HyperionInfo {
     pub detected: bool,
@@ -166,6 +242,7 @@ pub struct DoctorReport {
     pub host: HostInfo,
     pub nodeos: NodeosInfo,
     pub web: WebInfo,
+    pub haproxy: HaproxyInfo,
     pub hyperion_legacy: HyperionInfo,
     pub elasticsearch: EsInfo,
     pub metalgo: MetalgoInfo,
@@ -433,6 +510,207 @@ pub fn parse_nginx_dump(dump: &str) -> WebInfo {
     web
 }
 
+/// Parse a haproxy.cfg into the same route-map shape as the nginx parser:
+/// public surface (frontend binds + path rules) -> backend server lines.
+///
+/// haproxy configs are line-oriented: a section keyword in the first token
+/// (`global`, `frontend x`, `backend x`, `listen x`, ...) opens a section and
+/// everything until the next keyword belongs to it — indentation is
+/// conventional, not structural, so this parser keys on first tokens only.
+/// Exotic configs degrade to fewer detected routes, never wrong ones: every
+/// emitted route carries the backend and server names install.sh will look
+/// for verbatim before templating a flip.
+pub fn parse_haproxy_cfg(text: &str) -> HaproxyInfo {
+    #[derive(Default)]
+    struct Fe {
+        name: String,
+        binds: Vec<String>,
+        tls: bool,
+        /// acl <name> <criterion...> definitions, for expanding use_backend rules.
+        acls: Vec<(String, String)>,
+        /// (backend, raw condition) in declaration order — haproxy evaluates
+        /// use_backend rules first-match-wins, then default_backend.
+        uses: Vec<(String, String)>,
+        default_backend: Option<String>,
+        /// `listen` blocks carry their own server lines (frontend + backend
+        /// fused); they become an implicit backend of the same name.
+        servers: Vec<HaproxyServer>,
+    }
+    enum Sect {
+        Global,
+        Fe(usize),
+        Be(String),
+        Other,
+    }
+
+    let mut hap = HaproxyInfo::default();
+    let mut fes: Vec<Fe> = Vec::new();
+    let mut sect = Sect::Other;
+
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let first = tokens[0];
+        // Section openers.
+        match first {
+            "global" => {
+                sect = Sect::Global;
+                continue;
+            }
+            "defaults" | "resolvers" | "peers" | "userlist" | "mailers" | "program" | "ring"
+            | "cache" | "http-errors" | "fcgi-app" => {
+                sect = Sect::Other;
+                continue;
+            }
+            "frontend" | "listen" => {
+                fes.push(Fe {
+                    name: tokens.get(1).unwrap_or(&"").to_string(),
+                    ..Default::default()
+                });
+                sect = Sect::Fe(fes.len() - 1);
+                continue;
+            }
+            "backend" => {
+                let name = tokens.get(1).unwrap_or(&"").to_string();
+                hap.backends.entry(name.clone()).or_default();
+                sect = Sect::Be(name);
+                continue;
+            }
+            _ => {}
+        }
+        // Directives inside the current section.
+        match &sect {
+            Sect::Global => {
+                // stats socket <path> [mode ...] [level admin|operator|user] ...
+                if first == "stats" && tokens.get(1) == Some(&"socket") {
+                    let path = tokens.get(2).unwrap_or(&"").to_string();
+                    let level = tokens
+                        .iter()
+                        .position(|t| *t == "level")
+                        .and_then(|i| tokens.get(i + 1))
+                        .map(|s| s.to_string());
+                    let admin = level.as_deref() == Some("admin");
+                    // Only a UNIX-path admin socket is usable for the flip
+                    // (ipv4@/ipv6@ sockets exist but we don't drive those).
+                    if admin && path.starts_with('/') && hap.admin_socket.is_none() {
+                        hap.admin_socket = Some(path.clone());
+                    }
+                    hap.stats_sockets.push(StatsSocket { path, level, admin });
+                }
+            }
+            Sect::Fe(i) => {
+                let fe = &mut fes[*i];
+                match first {
+                    "bind" => {
+                        if let Some(addr) = tokens.get(1) {
+                            fe.binds.push(addr.to_string());
+                        }
+                        if tokens.contains(&"ssl") {
+                            fe.tls = true;
+                        }
+                    }
+                    "acl" if tokens.len() >= 3 => {
+                        fe.acls.push((tokens[1].to_string(), tokens[2..].join(" ")));
+                    }
+                    "default_backend" => {
+                        fe.default_backend = tokens.get(1).map(|s| s.to_string());
+                    }
+                    "use_backend" => {
+                        if let Some(b) = tokens.get(1) {
+                            fe.uses.push((b.to_string(), tokens[2..].join(" ")));
+                        }
+                    }
+                    "server" => {
+                        if let Some(s) = parse_haproxy_server(&tokens) {
+                            fe.servers.push(s);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Sect::Be(name) => {
+                if first == "server" {
+                    if let Some(s) = parse_haproxy_server(&tokens) {
+                        hap.backends.entry(name.clone()).or_default().push(s);
+                    }
+                }
+            }
+            Sect::Other => {}
+        }
+    }
+
+    // listen blocks: their own servers form an implicit backend of the same name.
+    for fe in &fes {
+        if !fe.servers.is_empty() {
+            hap.backends
+                .entry(fe.name.clone())
+                .or_insert_with(|| fe.servers.clone());
+        }
+    }
+
+    // Emit routes in evaluation order: use_backend rules, then default_backend
+    // (or the listen block's own servers).
+    for fe in &fes {
+        // Expand named ACLs so the rule is readable standalone:
+        // "if is_v1" -> "if path_beg /v1". Anonymous ACLs lose their braces.
+        let expand = |cond: &str| -> String {
+            cond.split_whitespace()
+                .filter(|t| *t != "{" && *t != "}")
+                .map(|t| {
+                    let (neg, base) = match t.strip_prefix('!') {
+                        Some(b) => ("!", b),
+                        None => ("", t),
+                    };
+                    match fe.acls.iter().find(|(n, _)| n == base) {
+                        Some((_, def)) => format!("{neg}{def}"),
+                        None => t.to_string(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut targets: Vec<(String, String)> = fe
+            .uses
+            .iter()
+            .map(|(b, c)| {
+                let rule = if c.trim().is_empty() { "always".into() } else { expand(c) };
+                (b.clone(), rule)
+            })
+            .collect();
+        if let Some(d) = &fe.default_backend {
+            targets.push((d.clone(), "default".into()));
+        } else if !fe.servers.is_empty() {
+            // A `listen` block's own servers ARE its default backend.
+            targets.push((fe.name.clone(), "default".into()));
+        }
+        for (backend, rule) in targets {
+            hap.routes.push(HaproxyRoute {
+                frontend: fe.name.clone(),
+                binds: fe.binds.clone(),
+                tls: fe.tls,
+                rule,
+                backend: backend.clone(),
+                servers: hap.backends.get(&backend).cloned().unwrap_or_default(),
+            });
+        }
+    }
+    hap
+}
+
+/// "server <name> <addr[:port]> [check] [backup] [disabled] ..." -> parsed.
+fn parse_haproxy_server(tokens: &[&str]) -> Option<HaproxyServer> {
+    Some(HaproxyServer {
+        name: tokens.get(1)?.to_string(),
+        addr: tokens.get(2)?.to_string(),
+        check: tokens.contains(&"check"),
+        backup: tokens.contains(&"backup"),
+        disabled: tokens.contains(&"disabled"),
+    })
+}
+
 /// `ss -ltnpH` (or `ss -ltnp` minus header) -> (port, process) pairs.
 pub fn parse_ss_listeners(text: &str) -> Vec<(u16, Option<String>)> {
     let mut out = Vec::new();
@@ -549,12 +827,12 @@ pub fn compute_verdicts(r: &DoctorReport) -> BTreeMap<String, Verdict> {
         // api / hyperion: the public edge.
         if mode != "bp" {
             match r.web.server.as_str() {
-                "nginx" | "none" => {} // none: install.sh installs nginx
+                "nginx" | "none" => {} // none: haproxy may be the edge, else install.sh installs nginx
                 other => unsupported.push(format!(
                     "{other} is serving the public edge — the flip templater currently \
-                     speaks nginx only; a {other} setup is detectable but not yet supported: \
-                     run `pulse-cutover report` and share the bundle (flipping by hand is \
-                     documented in the README meanwhile)"
+                     speaks nginx and haproxy only; a {other} setup is detectable but not yet \
+                     supported: run `pulse-cutover report` and share the bundle (flipping by \
+                     hand is documented in the README meanwhile)"
                 )),
             }
             if r.web.server == "nginx" && r.web.dump_failed {
@@ -563,6 +841,70 @@ pub fn compute_verdicts(r: &DoctorReport) -> BTreeMap<String, Verdict> {
                      server_name -> upstream map (run as root?)"
                         .into(),
                 );
+            }
+            // haproxy edge — parsed like nginx; flipped via the runtime socket
+            // (preferred) or cfg-edit + graceful reload.
+            if r.haproxy.running {
+                if r.haproxy.parse_failed {
+                    needs.push(
+                        "haproxy is running but doctor could not read its config (checked \
+                         the process's -f path and /etc/haproxy/haproxy.cfg) — run doctor \
+                         as root, or run `pulse-cutover report` so we can support this layout"
+                            .into(),
+                    );
+                }
+                // Two live edges: doctor cannot know which one the public URL
+                // reaches — the operator declares it in the manifest.
+                if r.web.server == "nginx"
+                    && !r.web.routes.is_empty()
+                    && !r.haproxy.routes.is_empty()
+                {
+                    needs.push(
+                        "two web edges detected (nginx AND haproxy are both running with \
+                         routes) — set flip.edge = \"nginx\" or \"haproxy\" in the manifest \
+                         so the ceremony flips the edge your users actually reach"
+                            .into(),
+                    );
+                }
+                // Multi-server backends fronting the source nodeos: BPs often
+                // balance several nodeos boxes in one backend, but a
+                // single-box ceremony flips only THIS box's server entry —
+                // proceeding silently would leave the others serving the old
+                // chain. The operator must decide the drain strategy first.
+                let nodeos_port = r
+                    .nodeos
+                    .chain_api_url
+                    .as_deref()
+                    .and_then(|u| u.rsplit(':').next())
+                    .unwrap_or("8888");
+                let suffix = format!(":{nodeos_port}");
+                let mut flagged: Vec<&str> = Vec::new();
+                for route in &r.haproxy.routes {
+                    let active = route.servers.iter().filter(|s| !s.disabled).count();
+                    if active > 1
+                        && route.servers.iter().any(|s| s.addr.ends_with(&suffix))
+                        && !flagged.contains(&route.backend.as_str())
+                    {
+                        flagged.push(&route.backend);
+                        needs.push(format!(
+                            "haproxy backend '{}' balances {} active servers — a \
+                             single-box ceremony flips only THIS box's backend entry, so \
+                             decide the drain strategy first: mark the servers that must \
+                             not take post-cut traffic `disabled`, or coordinate a fleet \
+                             flip (see the README's HAProxy notes)",
+                            route.backend, active
+                        ));
+                    }
+                }
+                // The zero-reload flip drives the admin socket through socat.
+                if r.haproxy.admin_socket.is_some() && r.haproxy.socket_tool.is_none() {
+                    needs.push(
+                        "socat — haproxy exposes an admin-level stats socket, so the flip \
+                         can be a zero-reload socket command; apt-get install -y socat \
+                         (install.sh installs it automatically when it picks this strategy)"
+                            .into(),
+                    );
+                }
             }
             if r.nodeos.detected
                 && r.nodeos.runtime == "native"
@@ -595,7 +937,7 @@ pub fn compute_verdicts(r: &DoctorReport) -> BTreeMap<String, Verdict> {
             let owner = p.process.clone().unwrap_or_default();
             let expected = matches!(
                 owner.as_str(),
-                "metalgo" | "node" | "nginx" | "hyperion" | "java" | "docker-proxy"
+                "metalgo" | "node" | "nginx" | "haproxy" | "hyperion" | "java" | "docker-proxy"
             );
             if !expected {
                 needs.push(format!(
@@ -722,6 +1064,9 @@ pub fn survey() -> DoctorReport {
 
     // ---- web server ----
     survey_web(&mut r);
+
+    // ---- haproxy (may coexist with nginx — both are reported) ----
+    survey_haproxy(&mut r);
 
     // ---- legacy hyperion + ES ----
     survey_hyperion_es(&mut r);
@@ -967,6 +1312,113 @@ fn survey_web(r: &mut DoctorReport) {
     }
 }
 
+fn survey_haproxy(r: &mut DoctorReport) {
+    let mut hap = HaproxyInfo {
+        runtime: "unknown".into(),
+        ..Default::default()
+    };
+
+    // Process. Match on the comm field (executable name), NOT a substring of
+    // the full command line — an ancestor shell whose command line merely
+    // mentions "haproxy" (e.g. `doctor --json | jq .haproxy`) must not count.
+    // A containerized haproxy ALSO shows in host ps — the pid's cgroup
+    // decides whether it's native (same trick as the nodeos survey).
+    let ps = sh("ps axo pid=,comm=,args= 2>/dev/null | awk '$2==\"haproxy\"'");
+    let mut native = false;
+    if let Some(t) = &ps {
+        hap.running = true;
+        native = t.lines().any(|l| {
+            let pid = l.split_whitespace().next().unwrap_or("");
+            sh(&format!(
+                "grep -sqE 'docker|containerd|kubepods' /proc/{pid}/cgroup && echo containerized"
+            ))
+            .is_none()
+        });
+    }
+    // The config path the process was started with (-f).
+    let cmdline_cfg = ps.as_ref().and_then(|t| t.lines().find_map(|l| arg_value(l, "-f")));
+
+    // systemd unit (present even if currently stopped).
+    if r.systemd_present
+        && sh("systemctl cat haproxy.service >/dev/null 2>&1 && echo yes").is_some()
+    {
+        hap.systemd_unit = Some("haproxy".into());
+        if sh("systemctl is-active haproxy 2>/dev/null | grep -x active").is_some() {
+            hap.running = true;
+            native = true;
+        }
+    }
+    // Docker container.
+    if r.docker_present {
+        if let Some(rows) = sh("docker ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null") {
+            for row in rows.lines() {
+                let cols: Vec<&str> = row.split('\t').collect();
+                if cols.len() == 2 && (cols[0].contains("haproxy") || cols[1].contains("haproxy"))
+                {
+                    hap.container_name = Some(cols[0].to_string());
+                    hap.running = true;
+                    break;
+                }
+            }
+        }
+    }
+    hap.runtime = if native {
+        "native".into()
+    } else if hap.container_name.is_some() {
+        "docker".into()
+    } else {
+        "unknown".into()
+    };
+
+    // Config file: the -f path if it's readable on THIS host, else the
+    // distro-standard /etc/haproxy/haproxy.cfg (a container's internal -f
+    // path is kept separately so install.sh can validate through docker exec).
+    let host_readable = |p: &str| sh(&format!("test -r '{p}' && echo yes")).is_some();
+    if let Some(p) = &cmdline_cfg {
+        if host_readable(p) {
+            hap.cfg_path = Some(p.clone());
+        } else {
+            hap.container_cfg_path = Some(p.clone());
+        }
+    }
+    if hap.cfg_path.is_none() && host_readable("/etc/haproxy/haproxy.cfg") {
+        hap.cfg_path = Some("/etc/haproxy/haproxy.cfg".into());
+    }
+
+    hap.detected = hap.running || hap.systemd_unit.is_some() || hap.cfg_path.is_some();
+    if !hap.detected {
+        r.haproxy = hap;
+        return;
+    }
+
+    hap.version = sh("haproxy -v 2>/dev/null | head -1")
+        .or_else(|| {
+            hap.container_name
+                .as_ref()
+                .and_then(|c| sh(&format!("docker exec {c} haproxy -v 2>/dev/null | head -1")))
+        })
+        .map(|s| s.trim().to_string());
+    // What a runtime-socket flip would talk through (socat preferred).
+    hap.socket_tool = sh("command -v socat >/dev/null 2>&1 && echo socat")
+        .or_else(|| sh("command -v nc >/dev/null 2>&1 && echo nc"));
+
+    match hap
+        .cfg_path
+        .as_ref()
+        .and_then(|p| sh(&format!("cat '{p}' 2>/dev/null")))
+    {
+        Some(cfg) => {
+            let parsed = parse_haproxy_cfg(&cfg);
+            hap.routes = parsed.routes;
+            hap.backends = parsed.backends;
+            hap.stats_sockets = parsed.stats_sockets;
+            hap.admin_socket = parsed.admin_socket;
+        }
+        None => hap.parse_failed = true,
+    }
+    r.haproxy = hap;
+}
+
 fn survey_hyperion_es(r: &mut DoctorReport) {
     // Legacy (node.js) Hyperion under pm2?
     if let Some(jlist) = sh("pm2 jlist 2>/dev/null") {
@@ -1169,6 +1621,61 @@ pub fn render_human(r: &DoctorReport) -> String {
                 &format!("{} (until {}){status}", cert.cert_path, opt(&cert.not_after)),
             );
         }
+    }
+
+    if r.haproxy.detected {
+        o.push_str("\nWEB EDGE (haproxy)\n");
+        line(&mut o, "state", &match (r.haproxy.running, r.haproxy.runtime.as_str()) {
+            (true, "docker") => format!("running (docker container `{}`)", opt(&r.haproxy.container_name)),
+            (true, "native") => format!(
+                "running (native{})",
+                r.haproxy.systemd_unit.as_ref().map(|u| format!(", unit {u}")).unwrap_or_default()
+            ),
+            (true, _) => "running".into(),
+            (false, _) => "installed but not running".into(),
+        });
+        line(&mut o, "version", &opt(&r.haproxy.version));
+        line(&mut o, "config", &opt(&r.haproxy.cfg_path));
+        if r.haproxy.parse_failed {
+            line(&mut o, "routes", "config unreadable — run doctor as root to map routes");
+        }
+        for route in &r.haproxy.routes {
+            let servers = route
+                .servers
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{} {}{}",
+                        s.name,
+                        s.addr,
+                        if s.disabled { " (disabled)" } else if s.backup { " (backup)" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            line(
+                &mut o,
+                &format!("route {}", route.frontend),
+                &format!(
+                    "{}{} [{}] -> {} {{ {} }}",
+                    route.binds.join(","),
+                    if route.tls { " ssl" } else { "" },
+                    route.rule,
+                    route.backend,
+                    if servers.is_empty() { "-".to_string() } else { servers }
+                ),
+            );
+        }
+        line(&mut o, "admin socket", &match &r.haproxy.admin_socket {
+            Some(path) => format!(
+                "{path} (level admin) — zero-reload runtime flip{}",
+                match &r.haproxy.socket_tool {
+                    Some(tool) => format!(" via {tool}"),
+                    None => " (needs socat: apt-get install -y socat)".into(),
+                }
+            ),
+            None => "none — flips fall back to cfg edit + validate + graceful reload".into(),
+        });
     }
 
     o.push_str("\nHISTORY STACK\n");
@@ -1442,6 +1949,247 @@ LISTEN 0      4096   *:9650          *:*"#;
             Some("/etc/nodeos".into())
         );
         assert_eq!(arg_value("nodeos", "--config-dir"), None);
+    }
+
+    // ------------------------------------------------------ haproxy --
+
+    /// Fixture 1: the simplest real layout — one frontend, one backend,
+    /// single nodeos server. This is the shape the flip templater loves.
+    const HAP_SIMPLE: &str = r#"
+global
+    log /dev/log local0
+    maxconn 4096
+
+defaults
+    mode http
+    timeout connect 5s
+    timeout client 30s
+    timeout server 30s
+
+frontend fe_main
+    bind *:80
+    default_backend be_nodeos
+
+backend be_nodeos
+    server nodeos1 127.0.0.1:8888 check
+"#;
+
+    /// Fixture 2: TLS frontend with named-ACL path routing (/v1 vs /v2) and
+    /// both flavors of stats socket (UNIX admin + inet operator).
+    const HAP_TLS_ACL: &str = r#"
+global
+    stats socket /run/haproxy/admin.sock mode 660 level admin
+    stats socket ipv4@127.0.0.1:9999 level operator
+
+frontend fe_https
+    bind :443 ssl crt /etc/haproxy/certs/rpc.pem alpn h2,http/1.1
+    acl is_v1 path_beg /v1
+    acl is_v2 path_beg /v2
+    use_backend be_v1 if is_v1
+    use_backend be_hyperion if is_v2
+    default_backend be_web
+
+backend be_v1
+    server nodeos 127.0.0.1:8888 check
+
+backend be_hyperion
+    server hyp 127.0.0.1:7000 check
+
+backend be_web
+    server web 127.0.0.1:3000
+"#;
+
+    /// Fixture 3: the multi-nodeos load-balancing layout common among
+    /// Antelope BPs — several servers (incl. backup + one drained) in one
+    /// backend. The route map must carry all of them so the verdict can
+    /// demand a drain decision.
+    const HAP_MULTI: &str = r#"
+frontend fe
+    bind *:80
+    default_backend be_pool
+
+backend be_pool
+    balance roundrobin
+    option httpchk GET /v1/chain/get_info
+    server api1 10.0.0.1:8888 check
+    server api2 10.0.0.2:8888 check
+    server api3 10.0.0.3:8888 check backup
+    server old 10.0.0.4:8888 disabled
+"#;
+
+    /// Fixture 4: no stats socket at all, and a `listen` block (frontend +
+    /// backend fused) — plus an anonymous-ACL use_backend.
+    const HAP_LISTEN: &str = r#"
+global
+    log /dev/log local0
+
+listen l_v1
+    bind 0.0.0.0:8080
+    use_backend be_history if { path_beg /v2 }
+    server nodeos 127.0.0.1:8888 check
+
+backend be_history
+    server hyp 127.0.0.1:7000
+"#;
+
+    #[test]
+    fn haproxy_simple_frontend_backend_maps_route() {
+        let hap = parse_haproxy_cfg(HAP_SIMPLE);
+        assert_eq!(hap.routes.len(), 1);
+        let route = &hap.routes[0];
+        assert_eq!(route.frontend, "fe_main");
+        assert_eq!(route.binds, vec!["*:80"]);
+        assert!(!route.tls);
+        assert_eq!(route.rule, "default");
+        assert_eq!(route.backend, "be_nodeos");
+        assert_eq!(route.servers.len(), 1);
+        assert_eq!(route.servers[0].name, "nodeos1");
+        assert_eq!(route.servers[0].addr, "127.0.0.1:8888");
+        assert!(route.servers[0].check);
+        assert!(!route.servers[0].disabled);
+        // No stats socket in the config -> no zero-reload flip path.
+        assert!(hap.stats_sockets.is_empty());
+        assert_eq!(hap.admin_socket, None);
+    }
+
+    #[test]
+    fn haproxy_tls_acl_routing_and_admin_socket() {
+        let hap = parse_haproxy_cfg(HAP_TLS_ACL);
+        // Routes come out in haproxy's evaluation order: use_backend rules
+        // first (declaration order), default_backend last.
+        assert_eq!(hap.routes.len(), 3);
+        assert_eq!(hap.routes[0].backend, "be_v1");
+        assert_eq!(hap.routes[0].rule, "if path_beg /v1"); // named ACL expanded
+        assert!(hap.routes[0].tls);
+        assert_eq!(hap.routes[0].binds, vec![":443"]);
+        assert_eq!(hap.routes[0].servers[0].addr, "127.0.0.1:8888");
+        assert_eq!(hap.routes[1].backend, "be_hyperion");
+        assert_eq!(hap.routes[1].rule, "if path_beg /v2");
+        assert_eq!(hap.routes[2].backend, "be_web");
+        assert_eq!(hap.routes[2].rule, "default");
+        // Both stats sockets seen; only the UNIX admin one is the flip path.
+        assert_eq!(hap.stats_sockets.len(), 2);
+        assert!(hap.stats_sockets[0].admin);
+        assert_eq!(hap.stats_sockets[1].level.as_deref(), Some("operator"));
+        assert!(!hap.stats_sockets[1].admin);
+        assert_eq!(hap.admin_socket.as_deref(), Some("/run/haproxy/admin.sock"));
+    }
+
+    #[test]
+    fn haproxy_multi_server_backend_parses_flags() {
+        let hap = parse_haproxy_cfg(HAP_MULTI);
+        assert_eq!(hap.routes.len(), 1);
+        let servers = &hap.routes[0].servers;
+        assert_eq!(servers.len(), 4);
+        assert!(servers[2].backup);
+        assert!(servers[3].disabled);
+        // 3 active (non-disabled) servers — the verdict test below insists on
+        // a drain decision for exactly this shape.
+        assert_eq!(servers.iter().filter(|s| !s.disabled).count(), 3);
+    }
+
+    #[test]
+    fn haproxy_listen_block_and_anonymous_acl() {
+        let hap = parse_haproxy_cfg(HAP_LISTEN);
+        assert_eq!(hap.admin_socket, None);
+        assert_eq!(hap.routes.len(), 2);
+        // use_backend inside the listen block, anonymous ACL braces dropped.
+        assert_eq!(hap.routes[0].backend, "be_history");
+        assert_eq!(hap.routes[0].rule, "if path_beg /v2");
+        // The listen block's own servers form an implicit same-name backend.
+        assert_eq!(hap.routes[1].backend, "l_v1");
+        assert_eq!(hap.routes[1].rule, "default");
+        assert_eq!(hap.routes[1].servers[0].addr, "127.0.0.1:8888");
+        assert_eq!(hap.backends["l_v1"].len(), 1);
+    }
+
+    /// A report where haproxy (not nginx) is the sole edge, socket flip ready.
+    fn haproxy_ready_report(cfg: &str) -> DoctorReport {
+        let mut r = ready_report();
+        r.web = WebInfo { server: "none".into(), ..Default::default() };
+        let parsed = parse_haproxy_cfg(cfg);
+        r.haproxy = HaproxyInfo {
+            detected: true,
+            running: true,
+            runtime: "native".into(),
+            systemd_unit: Some("haproxy".into()),
+            cfg_path: Some("/etc/haproxy/haproxy.cfg".into()),
+            routes: parsed.routes,
+            backends: parsed.backends,
+            stats_sockets: parsed.stats_sockets,
+            admin_socket: parsed.admin_socket,
+            socket_tool: Some("socat".into()),
+            ..Default::default()
+        };
+        r
+    }
+
+    #[test]
+    fn verdict_haproxy_single_server_edge_is_ready() {
+        let v = compute_verdicts(&haproxy_ready_report(HAP_SIMPLE));
+        assert_eq!(v["api"].status, "READY");
+        assert_eq!(v["hyperion"].status, "READY");
+        assert_eq!(v["bp"].status, "READY");
+    }
+
+    #[test]
+    fn verdict_haproxy_multi_server_backend_demands_drain_decision() {
+        let v = compute_verdicts(&haproxy_ready_report(HAP_MULTI));
+        assert_eq!(v["api"].status, "NEEDS");
+        let need = v["api"]
+            .needs
+            .iter()
+            .find(|n| n.contains("be_pool"))
+            .expect("multi-server backend need");
+        assert!(need.contains("3 active servers"));
+        assert!(need.contains("drain strategy"));
+        assert!(need.contains("HAProxy notes"));
+        // bp mode has no public edge — the backend shape does not block it.
+        assert_eq!(v["bp"].status, "READY");
+    }
+
+    #[test]
+    fn verdict_two_edges_needs_flip_edge_declared() {
+        let mut r = haproxy_ready_report(HAP_SIMPLE);
+        // nginx is ALSO running with routes -> ambiguous public edge.
+        r.web = parse_nginx_dump(
+            "# configuration file /etc/nginx/sites-enabled/rpc:\n\
+             server { listen 80; server_name rpc.example.com; \
+             location /v1/chain/ { proxy_pass http://127.0.0.1:8888; } }\n",
+        );
+        r.web.server = "nginx".into();
+        let v = compute_verdicts(&r);
+        assert_eq!(v["api"].status, "NEEDS");
+        assert!(v["api"].needs.iter().any(|n| n.contains("two web edges") && n.contains("flip.edge")));
+    }
+
+    #[test]
+    fn verdict_haproxy_parse_failure_and_missing_socat_are_named() {
+        let mut r = haproxy_ready_report(HAP_TLS_ACL);
+        r.haproxy.socket_tool = None;
+        let v = compute_verdicts(&r);
+        assert_eq!(v["api"].status, "NEEDS");
+        assert!(v["api"].needs.iter().any(|n| n.contains("socat")));
+
+        let mut r = haproxy_ready_report(HAP_SIMPLE);
+        r.haproxy.routes.clear();
+        r.haproxy.backends.clear();
+        r.haproxy.parse_failed = true;
+        let v = compute_verdicts(&r);
+        assert_eq!(v["api"].status, "NEEDS");
+        assert!(v["api"].needs.iter().any(|n| n.contains("could not read its config")));
+    }
+
+    #[test]
+    fn haproxy_report_serializes_route_map() {
+        let mut r = haproxy_ready_report(HAP_TLS_ACL);
+        r.verdicts = compute_verdicts(&r);
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["haproxy"]["running"], true);
+        assert_eq!(json["haproxy"]["admin_socket"], "/run/haproxy/admin.sock");
+        assert_eq!(json["haproxy"]["routes"][0]["backend"], "be_v1");
+        assert_eq!(json["haproxy"]["routes"][0]["servers"][0]["addr"], "127.0.0.1:8888");
+        assert_eq!(json["verdicts"]["api"]["status"], "READY");
     }
 
     #[test]

@@ -32,7 +32,7 @@ same chain_id, same state, zero read downtime. Operator walkthrough: README.md.
 usage: pulse-cutover <command> [options]   (pulse-cutover <command> --help for examples)
 
 read-only, safe anywhere (including production):
-  doctor          survey this box (nodeos, nginx, disk, ports) + per-mode verdicts
+  doctor          survey this box (nodeos, nginx/haproxy, disk, ports) + per-mode verdicts
   status          how far the ceremony got, from the journal
   scan-contracts  list contracts that reference host functions PulseVM stubs (advisory)
   report          build a sanitized tar.gz to share (keys/tokens auto-redacted)
@@ -99,7 +99,7 @@ const HELP_DOCTOR: &str = "\
 pulse-cutover doctor [--json] [--mode bp|api|hyperion]
 
 Strictly read-only survey of this box: how nodeos runs (native/docker),
-what nginx serves, history stack, metalgo, disk, ports. Ends with a
+what nginx and/or haproxy serve, history stack, metalgo, disk, ports. Ends with a
 verdict per mode: READY, NEEDS (precise list of what's missing and how to
 fix it), or UNSUPPORTED (precise reason — run 'pulse-cutover report' and
 share the bundle so we can add support). Safe to run anywhere, including

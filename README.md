@@ -75,8 +75,9 @@ same parent directory.
 
 ### Step 2 — survey the box: `pulse-cutover doctor`
 
-`doctor` reads your box — how nodeos runs, what nginx serves, disk, ports —
-and gives a per-mode verdict. It never writes, restarts, or changes anything.
+`doctor` reads your box — how nodeos runs, what nginx/haproxy serve, disk,
+ports — and gives a per-mode verdict. It never writes, restarts, or changes
+anything.
 
 ```sh
 pulse-cutover doctor
@@ -345,9 +346,18 @@ Plain-English versions of every term this repo uses:
   serving the same chain. `FLIPPED` (api modes): the public URL now points
   at the new engine. `LIVE`: done — new chain producing/serving, old node
   retired. `ABORTED`: stopped safely; the old chain is still the real one.
-- **Flip** — the single user-visible action: one nginx upstream line swapped
-  so the public URL answers from the new engine. Health-checked, instantly
-  revertible.
+- **Flip** — the single user-visible action: the public URL's edge (nginx or
+  haproxy) is swapped so it answers from the new engine. Health-checked,
+  instantly revertible. On nginx it's one upstream line + graceful reload;
+  on haproxy it's an enable/disable server pair on the admin socket (or the
+  same `disabled`-marker swap + reload without one).
+- **Edge** — the web server terminating your public URL (nginx or haproxy).
+  Doctor detects and maps both; when a box runs both, the manifest's
+  `flip.edge` declares which one the ceremony flips.
+- **Admin socket (haproxy)** — haproxy's local control socket
+  (`stats socket <path> ... level admin` in the `global` section). Lets the
+  flip enable/disable backend servers instantly, transactionally, with zero
+  reloads — the preferred haproxy flip strategy.
 - **Federator** — a small router that keeps one `/v2` history URL answering
   across the migration: old rows from the old archive, new rows from the new
   indexer.
@@ -489,9 +499,16 @@ What it detects:
   (`server_version_string`), chain_id + head, whether the producer_api
   answers (`/v1/producer/paused` probe: 200 = enabled, 404 = missing plugin,
   401/403 = restricted), state-history plugin on/off;
-- **web edge** — nginx, apache or caddy; for nginx the full
+- **web edge** — nginx, haproxy, apache or caddy. For nginx: the full
   `server_name -> location -> proxy_pass/upstream` map from `nginx -T`
-  (this is what the flip templater uses), plus TLS cert paths and expiry;
+  (this is what the flip templater uses), plus TLS cert paths and expiry.
+  For haproxy: the full `frontend (binds, TLS, ACL path rules) -> backend ->
+  server` map from haproxy.cfg, per-backend server counts (multi-nodeos
+  load balancing is detected, not assumed away), the *admin socket* (a
+  `stats socket ... level admin` line — its presence selects the zero-reload
+  flip strategy), and whether socat/nc is installed to drive it. If BOTH
+  nginx and haproxy are running with routes, doctor reports both maps and
+  the verdict asks you to declare `flip.edge` in the manifest;
 - **history stack** — legacy Hyperion under pm2 or systemd, its /v2 health;
   Elasticsearch version + heap;
 - **PulseVM target** — metalgo binary/node, plugins dir, staged
@@ -510,22 +527,121 @@ at `pulse-cutover report` so unsupported setups become supported ones.
 |---|---|---|
 | nodeos runtime | native (systemd unit or bare pid) · docker container | kubernetes-managed |
 | nodeos stop/start | manifest `stop_cmd` · derived `systemctl stop <unit>` · derived `docker stop <container>` | bare-pid nodeos in api mode without a manifest `stop_cmd` (NEEDS) |
-| public edge | nginx (any layout: named upstreams, direct proxy_pass, TLS server blocks, multiple domains) · no web server (managed layout staged) | apache · caddy |
+| public edge | nginx (any layout: named upstreams, direct proxy_pass, TLS server blocks, multiple domains) · haproxy (frontends/listens, TLS binds, named + anonymous ACL path rules, multi-server backends) · nginx AND haproxy together (declare `flip.edge`) · no web server (managed nginx layout staged) | apache · caddy |
 | nginx flip | templated byte-exact from the detected `server_name -> proxy_pass` map; refuses if no /v1 route points at your nodeos | hand-minified configs may degrade to fewer detected routes — doctor shows what it saw |
-| history | legacy Hyperion (pm2 or systemd) noted; hyperion mode flips the detected /v2 route | no detectable /v2 route in hyperion mode (refuses with reason) |
+| haproxy flip (socket) | admin-level `stats socket` present: the gateway is pre-staged as a `disabled` server at INSTALL time (the one and only reload), and the ceremony flip is a transactional `enable/disable server` on the runtime socket — zero reloads at H, response-checked, instantly revertible | multi-server backend without a drain decision (NEEDS — see HAProxy notes) |
+| haproxy flip (reload) | no admin socket: same pre-staged server; the flip swaps the `disabled` markers in haproxy.cfg, `haproxy -c` validates, then one graceful reload (native `systemctl reload` or docker `SIGHUP`) | same multi-server rule |
+| haproxy runtime | native (systemd unit) · docker container (validate via `docker exec`, reload via `SIGHUP`) | — |
+| history | legacy Hyperion (pm2 or systemd) noted; hyperion mode flips the detected /v2 route (nginx or haproxy) | no detectable /v2 route in hyperion mode (refuses with reason) |
 | OS | Ubuntu 22.04 / 24.04 | anything else (UNSUPPORTED — tell us via `report`) |
+
+### HAProxy notes
+
+HAProxy is common front-of-house for Antelope API providers (several nodeos
+boxes balanced in one backend, TLS termination, path routing), so it gets
+the same first-class treatment as nginx — and, when the admin socket exists,
+a *better* flip than a reload:
+
+**How the flip works.** At **install time** (days before the event),
+install.sh adds one line to the backend that fronts your nodeos:
+
+```
+server pulsevm-gw 127.0.0.1:8899 check disabled # pulse-cutover: staged flip target, ...
+```
+
+validates (`haproxy -c`) and does **one graceful reload**. That is the only
+reload in the whole procedure — from then on both servers exist in haproxy,
+with the gateway parked in maintenance. At H the generated flip script:
+
+- **runtime-socket strategy** (preferred — picked automatically when the
+  config has a UNIX `stats socket ... level admin`): sends
+  `enable server <backend>/pulsevm-gw`, checks haproxy's answer (an empty
+  response means OK; anything else aborts *before touching your nodeos
+  entry*), then `disable server <backend>/<your-nodeos>` — zero reloads,
+  takes effect immediately, reverts the same way. The script then persists
+  the same swap into haproxy.cfg (validated, not reloaded) so a later
+  haproxy restart doesn't quietly fall back to the retired nodeos.
+- **cfg-reload strategy** (fallback when there is no admin socket): swaps
+  which of the two server lines carries `disabled`, validates with
+  `haproxy -c`, then one graceful reload. Note a graceful reload is
+  *asynchronous* — the old worker keeps answering until the new one takes
+  the listeners — which is fine in a ceremony (the agent's health gate polls
+  the public URL for several consecutive good answers) but worth knowing
+  when testing by hand. Want the better strategy? Add
+  `stats socket /run/haproxy/admin.sock mode 660 level admin` to your
+  `global` section and re-run install.sh.
+
+**Multi-server backends (the drain decision).** If the backend that fronts
+your nodeos balances **several active servers**, doctor's verdict is NEEDS,
+not READY: a single-box ceremony flips only *this box's* backend entry, and
+proceeding silently would leave the other servers answering from the old
+chain after the cut. Decide first, then re-run doctor:
+
+- **drain**: mark every server that must not take post-cut traffic
+  `disabled` in the backend (haproxy's own maintenance mechanism — doctor
+  counts only non-`disabled` servers), or
+- **fleet flip**: run the ceremony on each balanced box and coordinate the
+  flips — every box runs its own install + flip against its own entry.
+
+`backup` servers count as active on purpose: after a flip, failover to a
+backup nodeos would silently serve the retired chain.
+
+**Docker-run haproxy** is detected and handled (validate via `docker exec`,
+reload via `SIGHUP` to the master). One gotcha the live test hit: bind-mount
+the config **directory**, not the single file — `sed -i`/`mv` replace the
+file's inode, and a single-file mount pins the container to the old inode so
+every reload re-reads stale config. install.sh catches this: after staging
+it asks the running haproxy (via the admin socket) whether the staged server
+actually exists, and refuses with the fix if not. The containerized test rig
+we validate with is in `examples/haproxy-test/`.
+
+**Two edges at once.** A box running both nginx and haproxy (e.g. haproxy
+terminating TLS in front of nginx, or a half-migrated setup) makes doctor
+report **both** route maps and demand `flip.edge` in the manifest — it will
+not guess which edge your users actually reach. `"edge": "auto"` (the
+default) only auto-picks when exactly one edge routes /v1 to your nodeos.
+Real doctor output from the dual-edge validation box (trimmed):
+
+```
+WEB EDGE (nginx)
+  version                nginx/1.24.0 (Ubuntu)
+  route _                /v1/chain/ -> 127.0.0.1:8888 (upstream pulse_loop_backend)
+  ...
+
+WEB EDGE (haproxy)
+  state                  running (docker container `pulse-haproxy`)
+  version                HAProxy version 2.9.15-e872a3f 2025/03/21 - https://haproxy.org/
+  config                 /etc/haproxy/haproxy.cfg
+  route fe_pulse_test    *:8081 [if path_beg /v1] -> be_v1 { nodeos 127.0.0.1:8888 }
+  route fe_pulse_test    *:8081 [default] -> be_v1 { nodeos 127.0.0.1:8888 }
+  admin socket           /run/haproxy/admin.sock (level admin) — zero-reload runtime flip via socat
+
+VERDICTS
+  api       NEEDS
+            NEEDS: two web edges detected (nginx AND haproxy are both running with
+            routes) — set flip.edge = "nginx" or "haproxy" in the manifest so the
+            ceremony flips the edge your users actually reach
+```
 
 ### `install.sh` internals
 
 `install.sh` runs **doctor first** and consumes its JSON:
 
 - refuses per the doctor verdict — UNSUPPORTED prints the precise reason and
-  points at `report`; NEEDS prints the exact missing list;
-- templates the flip/revert scripts from the **detected** nginx map
-  (domain -> upstream), byte-exact against your own config files — your
-  nginx is untouched until the ceremony's flip stage. Only on a box with no
-  /v1 routes at all does it stage the managed layout from the recorded runs.
-  If nginx has routes but none reach your nodeos, it refuses and says so;
+  points at `report`; NEEDS prints the exact missing list (needs the
+  manifest or the installer itself satisfies — an explicit `stop_cmd`, a
+  declared `flip.edge`, socat — are filtered out, not ignored);
+- resolves **which edge the ceremony flips**: manifest `flip.edge`
+  (`nginx` | `haproxy` | `auto`, default `auto` = the one edge that routes
+  /v1 to your nodeos; refuses if both do);
+- templates the flip/revert scripts from the **detected** map — nginx:
+  domain -> upstream, byte-exact against your own config files; haproxy:
+  backend/server names + the chosen strategy (runtime-socket or
+  cfg-reload, see [HAProxy notes](#haproxy-notes)). Your edge is untouched
+  until the ceremony's flip stage — except haproxy's one install-time
+  staging reload, documented above. Only on a box with no /v1 routes at all
+  does it stage the managed nginx layout from the recorded runs. If the
+  edge has routes but none reach your nodeos, it refuses and says so;
 - defaults `source.stop_cmd`/`start_cmd` from the detected systemd unit or
   docker container when the manifest doesn't declare them;
 - runs the stubbed-intrinsic scan (advisory) when a prescan snapshot is
@@ -558,7 +674,8 @@ else = ABORTED with the journal path (the source chain is still authoritative).
   "target":   { "network_id": "tahoe", "subnet_id": "…", "blockchain_id": "…",
                 "vm_id": "…", "producer_name": "eosio", "producer_key": "PVT_K1_…",
                 "staking_dir": "/root/api-cutover/staking" },
-  "flip":     { "public_host": "<public-ip-or-domain>" },
+  "flip":     { "public_host": "<public-ip-or-domain>",
+                "edge": "auto" },
   "artifacts": { "agent":   {"url": "…", "sha256": "…"},
                  "plugin":  {"url": "…", "sha256": "…"},
                  "metalgo": {"url": "…", "sha256": "…"},
@@ -566,6 +683,11 @@ else = ABORTED with the journal path (the source chain is still authoritative).
   "paths": { "work_dir": "/root/api-cutover" }
 }
 ```
+
+`flip.edge` picks which web edge the ceremony flips when the box runs more
+than one: `"nginx"`, `"haproxy"`, or `"auto"` (default — auto-picks the one
+edge that routes /v1 to your nodeos, and refuses to guess if both do).
+Boxes with a single edge can omit it entirely.
 
 In a real multi-operator ceremony this file is generated from the on-chain
 msig declaration (freeze height, pinned versions, goldens) — see wiki/59 §A.3.
@@ -669,11 +791,11 @@ what testers get out of it.
 
 ## Status & caveats
 
-- v0.2.0 — rehearsal-grade. The recorded ceremonies are real, on live-testnet
+- v0.3.0 — rehearsal-grade. The recorded ceremonies are real, on live-testnet
   state, but no *mainnet* event has run yet.
-- Ubuntu 22.04/24.04 + systemd only; nginx-only traffic flips (apache/caddy
-  detected and refused with reasons). `report` bundles are how new setups
-  get added.
+- Ubuntu 22.04/24.04 + systemd only; nginx and haproxy traffic flips
+  (apache/caddy detected and refused with reasons). `report` bundles are how
+  new setups get added.
 - Depends on the PulseVM arena-import branch (`paulgnz/pulsevm`,
   `feat/arena-snapshot-import`) for snapshot import + fingerprints.
 - Guide + video: [pulsevm.dev/guide/migrate-antelope-chain](https://pulsevm.dev/guide/migrate-antelope-chain)

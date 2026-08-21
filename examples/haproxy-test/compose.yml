@@ -1,0 +1,47 @@
+# pulse-cutover HAProxy live-test fixture — runs haproxy IN A CONTAINER so a
+# rehearsal box can exercise the haproxy flip machinery end to end WITHOUT
+# installing haproxy or touching its existing nginx stack.
+#
+#   sudo mkdir -p /etc/haproxy /run/haproxy
+#   sudo cp haproxy.cfg /etc/haproxy/haproxy.cfg
+#   sudo docker compose -f compose.yml up -d
+#   pulse-cutover doctor          # now reports BOTH edges (nginx + haproxy)
+#
+# Why each knob is what it is:
+#   network_mode: host   -> the frontend binds :8081 on the host (nginx keeps
+#                           its ports) and the backend reaches the box's
+#                           nodeos on 127.0.0.1:8888.
+#   /run/haproxy shared  -> the admin socket has the SAME path inside and
+#                           outside the container, so the generated
+#                           runtime-socket flip works unchanged.
+#   /etc/haproxy DIR mount -> install.sh edits the HOST file; the container
+#                           sees the edits through the mount. It must be the
+#                           DIRECTORY, not the file: sed -i and mv replace
+#                           the inode, and a single-file bind mount keeps
+#                           serving the old inode forever. Validation runs
+#                           via `docker exec pulse-haproxy haproxy -c -f ...`
+#                           and reload via `docker kill -s HUP pulse-haproxy`
+#                           (the official image runs master-worker mode, so
+#                           SIGHUP is a graceful reload) — install.sh derives
+#                           both commands from doctor's runtime detection.
+#
+# No compose plugin on the box? The equivalent docker run:
+#   docker run -d --name pulse-haproxy --network host --user root \
+#     -v /etc/haproxy:/usr/local/etc/haproxy:ro \
+#     -v /run/haproxy:/run/haproxy --restart unless-stopped haproxy:2.9
+#
+# Cleanup after testing: docker compose -f compose.yml down
+#                        (or: docker rm -f pulse-haproxy)
+#                        sudo rm -rf /etc/haproxy /run/haproxy
+services:
+  haproxy:
+    image: haproxy:2.9
+    container_name: pulse-haproxy
+    network_mode: host
+    # Root so the worker may create the admin socket under /run/haproxy.
+    user: root
+    volumes:
+      # Directory, NOT the single file — see the inode note above.
+      - /etc/haproxy:/usr/local/etc/haproxy:ro
+      - /run/haproxy:/run/haproxy
+    restart: unless-stopped

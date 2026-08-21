@@ -22,7 +22,7 @@ Human-oriented docs: [README.md](README.md) (operator walkthrough + design),
 | `install.sh` | stages a box for a ceremony (doctor-gated, idempotent, sha256-pinned artifacts) |
 | `cutover.sh` | day-of wrapper: validate → run agent → plain-language streaming; `status` / `abort` |
 | `federator/` | /v2 history federation router (pre-cut = legacy Hyperion, post-cut = local) |
-| `examples/` | commented manifests per mode + the reference loop deployment |
+| `examples/` | commented manifests per mode + the reference loop deployment + the containerized haproxy test rig (`haproxy-test/`) |
 
 ## Command surface + contracts
 
@@ -47,9 +47,15 @@ Mutating (see SAFETY RAILS before running):
   binaries to `/usr/local/bin` + `/opt/{metalgo,pulsevm,pulse-cutover,pulse-gateway}`,
   stages systemd services (`metalgo-pulse`, api modes: `pulse-gateway`,
   hyperion: `hyperion-*`), writes `/etc/pulse-cutover/ceremony.{toml,json}`,
-  may install nginx and stage flip scripts. Does NOT touch the running
-  nodeos, does NOT flip traffic, does NOT start a ceremony. Idempotent.
-  Exit 0 staged; exit 1 refused (reason printed, nothing half-done); exit 2 usage.
+  may install nginx/socat and stage flip scripts. Edge selection: manifest
+  `flip.edge` = `nginx|haproxy|auto` (default auto; refuses if both edges
+  route /v1). NOTE the one haproxy exception to "touches nothing": on a
+  haproxy edge it stages a `disabled` gateway server into the operator's
+  backend and gracefully reloads haproxy ONCE, at install time — announced
+  in the output, verified against the running process. Does NOT touch the
+  running nodeos, does NOT flip traffic, does NOT start a ceremony.
+  Idempotent. Exit 0 staged; exit 1 refused (reason printed, nothing
+  half-done); exit 2 usage.
 - `./cutover.sh --manifest ceremony.json` (wraps `pulse-cutover run`) — ARMS
   AND RUNS a ceremony: will pause producers (bp mode), snapshot, ignite the
   target chain, FLIP public traffic (api modes) and run the manifest's
@@ -81,10 +87,23 @@ Top level: `schema` (currently `"pulse-cutover-doctor-v1"`), `agent_version`,
   `chain_api_url`, `chain_id`, `head_block_num`, `server_version_string`,
   `producer_api` (`"enabled"|"enabled-restricted"|"missing"|"unreachable"`),
   `state_history`, `config_dir`, `host_kubelet`.
-- `web` — `server` (`"nginx"|"apache"|"caddy"|"none"`), `version`,
+- `web` — `server` (`"nginx"|"apache"|"caddy"|"none"` — haproxy is reported
+  separately, below, because both can run at once), `version`,
   `routes[] {file, server_names[], listens[], location, proxy_pass,
   upstream_name, backends[]}`, `upstreams` (name → backends), `tls[]`,
   `dump_failed`.
+- `haproxy` — `detected`, `running` (verdicts key on running), `version`,
+  `runtime` (`"native"|"docker"|"unknown"`), `systemd_unit`,
+  `container_name`, `cfg_path` (host view), `container_cfg_path` (the
+  process's `-f` path when not host-readable), `routes[] {frontend, binds[],
+  tls, rule, backend, servers[]}` (rule = `"default"` or the use_backend
+  condition with named ACLs expanded, e.g. `"if path_beg /v1"`),
+  `backends` (name → `servers[] {name, addr, check, backup, disabled}`),
+  `stats_sockets[] {path, level, admin}`, `admin_socket` (first admin-level
+  UNIX socket — selects the zero-reload flip strategy), `socket_tool`
+  (`"socat"|"nc"|null`), `parse_failed`. Multi-server backends fronting the
+  nodeos produce a NEEDS verdict ("decide the drain strategy") — surface it
+  verbatim; the fix is an operator decision, not a config you should make.
 - `hyperion_legacy` — `detected`, `manager` (`"pm2"|"systemd"`), `processes[]`,
   `api_url`, `healthy`.
 - `elasticsearch` — `detected`, `url`, `version`, `heap`, `in_docker`.

@@ -2,7 +2,7 @@
 
 We are preparing for a real Antelope → PulseVM migration event by rehearsing
 the cutover on as many *different* operator setups as possible: docker vs
-native nodeos, every nginx layout, legacy Hyperion stacks, odd disks, odd
+native nodeos, every nginx and haproxy layout, legacy Hyperion stacks, odd disks, odd
 kernels. The tool detects instead of assumes — but it can only detect what
 someone has shown it. That someone is you.
 
@@ -30,7 +30,7 @@ Budget about 40 minutes for a first run.
   on**; it never touches your running nodeos and never changes public
   traffic.
 - The ceremony's only user-visible action (the URL flip) happens on the
-  rehearsal box's own nginx — and an abort reverts it automatically.
+  rehearsal box's own web edge (nginx or haproxy) — and an abort reverts it automatically.
 - Your production BP infrastructure is never part of a rehearsal unless you
   deliberately point a manifest at it. Don't — rehearse beside it instead.
 
