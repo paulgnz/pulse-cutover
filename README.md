@@ -14,15 +14,29 @@ ARMED → FROZEN → SNAPSHOTTED → VERIFIED → IGNITED → LIVE
 One agent, one manifest format, three operator roles — pick with
 `install.sh --mode bp|api|hyperion`:
 
-| | **bp** (producer) | **api** (/v1 provider) | **hyperion** (api + /v2 history) |
+**Which mode am I?**
+
+| | **bp** | **api** | **hyperion** |
 |---|---|---|---|
-| who runs it | a block producer | an RPC/API provider | an API provider serving Hyperion |
-| what freezes | the chain: writes at the API edge, empty blocks through H (R1) | nothing this node controls — the freeze is observed (LIB ≥ H) | same as api |
-| snapshot | **scheduled at exactly H** (`schedule_at_h`); the declared block IS the cut block | own `create_snapshot` at ~finality (cut lands ~LIB-lag past H, R17) | same as api |
-| what flips | nothing public — this node becomes a producer of the new chain | the public /v1 upstream (one-line nginx swap, health-gated) | /v1 AND /v2 in the same flip stage; /v2 → the federating history router |
-| what continues | production, block numbering, chain_id | reads — zero gap; nodeos outlives ignition and retires LAST | reads AND history: pre-cut rows from the legacy Hyperion, post-cut from local hyperion-rs — **the URL keeps its memory** |
-| state machine | ARMED→FROZEN→SNAPSHOTTED→VERIFIED→IGNITED→LIVE | …→IGNITED→**FLIPPED**→LIVE | + hydration gate inside IGNITED; dual-surface FLIPPED |
-| recorded result | real XPR state: cut at exactly H, gap 197.0s, box produces the migrated chain | live XPR testnet: 99.8% read availability, 0.75s flip gap, 22/22 loop runs LIVE | live XPR testnet: one public /v2 URL serving pre-cut eosusa rows + post-cut local rows minutes after the cut |
+| Who runs it | block producer | RPC/API provider | API provider w/ Hyperion |
+| What freezes | the chain (writes at API edge) | observed only (LIB ≥ H) | observed only |
+| Snapshot | at **exactly H** | at ~finality (R17) | at ~finality |
+| What flips | nothing public | `/v1` upstream | `/v1` **and** `/v2` together |
+| What continues | production, numbering, chain_id | reads — zero gap | reads **and history** |
+
+Per-mode ceremony:
+
+```
+bp        ARMED → FROZEN → SNAPSHOTTED → VERIFIED → IGNITED → LIVE
+api       ARMED → FROZEN → SNAPSHOTTED → VERIFIED → IGNITED → FLIPPED → LIVE
+hyperion  ARMED → FROZEN → SNAPSHOTTED → VERIFIED → IGNITED* → FLIPPED† → LIVE
+          * + hyperion-rs hydration gate   † flips /v1 and /v2 in one stage
+```
+
+Key mode details:
+- **bp** — writes reject at the API edge while empty blocks carry the chain to H; the snapshot is scheduled at exactly the declared block, and this node becomes a producer of the migrated chain. Recorded: real XPR state, cut at exactly H, gap 197.0s.
+- **api** — nodeos outlives ignition and retires *last*, so reads never gap; the flip is a one-line health-gated nginx swap. Recorded: live XPR testnet, **99.8% read availability, 0.75s flip, 22/22 loop runs LIVE**.
+- **hyperion** — everything api does, plus post-cut history from local hyperion-rs federated over pre-cut rows from the legacy archive: **the URL keeps its memory**. Recorded: one public `/v2` call returning post-cut + 3,206 pre-cut rows minutes after the cut.
 
 (Recorded evidence: wiki/59 Appendices B + C in pulsevm-experimental.)
 
