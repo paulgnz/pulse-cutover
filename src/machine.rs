@@ -115,6 +115,19 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 problems.push(format!("staged_path dir {} missing", dir.display()));
             }
         }
+        // Stage-path hygiene (R12): the pre-staged target imports whatever sits
+        // at snapshot_path the moment its chain first initializes. A stale file
+        // from an earlier ceremony pins the chain to the WRONG cut before this
+        // ceremony even freezes — the file must not exist until VERIFIED stages
+        // the verified one.
+        if self.cfg.snapshot.staged_path.exists() {
+            problems.push(format!(
+                "staged_path {} already exists — stale snapshot from a previous ceremony? \
+                 the target would import it prematurely; remove it (and re-create the target \
+                 chain if it already initialized from it)",
+                self.cfg.snapshot.staged_path.display()
+            ));
+        }
         if let Some(g) = &self.cfg.snapshot.golden_roots {
             if !g.exists() {
                 problems.push(format!("golden_roots {} missing", g.display()));
