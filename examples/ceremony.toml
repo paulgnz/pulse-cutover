@@ -36,6 +36,7 @@ quorum_timeout_secs = 600        # partial-quorum limbo timeout -> ABORT + rollb
 auto_rollback = true             # on abort, resume the source producer
 
 [hooks]
+on_freeze = "/root/cutover-rehearsal/freeze-writes.sh"   # R2: reject writes at the API edge; production continues
 post_ignite = "/root/cutover-rehearsal/repoint-traffic.sh"
 on_live = "echo 'flip gateway upstreams here'"
 on_abort = "echo 'page the operator'"
