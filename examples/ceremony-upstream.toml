@@ -55,7 +55,7 @@ work_dir = "/root/upstream-work"
 # Size chainbase generously for the replay.
 export_cmd = """docker run --rm -v {export_dir}:/out -v {snapshot}:/in/cut.bin:ro \
 -v /root/upstream-work/export.sh:/in/export.sh:ro nodeos:5.0.3 \
-bash /in/export.sh --nodeos /usr/local/bin/nodeos --snapshot /in/cut.bin \
+bash /in/export.sh --nodeos /usr/bin/nodeos --snapshot /in/cut.bin \
 --work-dir /out/work --chain-state-db-size-mb 4096 --timeout-seconds 600"""
 
 # The #61 example binaries (cargo build --release --examples -p pulsevm_database).

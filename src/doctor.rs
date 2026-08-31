@@ -1190,11 +1190,18 @@ fn survey_nodeos(r: &mut DoctorReport) {
     n.runtime = "unknown".into();
     n.host_kubelet = sh("ps axo comm= 2>/dev/null | grep -x kubelet").is_some();
 
-    // Native process? A containerized nodeos ALSO shows up in host ps (its
-    // cmdline is just `nodeos ...`), so the pid's cgroup decides: docker/
-    // containerd/kubepods there means it is NOT native — the docker pass
-    // below (or the kubelet flag) owns it.
-    if let Some(ps) = sh("ps axo pid=,command= 2>/dev/null | grep -E '[n]odeos( |$)'") {
+    // Native process? Prefer matching on the comm field (executable name),
+    // same discipline as the haproxy survey: a wrapper shell whose command
+    // LINE merely mentions "nodeos" (`bash start.sh ... nodeos ...` — the
+    // script-managed pattern) must not be mistaken for the nodeos process
+    // itself, or the generated stop script would SIGTERM the wrapper.
+    // Fall back to the cmdline grep for exotic argv0s. A containerized
+    // nodeos ALSO shows up in host ps (its cmdline is just `nodeos ...`),
+    // so the pid's cgroup decides: docker/containerd/kubepods there means
+    // it is NOT native — the docker pass below (or the kubelet flag) owns it.
+    if let Some(ps) = sh("ps axo pid=,comm=,args= 2>/dev/null | awk '$2==\"nodeos\"{$2=\"\";print}'")
+        .or_else(|| sh("ps axo pid=,command= 2>/dev/null | grep -E '[n]odeos( |$)'"))
+    {
         let native_line = ps.lines().find(|l| !l.contains("docker")).filter(|l| {
             let pid = l.split_whitespace().next().unwrap_or("");
             sh(&format!(
