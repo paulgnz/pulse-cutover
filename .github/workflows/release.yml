@@ -1,0 +1,78 @@
+# Release binaries: STATIC musl builds attached to a GitHub release on tag push.
+#
+# Why musl/static (the glibc lesson): a bookworm-built (glibc 2.36) binary
+# failed outright on a real BP box running Ubuntu 20.04 (glibc 2.31). A
+# x86_64-unknown-linux-musl static binary runs on any of the supported
+# Ubuntus (20.04/22.04/24.04) regardless of glibc.
+#
+# Why this works without special-casing TLS: the dependency tree is
+# rustls/ring end to end (ureq's default TLS) — `grep openssl Cargo.lock`
+# is empty — so there is no C openssl to cross-compile. The pulsevm
+# snapshot/import crates are pure Rust. Both targets were proven to compile
+# in messense/rust-musl-cross containers (and the x86_64 binary proven to
+# RUN in ubuntu:20.04 + ubuntu:24.04 containers) before this workflow was
+# committed. If a future dependency ever breaks musl, the documented
+# fallback is a rust:1-bullseye (glibc 2.31) build — oldest supported
+# glibc — with a note in the release body; keep the asset names stable.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            image: messense/rust-musl-cross:x86_64-musl
+          # aarch64 is nearly free with the same cross image (ARM boxes are
+          # appearing among BPs; the installer picks the asset by uname -m).
+          - target: aarch64-unknown-linux-musl
+            image: messense/rust-musl-cross:aarch64-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build static ${{ matrix.target }}
+        run: |
+          docker run --rm -v "$PWD":/home/rust/src ${{ matrix.image }} \
+            sh -c "cargo build --release --target ${{ matrix.target }} && \
+                   musl-strip target/${{ matrix.target }}/release/pulse-cutover"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/pulse-cutover" \
+             "dist/pulse-cutover-${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pulse-cutover-${{ matrix.target }}
+          path: dist/pulse-cutover-${{ matrix.target }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: sha256sums
+        run: |
+          cd dist
+          sha256sum pulse-cutover-* > sha256sums.txt
+          cat sha256sums.txt
+      - name: Create release with assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/pulse-cutover-*
+            dist/sha256sums.txt
+          generate_release_notes: true
+          body: |
+            Static musl binaries — run on Ubuntu 20.04/22.04/24.04 (any glibc).
+            Verify: `sha256sum -c sha256sums.txt --ignore-missing`.
+            `install.sh` fetches + verifies these automatically when the
+            ceremony manifest pins no agent artifact.

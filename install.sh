@@ -95,6 +95,22 @@ extract_safe(){ # tarball stagedir
   tar -xzf "$1" -C "$2" --no-same-owner --no-same-permissions
 }
 
+# The gateway + federator are modern Node scripts (optional chaining `?.`,
+# nullish `??`): they need Node >= 14. The distro nodejs does NOT always
+# qualify — Ubuntu 20.04 ships Node 10 and 22.04 ships Node 12 — so verify
+# the actual major version instead of trusting `apt-get install nodejs`.
+node_major(){ command -v node >/dev/null && node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0; }
+ensure_node(){
+  if [ "$(node_major)" -ge 14 ]; then return; fi
+  apt-get install -y -qq nodejs >/dev/null 2>&1 || true
+  if [ "$(node_major)" -ge 14 ]; then return; fi
+  echo "ABORT: the /v1 gateway (and federator) need Node.js >= 14; this box has $(command -v node >/dev/null && node --version || echo none)."
+  echo "       Ubuntu 20.04/22.04's apt nodejs is too old. Install a current LTS, e.g.:"
+  echo "         curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash - && sudo apt-get install -y nodejs"
+  echo "       then re-run this installer (re-running is always safe)."
+  exit 1
+}
+
 # ---------- haproxy flip helpers (used when the detected edge is haproxy) ----------
 # Both use the globals resolved in the edge section below:
 #   HAP_CFG (config path), HAP_VALIDATE / HAP_RELOAD (per-runtime commands),
@@ -245,8 +261,58 @@ FLIP
 mkdir -p "$WORK" /opt/pulsevm/plugins /opt/metalgo /etc/pulse-cutover /opt/pulse-cutover
 
 # ---------- the agent first: doctor drives everything after this ----------
+# Three ways to the binary, in preference order:
+#   1. manifest-pinned artifact (ceremony-grade: URL + sha256, fail-closed);
+#   2. GitHub release binary — STATIC musl build, so it runs on any glibc
+#      (the bookworm-built binary failing on a glibc-2.31 box is why),
+#      verified against the release's sha256sums.txt;
+#   3. cargo build from this checkout (slowest; needs rustup + build deps).
+install_agent_release(){
+  local arch tag base sums bin
+  case "$(uname -m)" in
+    x86_64) arch=x86_64;;
+    aarch64|arm64) arch=aarch64;;
+    *) echo "  release binaries cover x86_64/aarch64 only (this box: $(uname -m))"; return 1;;
+  esac
+  bin="pulse-cutover-$arch-unknown-linux-musl"
+  tag=$(mget_opt '.artifacts.agent_release_tag')
+  if [ -n "$tag" ]; then
+    base="https://github.com/paulgnz/pulse-cutover/releases/download/$tag"
+  else
+    base="https://github.com/paulgnz/pulse-cutover/releases/latest/download"
+  fi
+  echo "  fetching release binary $bin (${tag:-latest}) ..."
+  curl -fsSL "$base/sha256sums.txt" -o /tmp/pulse-cutover.sums || { echo "  no release sums reachable"; return 1; }
+  curl -fsSL "$base/$bin" -o /tmp/pulse-cutover.bin || { echo "  no release binary for $arch"; return 1; }
+  sums=$(grep " $bin\$" /tmp/pulse-cutover.sums | awk '{print $1}')
+  [ -n "$sums" ] || { echo "  sha256sums.txt has no entry for $bin"; return 1; }
+  echo "$sums  /tmp/pulse-cutover.bin" | sha256sum -c - >/dev/null || {
+    echo "  ABORT-worthy: release binary does not match its published sha256 — not installing it"
+    rm -f /tmp/pulse-cutover.bin; return 1
+  }
+  install -m 0755 /tmp/pulse-cutover.bin /usr/local/bin/pulse-cutover
+  rm -f /tmp/pulse-cutover.bin /tmp/pulse-cutover.sums
+  echo "  verified + installed: pulse-cutover ($bin, sha256 $sums)"
+}
+install_agent_source(){
+  local repo; repo=$(cd "$(dirname "$0")" && pwd)
+  command -v cargo >/dev/null || { echo "  no cargo either — install rustup (see README Step 1) or add artifacts.agent to the manifest"; return 1; }
+  echo "  building from source in $repo (this takes a few minutes) ..."
+  (cd "$repo" && cargo build --release) || return 1
+  install -m 0755 "$repo/target/release/pulse-cutover" /usr/local/bin/pulse-cutover
+  echo "  built + installed: pulse-cutover (source build)"
+}
 echo "artifacts:"
-fetch_verify "$(mget '.artifacts.agent.url')"  "$(mget '.artifacts.agent.sha256')"  /usr/local/bin/pulse-cutover
+AGENT_URL=$(mget_opt '.artifacts.agent.url')
+if [ -n "$AGENT_URL" ]; then
+  fetch_verify "$AGENT_URL" "$(mget '.artifacts.agent.sha256')" /usr/local/bin/pulse-cutover
+else
+  echo "  (manifest pins no agent binary — trying the GitHub release, then source)"
+  install_agent_release || install_agent_source || {
+    echo "ABORT: could not install the pulse-cutover agent by any path."
+    exit 1
+  }
+fi
 chmod +x /usr/local/bin/pulse-cutover
 
 # ---------- doctor: DETECT the box, never assume ----------
@@ -269,9 +335,11 @@ if [ "$VERDICT" = "UNSUPPORTED" ]; then
 fi
 if [ "$VERDICT" = "NEEDS" ]; then
   # A need the manifest (or this installer itself) satisfies is not a gap:
-  #   - stop_cmd:   the manifest may declare it explicitly;
-  #   - flip.edge:  doctor flags "two web edges" — the manifest resolves it;
-  #   - socat:      installed by this script when the socket flip is chosen.
+  #   - stop_cmd:        the manifest may declare it explicitly;
+  #   - flip.edge:       doctor flags "two web edges" — the manifest resolves it;
+  #   - socat:           installed by this script when the socket flip is chosen;
+  #   - script-managed:  this installer generates the reviewed stop/start pair
+  #                      (graceful-SIGTERM stop + [CHANGE] start placeholder).
   M_STOP=$(mget_opt '.source.stop_cmd')
   M_EDGE=$(mget_opt '.flip.edge')
   NEEDS=$(jq -r --arg m "$MODE" '.verdicts[$m].needs[]' "$DOC")
@@ -281,6 +349,7 @@ if [ "$VERDICT" = "NEEDS" ]; then
     if [ -n "$M_STOP" ] && echo "$n" | grep -q "stop_cmd"; then continue; fi
     if [ -n "$M_EDGE" ] && echo "$n" | grep -q "flip.edge"; then continue; fi
     if echo "$n" | grep -q "socat"; then continue; fi
+    if echo "$n" | grep -q "script-managed"; then continue; fi
     REMAINING="$REMAINING  - $n\n"
   done <<< "$NEEDS"
   if [ -n "$REMAINING" ]; then
@@ -334,15 +403,71 @@ if $API_LIKE && [ -z "$STOP_CMD" ]; then
   NRUNTIME=$(jq -r '.nodeos.runtime // "unknown"' "$DOC")
   NCONTAINER=$(jq -r '.nodeos.container_name // empty' "$DOC")
   NUNIT=$(jq -r '.nodeos.systemd_units[0] // empty' "$DOC")
+  NMGR=$(jq -r '.nodeos.script_manager // empty' "$DOC")
+  NPID=$(jq -r '.nodeos.pid // empty' "$DOC")
+  NBIN=$(jq -r '.nodeos.binary // "nodeos"' "$DOC")
+  NDISC=$(jq -r '.nodeos.config_path // .nodeos.data_dir // .nodeos.binary // "nodeos"' "$DOC")
   if [ "$NRUNTIME" = "docker" ] && [ -n "$NCONTAINER" ]; then
     STOP_CMD="docker stop $NCONTAINER"; START_CMD=${START_CMD:-"docker start $NCONTAINER"}
     echo "source stop/start: derived from detected docker container '$NCONTAINER'"
   elif [ -n "$NUNIT" ]; then
     STOP_CMD="systemctl stop $NUNIT"; START_CMD=${START_CMD:-"systemctl start $NUNIT"}
     echo "source stop/start: derived from detected systemd unit '$NUNIT'"
+  elif [ "$NRUNTIME" = "native" ] && [ -n "$NMGR" ]; then
+    # Script-managed nodeos (the classic Antelope BP pattern: a start script
+    # under screen/tmux/nohup, no unit). The STOP side is derivable — a
+    # graceful SIGTERM to the exact process doctor identified, plus a
+    # wait-for-exit loop (Leap flushes chainbase on SIGTERM; anything harder
+    # risks a dirty database). The START side is NOT derivable: only the
+    # operator's own start script knows how this nodeos comes up, so we
+    # stage a clearly-marked placeholder they must edit.
+    cat > /opt/pulse-cutover/source-stop.sh <<STOP
+#!/usr/bin/env bash
+# GENERATED by install.sh for a script-managed nodeos (no unit, no container;
+# detected parent: $NMGR). Review before the ceremony.
+# Graceful stop: SIGTERM to the nodeos whose command line matches BOTH the
+# detected binary and its config/data path, then wait for it to exit.
+set -e
+PID=""
+for p in \$(pgrep -x nodeos 2>/dev/null || pgrep -f nodeos); do
+  cl=\$(tr '\\0' ' ' < "/proc/\$p/cmdline" 2>/dev/null || true)
+  case "\$cl" in *"$NBIN"*"$NDISC"*|*"$NDISC"*"$NBIN"*|*"$NBIN"*) PID=\$p; break;; esac
+done
+[ -n "\$PID" ] || { echo "nodeos not running (nothing matching '$NBIN' + '$NDISC') — treating as already stopped"; exit 0; }
+echo "stopping nodeos pid \$PID (SIGTERM, graceful — chainbase flush can take a while)"
+kill -TERM "\$PID"
+for i in \$(seq 1 120); do
+  kill -0 "\$PID" 2>/dev/null || { echo "nodeos stopped after \${i}s"; exit 0; }
+  sleep 1
+done
+echo "ERROR: nodeos (pid \$PID) still running after 120s. NOT escalating to SIGKILL"
+echo "       (a killed Leap leaves a dirty chainbase). Investigate, then stop it yourself."
+exit 1
+STOP
+    cat > /opt/pulse-cutover/source-start.sh <<'START'
+#!/usr/bin/env bash
+# [CHANGE] pulse-cutover cannot know how YOUR script-managed nodeos starts —
+# only your own start script does. Replace the two lines below with it, e.g.:
+#   exec screen -dmS nodeos /opt/xpr/start.sh
+# or whatever launched the nodeos that doctor detected. Until you do, an
+# aborted ceremony CANNOT bring your nodeos back automatically (the abort is
+# still safe — the flip is reverted first — but nodeos stays down until you
+# start it by hand).
+echo "[CHANGE] edit /opt/pulse-cutover/source-start.sh: point it at YOUR nodeos start script" >&2
+exit 1
+START
+    chmod +x /opt/pulse-cutover/source-stop.sh /opt/pulse-cutover/source-start.sh
+    STOP_CMD=/opt/pulse-cutover/source-stop.sh
+    if [ -z "$START_CMD" ]; then START_CMD=/opt/pulse-cutover/source-start.sh; fi
+    echo "source stop/start: nodeos is SCRIPT-MANAGED (parent: $NMGR, pid ${NPID:-?})"
+    echo "  generated: /opt/pulse-cutover/source-stop.sh   (graceful SIGTERM + wait — REVIEW it)"
+    echo "  generated: /opt/pulse-cutover/source-start.sh  ([CHANGE] placeholder — EDIT it to"
+    echo "             call your own start script; needed only if an aborted ceremony must"
+    echo "             restart nodeos automatically)"
   else
     echo "ABORT: api mode retires nodeos after the flip, but the manifest has no source.stop_cmd"
-    echo "       and doctor found neither a systemd unit nor a docker container running nodeos."
+    echo "       and doctor found neither a systemd unit, a docker container, nor a"
+    echo "       classifiable script-managed nodeos process."
     echo "       Declare source.stop_cmd/start_cmd in the manifest."
     exit 1
   fi
@@ -409,7 +534,7 @@ systemctl enable --now metalgo-pulse >/dev/null 2>&1
 
 # ---------- api mode: REST gateway + web-edge flip machinery ----------
 if $API_LIKE; then
-  command -v node >/dev/null || { apt-get install -y -qq nodejs >/dev/null; }
+  ensure_node
   mkdir -p /opt/pulse-gateway
   fetch_verify "$(mget '.artifacts.gateway.url')" "$(mget '.artifacts.gateway.sha256')" /opt/pulse-gateway/server.js
   cat > /etc/systemd/system/pulse-gateway.service <<UNIT
