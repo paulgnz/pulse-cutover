@@ -32,7 +32,7 @@ use is defined in the [Glossary](#glossary).
 
 ### Step 0 — what you need
 
-- **A box**: a spare Ubuntu 22.04 or 24.04 server, or your existing node box.
+- **A box**: a spare Ubuntu 20.04, 22.04 or 24.04 server, or your existing node box.
   The first tool you'll run (`doctor`) is strictly read-only and safe anywhere,
   including production. The later steps (install + rehearsal) belong on a
   spare/test box.
@@ -66,6 +66,22 @@ You should see the build end with:
 ```
     Finished `release` profile [optimized + debuginfo] target(s) in 7.15s
 ```
+
+**Or skip the build entirely:** every tagged release ships **static musl
+binaries** (x86_64 + aarch64) that run on any supported Ubuntu regardless of
+glibc — a glibc-2.36-built binary once failed on a 20.04 box's glibc 2.31,
+hence static:
+
+```sh
+curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/latest/download/pulse-cutover-x86_64-unknown-linux-musl
+curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/latest/download/sha256sums.txt
+sha256sum -c sha256sums.txt --ignore-missing
+sudo install -m 0755 pulse-cutover-x86_64-unknown-linux-musl /usr/local/bin/pulse-cutover
+```
+
+`install.sh` does the same automatically (release binary, sha256-verified,
+falling back to `cargo build`) whenever the ceremony manifest pins no agent
+artifact — a manifest-pinned binary still wins, fail-closed, in a real event.
 
 (In an organized test event the coordinator ships a prebuilt, sha256-pinned
 binary in the ceremony bundle, and `install.sh` verifies and installs it for
@@ -528,14 +544,14 @@ at `pulse-cutover report` so unsupported setups become supported ones.
 | dimension | detected & handled | detected, NOT yet handled (UNSUPPORTED + explain) |
 |---|---|---|
 | nodeos runtime | native (systemd unit or bare pid) · docker container | kubernetes-managed |
-| nodeos stop/start | manifest `stop_cmd` · derived `systemctl stop <unit>` · derived `docker stop <container>` | bare-pid nodeos in api mode without a manifest `stop_cmd` (NEEDS) |
+| nodeos stop/start | manifest `stop_cmd` · derived `systemctl stop <unit>` · derived `docker stop <container>` · **script-managed** (no unit — doctor classifies the parent chain: screen/tmux/cron/nohup-orphan/shell, reports pid + config + data dir + where stdout/stderr go; install.sh generates a reviewed graceful-SIGTERM stop script, and a `[CHANGE]` start placeholder you point at your own start script — we cannot guess it, so we say so) | native nodeos whose management doctor cannot classify at all, in api mode without a manifest `stop_cmd` (NEEDS) |
 | public edge | nginx (any layout: named upstreams, direct proxy_pass, TLS server blocks, multiple domains) · haproxy (frontends/listens, TLS binds, named + anonymous ACL path rules, multi-server backends) · nginx AND haproxy together (declare `flip.edge`) · no web server (managed nginx layout staged) | apache · caddy |
 | nginx flip | templated byte-exact from the detected `server_name -> proxy_pass` map; refuses if no /v1 route points at your nodeos | hand-minified configs may degrade to fewer detected routes — doctor shows what it saw |
 | haproxy flip (socket) | admin-level `stats socket` present: the gateway is pre-staged as a `disabled` server at INSTALL time (the one and only reload), and the ceremony flip is a transactional `enable/disable server` on the runtime socket — zero reloads at H, response-checked, instantly revertible | multi-server backend without a drain decision (NEEDS — see HAProxy notes) |
 | haproxy flip (reload) | no admin socket: same pre-staged server; the flip swaps the `disabled` markers in haproxy.cfg, `haproxy -c` validates, then one graceful reload (native `systemctl reload` or docker `SIGHUP`) | same multi-server rule |
 | haproxy runtime | native (systemd unit) · docker container (validate via `docker exec`, reload via `SIGHUP`) | — |
 | history | legacy Hyperion (pm2 or systemd) noted; hyperion mode flips the detected /v2 route (nginx or haproxy) | no detectable /v2 route in hyperion mode (refuses with reason) |
-| OS | Ubuntu 22.04 / 24.04 | anything else (UNSUPPORTED — tell us via `report`) |
+| OS | Ubuntu 20.04 / 22.04 / 24.04 (20.04 note: the distro's Node 10 is too old for the gateway/federator — install.sh checks for Node ≥ 14 and prints the exact NodeSource one-liner if missing; all staged unit files use systemd-245-era directives only) | anything else (UNSUPPORTED — tell us via `report`) |
 
 ### HAProxy notes
 
@@ -775,7 +791,7 @@ config format.
 
 ## Upstream alignment
 
-> **Cross-validated:** the two verification stacks agree in practice — upstream's #61 pipeline and this project's importer were run against the same XPR testnet snapshot and produced byte-identical state (including row order) on every table both carry, measured with upstream's own `xpr_state_fingerprint` / `xpr_19_table_compare` ([results](https://github.com/MetalBlockchain/pulsevm/pull/61#issuecomment-5485633926)). Verifying with either toolchain is verifying against the same ground truth.
+> **Cross-validated:** the two verification stacks agree in practice — upstream's #61 pipeline and this project's importer were run against the same XPR testnet snapshot and produced byte-identical state (including row order) on every table both carry, measured with upstream's own `xpr_state_fingerprint` / `xpr_19_table_compare` ([results](https://github.com/MetalBlockchain/pulsevm/pull/61#issuecomment-5485633926)). The upstream tools are the spec; that one-time cross-check is what lets the interim fork path be trusted until #61 ships.
 
 Metallicus is building the node-side migration path in
 [MetalBlockchain/pulsevm#61](https://github.com/MetalBlockchain/pulsevm/pull/61)
@@ -785,18 +801,67 @@ migration, so the two stacks map onto each other rather than competing:
 
 | Upstream (#61 branch) | pulse-cutover | Relationship |
 |---|---|---|
-| `tools/xpr-chainbase-export/export.sh` (nodeos→SHiP full-state export) | freeze + snapshot stages (nodeos `create_snapshot` → portable `.bin`) | Two independent input paths into Arena — cross-checkable |
-| `xpr_state_fingerprint` / `xpr_19_table_compare` (whole-state root + per-table SHA-256) | `verify` — dual fresh-arena import + 19-table `DefaultHasher` goldens | Same goal, independent implementations; agreement between them is the strongest correctness signal |
+| `tools/xpr-chainbase-export/export.sh` (nodeos→SHiP full-state export) | freeze + snapshot stages (nodeos `create_snapshot` → portable `.bin`) — and `import_backend = "upstream"` drives export.sh itself from that `.bin` | The ceremony feeds the official pipeline |
+| `xpr_state_fingerprint` / `xpr_19_table_compare` (whole-state root + per-table SHA-256) | `verify` — dual fresh-arena import + 19-table `DefaultHasher` goldens (fork backend only) | Same goal; equivalence was established once by the published cross-check below — in upstream mode the ceremony verifies with the official tools |
 | `host-function-audit.sh` (Leap registry ↔ PulseVM import map, source-based) | `scan-contracts` (wasm imports of every *deployed* code object vs the served set) | Complementary: theirs finds surface gaps, ours finds real-world exposure |
 | five-node runner / EC2 scripts | ignite + flip + hyperion federation (endpoint keeps its memory) | Upstream boots the network; the ceremony keeps operators' public surfaces alive across the cut |
 
-Preference order: **once #61 merges, the upstream tool is the canonical
-verifier.** The `[snapshot] upstream_fingerprint_bin` knob runs an
-`xpr_state_fingerprint`-compatible binary at verify time alongside (never
-replacing) our 19-table check and journals both reports; a missing binary is
-a clean journaled no-op, so configs can carry the knob today. Until #61
-ships, `scan-contracts` and our fingerprint goldens remain the fallback —
-and afterwards they stay on as the independent second opinion.
+### Import backends
+
+The ceremony has two ways to turn the cut snapshot into PulseVM state,
+selected by `[ceremony] import_backend = "fork" | "upstream"`:
+
+- **`upstream` — the official path (#61), the target.** The ceremony drives
+  the core team's own pipeline for SNAPSHOTTED → VERIFIED: `export.sh` (a
+  pinned Leap replays the cut `.bin` into a SHiP full-state
+  `chain_state_history.log`) → `xpr_import_check` (SHiP → Arena checkpoint +
+  a manifest binding checkpoint bytes to the source block id) — and
+  **verification is upstream's own tooling**: `xpr_19_table_compare` (a
+  wire-level nodeos-vs-Arena comparison of all 19 tables; any mismatch fails
+  the ceremony) plus `xpr_state_fingerprint` (whole-state root — journaled,
+  and golden-comparable across operators via `[upstream] golden_state_root`).
+  Every artifact is bound back to the ceremony's pinned cut: the export
+  manifest's `INPUT_SNAPSHOT_SHA256` must equal the cut snapshot's hash, and
+  the checkpoint manifest's `source_block_id`/`checkpoint_revision` must
+  equal the pinned cut block id/height. **IGNITED from the checkpoint is
+  pending the #61 merge** (the checkpoint-consuming node — migration genesis
+  committing the checkpoint sha256 + `migration_checkpoint` node-config
+  knobs — exists only on the PR branch); until then an upstream-mode
+  ceremony stops after VERIFIED with the precise remaining list in the
+  journal. Config: `[upstream]` (work_dir, export_cmd, import_bin,
+  compare_bin, fingerprint_bin) — see `src/config.rs` for the documented
+  fields and `examples/ceremony-upstream.toml` for a working shape.
+
+- **`fork` — the interim bridge (today's default).** Our
+  `feat/arena-snapshot-import` branch reads the Leap `.bin` directly and the
+  target chain boots via `snapshot_path`; verification is the dual
+  fresh-arena import + 19-table fingerprints. It is the default **only
+  because #61 is unmerged** (it is the path that can actually IGNITE today);
+  when #61 lands, the default flips to `upstream` and the fork path is
+  slated for retirement. Its correctness was established by a **one-time
+  published cross-check** against the #61 pipeline — byte-identical state,
+  row order included, on every table both implementations carry, measured
+  with upstream's own tools
+  ([results](https://github.com/MetalBlockchain/pulsevm/pull/61#issuecomment-5485633926)).
+  That cross-check is why the fork path needs no standing in-ceremony
+  shadow: `[upstream] fork_audit = true` can journal the fork fingerprints
+  as a labeled dev/audit extra, but it is off by default, never a gate, and
+  documented as a release-validation tool — not an operator step.
+
+Fidelity notes, tracked for **upstream** resolution (not papered over here):
+the SHiP export path currently lacks the per-account **sequence counters**
+and the transaction **dedupe set** that the `.bin` carries (details in the
+[cross-check comment](https://github.com/MetalBlockchain/pulsevm/pull/61#issuecomment-5485633926));
+`export.sh`'s completion probe uses `rg`, which minimal nodeos images lack —
+an `rg`→`grep` one-line patch is the validated workaround until it lands
+upstream.
+
+Legacy knob: `[snapshot] upstream_fingerprint_bin` still runs an
+`xpr_state_fingerprint`-compatible binary alongside the fork backend's check
+(journaled, advisory, clean no-op when absent) — superseded by the full
+upstream backend above, kept for configs that already carry it.
+`scan-contracts` (read-only wasm-import audit of deployed contracts) runs
+under both backends.
 
 ---
 
@@ -820,13 +885,15 @@ what testers get out of it.
 
 ## Status & caveats
 
-- v0.3.0 — rehearsal-grade. The recorded ceremonies are real, on live-testnet
+- v0.4.0 — rehearsal-grade. The recorded ceremonies are real, on live-testnet
   state, but no *mainnet* event has run yet.
-- Ubuntu 22.04/24.04 + systemd only; nginx and haproxy traffic flips
+- Ubuntu 20.04/22.04/24.04 + systemd only; nginx and haproxy traffic flips
   (apache/caddy detected and refused with reasons). `report` bundles are how
   new setups get added.
-- Depends on the PulseVM arena-import branch (`paulgnz/pulsevm`,
-  `feat/arena-snapshot-import`) for snapshot import + fingerprints.
+- Default import backend is still the fork path (`paulgnz/pulsevm`,
+  `feat/arena-snapshot-import`) — an interim bridge until
+  MetalBlockchain/pulsevm#61 merges; `import_backend = "upstream"` already
+  drives the official pipeline through VERIFIED (see "Import backends").
 - Guide + video: [pulsevm.dev/guide/migrate-antelope-chain](https://pulsevm.dev/guide/migrate-antelope-chain)
 - Questions / test bundles: [Telegram](https://t.me/+N1mAvoUDbtVmNTBh) ·
   [rehearsal-feedback issues](https://github.com/paulgnz/pulse-cutover/issues/new?template=rehearsal-feedback.md)
