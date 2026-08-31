@@ -1862,6 +1862,7 @@ dependencies = [
 [[package]]
 name = "pulsevm_arena"
 version = "0.1.0"
+source = "git+https://github.com/paulgnz/pulsevm?branch=feat%2Farena-snapshot-import#8a81171e5c549a433d9929829a319457c95f74dd"
 dependencies = [
  "pulsevm_arena_derive",
  "sha2 0.10.9",
@@ -1871,6 +1872,7 @@ dependencies = [
 [[package]]
 name = "pulsevm_arena_derive"
 version = "0.1.0"
+source = "git+https://github.com/paulgnz/pulsevm?branch=feat%2Farena-snapshot-import#8a81171e5c549a433d9929829a319457c95f74dd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1880,10 +1882,12 @@ dependencies = [
 [[package]]
 name = "pulsevm_billable_size"
 version = "0.1.0"
+source = "git+https://github.com/paulgnz/pulsevm?branch=feat%2Farena-snapshot-import#8a81171e5c549a433d9929829a319457c95f74dd"
 
 [[package]]
 name = "pulsevm_chain_types"
 version = "0.1.0"
+source = "git+https://github.com/paulgnz/pulsevm?branch=feat%2Farena-snapshot-import#8a81171e5c549a433d9929829a319457c95f74dd"
 dependencies = [
  "prost-types",
  "pulsevm_billable_size",
@@ -1899,6 +1903,7 @@ dependencies = [
 [[package]]
 name = "pulsevm_chaindb"
 version = "0.1.0"
+source = "git+https://github.com/paulgnz/pulsevm?branch=feat%2Farena-snapshot-import#8a81171e5c549a433d9929829a319457c95f74dd"
 dependencies = [
  "pulsevm_arena",
  "zerocopy",
@@ -1907,6 +1912,7 @@ dependencies = [
 [[package]]
 name = "pulsevm_crypto"
 version = "0.1.0"
+source = "git+https://github.com/paulgnz/pulsevm?branch=feat%2Farena-snapshot-import#8a81171e5c549a433d9929829a319457c95f74dd"
 dependencies = [
  "bs58",
  "hex",
@@ -1921,6 +1927,7 @@ dependencies = [
 [[package]]
 name = "pulsevm_error"
 version = "0.1.0"
+source = "git+https://github.com/paulgnz/pulsevm?branch=feat%2Farena-snapshot-import#8a81171e5c549a433d9929829a319457c95f74dd"
 dependencies = [
  "anyhow",
  "jsonrpsee",
@@ -1931,6 +1938,7 @@ dependencies = [
 [[package]]
 name = "pulsevm_name"
 version = "0.1.0"
+source = "git+https://github.com/paulgnz/pulsevm?branch=feat%2Farena-snapshot-import#8a81171e5c549a433d9929829a319457c95f74dd"
 dependencies = [
  "proc-macro2",
  "pulsevm_error",
@@ -1944,6 +1952,7 @@ dependencies = [
 [[package]]
 name = "pulsevm_proc_macros"
 version = "0.1.0"
+source = "git+https://github.com/paulgnz/pulsevm?branch=feat%2Farena-snapshot-import#8a81171e5c549a433d9929829a319457c95f74dd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1953,6 +1962,7 @@ dependencies = [
 [[package]]
 name = "pulsevm_serialization"
 version = "0.1.0"
+source = "git+https://github.com/paulgnz/pulsevm?branch=feat%2Farena-snapshot-import#8a81171e5c549a433d9929829a319457c95f74dd"
 dependencies = [
  "pulsevm_error",
  "serde",
@@ -1962,6 +1972,7 @@ dependencies = [
 [[package]]
 name = "pulsevm_snapshot"
 version = "0.1.0"
+source = "git+https://github.com/paulgnz/pulsevm?branch=feat%2Farena-snapshot-import#8a81171e5c549a433d9929829a319457c95f74dd"
 dependencies = [
  "pulsevm_chain_types",
  "pulsevm_crypto",
@@ -1973,6 +1984,7 @@ dependencies = [
 [[package]]
 name = "pulsevm_snapshot_import"
 version = "0.1.0"
+source = "git+https://github.com/paulgnz/pulsevm?branch=feat%2Farena-snapshot-import#8a81171e5c549a433d9929829a319457c95f74dd"
 dependencies = [
  "pulsevm_chaindb",
  "pulsevm_crypto",

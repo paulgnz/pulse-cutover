@@ -19,9 +19,9 @@ wasmparser = "0.245"
 # The snapshot/fingerprint stack, straight from the arena-import workspace.
 # Convention: pulse-cutover and pulsevm-arena-import are sibling checkouts
 # (~/dev/... on dev boxes, /root/... on servers).
-pulsevm_snapshot = { path = "../pulsevm-arena-import/crates/pulsevm_snapshot" }
-pulsevm_snapshot_import = { path = "../pulsevm-arena-import/crates/pulsevm_snapshot_import" }
-pulsevm_chaindb = { path = "../pulsevm-arena-import/crates/pulsevm_chaindb" }
+pulsevm_snapshot = { git = "https://github.com/paulgnz/pulsevm", branch = "feat/arena-snapshot-import" }
+pulsevm_snapshot_import = { git = "https://github.com/paulgnz/pulsevm", branch = "feat/arena-snapshot-import" }
+pulsevm_chaindb = { git = "https://github.com/paulgnz/pulsevm", branch = "feat/arena-snapshot-import" }
 
 [dev-dependencies]
 tempfile = "3"
