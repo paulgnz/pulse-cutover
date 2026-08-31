@@ -28,6 +28,10 @@ pub struct Config {
     /// "your endpoint keeps its memory").
     #[serde(default)]
     pub hyperion: Option<Hyperion>,
+    /// The official (#61) import pipeline — required when
+    /// `ceremony.import_backend = "upstream"`.
+    #[serde(default)]
+    pub upstream: Option<Upstream>,
     /// loop-harness settings (`pulse-cutover loop`).
     #[serde(default)]
     pub r#loop: Option<LoopCfg>,
@@ -100,6 +104,30 @@ pub struct Ceremony {
     /// producer that did not actually stop, or late blocks arriving on p2p).
     #[serde(default = "default_quiescence_polls")]
     pub quiescence_polls: u32,
+    /// Which import stack turns the cut snapshot into PulseVM state:
+    /// - "fork": our arena-snapshot-import branch reads the Leap `.bin`
+    ///   directly and the target chain boots via `snapshot_path`. This is
+    ///   the interim/bridge implementation, and it stays the DEFAULT only
+    ///   until MetalBlockchain/pulsevm#61 merges — once the official path
+    ///   ships, the default flips to "upstream" and the fork path retires.
+    /// - "upstream": the core team's official migration path (#61):
+    ///   export.sh replays the `.bin` through a pinned Leap into a SHiP
+    ///   full-state log, `xpr_import_check` hydrates it into an Arena
+    ///   checkpoint, and verification uses upstream's OWN tools
+    ///   (`xpr_19_table_compare` + `xpr_state_fingerprint`). Requires the
+    ///   `[upstream]` section. IGNITED from the checkpoint is pending the
+    ///   #61 merge (the ceremony stops after VERIFIED with a precise
+    ///   explanation of what remains).
+    #[serde(default)]
+    pub import_backend: ImportBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportBackend {
+    #[default]
+    Fork,
+    Upstream,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -255,6 +283,63 @@ pub struct Snapshot {
     /// (currently `<checkpoint> <arena-directory>` on the #61 branch).
     #[serde(default)]
     pub upstream_fingerprint_args: Option<Vec<String>>,
+}
+
+/// The official import pipeline from MetalBlockchain/pulsevm#61 (unmerged;
+/// fetch `pull/61/head` and `cargo build --release --examples -p
+/// pulsevm_database` for the tools). The ceremony drives it for the
+/// SNAPSHOTTED -> VERIFIED stages when `ceremony.import_backend = "upstream"`:
+///
+///   export_cmd (export.sh: pinned Leap replays the cut `.bin` into a SHiP
+///   chain_state_history.log) -> import_bin (xpr_import_check: SHiP ->
+///   Arena checkpoint + manifest) -> compare_bin (xpr_19_table_compare:
+///   wire-level nodeos-vs-Arena 19-table comparison, THE verification gate)
+///   + fingerprint_bin (xpr_state_fingerprint: whole-state root, journaled,
+///   golden-comparable across nodes).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Upstream {
+    /// Scratch root for export/import artifacts. The agent creates
+    /// `export-<cut_height>/` (the export.sh work dir lands under it),
+    /// `checkpoint-<cut_height>.bin`, and per-tool arena directories here.
+    pub work_dir: PathBuf,
+    /// Runs the official export.sh flow against the cut snapshot.
+    /// Placeholders: `{snapshot}` = host path of the cut `.bin`,
+    /// `{export_dir}` = a fresh directory the agent names (the command may
+    /// nest export.sh's own `--work-dir` under it — the agent finds
+    /// `chain_state_history.log` and `manifest.env` anywhere below).
+    /// Typical (dockerized Leap, the validated shape):
+    ///   docker run --rm -v <work_dir>:/w nodeos:5.0.3 bash /w/export.sh
+    ///     --nodeos /usr/local/bin/nodeos --snapshot /w/<cut>.bin
+    ///     --work-dir /w/export-<h>/work --chain-state-db-size-mb 4096
+    /// (export.sh's `rg` calls need the rg->grep patch on images without
+    /// ripgrep — see README "Import backends".)
+    pub export_cmd: String,
+    /// xpr_import_check binary: `<chain_state_history.log> <arena-dir>
+    /// [checkpoint]` — writes the Arena checkpoint + `.manifest.json`.
+    pub import_bin: PathBuf,
+    /// xpr_state_fingerprint binary: `<checkpoint> <arena-dir>` — prints
+    /// `revision` / `state_root` / per-table sha256 lines (journaled; the
+    /// cross-node golden once multiple operators run the same cut).
+    pub fingerprint_bin: PathBuf,
+    /// xpr_19_table_compare binary: `<log> <checkpoint> <arena-dir>
+    /// <chain-id-hex> [report.json]`. When set this is a hard gate: a
+    /// non-zero exit (any table mismatch between nodeos's SHiP snapshot and
+    /// Arena's re-serialization) fails verification.
+    #[serde(default)]
+    pub compare_bin: Option<PathBuf>,
+    /// Multi-node mode: the published golden `state_root` this node must
+    /// reproduce (from another operator's journal / the coordinator).
+    #[serde(default)]
+    pub golden_state_root: Option<String>,
+    /// Dev/audit only, default OFF: additionally run our fork importer's
+    /// dual-arena 19-table fingerprint over the same cut `.bin` and journal
+    /// it. This is a release-validation tool, not an operator step, and it
+    /// is NEVER a gate — the one-time published cross-check against #61
+    /// already established equivalence; the ceremony verifies with the
+    /// official tools above.
+    #[serde(default)]
+    pub fork_audit: bool,
 }
 
 /// hyperion mode (api mode + `[hyperion]`): /v2 history continuity across
@@ -426,6 +511,12 @@ impl Config {
         if config.hyperion.is_some() && config.ceremony.mode != Mode::Api {
             return Err("[hyperion] composes with api mode (mode = \"api\"): /v2 continuity \
                         is an API-provider concern — the flip is the user-visible act"
+                .into());
+        }
+        if config.ceremony.import_backend == ImportBackend::Upstream && config.upstream.is_none() {
+            return Err("ceremony.import_backend = \"upstream\" requires an [upstream] section \
+                        (work_dir, export_cmd, import_bin, fingerprint_bin — the official #61 \
+                        pipeline the ceremony drives)"
                 .into());
         }
         if config.ceremony.freeze_strategy == FreezeStrategy::ScheduleAtH

@@ -1,0 +1,73 @@
+# =============================================================================
+# import_backend = "upstream" — the ceremony drives the OFFICIAL migration
+# pipeline (MetalBlockchain/pulsevm#61) for SNAPSHOTTED -> VERIFIED and
+# verifies with upstream's own tools. This is the validated box shape from
+# the 2026-09 run: dockerized pinned Leap (nodeos:5.0.3 image) for export,
+# the #61 example binaries for import/verify.
+#
+# Status: verification-complete, ignition pending — an upstream-mode ceremony
+# runs export -> import -> 19-table compare -> state fingerprint, then stops
+# after VERIFIED with the precise remaining list in the journal (the
+# checkpoint-consuming node only exists on the unmerged #61 branch).
+#
+# Prep on the box (once):
+#   git clone https://github.com/MetalBlockchain/pulsevm /root/pr61 \
+#     && cd /root/pr61 && git fetch origin pull/61/head:pr61 && git checkout pr61
+#   cargo build --release --examples -p pulsevm_database
+#   cp tools/xpr-chainbase-export/export.sh /root/upstream-work/export.sh
+#   sed -i 's/rg -q/grep -q/' /root/upstream-work/export.sh   # images without ripgrep
+# =============================================================================
+
+journal_path = "/root/upstream-run/journal.jsonl"
+poll_ms = 250
+
+[ceremony]
+freeze_height = 12345
+import_cpu_scale = 143
+import_backend = "upstream"
+
+[source]
+rpc_url = "http://127.0.0.1:8888"
+producer_api_url = "http://127.0.0.1:8888"
+snapshot_timeout_secs = 900
+
+[snapshot]
+# Unused for booting in upstream mode (the target boots from the checkpoint
+# once #61 ships) but still the R12-checked stage path.
+staged_path = "/root/upstream-run/snapshot-cut.bin"
+
+[target]
+metalgo_unit = "metalgo-pulse"
+rpc_url = "http://127.0.0.1:9650/ext/bc/CHAIN_ID_HERE/rpc"
+auto_rollback = true
+
+[upstream]
+# Scratch root: export-<cut_height>/, checkpoint-<cut_height>.bin and the
+# per-tool arena directories land here.
+work_dir = "/root/upstream-work"
+
+# The official export.sh flow, dockerized: the pinned-revision Leap replays
+# the cut .bin into a SHiP full-state log. {snapshot} and {export_dir} are
+# host paths substituted by the agent; the -v mounts map them into the
+# container. The agent pre-creates {export_dir} and then finds
+# chain_state_history.log + manifest.env anywhere below it, so export.sh's
+# own --work-dir (which must not pre-exist) nests cleanly as /out/work.
+# Size chainbase generously for the replay.
+export_cmd = """docker run --rm -v {export_dir}:/out -v {snapshot}:/in/cut.bin:ro \
+-v /root/upstream-work/export.sh:/in/export.sh:ro nodeos:5.0.3 \
+bash /in/export.sh --nodeos /usr/local/bin/nodeos --snapshot /in/cut.bin \
+--work-dir /out/work --chain-state-db-size-mb 4096 --timeout-seconds 600"""
+
+# The #61 example binaries (cargo build --release --examples -p pulsevm_database).
+import_bin      = "/root/pr61/target/release/examples/xpr_import_check"
+compare_bin     = "/root/pr61/target/release/examples/xpr_19_table_compare"
+fingerprint_bin = "/root/pr61/target/release/examples/xpr_state_fingerprint"
+
+# Multi-operator mode: require this exact whole-state root (from the
+# coordinator / another operator's journal). Omit on the first/capture node.
+# golden_state_root = "ad82d8423cce5f5bb3dd6b36b9c95139d45c18faafd7f345e8ac637d433c290d"
+
+# Dev/audit only (default false): additionally journal the fork importer's
+# fingerprints over the same cut. Release-validation tool, never a gate,
+# not an operator step.
+# fork_audit = true

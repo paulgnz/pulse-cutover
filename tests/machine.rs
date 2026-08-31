@@ -181,6 +181,12 @@ impl ChainOps for MockOps {
         let cut = self.head.get();
         let m = mini(cut as u32);
         std::fs::write(self.snapshot_path(), m.build()).map_err(|e| e.to_string())?;
+        // Cut facts for the fake upstream tools (the real xpr_import derives
+        // these from the SHiP log; the fakes read them from here).
+        let _ = std::fs::write(
+            self.dir.join("cut-facts.env"),
+            format!("CUT_HEIGHT={cut}\nCUT_BLOCK_ID={}\n", hex::encode(m.head_id())),
+        );
         // Production continues; the block that finalized the cut arrives.
         self.head.set(cut + 1);
         self.target_head.set(cut);
@@ -250,6 +256,12 @@ impl ChainOps for MockOps {
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
         self.hooks.borrow_mut().push(cmd.to_string());
+        // Upstream-pipeline commands reference generated fake tools in the
+        // test dir — execute them for real: the pipeline verifies their
+        // file outputs (SHiP log, manifest.env, checkpoint + manifest).
+        if cmd.contains("fake-") {
+            return pulse_cutover::ops::run_shell(cmd);
+        }
         if cmd.contains("flip-nginx") {
             self.flipped.set(true);
         }
@@ -1049,4 +1061,178 @@ fn upstream_fingerprint_runs_alongside_ours_and_noops_when_missing() {
         verified2["data"]["upstream_fingerprint"]["status"],
         "skipped_missing_binary"
     );
+}
+
+// ---------------------------------------------------------------------------
+// import_backend = "upstream": the ceremony drives the official #61 pipeline
+// (export.sh -> xpr_import_check) and verifies with upstream's own tools
+// (xpr_19_table_compare gate + xpr_state_fingerprint). Fake tools stand in
+// for the real binaries; the pipeline's file-output contract is exercised
+// for real (SHiP log, manifest.env, checkpoint + .manifest.json).
+// ---------------------------------------------------------------------------
+
+fn write_script(path: &std::path::Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn stage_fake_upstream_tools(dir: &std::path::Path, compare_exit: i32) {
+    let d = dir.display();
+    // export.sh stand-in: nests its own work dir (the docker-mount shape),
+    // emits the SHiP log + a manifest.env whose INPUT_SNAPSHOT_SHA256 is the
+    // REAL sha256 of the snapshot it was handed.
+    write_script(
+        &dir.join("fake-export.sh"),
+        &format!(
+            "#!/bin/sh\nset -e\nsnap=\"$1\"; out=\"$2\"\n\
+             sha() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi | awk '{{print $1}}'; }}\n\
+             mkdir -p \"$out/work/state-history\"\n\
+             printf SHIPLOG > \"$out/work/state-history/chain_state_history.log\"\n\
+             {{ echo \"XPR_CORE_REVISION=d133c641\"; echo \"INPUT_SNAPSHOT_SHA256=$(sha \"$snap\")\"; \
+                echo \"CHAIN_STATE_HISTORY_SHA256=$(sha \"$out/work/state-history/chain_state_history.log\")\"; }} > \"$out/work/manifest.env\"\n\
+             echo \"exported full XPR chain-state history to $out/work\"\n"
+        ),
+    );
+    // xpr_import_check stand-in: writes the checkpoint + the manifest that
+    // binds it to the cut (facts recorded by the mock's create_snapshot).
+    write_script(
+        &dir.join("fake-import.sh"),
+        &format!(
+            "#!/bin/sh\nset -e\n. {d}/cut-facts.env\n\
+             sha() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi | awk '{{print $1}}'; }}\n\
+             printf CKPT > \"$3\"\n\
+             printf '{{\"checkpoint_sha256\":\"%s\",\"checkpoint_revision\":%s,\"source_block_id\":\"%s\"}}' \
+               \"$(sha \"$3\")\" \"$CUT_HEIGHT\" \"$CUT_BLOCK_ID\" > \"$3.manifest.json\"\n\
+             echo 'XPR state imported successfully: ImportSummary {{ accounts: 1 }}'\n"
+        ),
+    );
+    write_script(
+        &dir.join("fake-compare.sh"),
+        &format!(
+            "#!/bin/sh\n\
+             if [ {compare_exit} -ne 0 ]; then echo 'table permission: nodeos=1 arena=2' >&2; exit {compare_exit}; fi\n\
+             echo 'table account: rows=1 sha256=aa55'\necho 'table permission: rows=2 sha256=bb66'\nexit 0\n"
+        ),
+    );
+    write_script(
+        &dir.join("fake-fingerprint.sh"),
+        "#!/bin/sh\necho 'revision 999'\necho 'state_root feedfacecafebeef'\necho 'table account bytes=10 sha256=aa55'\n",
+    );
+}
+
+fn upstream_test_config(dir: &std::path::Path, freeze_height: u64) -> Config {
+    let toml_text = format!(
+        r#"
+journal_path = "{dir}/journal.jsonl"
+poll_ms = 1
+
+[ceremony]
+freeze_height = {freeze_height}
+quiescence_polls = 3
+import_backend = "upstream"
+
+[source]
+rpc_url = "http://mock"
+producer_api_url = "http://mock"
+
+[snapshot]
+staged_path = "{dir}/staged.bin"
+
+[target]
+metalgo_unit = "mock.service"
+rpc_url = "http://mock"
+quorum_timeout_secs = 60
+
+[upstream]
+work_dir = "{dir}/upstream-work"
+export_cmd = "sh {dir}/fake-export.sh {{snapshot}} {{export_dir}}"
+import_bin = "{dir}/fake-import.sh"
+fingerprint_bin = "{dir}/fake-fingerprint.sh"
+compare_bin = "{dir}/fake-compare.sh"
+"#,
+        dir = dir.display(),
+    );
+    let path = dir.join("ceremony-upstream.toml");
+    std::fs::write(&path, toml_text).unwrap();
+    Config::load(&path).unwrap()
+}
+
+#[test]
+fn upstream_backend_verifies_with_official_tools_and_stubs_ignite() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    // VERIFIED is reached with the official tools; ignition from the
+    // checkpoint is pending #61, so the ceremony stops there — safely.
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let entries: Vec<serde_json::Value> =
+        text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let verified = entries
+        .iter()
+        .find(|v| v["state"] == "VERIFIED" && v["kind"] == "transition")
+        .expect("VERIFIED reached");
+    let data = &verified["data"];
+    assert!(data["verify_backend"].as_str().unwrap().contains("upstream"));
+    assert_eq!(data["table_compare"], "MATCH");
+    assert_eq!(data["state_root"], "feedfacecafebeef");
+    assert!(data["checkpoint_sha256"].as_str().unwrap().len() == 64);
+    // The export manifest's input hash was verified against the cut.
+    assert!(data["export_manifest"]["INPUT_SNAPSHOT_SHA256"].is_string());
+    // The 19-table compare ran and its per-table rows are journaled.
+    let compare = entries
+        .iter()
+        .find(|v| v["data"].get("upstream_19_table_compare").is_some()
+            && v["data"]["upstream_19_table_compare"].is_object())
+        .expect("compare evidence");
+    assert_eq!(compare["data"]["upstream_19_table_compare"]["result"], "MATCH");
+    // No fork-importer artifacts: staged .bin never written, no captured roots.
+    assert!(!dir.path().join("staged.bin").exists());
+    // The stop is the documented #61 stub, with the remaining work listed.
+    let abort_err = entries
+        .iter()
+        .find(|v| v["kind"] == "error")
+        .expect("journaled abort reason");
+    assert!(abort_err["data"]["message"].as_str().unwrap().contains("#61"));
+    assert!(abort_err["data"]["detail"]["remaining"].is_array());
+}
+
+#[test]
+fn upstream_table_compare_mismatch_fails_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 1); // compare exits non-zero
+    let cfg = upstream_test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    // Never VERIFIED; the error names the official tool and the mismatch.
+    assert!(!text.lines().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["state"] == "VERIFIED" && v["kind"] == "transition"
+    }));
+    assert!(text.contains("xpr_19_table_compare FAILED"));
+    // Producer-mode rollback ran: the source producer was resumed.
+    assert_eq!(ops.resumes.get(), 1);
+}
+
+#[test]
+fn upstream_backend_requires_upstream_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml_text = format!(
+        "journal_path = \"{d}/j.jsonl\"\n[ceremony]\nfreeze_height = 5\nimport_backend = \"upstream\"\n\
+         [source]\nrpc_url = \"http://m\"\nproducer_api_url = \"http://m\"\n\
+         [snapshot]\nstaged_path = \"{d}/s.bin\"\n\
+         [target]\nmetalgo_unit = \"m\"\nrpc_url = \"http://m\"\n",
+        d = dir.path().display()
+    );
+    let path = dir.path().join("bad.toml");
+    std::fs::write(&path, toml_text).unwrap();
+    let err = Config::load(&path).unwrap_err();
+    assert!(err.contains("[upstream]"));
 }

@@ -130,8 +130,11 @@ One JSON object per line, append-only, fsynced. Envelope:
 - `data` — evidence for that step. Load-bearing fields:
   ARMED: `resolved_h`, `chain_id`, `mode`; SNAPSHOTTED: `cut_height`,
   `cut_block_id`, `snapshot_file`, `size_bytes`, `snapshot_wall_ms`;
-  VERIFIED: `sha256`, `fingerprints` (table → 16-hex-digit root),
-  `golden_mode` (`"verified"|"captured"|"none"`), `dual_import`;
+  VERIFIED (fork backend): `sha256`, `fingerprints` (table → 16-hex-digit
+  root), `golden_mode` (`"verified"|"captured"|"none"`), `dual_import`;
+  VERIFIED (`import_backend = "upstream"`): `verify_backend`, `sha256`,
+  `checkpoint`, `checkpoint_sha256`, `checkpoint_revision`, `table_compare`
+  (`"MATCH"` or `"not configured"`), `state_root`, `export_manifest`;
   IGNITED: `target_chain_id`, `target_head`; FLIPPED: `flip_cmd_output`,
   `health`; LIVE: `ceremony_gap_ms_wallclock`; `error` lines:
   `{"message": "<plain-words reason>", "detail": {…}}`.

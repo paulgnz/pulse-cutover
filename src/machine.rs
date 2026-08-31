@@ -12,6 +12,7 @@ use crate::{
     config::{
         Config,
         FreezeStrategy,
+        ImportBackend,
         Mode,
     },
     journal::{
@@ -21,6 +22,7 @@ use crate::{
     ops::ChainOps,
     scan,
     state::State,
+    upstream,
     verify,
 };
 
@@ -782,8 +784,123 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Ok(())
     }
 
+    /// SNAPSHOTTED (upstream backend): drive the official #61 pipeline —
+    /// export.sh (pinned Leap -> SHiP full-state log) -> xpr_import_check
+    /// (-> Arena checkpoint) — and verify with upstream's OWN tools:
+    /// xpr_19_table_compare (the gate) + xpr_state_fingerprint (the
+    /// journaled, golden-comparable whole-state root). Every artifact is
+    /// bound back to the ceremony's pinned cut (snapshot sha256, cut block
+    /// id, cut height). The fork importer is not part of verification here;
+    /// `[upstream] fork_audit = true` may journal it as a labeled dev extra.
+    fn step_snapshotted_upstream(&mut self) -> Result<(), String> {
+        let path = std::path::PathBuf::from(
+            self.snapshot_file.clone().expect("snapshot file recorded"),
+        );
+        let up = self.cfg.upstream.clone().expect("validated: upstream section");
+        let started = self.ops.now_ms();
+        let (sha256, file_size) = match verify::sha256_file(&path) {
+            Ok(v) => v,
+            Err(e) => {
+                self.abort("cannot hash cut snapshot", json!({"error": e}))?;
+                return Ok(());
+            }
+        };
+        if let Some(expected) = &self.cfg.snapshot.expected_sha256 {
+            if !sha256.eq_ignore_ascii_case(expected) {
+                self.abort(
+                    "snapshot sha256 mismatch vs ceremony manifest",
+                    json!({"computed": sha256, "expected": expected}),
+                )?;
+                return Ok(());
+            }
+        }
+        let cut_height = self.cut_height.expect("cut pinned");
+        let cut_block_id = self.cut_block_id.clone().expect("cut pinned");
+        let chain_id = self.chain_id.clone().unwrap_or_default();
+        let outcome = {
+            let journal = &mut self.journal;
+            upstream::run_pipeline(
+                &up,
+                self.ops,
+                &path,
+                &sha256,
+                cut_height,
+                &cut_block_id,
+                &chain_id,
+                |evidence| {
+                    let _ = journal.evidence(State::Snapshotted, evidence);
+                },
+            )
+        };
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                self.abort("upstream verification failed", json!({"error": e}))?;
+                return Ok(());
+            }
+        };
+        // Advisory stubbed-intrinsic scan of the actual cut (read-only audit
+        // over the deployed code objects; backend-independent).
+        self.advisory_scan(&path, State::Snapshotted)?;
+        // Dev/audit extra, clearly labeled and NEVER a gate: the fork
+        // importer's dual-arena fingerprints over the same cut.
+        if up.fork_audit {
+            match verify::verify_snapshot(&path, self.cfg.ceremony.import_cpu_scale) {
+                Ok(o) => {
+                    let roots: serde_json::Map<String, serde_json::Value> = o
+                        .roots
+                        .iter()
+                        .map(|(n, r)| (n.clone(), json!(format!("{r:016x}"))))
+                        .collect();
+                    self.journal.evidence(
+                        State::Snapshotted,
+                        json!({"fork_audit": {
+                            "note": "release-validation audit only — not an operator step, not a gate",
+                            "fingerprints": roots,
+                        }}),
+                    )?;
+                }
+                Err(e) => self.journal.evidence(
+                    State::Snapshotted,
+                    json!({"fork_audit_error": e, "advisory": true}),
+                )?,
+            }
+        }
+        self.sha256 = Some(sha256.clone());
+        self.state = State::Verified;
+        self.journal.transition(
+            State::Verified,
+            json!({
+                "verify_backend": "upstream (#61: export.sh -> xpr_import_check; gates: \
+                                   xpr_19_table_compare + manifest bindings)",
+                "sha256": sha256,
+                "size_bytes": file_size,
+                "chain_id": chain_id,
+                "cut_height": cut_height,
+                "cut_block_id": cut_block_id,
+                "ship_log": outcome.ship_log.display().to_string(),
+                "export_manifest": outcome.manifest_env,
+                "export_reused": outcome.export_reused,
+                "checkpoint": outcome.checkpoint_path.display().to_string(),
+                "checkpoint_sha256": outcome.checkpoint_sha256,
+                "checkpoint_revision": outcome.checkpoint_revision,
+                "table_compare": outcome
+                    .compare_stdout
+                    .as_deref()
+                    .map(|_| "MATCH")
+                    .unwrap_or("not configured"),
+                "state_root": outcome.state_root,
+                "verify_wall_ms": self.ops.now_ms() - started,
+            }),
+        )?;
+        Ok(())
+    }
+
     /// SNAPSHOTTED: verify — sha256, dual-import fingerprints, goldens.
     fn step_snapshotted(&mut self) -> Result<(), String> {
+        if self.cfg.ceremony.import_backend == ImportBackend::Upstream {
+            return self.step_snapshotted_upstream();
+        }
         let path = std::path::PathBuf::from(
             self.snapshot_file.clone().expect("snapshot file recorded"),
         );
@@ -916,6 +1033,21 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// VERIFIED: ignite the target and wait for it to present the source
     /// chain at the cut height.
     fn step_verified(&mut self) -> Result<(), String> {
+        // Upstream backend: igniting FROM the #61 checkpoint needs the
+        // checkpoint-consuming node, which only exists on the unmerged PR
+        // branch (migration genesis committing the checkpoint sha256 +
+        // node-config migration_checkpoint knobs). Verification is done and
+        // journaled; stop here with the precise remaining list rather than
+        // pretending the fork plugin could boot his checkpoint.
+        if self.cfg.ceremony.import_backend == ImportBackend::Upstream {
+            self.abort(
+                "upstream ignite pending MetalBlockchain/pulsevm#61 merge — verification \
+                 completed with the official tools; ignition from the checkpoint is not \
+                 yet available",
+                json!({"remaining": upstream::ignite_pending_reasons()}),
+            )?;
+            return Ok(());
+        }
         let started = self.ops.now_ms();
         let output = match self.ops.ignite() {
             Ok(o) => o,
