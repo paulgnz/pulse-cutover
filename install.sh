@@ -429,7 +429,9 @@ if $API_LIKE && [ -z "$STOP_CMD" ]; then
 # detected binary and its config/data path, then wait for it to exit.
 set -e
 PID=""
-for p in \$(pgrep -x nodeos 2>/dev/null || pgrep -f nodeos); do
+# Strictly comm == nodeos (exactly what doctor detected) — a cmdline-substring
+# fallback once matched an innocent process that merely MENTIONED the binary.
+for p in \$(pgrep -x nodeos 2>/dev/null || true); do
   cl=\$(tr '\\0' ' ' < "/proc/\$p/cmdline" 2>/dev/null || true)
   case "\$cl" in *"$NBIN"*"$NDISC"*|*"$NDISC"*"$NBIN"*|*"$NBIN"*) PID=\$p; break;; esac
 done
