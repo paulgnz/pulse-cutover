@@ -775,6 +775,8 @@ config format.
 
 ## Upstream alignment
 
+> **Cross-validated:** the two verification stacks agree in practice — upstream's #61 pipeline and this project's importer were run against the same XPR testnet snapshot and produced byte-identical state (including row order) on every table both carry, measured with upstream's own `xpr_state_fingerprint` / `xpr_19_table_compare` ([results](https://github.com/MetalBlockchain/pulsevm/pull/61#issuecomment-5485633926)). Verifying with either toolchain is verifying against the same ground truth.
+
 Metallicus is building the node-side migration path in
 [MetalBlockchain/pulsevm#61](https://github.com/MetalBlockchain/pulsevm/pull/61)
 (Chainbase→Arena conversion via a pinned Leap node's SHiP full-state export)
