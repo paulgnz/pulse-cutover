@@ -75,6 +75,29 @@ pub struct NodeosInfo {
     pub config_dir: Option<String>,
     /// kubelet runs on this host — nodeos may be kube-managed.
     pub host_kubelet: bool,
+    // ---- script-managed detection (native nodeos with NO systemd unit —
+    // the classic Antelope BP pattern: a start script under screen/tmux/
+    // nohup/cron, config.ini at some /opt path, logs to stderr.txt) ----
+    /// How the unit-less native nodeos appears to be managed, classified
+    /// from the parent process chain: "screen" | "tmux" | "cron" |
+    /// "shell script (<shell>)" | "orphaned (nohup/setsid — parent is init)".
+    pub script_manager: Option<String>,
+    /// comm names of the ancestor processes, nearest parent first, up to
+    /// (and excluding) pid 1 — the raw evidence behind `script_manager`.
+    pub parent_chain: Vec<String>,
+    /// Full command line of the native nodeos process (the stop script
+    /// install.sh generates matches THIS exact process).
+    pub cmdline: Option<String>,
+    /// --data-dir (or -d) from the command line.
+    pub data_dir: Option<String>,
+    /// Resolved config file: --config, or --config-dir + "/config.ini".
+    pub config_path: Option<String>,
+    /// Working directory of the process (relative --config-dir/--data-dir
+    /// resolve against this).
+    pub cwd: Option<String>,
+    /// Where the process's stdout/stderr actually go, when they are regular
+    /// files (tn1 pattern: a start script redirecting to stderr.txt).
+    pub stdio_log: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -734,6 +757,51 @@ pub fn parse_ss_listeners(text: &str) -> Vec<(u16, Option<String>)> {
     out
 }
 
+/// Classify how a unit-less native nodeos is managed from the comm names of
+/// its ancestor processes (nearest parent first, pid 1 excluded).
+///
+/// The classic Antelope BP patterns, in the order we discriminate them:
+/// a screen/tmux session, a cron job, a plain shell script still holding the
+/// child, or an orphan re-parented to init (nohup/setsid/`script.sh &` +
+/// logout). The raw chain is always reported next to the classification so
+/// an operator can dispute it.
+pub fn classify_parent_chain(chain: &[String]) -> Option<String> {
+    let lower: Vec<String> = chain.iter().map(|c| c.to_lowercase()).collect();
+    if lower.iter().any(|c| c.contains("screen")) {
+        return Some("screen".into());
+    }
+    if lower.iter().any(|c| c.starts_with("tmux")) {
+        return Some("tmux".into());
+    }
+    if lower.iter().any(|c| c.contains("cron")) {
+        return Some("cron".into());
+    }
+    match lower.first().map(String::as_str) {
+        // Direct child of init: the launcher (nohup ./start.sh &, setsid,
+        // an rc.local one-shot, an exited wrapper script) is gone.
+        None => Some("orphaned (nohup/setsid — parent is init; started by a script that has exited)".into()),
+        Some(shell) if matches!(shell, "bash" | "sh" | "dash" | "zsh" | "ksh") => {
+            Some(format!("shell script ({})", chain[0]))
+        }
+        Some(other) if matches!(other, "sudo" | "su" | "sshd" | "login") => {
+            Some(format!("interactive session ({})", chain[0]))
+        }
+        Some(_) => Some(format!("under `{}`", chain[0])),
+    }
+}
+
+/// Resolve a possibly-relative path from a process command line against the
+/// process's working directory.
+pub fn resolve_against_cwd(path: &str, cwd: Option<&str>) -> String {
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    match cwd {
+        Some(dir) => format!("{}/{path}", dir.trim_end_matches('/')),
+        None => path.to_string(),
+    }
+}
+
 // ------------------------------------------------------------ verdicts --
 
 const RAM_MIN_API_MB: u64 = 7_500;
@@ -746,10 +814,10 @@ pub fn compute_verdicts(r: &DoctorReport) -> BTreeMap<String, Verdict> {
         let mut needs: Vec<String> = Vec::new();
         let mut unsupported: Vec<String> = Vec::new();
 
-        // OS gate: install.sh pins Ubuntu 22.04/24.04.
+        // OS gate: install.sh pins Ubuntu 20.04/22.04/24.04.
         if !r.host.os_supported {
             unsupported.push(format!(
-                "OS is {} {} — install.sh currently supports Ubuntu 22.04/24.04 only; \
+                "OS is {} {} — install.sh currently supports Ubuntu 20.04/22.04/24.04 only; \
                  run `pulse-cutover report` and share the bundle so we learn what to support next",
                 r.host.os, r.host.os_version
             ));
@@ -910,11 +978,23 @@ pub fn compute_verdicts(r: &DoctorReport) -> BTreeMap<String, Verdict> {
                 && r.nodeos.runtime == "native"
                 && r.nodeos.systemd_units.is_empty()
             {
-                needs.push(
-                    "api mode retires nodeos AFTER the flip: no systemd unit detected for \
-                     the native nodeos, so source.stop_cmd must be declared in the manifest"
-                        .into(),
-                );
+                match &r.nodeos.script_manager {
+                    // Script-managed: the STOP side is derivable (graceful
+                    // SIGTERM to the exact pid — install.sh generates it);
+                    // only the START side needs the operator's own script,
+                    // and only for abort rollback.
+                    Some(mgr) => needs.push(format!(
+                        "source.start_cmd in the manifest — nodeos is script-managed \
+                         (parent: {mgr}): install.sh derives a graceful stop (SIGTERM to the \
+                         exact detected process + wait-for-exit), but only YOUR start script \
+                         can bring nodeos back if the ceremony aborts after the stop"
+                    )),
+                    None => needs.push(
+                        "api mode retires nodeos AFTER the flip: no systemd unit detected for \
+                         the native nodeos, so source.stop_cmd must be declared in the manifest"
+                            .into(),
+                    ),
+                }
             }
         }
 
@@ -1018,7 +1098,7 @@ pub fn survey() -> DoctorReport {
         r.host.os_version = sh("sw_vers -productVersion 2>/dev/null").unwrap_or_default();
     }
     r.host.os_supported = r.host.os.to_lowercase().contains("ubuntu")
-        && matches!(r.host.os_version.as_str(), "22.04" | "24.04");
+        && matches!(r.host.os_version.as_str(), "20.04" | "22.04" | "24.04");
     r.host.kernel = sh("uname -sr").unwrap_or_default();
     r.host.arch = sh("uname -m").unwrap_or_default();
     r.host.cpu_cores = sh("nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null")
@@ -1129,8 +1209,32 @@ fn survey_nodeos(r: &mut DoctorReport) {
             n.detected = true;
             n.runtime = "native".into();
             let cmdline = line.to_string();
+            // Everything after the pid column is the command line the stop
+            // script will have to re-identify this process by.
+            n.cmdline = cmdline
+                .split_once(char::is_whitespace)
+                .map(|(_, rest)| rest.trim().to_string());
+            n.cwd = n
+                .pid
+                .and_then(|pid| sh(&format!("readlink /proc/{pid}/cwd 2>/dev/null")))
+                .map(|s| s.trim().to_string());
             if let Some(cfg) = arg_value(&cmdline, "--config-dir") {
                 n.config_dir = Some(cfg);
+            }
+            n.config_path = arg_value(&cmdline, "--config")
+                .or_else(|| n.config_dir.as_ref().map(|d| format!("{}/config.ini", d.trim_end_matches('/'))))
+                .map(|p| resolve_against_cwd(&p, n.cwd.as_deref()));
+            n.data_dir = arg_value(&cmdline, "--data-dir")
+                .or_else(|| arg_value(&cmdline, "-d"))
+                .map(|p| resolve_against_cwd(&p, n.cwd.as_deref()));
+            // Where do this process's stdout/stderr land? A script-managed
+            // nodeos typically redirects them to a file (tn1: stderr.txt).
+            if let Some(pid) = n.pid {
+                n.stdio_log = ["2", "1"].iter().find_map(|fd| {
+                    sh(&format!("readlink /proc/{pid}/fd/{fd} 2>/dev/null"))
+                        .map(|s| s.trim().to_string())
+                        .filter(|t| t.starts_with('/') && !t.starts_with("/dev/"))
+                });
             }
             n.state_history = Some(
                 cmdline.contains("state_history_plugin")
@@ -1224,6 +1328,32 @@ fn survey_nodeos(r: &mut DoctorReport) {
                 }
             }
         }
+    }
+
+    // Script-managed detection: a native nodeos with NO systemd unit is the
+    // classic Antelope BP pattern (started by a script under screen/tmux/
+    // nohup/cron). Walk the parent chain and classify HOW it is managed so
+    // the report says "script-managed (parent: screen)" instead of just "-".
+    if n.runtime == "native" && n.systemd_units.is_empty() {
+        if let Some(pid) = n.pid {
+            let mut cur = pid;
+            for _ in 0..12 {
+                let ppid: u32 = match sh(&format!("ps -o ppid= -p {cur} 2>/dev/null"))
+                    .and_then(|s| s.trim().parse().ok())
+                {
+                    Some(p) => p,
+                    None => break,
+                };
+                if ppid <= 1 {
+                    break;
+                }
+                if let Some(comm) = sh(&format!("ps -o comm= -p {ppid} 2>/dev/null")) {
+                    n.parent_chain.push(comm.trim().to_string());
+                }
+                cur = ppid;
+            }
+        }
+        n.script_manager = classify_parent_chain(&n.parent_chain);
     }
 
     // Chain API probe: detected address, else the default.
@@ -1577,6 +1707,29 @@ pub fn render_human(r: &DoctorReport) -> String {
             _ => "answering on the API but process not identified".into(),
         });
         line(&mut o, "systemd unit(s)", &if r.nodeos.systemd_units.is_empty() { "-".into() } else { r.nodeos.systemd_units.join(", ") });
+        if let Some(mgr) = &r.nodeos.script_manager {
+            line(
+                &mut o,
+                "managed",
+                &format!(
+                    "script-managed (parent: {mgr}{})",
+                    if r.nodeos.parent_chain.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; chain: {} -> init", r.nodeos.parent_chain.join(" -> "))
+                    }
+                ),
+            );
+            if let Some(cfg) = &r.nodeos.config_path {
+                line(&mut o, "config", cfg);
+            }
+            if let Some(d) = &r.nodeos.data_dir {
+                line(&mut o, "data dir", d);
+            }
+            if let Some(l) = &r.nodeos.stdio_log {
+                line(&mut o, "stdout/stderr", l);
+            }
+        }
         line(&mut o, "chain api", &opt(&r.nodeos.chain_api_url));
         line(&mut o, "version", &opt(&r.nodeos.server_version_string));
         line(&mut o, "chain_id", &opt(&r.nodeos.chain_id));
@@ -1919,6 +2072,75 @@ LISTEN 0      4096   *:9650          *:*"#;
         let v = compute_verdicts(&r);
         assert_eq!(v["api"].status, "NEEDS");
         assert!(v["api"].needs.iter().any(|n| n.contains("stop_cmd")));
+    }
+
+    #[test]
+    fn verdict_script_managed_nodeos_softens_to_start_cmd_only() {
+        // tn1 pattern: native nodeos, no unit, but the parent chain told us
+        // HOW it is managed — the stop side is derivable, so the need is
+        // only the operator's start script (for abort rollback).
+        let mut r = ready_report();
+        r.nodeos.runtime = "native".into();
+        r.nodeos.container_name = None;
+        r.nodeos.systemd_units = vec![];
+        r.nodeos.parent_chain = vec!["bash".into(), "screen".into()];
+        r.nodeos.script_manager = classify_parent_chain(&r.nodeos.parent_chain);
+        let v = compute_verdicts(&r);
+        assert_eq!(v["api"].status, "NEEDS");
+        let need = v["api"]
+            .needs
+            .iter()
+            .find(|n| n.contains("script-managed"))
+            .expect("script-managed need");
+        assert!(need.contains("start_cmd"));
+        assert!(need.contains("screen"));
+        assert!(!v["api"].needs.iter().any(|n| n.contains("stop_cmd must be declared")));
+        // bp mode never stops nodeos — unchanged READY.
+        assert_eq!(v["bp"].status, "READY");
+    }
+
+    #[test]
+    fn parent_chain_classification_covers_the_classic_bp_patterns() {
+        let c = |v: &[&str]| classify_parent_chain(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        // screen/tmux anywhere in the chain win (the shell under them is detail).
+        assert_eq!(c(&["bash", "SCREEN"]), Some("screen".into()));
+        assert_eq!(c(&["bash", "tmux: server"]), Some("tmux".into()));
+        // cron-launched.
+        assert_eq!(c(&["sh", "cron"]), Some("cron".into()));
+        // A shell still holding the child (operator ran ./start.sh in an
+        // interactive session that is still open).
+        assert_eq!(c(&["bash", "sshd"]), Some("shell script (bash)".into()));
+        // Orphan re-parented to init: nohup/setsid/& + logout, or rc.local.
+        assert_eq!(
+            c(&[]),
+            Some("orphaned (nohup/setsid — parent is init; started by a script that has exited)".into())
+        );
+        // Direct child of an ssh session (no wrapper shell fork).
+        assert_eq!(c(&["sshd"]), Some("interactive session (sshd)".into()));
+        // Anything else is reported, not guessed at.
+        assert_eq!(c(&["supervisord"]), Some("under `supervisord`".into()));
+    }
+
+    #[test]
+    fn os_gate_accepts_focal_jammy_noble_only() {
+        for (ver, ok) in [("20.04", true), ("22.04", true), ("24.04", true), ("18.04", false)] {
+            let mut r = ready_report();
+            r.host.os_version = ver.into();
+            r.host.os_supported = r.host.os.to_lowercase().contains("ubuntu")
+                && matches!(ver, "20.04" | "22.04" | "24.04");
+            let v = compute_verdicts(&r);
+            assert_eq!(v["api"].status == "READY", ok, "version {ver}");
+            if !ok {
+                assert!(v["api"].unsupported[0].contains("20.04/22.04/24.04"));
+            }
+        }
+    }
+
+    #[test]
+    fn cwd_resolution_for_relative_config_paths() {
+        assert_eq!(resolve_against_cwd("/opt/x/config.ini", Some("/home/u")), "/opt/x/config.ini");
+        assert_eq!(resolve_against_cwd("cfg/config.ini", Some("/opt/nodeos/")), "/opt/nodeos/cfg/config.ini");
+        assert_eq!(resolve_against_cwd("cfg/config.ini", None), "cfg/config.ini");
     }
 
     #[test]

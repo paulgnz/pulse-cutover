@@ -11,7 +11,7 @@ someone has shown it. That someone is you.
 The [Start here walkthrough](README.md#start-here--the-operator-walkthrough)
 in the README, end to end:
 
-1. a spare Ubuntu 22.04/24.04 box (or any box you're happy to experiment on)
+1. a spare Ubuntu 20.04/22.04/24.04 box (or any box you're happy to experiment on)
    with a synced testnet nodeos;
 2. `pulse-cutover doctor` — the read-only survey (safe to run anywhere,
    including production; that alone is a useful data point for us);
@@ -75,7 +75,7 @@ as useful as hand-driven ones; mention it was agent-driven in the issue.
 > **Help us test the XPR → PulseVM cutover tooling.**
 > pulse-cutover rehearses the whole migration on YOUR setup — same URL, same
 > chain_id, zero read downtime — without touching production. What it takes:
-> a spare Ubuntu 22.04/24.04 box with a testnet nodeos, ~40 minutes, and the
+> a spare Ubuntu 20.04/22.04/24.04 box with a testnet nodeos, ~40 minutes, and the
 > walkthrough at https://github.com/paulgnz/pulse-cutover#start-here--the-operator-walkthrough
 > 1. `pulse-cutover doctor` — read-only survey, tells you if your box is READY
 > 2. `./install.sh --mode api --manifest ceremony.json` — stages everything (ask here for the rehearsal bundle)
