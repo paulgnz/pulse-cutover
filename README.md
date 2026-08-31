@@ -773,6 +773,31 @@ config format.
 
 ---
 
+## Upstream alignment
+
+Metallicus is building the node-side migration path in
+[MetalBlockchain/pulsevm#61](https://github.com/MetalBlockchain/pulsevm/pull/61)
+(Chainbase→Arena conversion via a pinned Leap node's SHiP full-state export)
+and its companion PRs. pulse-cutover is the operator ceremony *around* a
+migration, so the two stacks map onto each other rather than competing:
+
+| Upstream (#61 branch) | pulse-cutover | Relationship |
+|---|---|---|
+| `tools/xpr-chainbase-export/export.sh` (nodeos→SHiP full-state export) | freeze + snapshot stages (nodeos `create_snapshot` → portable `.bin`) | Two independent input paths into Arena — cross-checkable |
+| `xpr_state_fingerprint` / `xpr_19_table_compare` (whole-state root + per-table SHA-256) | `verify` — dual fresh-arena import + 19-table `DefaultHasher` goldens | Same goal, independent implementations; agreement between them is the strongest correctness signal |
+| `host-function-audit.sh` (Leap registry ↔ PulseVM import map, source-based) | `scan-contracts` (wasm imports of every *deployed* code object vs the served set) | Complementary: theirs finds surface gaps, ours finds real-world exposure |
+| five-node runner / EC2 scripts | ignite + flip + hyperion federation (endpoint keeps its memory) | Upstream boots the network; the ceremony keeps operators' public surfaces alive across the cut |
+
+Preference order: **once #61 merges, the upstream tool is the canonical
+verifier.** The `[snapshot] upstream_fingerprint_bin` knob runs an
+`xpr_state_fingerprint`-compatible binary at verify time alongside (never
+replacing) our 19-table check and journals both reports; a missing binary is
+a clean journaled no-op, so configs can carry the knob today. Until #61
+ships, `scan-contracts` and our fingerprint goldens remain the fallback —
+and afterwards they stay on as the independent second opinion.
+
+---
+
 ## Reproduce our results
 
 The recorded numbers (22/22 api-mode loop runs LIVE, 99.8% read availability,

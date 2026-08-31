@@ -238,6 +238,23 @@ pub struct Snapshot {
     /// filename pins it to H's block id.
     #[serde(default)]
     pub dir: Option<PathBuf>,
+    /// Upstream alignment (MetalBlockchain/pulsevm#61): optional path to an
+    /// `xpr_state_fingerprint`-compatible binary — upstream's canonical
+    /// verification tool (whole-state root + per-table SHA-256 report). When
+    /// set and the binary exists, it runs at verify time ALONGSIDE (never
+    /// replacing) the 19-table fingerprint check, and its report is journaled
+    /// next to ours. When unset — or set but absent on this box — the step is
+    /// a journaled no-op: #61 is not merged yet, so absence is the normal
+    /// case. Advisory, never a gate; once the tool ships upstream it becomes
+    /// the preferred cross-implementation check.
+    #[serde(default)]
+    pub upstream_fingerprint_bin: Option<PathBuf>,
+    /// Arguments for the upstream fingerprint binary. `{snapshot}` expands to
+    /// the verified snapshot file, `{staged}` to `staged_path`. Defaults to
+    /// `["{snapshot}"]`; set explicitly to match the merged tool's final CLI
+    /// (currently `<checkpoint> <arena-directory>` on the #61 branch).
+    #[serde(default)]
+    pub upstream_fingerprint_args: Option<Vec<String>>,
 }
 
 /// hyperion mode (api mode + `[hyperion]`): /v2 history continuity across

@@ -997,3 +997,56 @@ fn hydration_predicate_accepts_idle_at_cut_indexer_warning() {
     ]});
     assert!(hyperion_hydrated(&es_down, 401579371, 0).is_none());
 }
+
+/// Upstream alignment knob (MetalBlockchain/pulsevm#61): when an
+/// `xpr_state_fingerprint`-compatible binary is configured and present, the
+/// VERIFIED journal entry carries its report next to our fingerprints; when
+/// the binary is missing the ceremony proceeds and the skip is journaled.
+#[test]
+fn upstream_fingerprint_runs_alongside_ours_and_noops_when_missing() {
+    // Present: a fake tool emitting the #61 report format.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("xpr_state_fingerprint");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho revision 9\necho state_root cafef00d\necho \"table account bytes=1 sha256=ab\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut cfg = test_config(dir.path(), 120);
+    cfg.snapshot.upstream_fingerprint_bin = Some(script.clone());
+    let ops = MockOps::new(dir.path(), 110);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let verified: serde_json::Value = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .find(|v: &serde_json::Value| v["state"] == "VERIFIED" && v["kind"] == "transition")
+        .unwrap();
+    let upstream = &verified["data"]["upstream_fingerprint"];
+    assert_eq!(upstream["status"], "ran");
+    assert_eq!(upstream["state_root"], "cafef00d");
+    // Ours still ran too — never replaced.
+    assert!(verified["data"]["fingerprints"]["account"].is_string());
+
+    // Missing: same ceremony, binary absent — clean journaled no-op.
+    let dir2 = tempfile::tempdir().unwrap();
+    let mut cfg2 = test_config(dir2.path(), 120);
+    cfg2.snapshot.upstream_fingerprint_bin = Some(dir2.path().join("not-built-yet"));
+    let ops2 = MockOps::new(dir2.path(), 110);
+    assert_eq!(run_machine(&cfg2, &ops2), State::Live);
+    let text2 = std::fs::read_to_string(&cfg2.journal_path).unwrap();
+    let verified2: serde_json::Value = text2
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .find(|v: &serde_json::Value| v["state"] == "VERIFIED" && v["kind"] == "transition")
+        .unwrap();
+    assert_eq!(
+        verified2["data"]["upstream_fingerprint"]["status"],
+        "skipped_missing_binary"
+    );
+}

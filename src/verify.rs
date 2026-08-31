@@ -231,3 +231,173 @@ pub fn format_goldens(outcome: &VerifyOutcome, cpu_scale: u64) -> String {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Upstream alignment (MetalBlockchain/pulsevm#61): the official
+// `xpr_state_fingerprint` tool, run alongside our 19-table check.
+// ---------------------------------------------------------------------------
+
+/// Result of attempting the upstream fingerprint tool. Always journaled;
+/// never a ceremony gate (the tool is optional until #61 merges, and its
+/// report format may still move — we record what it said, verbatim, next to
+/// our own fingerprints so the two are comparable after the fact).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UpstreamFingerprint {
+    /// "ran" | "skipped_missing_binary" | "failed"
+    pub status: String,
+    pub bin: String,
+    pub args: Vec<String>,
+    pub exit_code: Option<i32>,
+    /// Parsed `state_root <hex>` line, if the tool printed one.
+    pub state_root: Option<String>,
+    /// Parsed `table <name> bytes=N sha256=<hex>` lines.
+    pub tables: Vec<(String, String)>,
+    /// Raw stdout+stderr, truncated — the journal is the evidence log.
+    pub output: String,
+}
+
+const UPSTREAM_OUTPUT_CAP: usize = 16 * 1024;
+
+/// Parse the report format the #61-branch tool prints (`revision N`,
+/// `state_root <hex>`, `table <name> bytes=N sha256=<hex>`). Unknown lines
+/// are ignored — the raw output is kept anyway.
+pub fn parse_upstream_report(stdout: &str) -> (Option<String>, Vec<(String, String)>) {
+    let mut state_root = None;
+    let mut tables = Vec::new();
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("state_root") => {
+                if let Some(v) = parts.next() {
+                    state_root = Some(v.to_string());
+                }
+            }
+            Some("table") => {
+                let name = parts.next();
+                let sha = parts.find_map(|p| p.strip_prefix("sha256="));
+                if let (Some(name), Some(sha)) = (name, sha) {
+                    tables.push((name.to_string(), sha.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    (state_root, tables)
+}
+
+/// Run the configured upstream fingerprint binary on the verified snapshot /
+/// staged state. `{snapshot}` and `{staged}` placeholders in the args expand
+/// to the respective paths; with no args configured the snapshot path is
+/// passed alone. A missing binary is a clean, journaled no-op — #61 is not
+/// merged yet, so most boxes will not have the tool. Failure is recorded but
+/// deliberately not a gate: our own 19-table check remains the binding one
+/// until the upstream tool is the canonical release artifact.
+pub fn run_upstream_fingerprint(
+    bin: &Path,
+    args: &Option<Vec<String>>,
+    snapshot: &Path,
+    staged: &Path,
+) -> UpstreamFingerprint {
+    let expand = |a: &str| {
+        a.replace("{snapshot}", &snapshot.display().to_string())
+            .replace("{staged}", &staged.display().to_string())
+    };
+    let argv: Vec<String> = match args {
+        Some(list) => list.iter().map(|a| expand(a)).collect(),
+        None => vec![snapshot.display().to_string()],
+    };
+    let mut result = UpstreamFingerprint {
+        status: String::new(),
+        bin: bin.display().to_string(),
+        args: argv.clone(),
+        exit_code: None,
+        state_root: None,
+        tables: Vec::new(),
+        output: String::new(),
+    };
+    if !bin.exists() {
+        result.status = "skipped_missing_binary".into();
+        return result;
+    }
+    match std::process::Command::new(bin).args(&argv).output() {
+        Ok(out) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.trim().is_empty() {
+                text.push_str("\n[stderr]\n");
+                text.push_str(stderr.trim());
+            }
+            text.truncate(UPSTREAM_OUTPUT_CAP);
+            result.exit_code = out.status.code();
+            let (root, tables) = parse_upstream_report(&text);
+            result.state_root = root;
+            result.tables = tables;
+            result.output = text;
+            result.status = if out.status.success() { "ran" } else { "failed" }.into();
+        }
+        Err(e) => {
+            result.status = "failed".into();
+            result.output = format!("spawn failed: {e}");
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod upstream_tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_pr61_report_format() {
+        let out = "revision 42\nstate_root ab12cd\ntable account bytes=10 sha256=deadbeef\ntable code bytes=0 sha256=00ff\nnoise line\n";
+        let (root, tables) = parse_upstream_report(out);
+        assert_eq!(root.as_deref(), Some("ab12cd"));
+        assert_eq!(
+            tables,
+            vec![
+                ("account".to_string(), "deadbeef".to_string()),
+                ("code".to_string(), "00ff".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_binary_is_a_clean_noop() {
+        let r = run_upstream_fingerprint(
+            Path::new("/nonexistent/xpr_state_fingerprint"),
+            &None,
+            Path::new("/tmp/snap.bin"),
+            Path::new("/tmp/staged.bin"),
+        );
+        assert_eq!(r.status, "skipped_missing_binary");
+        assert_eq!(r.exit_code, None);
+    }
+
+    #[test]
+    fn runs_a_compatible_binary_and_journals_its_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-fingerprint.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho revision 7\necho state_root feedface\necho \"table permission bytes=3 sha256=aa55\"\necho \"args: $@\" >&2\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let r = run_upstream_fingerprint(
+            &script,
+            &Some(vec!["{snapshot}".into(), "extra".into()]),
+            Path::new("/data/cut.bin"),
+            Path::new("/data/staged.bin"),
+        );
+        assert_eq!(r.status, "ran");
+        assert_eq!(r.exit_code, Some(0));
+        assert_eq!(r.state_root.as_deref(), Some("feedface"));
+        assert_eq!(r.tables, vec![("permission".to_string(), "aa55".to_string())]);
+        assert_eq!(r.args, vec!["/data/cut.bin".to_string(), "extra".to_string()]);
+        assert!(r.output.contains("args: /data/cut.bin extra"));
+    }
+}

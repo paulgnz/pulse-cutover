@@ -62,6 +62,12 @@ path_map_to = "/root/cutover-rehearsal/nodeos-data/snapshots"
 # golden_roots = "/root/cutover-rehearsal/golden-roots.txt"
 # First node / rehearsal: capture the fingerprints (with provenance) instead:
 capture_roots = "/root/cutover-rehearsal/captured-roots.txt"
+# Upstream alignment (MetalBlockchain/pulsevm#61): once the official
+# `xpr_state_fingerprint` tool ships, point at it here and it runs at verify
+# time alongside our 19-table check — both reports land in the journal.
+# Missing binary = clean journaled no-op; advisory, never a gate.
+# upstream_fingerprint_bin = "/usr/local/bin/xpr_state_fingerprint"
+# upstream_fingerprint_args = ["{snapshot}"]   # {snapshot}/{staged} expand to paths
 
 [target]
 metalgo_unit = "metalgo-cutover"     # systemd unit of the PulseVM node

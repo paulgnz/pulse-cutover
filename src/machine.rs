@@ -865,6 +865,23 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // contracts reference host functions PulseVM stubs. Journaled table,
         // never a gate.
         self.advisory_scan(&path, State::Snapshotted)?;
+        // Upstream alignment (MetalBlockchain/pulsevm#61): if the official
+        // `xpr_state_fingerprint` tool is staged on this box, run it alongside
+        // our 19-table check and journal its report verbatim next to ours.
+        // Advisory, never a gate; a missing binary is a journaled no-op.
+        let upstream_fingerprint = self
+            .cfg
+            .snapshot
+            .upstream_fingerprint_bin
+            .as_ref()
+            .map(|bin| {
+                verify::run_upstream_fingerprint(
+                    bin,
+                    &self.cfg.snapshot.upstream_fingerprint_args,
+                    &path,
+                    &self.cfg.snapshot.staged_path,
+                )
+            });
         self.sha256 = Some(outcome.sha256.clone());
         self.state = State::Verified;
         let roots: serde_json::Map<String, serde_json::Value> = outcome
@@ -872,9 +889,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             .iter()
             .map(|(n, r)| (n.clone(), json!(format!("{r:016x}"))))
             .collect();
-        self.journal.transition(
-            State::Verified,
-            json!({
+        let mut verified_payload = json!({
                 "sha256": outcome.sha256,
                 "size_bytes": outcome.file_size,
                 "chain_id": outcome.chain_id,
@@ -889,8 +904,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "accounts": outcome.report.accounts,
                 "code_objects": outcome.report.code_objects,
                 "permissions": outcome.report.permissions.written,
-            }),
-        )?;
+        });
+        if let Some(upstream) = &upstream_fingerprint {
+            verified_payload["upstream_fingerprint"] = serde_json::to_value(upstream)
+                .unwrap_or_else(|_| json!({"status": "serialize_error"}));
+        }
+        self.journal.transition(State::Verified, verified_payload)?;
         Ok(())
     }
 
