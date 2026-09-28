@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Tests (state machine, doctor, verify, scan, upstream mode)
+        run: cargo test --locked
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Shell syntax
+        run: |
+          bash -n install.sh
+          bash -n cutover.sh
+          for f in $(git ls-files '*.sh'); do bash -n "$f"; done
+      - name: Node syntax (federator)
+        run: for f in $(git ls-files 'federator/*.js' 'examples/*.mjs'); do node --check "$f"; done
+      - name: Native /v1/chain pass-through (extracted from install.sh)
+        run: |
+          awk "/cat > \/opt\/pulse-gateway\/server.js <<'JS'/{f=1;next} /^JS$/{f=0} f" install.sh > native.js
+          node --check native.js
+          node -e "require('http').createServer((q,r)=>{r.writeHead(200,{'content-type':'application/json'});r.end(JSON.stringify({path:q.url,host:q.headers.host}))}).listen(19650,'127.0.0.1')" &
+          NATIVE_BASE=http://127.0.0.1:19650/ext/bc/TESTBID PORT=18899 node native.js &
+          sleep 1
+          out=$(curl -s -X POST http://127.0.0.1:18899/v1/chain/get_info -d '{}')
+          echo "$out"
+          echo "$out" | grep -q '"path":"/ext/bc/TESTBID/v1/chain/get_info"'
+          echo "$out" | grep -q '"host":"localhost"'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18899/rpc)" = 404

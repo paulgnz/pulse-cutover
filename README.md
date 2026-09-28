@@ -641,6 +641,15 @@ VERDICTS
             ceremony flips the edge your users actually reach
 ```
 
+### `/v1/chain`: legacy gateway or native
+
+API mode puts something on `127.0.0.1:8899` for the public `/v1` route to flip to. Which one is set by `gateway.mode` in the manifest:
+
+- **`legacy`** (default): the translating gateway from `artifacts.gateway`, which turns nodeos-style `/v1/chain/*` calls into `pulsevm.*` JSON-RPC. Needed for PulseVM builds without the in-node API, including v0.7.1.
+- **`native`**: for PulseVM builds that serve nodeos-style `/v1/chain` themselves (MetalBlockchain/pulsevm #98, at `/ext/bc/<BID>/v1/chain/`). The installer writes a dependency-free pass-through to port 8899 that forwards `/v1/chain/*` to the node with `Host: localhost` for metalgo's host check. No translation happens; `artifacts.gateway` is not needed.
+
+The flip and revert are identical in both modes: the public route swaps its backend to `127.0.0.1:8899`.
+
 ### `install.sh` internals
 
 `install.sh` runs **doctor first** and consumes its JSON:
@@ -698,6 +707,7 @@ else = ABORTED with the journal path (the source chain is still authoritative).
                  "plugin":  {"url": "…", "sha256": "…"},
                  "metalgo": {"url": "…", "sha256": "…"},
                  "gateway": {"url": "…", "sha256": "…"} },
+  "gateway": { "mode": "legacy" },
   "paths": { "work_dir": "/root/api-cutover" }
 }
 ```

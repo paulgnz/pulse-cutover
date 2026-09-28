@@ -538,13 +538,47 @@ systemctl enable --now metalgo-pulse >/dev/null 2>&1
 if $API_LIKE; then
   ensure_node
   mkdir -p /opt/pulse-gateway
-  fetch_verify "$(mget '.artifacts.gateway.url')" "$(mget '.artifacts.gateway.sha256')" /opt/pulse-gateway/server.js
+  # manifest .gateway.mode:
+  #   "legacy" (default) — the /v1/chain -> pulsevm.* translating gateway
+  #            (artifacts.gateway), for PulseVM builds without the in-node API.
+  #   "native" — PulseVM builds that serve nodeos-style /v1/chain themselves
+  #            (MetalBlockchain/pulsevm #98) at /ext/bc/<BID>/v1/chain/. A
+  #            dependency-free pass-through on the same port forwards to it,
+  #            so the flip/revert machinery below is unchanged.
+  GW_MODE=$(mget_opt '.gateway.mode'); GW_MODE=${GW_MODE:-legacy}
+  case "$GW_MODE" in
+    legacy)
+      fetch_verify "$(mget '.artifacts.gateway.url')" "$(mget '.artifacts.gateway.sha256')" /opt/pulse-gateway/server.js
+      GW_DESC="PulseVM /v1/chain REST compatibility gateway (translating)";;
+    native)
+      cat > /opt/pulse-gateway/server.js <<'JS'
+// pulse-cutover native pass-through: forwards /v1/chain/* to the PulseVM
+// node's own nodeos-compatible API. No translation; no dependencies.
+const http = require('http');
+const target = new URL(process.env.NATIVE_BASE); // http://127.0.0.1:9650/ext/bc/<BID>
+const port = Number(process.env.PORT || 8899);
+http.createServer((req, res) => {
+  if (!req.url.startsWith('/v1/chain/')) { res.writeHead(404, {'content-type': 'application/json'}); return res.end('{"code":404,"message":"not found"}'); }
+  const up = http.request({
+    host: target.hostname, port: target.port || 80, method: req.method,
+    path: target.pathname.replace(/\/$/, '') + req.url,
+    headers: { ...req.headers, host: 'localhost' }, // metalgo's host guard
+  }, (r) => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
+  up.on('error', (e) => { res.writeHead(502, {'content-type': 'application/json'}); res.end(JSON.stringify({code: 502, message: String(e.message)})); });
+  req.pipe(up);
+}).listen(port, '127.0.0.1');
+JS
+      GW_DESC="PulseVM /v1/chain native pass-through";;
+    *) echo "ABORT: manifest gateway.mode must be \"legacy\" or \"native\" (got \"$GW_MODE\")"; exit 1;;
+  esac
+  echo "gateway mode: $GW_MODE"
   cat > /etc/systemd/system/pulse-gateway.service <<UNIT
 [Unit]
-Description=PulseVM /v1/chain REST compatibility gateway
+Description=$GW_DESC
 After=network.target
 [Service]
 Environment=UPSTREAM=http://127.0.0.1:9650/ext/bc/$BID/rpc
+Environment=NATIVE_BASE=http://127.0.0.1:9650/ext/bc/$BID
 Environment=PORT=8899
 ExecStart=$(command -v node) /opt/pulse-gateway/server.js
 Restart=always

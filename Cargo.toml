@@ -16,12 +16,16 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex = "1"
 wasmparser = "0.245"
 
-# The snapshot/fingerprint stack, straight from the arena-import workspace.
-# Convention: pulse-cutover and pulsevm-arena-import are sibling checkouts
-# (~/dev/... on dev boxes, /root/... on servers).
-pulsevm_snapshot = { git = "https://github.com/paulgnz/pulsevm", branch = "feat/arena-snapshot-import" }
-pulsevm_snapshot_import = { git = "https://github.com/paulgnz/pulsevm", branch = "feat/arena-snapshot-import" }
-pulsevm_chaindb = { git = "https://github.com/paulgnz/pulsevm", branch = "feat/arena-snapshot-import" }
+# Linked PulseVM crates: only the snapshot reader (scan-contracts) and the
+# interim fork importer (import_backend = "fork") use them. Pinned to an exact
+# commit of the fork branch, which predates PulseVM's move from MIT to the
+# PulseVM Business License (2026-09-24), so this MIT crate links MIT code.
+# The official path (import_backend = "upstream") links nothing from PulseVM:
+# it drives upstream's own current tools (export.sh, xpr_import_check,
+# xpr_19_table_compare, xpr_state_fingerprint) as external programs.
+pulsevm_snapshot = { git = "https://github.com/paulgnz/pulsevm", rev = "8a81171e5c549a433d9929829a319457c95f74dd" }
+pulsevm_snapshot_import = { git = "https://github.com/paulgnz/pulsevm", rev = "8a81171e5c549a433d9929829a319457c95f74dd" }
+pulsevm_chaindb = { git = "https://github.com/paulgnz/pulsevm", rev = "8a81171e5c549a433d9929829a319457c95f74dd" }
 
 [dev-dependencies]
 tempfile = "3"
