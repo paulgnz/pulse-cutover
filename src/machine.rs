@@ -743,12 +743,37 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
 
-        // Burn-off audit (R2 evidence): blocks after the cut, up to the
-        // pause head, are outside the migrated state. With writes frozen
-        // they must be empty; any transactions here are journaled loudly.
+        // Burn-off audit (R2): blocks after the cut, up to the pause head,
+        // are outside the migrated state. With writes frozen they must be
+        // empty. Fail closed: a transaction here would be accepted on the
+        // source chain and missing from the migrated state, and a block we
+        // cannot read is not evidence that it was empty.
         let mut burnoff_txs = 0u64;
+        let mut burnoff_nonempty: Vec<serde_json::Value> = Vec::new();
         for n in (cut_height + 1)..=at_pause.head_block_num {
-            burnoff_txs += self.ops.source_block_tx_count(n).unwrap_or(0);
+            match self.ops.source_block_tx_count(n) {
+                Ok(0) => {}
+                Ok(count) => {
+                    burnoff_txs += count;
+                    burnoff_nonempty.push(json!({"block": n, "transactions": count}));
+                }
+                Err(e) => {
+                    self.abort(
+                        "burn-off audit could not read a post-cut block",
+                        json!({"block": n, "cut_height": cut_height, "error": e}),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        if burnoff_txs > 0 {
+            self.abort(
+                "transactions landed after the cut and would be missing from the migrated state",
+                json!({"cut_height": cut_height, "burnoff_transactions": burnoff_txs,
+                       "blocks": burnoff_nonempty,
+                       "fix": "close every admission path (API edge, p2p, producer) before the cut, then re-run"}),
+            )?;
+            return Ok(());
         }
 
         let host_path = self.cfg.map_snapshot_path(&snap.snapshot_name);

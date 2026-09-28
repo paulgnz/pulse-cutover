@@ -60,6 +60,10 @@ struct MockOps {
     /// late block arriving over p2p — quiescence must absorb + journal it).
     late_block: Cell<bool>,
     paused_polls: Cell<u32>,
+    /// Fault injection for the burn-off audit: transactions in each
+    /// post-cut block, or an unreadable post-cut block.
+    burnoff_tx_per_block: Cell<u64>,
+    burnoff_read_fails: Cell<bool>,
     hooks: RefCell<Vec<String>>,
     now: Cell<u64>,
     // --- api-mode world ---
@@ -100,6 +104,8 @@ impl MockOps {
             target_head: Cell::new(0),
             late_block: Cell::new(false),
             paused_polls: Cell::new(0),
+            burnoff_tx_per_block: Cell::new(0),
+            burnoff_read_fails: Cell::new(false),
             hooks: RefCell::new(Vec::new()),
             now: Cell::new(1_000_000),
             drift: Cell::new(1),
@@ -154,7 +160,10 @@ impl ChainOps for MockOps {
     }
 
     fn source_block_tx_count(&self, _block_num: u64) -> Result<u64, String> {
-        Ok(0) // writes are frozen: burn-off blocks are empty
+        if self.burnoff_read_fails.get() {
+            return Err("get_block timed out".into());
+        }
+        Ok(self.burnoff_tx_per_block.get()) // default 0: writes are frozen
     }
 
     fn producer_paused(&self) -> Result<bool, String> {
@@ -499,6 +508,37 @@ fn late_block_after_pause_is_absorbed_and_cut_repinned() {
     assert_eq!(snapped["data"]["cut_height"].as_u64().unwrap(), 120);
     assert_eq!(snapped["data"]["burnoff_blocks"].as_u64().unwrap(), 2);
     assert_eq!(snapped["data"]["burnoff_transactions"].as_u64().unwrap(), 0);
+}
+
+#[test]
+fn post_cut_transactions_abort_and_roll_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.late_block.set(true); // guarantees at least one post-cut block
+    ops.burnoff_tx_per_block.set(1); // and it carries a transaction
+
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Aborted);
+    assert!(!ops.ignited.get());
+    assert_eq!(ops.resumes.get(), 1);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("transactions landed after the cut"));
+}
+
+#[test]
+fn unreadable_post_cut_block_aborts_instead_of_counting_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.late_block.set(true);
+    ops.burnoff_read_fails.set(true);
+
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Aborted);
+    assert!(!ops.ignited.get());
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("burn-off audit could not read a post-cut block"));
 }
 
 #[test]
