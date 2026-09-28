@@ -90,6 +90,8 @@ struct MockOps {
     /// schedule_snapshot succeeds and stages the scheduled file.
     schedule_ok: Cell<bool>,
     scheduled_h: Cell<u64>,
+    /// Source head at the moment the write-freeze hook ran.
+    freeze_head: Cell<u64>,
 }
 
 impl MockOps {
@@ -118,6 +120,7 @@ impl MockOps {
             flipped_v2: Cell::new(false),
             schedule_ok: Cell::new(false),
             scheduled_h: Cell::new(0),
+            freeze_head: Cell::new(0),
         }
     }
 
@@ -265,6 +268,9 @@ impl ChainOps for MockOps {
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
         self.hooks.borrow_mut().push(cmd.to_string());
+        if cmd == "freeze-writes" {
+            self.freeze_head.set(self.head.get());
+        }
         // Upstream-pipeline commands reference generated fake tools in the
         // test dir — execute them for real: the pipeline verifies their
         // file outputs (SHiP log, manifest.env, checkpoint + manifest).
@@ -952,6 +958,70 @@ on_live = "flip-gateway"
     assert!(hooks.iter().any(|h| h == "quiesce-p2p"));
     // Head ran past H while waiting for finality: burn-off blocks audited.
     assert!(snapped["data"]["burnoff_blocks"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn producer_schedule_at_h_freezes_writes_before_h() {
+    // Multi-BP rehearsal finding: freezing at head >= H left in-flight
+    // transfers in H+1 on all five producers. With a lead, the write freeze
+    // runs `freeze_lead_blocks` before H while the cut stays exactly H.
+    let dir = tempfile::tempdir().unwrap();
+    let toml_text = format!(
+        r#"
+journal_path = "{dir}/journal.jsonl"
+poll_ms = 1
+
+[ceremony]
+freeze_height = 120
+freeze_strategy = "schedule_at_h"
+freeze_lead_blocks = 20
+quiescence_polls = 3
+
+[source]
+rpc_url = "http://mock"
+producer_api_url = "http://mock"
+quiesce_cmd = "quiesce-p2p"
+
+[snapshot]
+staged_path = "{dir}/staged.bin"
+capture_roots = "{dir}/captured-roots.txt"
+dir = "{dir}"
+
+[target]
+metalgo_unit = "mock.service"
+rpc_url = "http://mock"
+quorum_timeout_secs = 60
+
+[hooks]
+on_freeze = "freeze-writes"
+post_ignite = "resume-traffic"
+"#,
+        dir = dir.path().display(),
+    );
+    let path = dir.path().join("ceremony-lead.toml");
+    std::fs::write(&path, toml_text).unwrap();
+    let cfg = Config::load(&path).unwrap();
+
+    let ops = MockOps::new(dir.path(), 50);
+    ops.schedule_ok.set(true);
+
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Live);
+    assert_eq!(ops.freeze_head.get(), 100, "writes froze at H - lead");
+
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let lines: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let frozen = lines
+        .iter()
+        .find(|v| v["state"] == "FROZEN" && v["kind"] == "transition")
+        .unwrap();
+    assert_eq!(frozen["data"]["freeze_at"].as_u64().unwrap(), 100);
+    assert_eq!(frozen["data"]["declared_h"].as_u64().unwrap(), 120);
+    let snapped = lines
+        .iter()
+        .find(|v| v["state"] == "SNAPSHOTTED" && v["kind"] == "transition")
+        .unwrap();
+    assert_eq!(snapped["data"]["cut_height"].as_u64().unwrap(), 120, "cut is still exactly H");
 }
 
 #[test]

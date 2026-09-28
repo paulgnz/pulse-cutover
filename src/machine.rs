@@ -414,10 +414,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 }
             }
         }
+        // Multi-BP: close writes `freeze_lead_blocks` before H so in-flight
+        // transactions land at or before the cut, not in H+1.. (the cut
+        // itself stays pinned to exactly H by the scheduled snapshot).
+        let freeze_at = if self.scheduled {
+            self.h().saturating_sub(self.cfg.ceremony.freeze_lead_blocks)
+        } else {
+            self.h()
+        };
         let mut last_heartbeat = 0u64;
         let info = loop {
             let info = self.ops.source_info()?;
-            if info.head_block_num >= self.h() {
+            if info.head_block_num >= freeze_at {
                 break info;
             }
             let now = self.ops.now_ms();
@@ -425,7 +433,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.journal.evidence(
                     State::Armed,
                     json!({"head": info.head_block_num, "lib": info.last_irreversible_block_num,
-                           "blocks_to_h": self.h() - info.head_block_num}),
+                           "blocks_to_h": self.h().saturating_sub(info.head_block_num),
+                           "blocks_to_freeze": freeze_at.saturating_sub(info.head_block_num)}),
                 )?;
                 last_heartbeat = now;
             }
@@ -451,6 +460,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             State::Frozen,
             json!({
                 "declared_h": self.h(),
+                "freeze_at": freeze_at,
                 "head_at_freeze": info.head_block_num,
                 "lib_at_freeze": info.last_irreversible_block_num,
                 "chain_id": info.chain_id,

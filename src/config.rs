@@ -104,6 +104,14 @@ pub struct Ceremony {
     /// producer that did not actually stop, or late blocks arriving on p2p).
     #[serde(default = "default_quiescence_polls")]
     pub quiescence_polls: u32,
+    /// `schedule_at_h` only: freeze writes this many blocks BEFORE H. The
+    /// cut stays exactly H; the lead lets transactions already accepted at
+    /// an API edge or in flight on p2p land at or before H instead of in
+    /// H+1.. (where the burn-off audit would abort the ceremony — observed
+    /// in the 5-producer rehearsal: freezing at head >= H left 3 in-flight
+    /// transfers in H+1 on every producer). 24 blocks = 12s at 0.5s blocks.
+    #[serde(default = "default_freeze_lead_blocks")]
+    pub freeze_lead_blocks: u64,
     /// Which import stack turns the cut snapshot into PulseVM state:
     /// - "fork": our arena-snapshot-import branch reads the Leap `.bin`
     ///   directly and the target chain boots via `snapshot_path`. This is
@@ -452,6 +460,9 @@ fn default_flip_timeout() -> u64 {
 }
 fn default_cpu_scale() -> u64 {
     1
+}
+fn default_freeze_lead_blocks() -> u64 {
+    24
 }
 fn default_quiescence_polls() -> u32 {
     6

@@ -43,6 +43,12 @@ freeze_margin = 420          # rehearsal H = last-final + 420 (see note above) [
 # same block). "pause_at_h" = pause first, snapshot after (single-node).      [LEAVE]
 freeze_strategy = "schedule_at_h"
 
+# Close writes this many blocks BEFORE H (the cut stays exactly H) so
+# transactions already accepted or in flight on p2p land at or before the
+# cut. Freezing AT H leaked in-flight transfers into H+1 on every producer
+# in the 5-BP rehearsal (the burn-off audit caught it and aborted). [LEAVE]
+freeze_lead_blocks = 24
+
 # After pausing, the chain's head must hold still for this many consecutive
 # polls before the cut is trusted (catches stragglers/late blocks).           [LEAVE]
 quiescence_polls = 8
