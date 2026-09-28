@@ -811,7 +811,7 @@ migration, so the two stacks map onto each other rather than competing:
 The ceremony has two ways to turn the cut snapshot into PulseVM state,
 selected by `[ceremony] import_backend = "fork" | "upstream"`:
 
-- **`upstream` — the official path (#61), the target.** The ceremony drives
+- **`upstream` — the official path (#61), the target.** The export must write the `deferred-transactions.json` sidecar (`export.sh --deferred-sidecar`); the agent refuses to verify without it, because it carries the transaction dedupe set that stops pre-cut transactions replaying after the cut. The ceremony drives
   the core team's own pipeline for SNAPSHOTTED → VERIFIED: `export.sh` (a
   pinned Leap replays the cut `.bin` into a SHiP full-state
   `chain_state_history.log`) → `xpr_import_check` (SHiP → Arena checkpoint +

@@ -1058,17 +1058,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// VERIFIED: ignite the target and wait for it to present the source
     /// chain at the cut height.
     fn step_verified(&mut self) -> Result<(), String> {
-        // Upstream backend: igniting FROM the #61 checkpoint needs the
-        // checkpoint-consuming node, which only exists on the unmerged PR
-        // branch (migration genesis committing the checkpoint sha256 +
-        // node-config migration_checkpoint knobs). Verification is done and
-        // journaled; stop here with the precise remaining list rather than
-        // pretending the fork plugin could boot his checkpoint.
+        // Upstream backend: the #61 migration path is merged, but igniting
+        // FROM its checkpoint is not wired yet, and a same-chain-id mainnet
+        // cutover has hard prerequisites (see ignite_pending_reasons).
+        // Verification is done and journaled; stop here with the precise
+        // remaining list rather than booting anything unsafe.
         if self.cfg.ceremony.import_backend == ImportBackend::Upstream {
             self.abort(
-                "upstream ignite pending MetalBlockchain/pulsevm#61 merge — verification \
-                 completed with the official tools; ignition from the checkpoint is not \
-                 yet available",
+                "upstream ignite not yet available — verification completed with the \
+                 official #61 tools; booting from the checkpoint needs the remaining items",
                 json!({"remaining": upstream::ignite_pending_reasons()}),
             )?;
             return Ok(());

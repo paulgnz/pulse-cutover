@@ -1132,6 +1132,7 @@ fn stage_fake_upstream_tools(dir: &std::path::Path, compare_exit: i32) {
              sha() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi | awk '{{print $1}}'; }}\n\
              mkdir -p \"$out/work/state-history\"\n\
              printf SHIPLOG > \"$out/work/state-history/chain_state_history.log\"\n\
+             if [ -z \"$NO_SIDECAR\" ]; then printf '{{}}' > \"$out/work/deferred-transactions.json\"; fi\n\
              {{ echo \"XPR_CORE_REVISION=d133c641\"; echo \"INPUT_SNAPSHOT_SHA256=$(sha \"$snap\")\"; \
                 echo \"CHAIN_STATE_HISTORY_SHA256=$(sha \"$out/work/state-history/chain_state_history.log\")\"; }} > \"$out/work/manifest.env\"\n\
              echo \"exported full XPR chain-state history to $out/work\"\n"
@@ -1144,6 +1145,7 @@ fn stage_fake_upstream_tools(dir: &std::path::Path, compare_exit: i32) {
         &format!(
             "#!/bin/sh\nset -e\n. {d}/cut-facts.env\n\
              sha() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi | awk '{{print $1}}'; }}\n\
+             [ -f \"$4\" ] || {{ echo 'usage: sidecar (4th arg) missing' >&2; exit 2; }}\n\
              printf CKPT > \"$3\"\n\
              printf '{{\"checkpoint_sha256\":\"%s\",\"checkpoint_revision\":%s,\"source_block_id\":\"%s\"}}' \
                \"$(sha \"$3\")\" \"$CUT_HEIGHT\" \"$CUT_BLOCK_ID\" > \"$3.manifest.json\"\n\
@@ -1154,6 +1156,7 @@ fn stage_fake_upstream_tools(dir: &std::path::Path, compare_exit: i32) {
         &dir.join("fake-compare.sh"),
         &format!(
             "#!/bin/sh\n\
+             [ -f \"$5\" ] || {{ echo 'usage: sidecar (5th arg) missing' >&2; exit 2; }}\n\
              if [ {compare_exit} -ne 0 ]; then echo 'table permission: nodeos=1 arena=2' >&2; exit {compare_exit}; fi\n\
              echo 'table account: rows=1 sha256=aa55'\necho 'table permission: rows=2 sha256=bb66'\nexit 0\n"
         ),
@@ -1240,7 +1243,30 @@ fn upstream_backend_verifies_with_official_tools_and_stubs_ignite() {
         .find(|v| v["kind"] == "error")
         .expect("journaled abort reason");
     assert!(abort_err["data"]["message"].as_str().unwrap().contains("#61"));
+    let remaining = abort_err["data"]["detail"]["remaining"].to_string();
+    assert!(remaining.contains("TAPOS") && remaining.contains("chain_id"));
     assert!(abort_err["data"]["detail"]["remaining"].is_array());
+}
+
+#[test]
+fn upstream_export_without_sidecar_fails_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    // An export that does not write deferred-transactions.json (no
+    // --deferred-sidecar): the dedupe set would be missing on the target.
+    let export = dir.path().join("fake-export.sh");
+    let body = std::fs::read_to_string(&export).unwrap();
+    let body: String = body.lines().filter(|l| !l.contains("deferred-transactions.json")).collect::<Vec<_>>().join("\n");
+    write_script(&export, &format!("{body}\n"));
+    let cfg = upstream_test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("no deferred-transactions.json sidecar"));
+    assert!(!text.lines().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["state"] == "VERIFIED" && v["kind"] == "transition"
+    }));
 }
 
 #[test]
