@@ -22,6 +22,44 @@ any real event (plus credit for every setup you help us support).
 — repo map, machine-readable contracts (`doctor --json`, the journal), and
 the safety rails an agent must follow.
 
+## At a glance
+
+```mermaid
+flowchart LR
+    subgraph clients["Wallets · bots · exchanges"]
+        A["any Antelope client<br/>(cleos, eosjs, @proton/js, wharfkit)"]
+    end
+    subgraph edge["Each BP's public API edge (nginx)"]
+        E{"/v1/chain"}
+    end
+    subgraph old["Before the cut"]
+        N["Leap nodeos<br/>(DPoS, producer schedule)"]
+    end
+    subgraph new["After the cut"]
+        G["/v1/chain gateway or native"] --> P["PulseVM on Metal<br/>(Snowman consensus)"]
+    end
+    A --> E
+    E -- "ARMED → FROZEN<br/>(writes 503 from H−24)" --> N
+    E -. "LIVE: edge flips" .-> G
+    N -- "snapshot of exactly block H<br/>verified twice, imported 1:1" --> P
+```
+
+| What stays the same for users | How it is proven |
+|---|---|
+| **chain_id** — signatures, wallets and keys keep working | target must present the source chain_id at the cut block id before anything flips |
+| **Every account, permission, contract and table row** | snapshot imported into two independent arenas; 19–21 table fingerprints must match |
+| **The URL** | the API edge swaps its backend only after the new chain is producing (LIVE gate) |
+| **Nothing is lost at the boundary** | burn-off audit: zero transactions allowed after the cut, or the ceremony aborts and the old chain resumes |
+
+**Proven so far** (rehearsals, never mainnet):
+
+| Rehearsal | Result |
+|---|---|
+| Single node, API-provider mode, live XPR testnet | **22/22 LIVE**, 99.8% read availability, 0.75 s flip |
+| History (`/v2`) continuity via hyperion-rs + federating router | one URL serves pre- and post-cut history |
+| **5 block producers on 5 continents** (Sydney · Singapore · Los Angeles · New Jersey · Frankfurt) | **LIVE on all 5, four runs**: byte-identical snapshot at exactly H, identical fingerprints, 0 post-cut transactions, ~72 s client write gap, fully automatic ([details](#multi-producer-cutover-5-bps-5-continents)) |
+| **A live perps DEX + oracle + HFT bot across the cut** | the migrated perps contract kept trading on PulseVM unchanged; 0 duplicate orders; the oracle never went stale; 0 dropped transfers on the fixed build |
+
 ---
 
 ## Start here — the operator walkthrough
@@ -390,16 +428,163 @@ Plain-English versions of every term this repo uses:
 
 ---
 
+## Multi-producer cutover (5 BPs, 5 continents)
+
+The ceremony that matters in a real migration is not one node — it is every
+block producer cutting **the same block**, in different countries, with apps
+still writing. We rehearsed exactly that on disposable infrastructure
+(2026-09-28/29):
+
+```mermaid
+flowchart TB
+    subgraph metal["Private Metal network: 5 validators, 1 PulseVM subnet"]
+        direction LR
+        v1((syd)) --- v2((sgp)) --- v3((lax)) --- v4((ewr)) --- v5((fra)) --- v1
+    end
+    subgraph leap["Source chain: Leap 5.0.3, schedule bp1…bp5"]
+        direction LR
+        p1[bp1 syd] --- p2[bp2 sgp] --- p3[bp3 lax] --- p4[bp4 ewr] --- p5[bp5 fra]
+    end
+    bot["HFT bot: 1 transfer / 0.5 s<br/>round-robin + fail-over across the 5 BP edges"]
+    bot --> leap
+    leap == "pulse-cutover on every BP<br/>same H, same snapshot" ==> metal
+    bot -. "after LIVE (same URLs)" .-> metal
+```
+
+![5-BP cutover, recorded live (run 4, 6× speed)](docs/media/multibp-cutover.gif)
+
+*Recorded live, run 4 at 6× speed ([asciinema cast](docs/media/multibp-cutover.cast)). Each row is one BP's public API edge:
+it serves nodeos, answers writes with 503 from H−24, then flips to PulseVM at LIVE. Underneath, three bots keep
+writing through those same edges: an HFT transfer bot, a perps order bot and an oracle feeder. The recording ends
+inside the ~50 s post-LIVE stall described in field note 10.*
+
+Every box runs a Leap producer **and** a Metal validator, plus nginx as its
+public `/v1/chain` edge. Each BP runs its own `pulse-cutover` with the same
+declared `H`; nobody coordinates at runtime.
+
+### What happens, in order
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as App / bot
+    participant Edge as BP API edge
+    participant Leap as nodeos (×5)
+    participant Agent as pulse-cutover (×5)
+    participant PVM as PulseVM (×5)
+    Agent->>Leap: schedule snapshot at exactly H (ARMED)
+    App->>Edge: writes (normal traffic)
+    Edge->>Leap: forwarded
+    Note over Agent: head reaches H − 24
+    Agent->>Edge: on_freeze: writes → 503 (reads keep working)
+    App--xEdge: 503 "writes frozen, retry shortly"
+    Leap->>Leap: empty blocks until H is irreversible
+    Leap-->>Agent: snapshot-<id of H>.bin (identical on all 5)
+    Agent->>Leap: pause · quiescence · burn-off audit (0 tx after H)
+    Agent->>Agent: import twice, fingerprints match (VERIFIED)
+    Agent->>PVM: ignite from the verified snapshot
+    PVM-->>Agent: serves source chain_id at the cut block id (IGNITED)
+    Agent->>PVM: post_ignite heartbeat → blocks H+1, H+2…
+    Agent->>Edge: on_live: backend flips to PulseVM
+    App->>Edge: writes resume, same URL, same keys
+    Edge->>PVM: forwarded
+```
+
+### Real timeline (run 3, all 5 BPs within ±1 s of each other)
+
+```mermaid
+gantt
+    title Run 3: write freeze to LIVE (UTC)
+    dateFormat HH:mm:ss
+    axisFormat %H:%M:%S
+    section Writes
+    open on Leap                         :done, 22:59:40, 23:00:13
+    frozen at the edge (503)             :crit, 23:00:13, 23:01:26
+    open on PulseVM                      :active, 23:01:26, 23:02:00
+    section Ceremony
+    empty blocks until H is final        :23:00:13, 23:01:02
+    verify (2 imports + fingerprints)    :23:01:02, 23:01:03
+    ignite (metalgo restart + import)    :23:01:03, 23:01:20
+    heartbeat → LIVE → edge flip         :23:01:20, 23:01:26
+```
+
+| Run | Outcome | What we learned |
+|---|---|---|
+| 1 | **ABORTED on all 5** (correctly) | Byte-identical snapshot at H on all 5, but writes froze *at* H: 3 in-flight transfers landed in H+1. The burn-off audit caught it everywhere; every BP resumed the old chain automatically. → added `freeze_lead_blocks` |
+| 2 | **LIVE on all 5** | Freeze at H−24: 0 transactions after the cut. Identical fingerprints and head block id on all 5 validators; balances continuous across the boundary. Needed a manual transaction to pass the LIVE gate. → `post_ignite` heartbeat |
+| 3 | **LIVE on all 5, unattended** | Public API edges + HFT bot: 143 clean 503s during the freeze, **73.5 s client write gap**, edges flipped on their own. Surfaced a mempool bug in our PulseVM build (below) |
+| 4 | **LIVE on all 5, with a perps DEX live** | Fixed plugin: **79/79 admitted transfers landed** (run 3: 108/193). A perps contract deployed on the old chain kept taking orders on PulseVM with no changes, with 0 duplicates and the oracle within its 120 s window across the cut. New: a **~50 s finality stall right after LIVE** (field note 10) |
+
+Evidence (journals, fingerprints, snapshot hashes per BP) is kept with the
+rehearsal notes; the configs are reproducible from `examples/ceremony-bp.toml`.
+
+## Field notes: what real-world rehearsals taught us
+
+Things you only find by running it. Each one is either fixed in this repo, fixed
+upstream, or an open item with a workaround.
+
+| # | Finding | Impact | Status |
+|---|---|---|---|
+| 1 | **Freezing writes *at* H leaks in-flight transactions into H+1** | Those transactions would vanish from the migrated state | ✅ `freeze_lead_blocks` (default 24): writes close before H, cut stays exactly H |
+| 2 | **Pause-then-snapshot deadlocks** on Leap 5 (snapshots wait for finality; a paused DPoS chain never finalizes) | Ceremony hangs | ✅ `schedule_at_h`: keep producing empty blocks, snapshot at finality, pause after |
+| 3 | **PulseVM builds blocks on demand**; an idle new chain never passes the cut | LIVE gate times out → abort | ✅ `post_ignite` heartbeat hook; flip only `on_live` |
+| 4 | **Head time is frozen at the cut** until the first new block, and on any idle PulseVM chain | Clients set `expiration = head_time + 30s`, so transactions arrive already expired | ✅ gateway reports a fresh `head_block_time` when idle (true value in `pulsevm_head_block_time`); ⚠ libraries that take the time of the block 3 behind head (eosjs/@proton/js `blocksBehind: 3`) can still fail the first transaction. Use `expireSeconds ≥ 120` |
+| 5 | Our fork build of the plugin **panicked in the mempool while verifying peers' blocks** (`mempool.rs:180`) | Transactions admitted by one validator silently dropped (108 of 193 landed in run 3) | ✅ already fixed upstream ("keep consensus alive when mempool expiry index drifts"); fork rebuilt with it: **0 panics, 79/79 landed** in run 4 |
+| 6 | After import the producer schedule is **seeded from node config + genesis `initial_key`**, not from the imported schedule | Every validator must run the same producer name and key | ⚠ open, raised upstream; per-BP identities need the schedule derived from imported state |
+| 7 | Legacy `/v1/chain` gateway: cleos 5 `send_transaction2`, and `EOS…` vs `PUB_K1_…` key spellings in `get_required_keys` | "Invalid params" / "irrelevant signatures" | ✅ fixed in the gateway; the native `/v1/chain` in PulseVM avoids this layer |
+| 8 | Dependent transactions sent back to back can reach *different* producers out of order | e.g. `issue` before `create` lands | ✅ app/deploy scripts: wait for inclusion before a dependent action |
+| 9 | A private Metal network needs a custom network id (not `local`) for a custom genesis; old SDKs build Etna-invalid P-chain fees | Can't stand up the testbed | ✅ network id 88888 + `custom` HRP; metalgojs (Node ≥ 20) |
+| 10 | **~50 s finality stall right after LIVE** (run 4): blocks H+1…H+4 accepted within 5 s, then nothing accepted for 50 s while all 5 metalgo nodes were still re-peering after their ignite restarts (readiness passed ~15–45 s after ignite), under 4 bots' worth of backlog | Clients saw timeouts and "expired" for ~40 s after the flip, then full recovery at ~1 block/s | ⚠ open. Not seen in run 3 (lighter load). Mitigations to test: gate LIVE on *every* validator's readiness, not just local head > H; restart-less ignition (load the snapshot on chain retry instead of restarting metalgo); ramp traffic after the flip |
+| 11 | Imported chains log `onblock failed … resource usage row is missing for account pulse` on every block | None for contracts without `onblock` logic (the perps contract has none) | ⚠ open upstream item: the importer should seed the system account's resource row |
+| 12 | The perps writer's 750 ms read-back called 94 orders "admitted, not landed"; 93 were on the book, placed just outside the window by 5-producer propagation | Would have reported phantom drops | ✅ reconcile against a final chain read, not only a read-back timer |
+
+## Building apps that survive a cutover
+
+What a bot, wallet or exchange integration should do. All of this was
+exercised by the rehearsal bots.
+
+- [x] **Treat HTTP 503 during a migration as "hold", not "failed"**: retry with a *freshly built* transaction, never re-send the same signed bytes.
+- [x] **Fail over across several BP endpoints.** During run 3 every edge answered reads throughout; writes resumed on all of them at the same moment.
+- [x] **Use `expireSeconds` ≥ 120**, and don't derive expiration from an old block (finding 4).
+- [x] **Confirm inclusion, not just acceptance.** On PulseVM a gateway "admitted" response means accepted into the mempool; read your state back (or check the block) before treating it as final.
+- [x] **Oracle-driven apps**: the chain clock jumps forward by the freeze length at the first new block. Contracts with a staleness window (e.g. 120 s) will see the last pre-freeze price as stale until a fresh one lands, so **push a fresh oracle update as the first post-cut write**. Liquidations and funding that are gated on freshness pause safely in the meantime.
+- [x] **Nothing keyed on block numbers breaks**: heights continue at H+1, and the chain_id and keys are unchanged.
+- [x] **Contracts move as-is.** The perps contract, its oracle and token were deployed on the old chain with plain `cleos set contract` and kept working on PulseVM after the cut: orders placed, cranked and cancelled with no contract or bot changes.
+- [x] **Expect a short, bumpy restart.** Budget for about 1–2 minutes of 503s plus up to a minute of slow confirmations right after the flip (field note 10), and make your bot's retry loop tolerate both.
+
+**Measured across the cut (run 4):**
+
+| App | Before the cut | During the freeze | After the flip |
+|---|---|---|---|
+| HFT transfer bot (0.5 s) | 309 executed, ~30 ms | 140 × HTTP 503 from all 5 edges | 79 admitted, **79 landed**; 57 expired + 31 timeouts during the stall |
+| Perps order bot (place → crank → cancel) | 293 orders, all landed | 21 rejected (503), 2 landed just before the cut | 16/17 landed on PulseVM; **0 duplicate orders** (TAPOS double-apply check) |
+| Oracle (BTC, 120 s staleness limit) | fresh | newest price aged to ~72 s | fresh again within seconds of the flip; **never stale**, so liquidations and funding never paused |
+
 ## How it works (the builders' half)
 
 Everything below is reference detail. You do not need it to rehearse.
 
 ### The state machine
 
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> ARMED
+    ARMED --> FROZEN: head ≥ H − lead · writes 503
+    FROZEN --> SNAPSHOTTED: snapshot of exactly H · burn-off = 0
+    SNAPSHOTTED --> VERIFIED: 2 imports · fingerprints match
+    VERIFIED --> IGNITED: target serves source chain_id at H
+    IGNITED --> LIVE: head > H (quorum producing)
+    LIVE --> [*]
+    FROZEN --> ABORTED
+    SNAPSHOTTED --> ABORTED
+    VERIFIED --> ABORTED
+    IGNITED --> ABORTED: quorum timeout
+    ABORTED --> [*]: source producer resumed
 ```
-ARMED → FROZEN → SNAPSHOTTED → VERIFIED → IGNITED → LIVE
-                    (ABORTED terminal from any state; source chain stays authoritative)
-```
+
+`ABORTED` is reachable from every state before `LIVE`; the source chain stays
+authoritative until then, and rollback is simply resuming it.
 
 Per-mode ceremony:
 
@@ -491,7 +676,11 @@ The producer-side ceremony from Appendix A: freeze writes at the API edge,
 **schedule the snapshot at exactly H** (`freeze_strategy = "schedule_at_h"` —
 nodeos writes `snapshot-<block_id(H)>.bin` when H finalizes and the agent picks
 it up by that exact name), pause after, quiescence-pin the cut, verify, ignite
-as the new chain's producer/validator. `source.quiesce_cmd` exists for
+as the new chain's producer/validator. Writes close `freeze_lead_blocks`
+(default 24) *before* H so nothing in flight lands after the cut; a
+`post_ignite` hook gives the on-demand chain its first blocks and `on_live`
+flips the API edge (see [Multi-producer cutover](#multi-producer-cutover-5-bps-5-continents)).
+`source.quiesce_cmd` exists for
 single-node rehearsals against a live-syncing replica (sever p2p to emulate
 "every producer paused"); a real multi-BP ceremony does not need it. The
 burn-off audit journals every transaction between the cut and the pause head —
@@ -880,7 +1069,9 @@ under both backends.
 The recorded numbers (22/22 api-mode loop runs LIVE, 99.8% read availability,
 0.75s flip; bp-mode cut at exactly H, gap 197.0s; hyperion /v2 federation
 minutes after the cut) come from rehearsals against the **live XPR testnet**
-on a single Ubuntu 24.04 box. To reproduce: walk Steps 0–5 above, then
+on a single Ubuntu 24.04 box; the multi-producer numbers come from a
+disposable 5-BP Leap chain + private 5-validator Metal network (see
+[Multi-producer cutover](#multi-producer-cutover-5-bps-5-continents)). To reproduce: walk Steps 0–5 above, then
 `pulse-cutover loop --runs N` with `examples/ceremony-api.toml` (the
 `examples/loop/` scripts show the exact reset harness we used). Evidence
 journals for the recorded runs: wiki/59 Appendices B + C.
@@ -901,9 +1092,13 @@ what testers get out of it.
   (apache/caddy detected and refused with reasons). `report` bundles are how
   new setups get added.
 - Default import backend is still the fork path (`paulgnz/pulsevm`,
-  `feat/arena-snapshot-import`) — an interim bridge until
-  MetalBlockchain/pulsevm#61 merges; `import_backend = "upstream"` already
-  drives the official pipeline through VERIFIED (see "Import backends").
+  `feat/arena-snapshot-import`), an interim bridge: the official migration
+  path (MetalBlockchain/pulsevm#61) is merged, and `import_backend = "upstream"`
+  drives it through VERIFIED; igniting from the upstream checkpoint waits for
+  a PulseVM release that boots from it (see "Import backends").
+- Multi-producer: proven LIVE across 5 BPs with a **shared** target producer
+  identity (field note 6). Per-BP producer keys on the migrated chain need an
+  upstream change.
 - Guide + video: [pulsevm.dev/guide/migrate-antelope-chain](https://pulsevm.dev/guide/migrate-antelope-chain)
 - Questions / test bundles: [Telegram](https://t.me/+N1mAvoUDbtVmNTBh) ·
   [rehearsal-feedback issues](https://github.com/paulgnz/pulse-cutover/issues/new?template=rehearsal-feedback.md)
