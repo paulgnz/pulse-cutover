@@ -72,9 +72,19 @@ pub struct Recovered {
     /// written before each external action). A resumed agent treats started as possibly
     /// applied — e.g. a flip that began before a crash must be considered live.
     pub side_effects: Vec<String>,
-    /// The journal showed IGNITED (or later) at some point: this node's target has been
-    /// started, so a local failure must seal instead of resuming the source.
+    /// The journal showed IGNITED (or later), OR recorded `ignite_started` (the side effect is
+    /// journaled BEFORE the ignite command runs): this node's target may be running, so a local
+    /// failure must seal instead of resuming the source.
     pub reached_ignited: bool,
+    /// Identity of the snapshot this ceremony staged at `staged_path` (evidence
+    /// `staged_artifact`): a resumed preflight accepts a staged file that matches it.
+    pub staged_sha256: Option<String>,
+    pub staged_cut_height: Option<u64>,
+    /// The state HALTED was entered from (so `unhalt` can return there).
+    pub halted_from: Option<State>,
+    /// An operator cleared the last HALT (`unhalt --i-understand`): a resumed run may continue
+    /// forward (failures still halt, since ignition-started stays recorded).
+    pub unhalted: bool,
     /// A trailing partial line (crash mid-write) was found and set aside on open.
     pub torn_tail: bool,
 }
@@ -204,7 +214,18 @@ impl Journal {
         let start = bytes[..trimmed_end].iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
         let last = &bytes[start..trimmed_end];
         let ends_with_newline = bytes.last() == Some(&b'\n');
-        if serde_json::from_slice::<Entry>(last).is_ok() {
+        let parses = serde_json::from_slice::<Entry>(last).is_ok();
+        if !parses && ends_with_newline {
+            // A complete (newline-terminated) line that does not parse is not a torn write: the
+            // writer finished it. That is corruption, and recovering past it could roll the
+            // ceremony backward (e.g. lose an authority-relevant last record). Refuse.
+            return Err(format!(
+                "journal {} ends with a complete but unparsable line: corruption, not a torn \
+                 write. Refusing to resume; inspect the journal by hand.",
+                path.display()
+            ));
+        }
+        if parses {
             if !ends_with_newline {
                 // Complete entry but missing its newline: add it so the next append starts clean.
                 let mut f = OpenOptions::new().append(true).open(path).map_err(|e| e.to_string())?;
@@ -218,7 +239,17 @@ impl Journal {
             path.display(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
         ));
-        std::fs::write(&aside, last).map_err(|e| format!("save torn tail: {e}"))?;
+        {
+            // The forensic copy must be durable BEFORE the journal is truncated.
+            let mut f = File::create(&aside).map_err(|e| format!("save torn tail: {e}"))?;
+            f.write_all(last).map_err(|e| format!("save torn tail: {e}"))?;
+            f.sync_all().map_err(|e| format!("fsync torn tail copy: {e}"))?;
+            if let Some(dir) = aside.parent() {
+                if let Ok(d) = File::open(dir) {
+                    let _ = d.sync_all();
+                }
+            }
+        }
         let f = OpenOptions::new().write(true).open(path).map_err(|e| e.to_string())?;
         f.set_len(start as u64).map_err(|e| format!("truncate torn tail: {e}"))?;
         f.sync_data().map_err(|e| e.to_string())?;
@@ -240,6 +271,7 @@ impl Journal {
             .lines()
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
+        let ends_with_newline = std::fs::read(path).map(|b| b.last() == Some(&b'\n')).unwrap_or(true);
         let last_nonempty = lines.iter().rposition(|l| !l.trim().is_empty());
         for (i, line) in lines.iter().enumerate() {
             if line.trim().is_empty() {
@@ -247,7 +279,7 @@ impl Journal {
             }
             let entry: Entry = match serde_json::from_str(line) {
                 Ok(e) => e,
-                Err(e) if Some(i) == last_nonempty => {
+                Err(e) if Some(i) == last_nonempty && !ends_with_newline => {
                     eprintln!("journal: WARNING ignoring a partial last line (crash mid-write): {e}");
                     out.torn_tail = true;
                     continue;
@@ -262,8 +294,12 @@ impl Journal {
             };
             if entry.kind == "transition" {
                 let st: State = entry.state.parse()?;
-                if matches!(st, State::Ignited | State::Flipped | State::Live) {
+                if matches!(st, State::Ignited | State::Flipped | State::Live | State::Halted) {
                     out.reached_ignited = true;
+                }
+                if st == State::Halted {
+                    out.unhalted = false;
+                    out.halted_from = entry.data.get("halted_from").and_then(|v| v.as_str()).and_then(|v| v.parse().ok());
                 }
                 out.state = Some(st);
                 if entry.state == State::Frozen.as_str() {
@@ -277,6 +313,18 @@ impl Journal {
                 if !out.side_effects.iter().any(|x| x == se) {
                     out.side_effects.push(se.to_string());
                 }
+                // Ignition may have started: from here a local failure seals (never resumes the
+                // source), whatever state the journal was in when the process died.
+                if se == "ignite_started" || se == "ignite" {
+                    out.reached_ignited = true;
+                }
+            }
+            if entry.data.get("unhalted_by").is_some() {
+                out.unhalted = true;
+            }
+            if let Some(a) = entry.data.get("staged_artifact") {
+                out.staged_sha256 = a.get("sha256").and_then(|v| v.as_str()).map(str::to_string);
+                out.staged_cut_height = a.get("cut_height").and_then(|v| v.as_u64());
             }
             for (key, slot) in [
                 ("chain_id", &mut out.chain_id),

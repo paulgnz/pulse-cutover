@@ -2,7 +2,9 @@
 //!
 //! Producer mode: ARMED -> FROZEN -> SNAPSHOTTED -> VERIFIED -> IGNITED -> LIVE
 //! API mode:      ARMED -> FROZEN -> SNAPSHOTTED -> VERIFIED -> IGNITED -> FLIPPED -> LIVE
-//! with ABORTED reachable from every non-terminal state. Transitions only
+//! with ABORTED reachable from every non-terminal state BEFORE ignition may have started, and
+//! HALTED reachable from every state after it (a sealed stop: nothing is rolled back, the run
+//! refuses to continue until an operator runs `pulse-cutover unhalt --i-understand`). Transitions only
 //! move forward; a crash resumes IN the last journaled state and re-runs that
 //! state's (idempotent) step.
 //!
@@ -37,6 +39,10 @@ pub enum State {
     /// Terminal failure; source chain remains authoritative (auto-rollback
     /// resumes the source producer if configured).
     Aborted,
+    /// Sealed stop after ignition may have started (this node's target may be running, peers
+    /// may be producing). Nothing was rolled back. Durable: a restarted run refuses to continue
+    /// or roll back until an operator clears it with `unhalt --i-understand` (journaled).
+    Halted,
 }
 
 impl State {
@@ -50,6 +56,7 @@ impl State {
             State::Flipped => "FLIPPED",
             State::Live => "LIVE",
             State::Aborted => "ABORTED",
+            State::Halted => "HALTED",
         }
     }
 }
@@ -72,6 +79,7 @@ impl FromStr for State {
             "FLIPPED" => State::Flipped,
             "LIVE" => State::Live,
             "ABORTED" => State::Aborted,
+            "HALTED" => State::Halted,
             other => return Err(format!("unknown state in journal: {other}")),
         })
     }
