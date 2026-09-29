@@ -185,30 +185,57 @@ print("NodeID-" + out)
 PY2
 }
 
-# identity_paths_ok DATA CONFIG_JSON EXECSTART → 0 when the existing node keeps its identity in DATA/staking at
-# the default file names (so this script's regenerated config keeps the same NodeID and BLS key). Prints why not.
+# identity_paths_ok DATA CONFIG_JSON EXECSTART [ENVIRONMENT] → 0 when the existing node keeps its identity in
+# DATA/staking at the default file names (so this script's regenerated config keeps the same NodeID and BLS key).
+# Prints why not. Reads identity settings the three ways metalgo accepts them: command-line flags (pflag rules:
+# a bare bool flag means true and never consumes the next word; values parse like strconv.ParseBool), the config
+# file, and AVAGO_* environment variables (viper AutomaticEnv, prefix "avago"). EXECSTART may be a plain command
+# line or `systemctl show -p ExecStart --value` output ("{ path=… ; argv[]=… ; … }").
 identity_paths_ok() {
-  python3 - "$1" "$2" "$3" <<'PY2'
-import json, os, re, sys
-data, cfgf, exec_ = sys.argv[1:4]
+  python3 - "$1" "$2" "$3" "${4:-}" <<'PY2'
+import json, os, shlex, sys
+data, cfgf, exec_, env_ = sys.argv[1:5]
 cfg = {}
 if cfgf and os.path.isfile(cfgf):
     try: cfg = json.load(open(cfgf))
     except Exception: print(f"cannot parse {cfgf}"); sys.exit(1)
-def flag(k):
-    m = re.search(r"--%s[= ]([^ ;]+)" % re.escape(k), exec_)
-    return m.group(1) if m else None
+if "argv[]=" in exec_:
+    exec_ = exec_.split("argv[]=", 1)[1].split(" ; ", 1)[0]
+try: argv = shlex.split(exec_)
+except ValueError: argv = exec_.split()
+BOOLS = {"staking-ephemeral-cert-enabled", "staking-ephemeral-signer-enabled"}
+flags = {}
+for i, t in enumerate(argv):
+    if not t.startswith("--"): continue
+    k, eq, v = t[2:].partition("=")
+    if eq: flags[k] = v
+    elif k in BOOLS: flags[k] = "true"                       # bare bool: true; the next word is NOT its value
+    elif i + 1 < len(argv) and not argv[i + 1].startswith("--"): flags[k] = argv[i + 1]
+    else: flags[k] = ""
+env = {}
+try: env_items = shlex.split(env_)
+except ValueError: env_items = env_.split()
+for kv in env_items:
+    k, eq, v = kv.partition("=")
+    if eq and k.startswith("AVAGO_"): env[k[6:].lower().replace("_", "-")] = v
+def get(k):   # flag beats env beats config file (viper precedence)
+    if k in flags: return flags[k]
+    if k in env: return env[k]
+    return cfg.get(k)
+def truthy(v):
+    if isinstance(v, bool): return v
+    if v is None: return False
+    return str(v) in ("1", "t", "T", "TRUE", "true", "True")
 want = {"staking-tls-cert-file": f"{data}/staking/staker.crt", "staking-tls-key-file": f"{data}/staking/staker.key",
         "staking-signer-key-file": f"{data}/staking/signer.key"}
 for k, dflt in want.items():
-    v = flag(k) or cfg.get(k)
+    v = get(k)
     if v and os.path.normpath(str(v)) != dflt:
         print(f"{k} is '{v}', not the default {dflt}: adopting would switch this node to a different identity"); sys.exit(1)
-for k in ("staking-ephemeral-cert-enabled", "staking-ephemeral-signer-enabled"):
-    v = flag(k) or cfg.get(k)
-    if str(v).lower() in ("true", "1"): print(f"{k} is enabled: this node has no persistent identity to keep"); sys.exit(1)
+for k in sorted(BOOLS):
+    if truthy(get(k)): print(f"{k} is enabled: this node has no persistent identity to keep"); sys.exit(1)
 for k in ("staking-tls-key-file-content", "staking-tls-cert-file-content", "staking-signer-key-file-content"):
-    if flag(k) or cfg.get(k): print(f"{k} is set: the identity is not in files this script can back up"); sys.exit(1)
+    if get(k): print(f"{k} is set: the identity is not in files this script can back up"); sys.exit(1)
 PY2
 }
 
@@ -492,32 +519,42 @@ swap_in() {
     [ -f "$ETC/config.json" ] && cp -p "$ETC/config.json" "$ETC/config.json.prev"
     [ -f "$UNIT" ] && cp -p "$UNIT" "$UNIT.prev"
   fi
-  APPLYING=1   # armed: the EXIT trap rolls back from here on
-  systemctl stop metalgo 2>/dev/null || true
+  if [ "$HAD_PREV" = 1 ] && existing_unit; then
+    # Stop first and prove it stopped. If it won't stop, nothing has been replaced yet: abort without a rollback.
+    if ! systemctl stop metalgo || systemctl is-active --quiet metalgo; then
+      rm -f "$BIN.prev" "$ETC/config.json.prev" "$UNIT.prev"
+      die "could not stop the running metalgo service: nothing was replaced and it was left as it was. Check: systemctl status metalgo"
+    fi
+  fi
+  APPLYING=1   # armed: the old node is stopped; the EXIT trap rolls back from here on
   [ "$METHOD" = docker ] || install -m 755 "$STAGE/metalgo" "$BIN.new"
   [ "$METHOD" = docker ] || mv -f "$BIN.new" "$BIN"
   install -m 644 "$STAGE/config.json" "$ETC/config.json.new"; mv -f "$ETC/config.json.new" "$ETC/config.json"
   install -m 644 "$STAGE/metalgo.service" "$UNIT.new"; mv -f "$UNIT.new" "$UNIT"
-  ${FAULT_AFTER_STOP:-true}   # test hook: FAULT_AFTER_STOP=false forces a failure right after the stop
   systemctl daemon-reload; systemctl enable metalgo >/dev/null 2>&1; systemctl start metalgo
 }
 # restore_previous REASON: put the previous installation back and prove it runs. Never exits by itself.
 restore_previous() {
+  set +e   # runs inside the EXIT trap: one failing step must not abandon the rest of the rollback
   ROLLED=1; APPLYING=0
+  local failed="" f
   warn "$1"
-  systemctl stop metalgo 2>/dev/null || true
+  systemctl stop metalgo 2>/dev/null
   if [ "$HAD_PREV" = 1 ]; then
-    [ -f "$BIN.prev" ] && mv -f "$BIN.prev" "$BIN"
-    [ -f "$ETC/config.json.prev" ] && mv -f "$ETC/config.json.prev" "$ETC/config.json"
-    [ -f "$UNIT.prev" ] && mv -f "$UNIT.prev" "$UNIT"
+    for f in "$BIN" "$ETC/config.json" "$UNIT"; do
+      if [ -f "$f.prev" ]; then mv -f "$f.prev" "$f" || failed="$failed $f"; fi
+    done
     rm -f "$BIN.new" "$ETC/config.json.new" "$UNIT.new"
-    systemctl daemon-reload 2>/dev/null || true; systemctl start metalgo 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || failed="$failed daemon-reload"
+    systemctl start metalgo 2>/dev/null || failed="$failed start"
     local nid="" bls="" _
     for _ in $(seq 1 60); do
       read_live_identity 2>/dev/null || true; nid=$NODEID; bls=$BLSPUB
       [ -n "$nid" ] && break; sleep 2
     done
-    if [ -n "$PREV_NODEID" ] && [ "$nid" = "$PREV_NODEID" ] && { [ -z "$PREV_BLS" ] || [ "$bls" = "$PREV_BLS" ]; }; then
+    if [ -n "$failed" ]; then
+      RESTORE_MSG="ROLLBACK INCOMPLETE: these restore steps failed:$failed (node answers as '${nid:-nothing}'). Restore by hand from the .prev files, then: systemctl start metalgo"
+    elif [ -n "$PREV_NODEID" ] && [ "$nid" = "$PREV_NODEID" ] && { [ -z "$PREV_BLS" ] || [ "$bls" = "$PREV_BLS" ]; }; then
       RESTORE_MSG="rolled back: the previous metalgo is running again with the same NodeID and BLS key ($nid)"
     elif [ -z "$PREV_NODEID" ]; then
       RESTORE_MSG="rolled back: previous binary, config and unit restored (service $(systemctl is-active metalgo 2>/dev/null); no previous identity was running to compare)"
@@ -533,7 +570,8 @@ rollback() { restore_previous "$1"; die "upgrade failed. $RESTORE_MSG. Details: 
 on_exit() {
   local rc=$?
   if [ "$APPLYING" = 1 ] && [ "$ROLLED" = 0 ]; then
-    restore_previous "unexpected failure (exit $rc) while applying: restoring the previous installation"
+    if [ "$rc" = 0 ]; then restore_previous "the script ended before the upgrade was verified: restoring the previous installation"
+    else restore_previous "unexpected failure (exit $rc) while applying: restoring the previous installation"; fi
     printf '\033[31m[x]\033[0m %s\n' "$RESTORE_MSG" >&2
     rc=1
   fi
@@ -722,7 +760,8 @@ main() {
       [ "$dd" = "$DATA" ] || die "--adopt: the existing metalgo uses data dir '$dd', not $DATA. Adopting a custom layout is not supported (it would risk the node identity)."
       local ex cf why; ex=$(systemctl show -p ExecStart --value metalgo 2>/dev/null || true)
       cf=$(printf '%s' "$ex" | grep -o -- '--config-file[= ][^ ;]*' | head -1 | sed 's/--config-file[= ]//' || true)
-      why=$(identity_paths_ok "$DATA" "$cf" "$ex") || die "--adopt refused: $why"
+      local envs; envs=$(systemctl show -p Environment --value metalgo 2>/dev/null || true)
+      why=$(identity_paths_ok "$DATA" "$cf" "$ex" "$envs") || die "--adopt refused: $why"
       say "adopting the existing metalgo service (data dir $DATA)"
     else say "metalgo installed by this script found: upgrading in place (identity kept, rollback on failure)"; fi
     if systemctl is-active --quiet metalgo; then read_live_identity; PREV_NODEID=$NODEID; PREV_BLS=$BLSPUB; fi

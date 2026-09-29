@@ -147,6 +147,48 @@ uninstall() {
   systemctl disable --now pulse-beacon 2>/dev/null || true; rm -f "$UNIT"
   systemctl daemon-reload; say "beacon removed (kept $ETC for your records; the token there is still enrolled until the operator revokes it)"
 }
+# beacon_unit RUNAS BIN ETC STATE → the systemd unit text. Same sandbox whether the beacon runs as its own user
+# or (fallback, when that user can't read the journal/snapshots) as root limited to CAP_DAC_READ_SEARCH.
+# Network: AF_INET/AF_INET6 for reports to mission control and local RPCs; AF_UNIX because `systemctl is-active`
+# talks to systemd over D-Bus. No IP allow-list: mission control's address can change and the beacon also polls
+# local nodeos/metalgo; the report destination is pinned by the https-only URL check instead.
+beacon_unit() {
+  local runas=$1 bin=$2 etc=$3 state=$4
+  cat <<UNIT
+[Unit]
+Description=pulse-cutover beacon (readiness reporter → mission control)
+After=network-online.target
+[Service]
+$( if [ "$runas" = root ]; then printf 'CapabilityBoundingSet=CAP_DAC_READ_SEARCH\nAmbientCapabilities=\n'; else printf 'User=%s\n' "$runas"; fi )
+ExecStart=$bin beacon --config $etc/beacon.toml
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+StateDirectory=pulse-beacon
+ReadWritePaths=$state
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
 
 main() {
   parse_args "$@"
@@ -351,27 +393,7 @@ for c in r.get("checks",[]): print("   ", "ok " if c.get("ok") else "-- ", c.get
     warn "the beacon user cannot read the ceremony journal or snapshots dir: running the beacon as root with read-only file access (CAP_DAC_READ_SEARCH only)"
     chmod 600 "$ETC/beacon.token"; chown root:root "$ETC/beacon.token"
   fi
-  cat > "$UNIT.new" <<UNIT
-[Unit]
-Description=pulse-cutover beacon (readiness reporter → mission control)
-After=network-online.target
-[Service]
-$( [ "$RUNAS" = root ] && echo 'CapabilityBoundingSet=CAP_DAC_READ_SEARCH' || echo "User=$SVC_USER" )
-ExecStart=$BIN beacon --config $ETC/beacon.toml
-Restart=always
-RestartSec=10
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=read-only
-PrivateTmp=yes
-PrivateDevices=yes
-# The beacon may write only its own state dir; the ceremony dir ($VAR) and /etc stay read-only to it.
-StateDirectory=pulse-beacon
-ReadWritePaths=$STATE
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-[Install]
-WantedBy=multi-user.target
-UNIT
+  beacon_unit "$RUNAS" "$BIN" "$ETC" "$STATE" > "$UNIT.new"
   mv -f "$UNIT.new" "$UNIT"
   ${FAULT_BEFORE_RESTART:-true}   # test hook: FAULT_BEFORE_RESTART=false forces a failure mid-apply
   systemctl daemon-reload; systemctl enable pulse-beacon >/dev/null 2>&1; systemctl restart pulse-beacon

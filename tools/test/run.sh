@@ -73,6 +73,23 @@ expect_die "adopt: ephemeral signer refused"                 identity_paths_ok /
 echo '{"staking-tls-key-file-content":"abc"}' > "$T/c5.json"
 expect_die "adopt: inline key content refused"               identity_paths_ok /var/lib/metalgo "$T/c5.json" ""
 
+# --- round 3 (#8): adoption must catch ephemeral identity in every form metalgo accepts ------------------
+# pflag bools: a bare flag means true (and does NOT consume the next word); =v parses like strconv.ParseBool.
+EX='/usr/bin/metalgo --config-file=/etc/metalgo/config.json'
+expect_die "adopt: bare --staking-ephemeral-signer-enabled before another flag refused" identity_paths_ok /var/lib/metalgo "" "$EX --staking-ephemeral-signer-enabled --staking-port=9651"
+expect_die "adopt: bare --staking-ephemeral-cert-enabled at the end refused"          identity_paths_ok /var/lib/metalgo "" "$EX --staking-ephemeral-cert-enabled"
+expect_die "adopt: bare bool followed by a word is still true (pflag)"                 identity_paths_ok /var/lib/metalgo "" "$EX --staking-ephemeral-signer-enabled false"
+for v in t T TRUE True 1; do expect_die "adopt: --staking-ephemeral-signer-enabled=$v refused" identity_paths_ok /var/lib/metalgo "" "$EX --staking-ephemeral-signer-enabled=$v"; done
+expect_ok  "adopt: --staking-ephemeral-signer-enabled=false accepted"                  identity_paths_ok /var/lib/metalgo "" "$EX --staking-ephemeral-signer-enabled=false"
+expect_die "adopt: systemctl-show ExecStart format parsed"                             identity_paths_ok /var/lib/metalgo "" "{ path=/usr/bin/metalgo ; argv[]=/usr/bin/metalgo --staking-ephemeral-cert-enabled --http-host=127.0.0.1 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+echo '{"staking-ephemeral-signer-enabled":"t"}' > "$T/c6.json"
+expect_die "adopt: config JSON string \"t\" refused"                                    identity_paths_ok /var/lib/metalgo "$T/c6.json" ""
+echo '{"staking-ephemeral-signer-enabled":false}' > "$T/c7.json"
+expect_ok  "adopt: config JSON false accepted"                                         identity_paths_ok /var/lib/metalgo "$T/c7.json" ""
+expect_die "adopt: env AVAGO_STAKING_EPHEMERAL_SIGNER_ENABLED=true refused"            identity_paths_ok /var/lib/metalgo "" "$EX" "AVAGO_STAKING_EPHEMERAL_SIGNER_ENABLED=true"
+expect_die "adopt: env AVAGO_STAKING_SIGNER_KEY_FILE elsewhere refused"               identity_paths_ok /var/lib/metalgo "" "$EX" "HOME=/root AVAGO_STAKING_SIGNER_KEY_FILE=/etc/signer.key"
+expect_ok  "adopt: unrelated env accepted"                                             identity_paths_ok /var/lib/metalgo "" "$EX" "AVAGO_HTTP_HOST=127.0.0.1"
+
 # --- --build needs a pinned commit ---------------------------------------------------------------------
 MF_COMMIT=""; expect_die "build: refused without metalgo_commit" require_build_commit
 MF_COMMIT=$(rep a 40); expect_ok "build: pinned commit accepted" require_build_commit
@@ -83,7 +100,7 @@ MF_COMMIT=$(rep a 40); expect_ok "build: pinned commit accepted" require_build_c
   BIN="$R/bin/metalgo"; ETC="$R/etc"; UNIT="$R/etc/metalgo.service"; STAGE="$R/stage"; TMP="$R/tmp"; mkdir -p "$TMP"
   echo old-bin > "$BIN"; echo old-cfg > "$ETC/config.json"; echo old-unit > "$UNIT"
   echo new-bin > "$STAGE/metalgo"; echo new-cfg > "$STAGE/config.json"; echo new-unit > "$STAGE/metalgo.service"
-  systemctl() { echo "systemctl $*" >> "$R/sys.log"; return 0; }
+  systemctl() { echo "systemctl $*" >> "$R/sys.log"; [ "$1" = is-active ] && return 3; return 0; }
   existing_unit() { return 0; }
   read_live_identity() { NODEID=NodeID-OLD; BLSPUB=0xold; BLSPOP=""; }
   sleep() { :; }
@@ -100,7 +117,7 @@ else bad "upgrade: failure after stop rolls back (rc=$rc; $(tr '\n' ' ' < "$T/mi
   BIN="$R/bin/metalgo"; ETC="$R/etc"; UNIT="$R/etc/metalgo.service"; STAGE="$R/stage"; TMP="$R/tmp"; mkdir -p "$TMP"
   echo old-bin > "$BIN"; echo old-cfg > "$ETC/config.json"; echo old-unit > "$UNIT"
   echo new-bin > "$STAGE/metalgo"; echo new-cfg > "$STAGE/config.json"; echo new-unit > "$STAGE/metalgo.service"
-  systemctl() { echo "systemctl $*" >> "$R/sys.log"; return 0; }
+  systemctl() { echo "systemctl $*" >> "$R/sys.log"; [ "$1" = is-active ] && return 3; return 0; }
   existing_unit() { return 0; }
   read_live_identity() { NODEID=NodeID-SOMETHINGELSE; BLSPUB=0xnew; }
   sleep() { :; }
@@ -109,6 +126,90 @@ else bad "upgrade: failure after stop rolls back (rc=$rc; $(tr '\n' ' ' < "$T/mi
   FAULT_AFTER_STOP=false swap_in
 ) > "$T/mi2.out" 2>&1
 if grep -q "ROLLBACK INCOMPLETE" "$T/mi2.out"; then ok "upgrade: a rollback that comes back with the wrong NodeID is reported, not hidden"; else bad "upgrade: wrong-NodeID rollback reported ($(tr '\n' ' ' < "$T/mi2.out" | head -c 200))"; fi
+
+# --- round 3 (#11/#6): the transaction under production errexit ---------------------------------------
+# swap_env: a fake installation in $1 with systemctl logged; callers override one command to fail.
+swap_env() {
+  R="$1"; mkdir -p "$R/etc" "$R/bin" "$R/stage" "$R/tmp"
+  BIN="$R/bin/metalgo"; ETC="$R/etc"; UNIT="$R/etc/metalgo.service"; STAGE="$R/stage"; TMP="$R/tmp"
+  echo old-bin > "$BIN"; echo old-cfg > "$ETC/config.json"; echo old-unit > "$UNIT"
+  echo new-bin > "$STAGE/metalgo"; echo new-cfg > "$STAGE/config.json"; echo new-unit > "$STAGE/metalgo.service"
+  systemctl() { echo "systemctl $*" >> "$R/sys.log"; [ "$1" = is-active ] && return 3; return 0; }
+  existing_unit() { return 0; }
+  read_live_identity() { NODEID=NodeID-OLD; BLSPUB=0xold; BLSPOP=""; }
+  sleep() { :; }
+  METHOD=binary; PREV_NODEID=NodeID-OLD; PREV_BLS=0xold; APPLYING=0; ROLLED=0; HAD_PREV=0
+}
+# (a) the first command after the stop fails (install), with set -euo pipefail exactly like production
+(
+  set -euo pipefail
+  swap_env "$T/r3a"
+  install() { echo "install $*" >> "$R/sys.log"; return 1; }
+  trap on_exit EXIT
+  swap_in
+  echo "REACHED-AFTER-SWAP"
+) > "$T/r3a.out" 2>&1; rc=$?
+R="$T/r3a"
+if [ $rc -ne 0 ] && ! grep -q REACHED-AFTER-SWAP "$T/r3a.out" && [ "$(cat "$R/bin/metalgo")" = old-bin ] && [ "$(cat "$R/etc/config.json")" = old-cfg ] \
+   && [ "$(cat "$R/etc/metalgo.service")" = old-unit ] && [ "$(sed -n 1p "$R/sys.log")" = "systemctl stop metalgo" ] && [ "$(grep -v '^systemctl is-active' "$R/sys.log" | sed -n 2p | cut -d' ' -f1)" = install ] \
+   && grep -q "systemctl start metalgo" "$R/sys.log" && grep -q "same NodeID and BLS key" "$T/r3a.out" && ! grep -q "(exit 0)" "$T/r3a.out" && [ ! -e "$R/bin/metalgo.new" ]
+then ok "txn (set -e): install failing right after the stop rolls back and restarts the old node"
+else bad "txn (set -e): install failing right after stop (rc=$rc; log: $(tr '\n' '|' < "$R/sys.log" 2>/dev/null); out: $(tr '\n' ' ' < "$T/r3a.out" | head -c 300))"; fi
+# (b) a rollback step itself failing (mv of the saved binary) must not abort the rest of the rollback and must be reported
+(
+  set -euo pipefail
+  swap_env "$T/r3b"
+  install() { return 1; }
+  mv() { case "$*" in *metalgo.prev*) return 1;; *) command mv "$@";; esac; }
+  trap on_exit EXIT
+  swap_in
+) > "$T/r3b.out" 2>&1; rc=$?
+if [ $rc -ne 0 ] && grep -q "systemctl start metalgo" "$T/r3b/sys.log" && grep -q "ROLLBACK INCOMPLETE" "$T/r3b.out"; then ok "txn (set -e): a failing rollback step is reported as ROLLBACK INCOMPLETE and the restart still runs"
+else bad "txn (set -e): failing rollback step (rc=$rc; out: $(tr '\n' ' ' < "$T/r3b.out" | head -c 300))"; fi
+# (c) stop fails → abort BEFORE swapping, nothing replaced, nothing rolled back
+(
+  set -euo pipefail
+  swap_env "$T/r3c"
+  systemctl() { echo "systemctl $*" >> "$R/sys.log"; [ "$1" = stop ] && return 1; return 0; }
+  trap on_exit EXIT
+  swap_in
+  echo "REACHED-AFTER-SWAP"
+) > "$T/r3c.out" 2>&1; rc=$?
+if [ $rc -ne 0 ] && ! grep -q REACHED-AFTER-SWAP "$T/r3c.out" && [ "$(cat "$T/r3c/bin/metalgo")" = old-bin ] && ! grep -q "systemctl start" "$T/r3c/sys.log" \
+   && grep -qi "could not stop" "$T/r3c.out"; then ok "txn (set -e): a failed stop aborts before anything is replaced"
+else bad "txn (set -e): failed stop (rc=$rc; log: $(tr '\n' '|' < "$T/r3c/sys.log"); out: $(tr '\n' ' ' < "$T/r3c.out" | head -c 300))"; fi
+# (d) stop "succeeds" but the unit is still active → same
+(
+  set -euo pipefail
+  swap_env "$T/r3d"
+  systemctl() { echo "systemctl $*" >> "$R/sys.log"; case "$1" in is-active) return 0;; esac; return 0; }
+  trap on_exit EXIT
+  swap_in
+  echo "REACHED-AFTER-SWAP"
+) > "$T/r3d.out" 2>&1; rc=$?
+if [ $rc -ne 0 ] && ! grep -q REACHED-AFTER-SWAP "$T/r3d.out" && [ "$(cat "$T/r3d/bin/metalgo")" = old-bin ]; then ok "txn (set -e): a unit still active after stop aborts before anything is replaced"
+else bad "txn (set -e): still-active after stop (rc=$rc; out: $(tr '\n' ' ' < "$T/r3d.out" | head -c 300))"; fi
+# (e) the script ending (exit 0) while armed is an interruption, reported without a misleading "exit 0"
+(
+  set -euo pipefail
+  swap_env "$T/r3e"
+  trap on_exit EXIT
+  swap_in
+  exit 0
+) > "$T/r3e.out" 2>&1; rc=$?
+if [ $rc -ne 0 ] && ! grep -q "(exit 0)" "$T/r3e.out" && grep -q "before the upgrade was verified" "$T/r3e.out"; then ok "txn: ending while armed is reported as an unverified upgrade, not 'unexpected failure (exit 0)'"
+else bad "txn: ending while armed (rc=$rc; out: $(tr '\n' ' ' < "$T/r3e.out" | head -c 300))"; fi
+# (f) rollback that comes back with the wrong identity exits non-zero
+(
+  set -euo pipefail
+  swap_env "$T/r3f"
+  install() { return 1; }
+  read_live_identity() { NODEID=NodeID-OTHER; BLSPUB=0xnew; }
+  trap on_exit EXIT
+  swap_in
+) > "$T/r3f.out" 2>&1; rc=$?
+if [ $rc -ne 0 ] && grep -q "ROLLBACK INCOMPLETE" "$T/r3f.out"; then ok "txn (set -e): wrong identity after rollback → ROLLBACK INCOMPLETE and non-zero exit"
+else bad "txn (set -e): wrong identity after rollback (rc=$rc)"; fi
 
 echo "beacon-install.sh"
 BEACON_INSTALL_SOURCED=1 source "$HERE/beacon-install.sh"; set +e
@@ -121,6 +222,17 @@ expect_die "beacon: https with userinfo refused"                            chec
 expect_ok  "beacon: http://localhost:8787 accepted"                         check_url http://localhost:8787
 expect_ok  "beacon: http://[::1]:8787 accepted"                             check_url 'http://[::1]:8787'
 expect_die "beacon: ftp refused"                                            check_url ftp://control.example.org
+
+# --- round 3 (#7): the beacon unit is sandboxed the same way whether it runs as its own user or as root ----
+for who in pulse-beacon root; do
+  U=$(beacon_unit "$who" /usr/local/bin/pulse-cutover /etc/pulse-cutover /var/lib/pulse-beacon)
+  for want in "NoNewPrivileges=yes" "ProtectSystem=strict" "ReadWritePaths=/var/lib/pulse-beacon" "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" \
+              "ProtectKernelTunables=yes" "ProtectKernelModules=yes" "ProtectControlGroups=yes" "RestrictNamespaces=yes" "LockPersonality=yes" "SystemCallFilter=@system-service"; do
+    printf '%s\n' "$U" | grep -qx "$want" || bad "beacon unit ($who): missing $want"
+  done
+  if [ "$who" = root ]; then printf '%s\n' "$U" | grep -qx "CapabilityBoundingSet=CAP_DAC_READ_SEARCH" && printf '%s\n' "$U" | grep -qx "AmbientCapabilities=" && ok "beacon unit (root fallback): only CAP_DAC_READ_SEARCH, hardened like the user unit" || bad "beacon unit (root fallback) capabilities"
+  else printf '%s\n' "$U" | grep -qx "User=pulse-beacon" && ok "beacon unit (pulse-beacon): unprivileged and hardened" || bad "beacon unit (pulse-beacon) user"; fi
+done
 
 # --- update transaction: restore puts back binary, config, instance id, unit and the ENROLLED token ------
 (
