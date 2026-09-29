@@ -37,6 +37,7 @@ poll_ms = 250                                     # poll interval, ms          [
 mode = "producer"            # you are a BP                                    [LEAVE]
 freeze_height = 0            # real event: the coordinator's published H       [CHANGE per event]
 freeze_margin = 420          # rehearsal H = last-final + 420 (see note above) [LEAVE for rehearsals]
+derive_h_at_arm = true       # rehearsal only: H derived at arm; a real event takes H from the signed event
 
 # "schedule_at_h" = tell nodeos IN ADVANCE to write the snapshot the moment
 # block H becomes final — the multi-BP discipline (everyone cuts the exact

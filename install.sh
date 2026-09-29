@@ -1071,7 +1071,7 @@ PRESCAN=$(mget_opt '.snapshot.prescan_path')
   echo '[ceremony]'
   echo "mode = \"$($API_LIKE && echo api || echo producer)\""
   echo "freeze_height = $FH"
-  [ -n "$FM" ] && echo "freeze_margin = $FM"
+  [ -n "$FM" ] && { echo "freeze_margin = $FM"; echo "derive_h_at_arm = true   # rehearsal: H derived at arm"; }
   [ "$SIM" = "true" ] && echo 'simulate_freeze = true'
   echo "chain_id = \"$CHAIN_ID\""
   echo "import_cpu_scale = $CPU_SCALE"
@@ -1090,6 +1090,10 @@ PRESCAN=$(mget_opt '.snapshot.prescan_path')
   if [ -n "$GOLDENS" ]; then echo "golden_roots = \"$GOLDENS\""; else echo "capture_roots = \"$WORK/captured-roots.txt\""; fi
   [ -n "$EXPECTED_SHA" ] && echo "expected_sha256 = \"$EXPECTED_SHA\""
   [ -n "$PRESCAN" ] && echo "prescan_path = \"$PRESCAN\""
+  # Exact-H cut (api mode without simulate_freeze, schedule_at_h): where nodeos writes
+  # the scheduled snapshot-<block_id_at_H>.bin.
+  SNAPDIR=$(mget_opt '.snapshot.dir')
+  [ -n "$SNAPDIR" ] && echo "dir = \"$SNAPDIR\""
   echo ''
   echo '[target]'
   echo 'metalgo_unit = "metalgo-pulse"'

@@ -131,8 +131,8 @@ pub fn run_loop<O: ChainOps>(cfg: &Config, ops: &O, runs: u32) -> Result<(), Str
         .r#loop
         .as_ref()
         .ok_or("loop mode requires a [loop] section (reset_cmd + metrics_path)")?;
-    if cfg.ceremony.freeze_margin.is_none() {
-        return Err("loop mode requires ceremony.freeze_margin (H re-derived per run)".into());
+    if cfg.ceremony.freeze_margin.is_none() || !cfg.ceremony.derive_h_at_arm {
+        return Err("loop mode requires ceremony.freeze_margin + derive_h_at_arm = true (H re-derived per run)".into());
     }
     let mut all: Vec<RunMetrics> = Vec::new();
     let mut metrics_file = std::fs::OpenOptions::new()
