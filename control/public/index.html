@@ -287,6 +287,35 @@ footer a{color:var(--muted)}
 .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:9px}
 .ep.mini{padding:9px 14px}.ep.mini .ep-h .srv-ic{width:26px;height:26px}
 @media (max-width:640px){.gl{grid-template-columns:24px minmax(0,1fr) auto}.gl .pbar{display:none}.srv-kv,.ep-m{grid-template-columns:repeat(2,minmax(0,1fr))}.srv-h{flex-wrap:wrap}.srv-h .pill{margin-left:50px}}
+
+/* full page per server / endpoint */
+.page{position:fixed;inset:0;z-index:60;overflow-y:auto;background:radial-gradient(1200px 600px at 80% -10%,rgba(139,92,246,.12),transparent),var(--bg,#070a16);display:none}
+.page.on{display:block}
+.pg{max-width:1080px;margin:0 auto;padding:22px 20px 60px}
+.crumb{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:12.5px}
+.crumb a{color:var(--muted);text-decoration:none;cursor:pointer}.crumb a:hover{color:var(--ink)}
+.pg-h{display:flex;align-items:center;gap:16px;margin:18px 0 20px;flex-wrap:wrap}
+.pg-h .srv-ic{width:56px;height:56px;border-radius:16px}
+.pg-h h2{margin:0;font:700 28px/1.1 var(--display)}.pg-h .meta{color:var(--muted);font-size:12.5px;margin-top:6px;display:flex;gap:6px 14px;flex-wrap:wrap}
+.pg-h .meta span{display:inline-flex;gap:5px;align-items:center}
+.pg-h .pill{margin-left:auto;font-size:13px;padding:6px 14px}
+.pg-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.card2{border-radius:18px;border:1px solid var(--line);background:rgba(255,255,255,.025);padding:16px 18px}
+.card2 h3{margin:0 0 12px;display:flex;align-items:center;gap:8px;font:600 11.5px var(--sans);letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)}
+.card2 h3 .cnt{margin-left:auto;font:600 12px var(--mono);letter-spacing:0;color:var(--ink);text-transform:none}
+.card2.span{grid-column:1/-1}
+.kv{display:grid;grid-template-columns:minmax(120px,max-content) minmax(0,1fr);gap:8px 16px;font-size:13px;align-items:baseline}
+.kv dt{color:var(--muted)}.kv dd{margin:0;font-family:var(--mono);overflow-wrap:anywhere}
+.cp{border:1px solid var(--line);background:rgba(255,255,255,.04);color:var(--muted);border-radius:7px;font-size:10.5px;padding:1px 7px;margin-left:6px;cursor:pointer;font-family:var(--sans)}
+.big3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:12px}
+.big3 div{border-radius:12px;background:rgba(255,255,255,.03);border:1px solid var(--line);padding:10px 12px;font:700 18px var(--mono)}
+.big3 div span{display:block;font:500 10.5px var(--sans);color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}
+.spark{width:100%;height:64px;display:block}
+.chainrow{display:flex;gap:8px;flex-wrap:wrap}
+pre.raw{margin:0;max-height:360px;overflow:auto;font:12px/1.5 var(--mono);color:var(--muted);background:rgba(0,0,0,.25);border-radius:12px;padding:12px}
+.openfull{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--muted);text-decoration:none;border:1px solid var(--line);border-radius:999px;padding:3px 10px;cursor:pointer;background:none}
+.openfull:hover{color:var(--ink);border-color:rgba(255,255,255,.2)}
+@media (max-width:760px){.pg-grid{grid-template-columns:minmax(0,1fr)}.big3{grid-template-columns:repeat(2,minmax(0,1fr))}.pg-h h2{font-size:22px}.pg-h .pill{margin-left:0}}
 @media (max-width:1100px){.hero{grid-template-columns:minmax(0,1fr)}.globe-card{min-height:440px}.duo{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:640px){
   .tile{padding-bottom:56px;min-height:128px}
@@ -357,7 +386,7 @@ footer a{color:var(--muted)}
     <div class="sec-h"><h2 id="t-infra">Infrastructure</h2><span id="infra-sub">every node every producer publishes in bp.json · probed read-only</span></div>
     <div class="inf-sum" id="inf-sum"></div>
     <div class="inf-tools" id="inf-tools"></div>
-    <div class="glass inf-table"><table><thead><tr><th>Producer</th><th>Node</th><th>Endpoint</th><th>API</th><th>Version</th><th>Lag</th><th>Edge</th><th>Hyperion</th><th>Atomic</th><th>P2P</th></tr></thead><tbody id="inf-rows"></tbody></table><div class="inf-foot" id="inf-foot"></div></div>
+    <div class="glass inf-table"><table><thead><tr><th>Operator</th><th>Node</th><th>Endpoint</th><th>API</th><th>Version</th><th>Lag</th><th>Edge</th><th>Hyperion</th><th>Atomic</th><th>P2P</th></tr></thead><tbody id="inf-rows"></tbody></table><div class="inf-foot" id="inf-foot"></div></div>
   </section>
   <section class="duo">
     <div>
@@ -372,6 +401,7 @@ footer a{color:var(--muted)}
   <p class="sr" aria-live="polite" id="announce"></p>
 </main>
 <div class="scrim" id="scrim"></div>
+<section class="page" id="page" aria-live="polite"></section>
 <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="dr-title" aria-hidden="true"></aside>
 <footer class="wrap">pulse-cutover mission control · read-only view of public chain data and opt-in producer beacons · <a href="https://github.com/paulgnz/pulse-cutover">github.com/paulgnz/pulse-cutover</a></footer>
 
@@ -590,6 +620,8 @@ const CHECKS = {
   hook_on_live: ['setup', 'Go-live hook', 'switches your public API to PulseVM'],
   hook_on_abort: ['setup', 'Rollback hook', 'reopens writes on the old chain if anything fails'],
   validator_running: ['setup', 'Metal validator', 'metalgo installed and running next to nodeos'],
+  metal_synced: ['setup', 'Metal node synced', 'the Metal P-Chain has finished bootstrapping'],
+  metal_reachable: ['setup', 'Staking port open', 'peers can reach port 9651/tcp from the internet'],
 };
 const kind = (c) => (CHECKS[c.name] || ['health'])[0];
 const label = (c) => (CHECKS[c.name] || [0, c.name])[1];
@@ -726,7 +758,7 @@ function render() {
 
 /* ---------------- infrastructure ---------------- */
 let infraData = {}, infraFilter = 'all', infraQuery = '';
-const FILTERS = [['all', 'All nodes'], ['api', 'API'], ['producer', 'Producer'], ['p2p', 'P2P peers'], ['hyperion', 'Hyperion'], ['atomic', 'AtomicAssets'], ['problems', 'Problems']];
+const FILTERS = [['all', 'All nodes'], ['api', 'API'], ['producer', 'Producer'], ['p2p', 'P2P peers'], ['hyperion', 'Hyperion'], ['atomic', 'AtomicAssets'], ['nonprod', 'Not producers'], ['problems', 'Problems']];
 const MIXC = ['#8b5cf6', '#34d399', '#60a5fa', '#f5a524', '#fb7185', '#a3e635', '#f472b6', '#94a3b8'];
 function mix(counts) {
   const tot = counts.reduce((a, [, n]) => a + n, 0) || 1;
@@ -743,13 +775,14 @@ function renderInfra() {
   const nodes = d.nodes || [];
   const api = nodes.filter((n) => n.url), up = api.filter((n) => n.api?.ok);
   const p2p = nodes.filter((n) => n.p2p), p2pUp = p2p.filter((n) => n.p2p_probe?.ok);
-  const hy = nodes.filter((n) => n.hyperion?.ok), at = nodes.filter((n) => n.atomic?.ok);
+  const hy = nodes.filter((n) => n.hyperion?.ok && !n.unregistered), at = nodes.filter((n) => n.atomic?.ok);
   $('inf-sum').innerHTML = `
     <div class="glass"><div class="label">API endpoints</div><div class="v">${up.length}<span style="color:var(--muted);font-size:14px"> / ${api.length}</span></div><div class="l">answering now</div></div>
     <div class="glass"><div class="label">nodeos versions</div>${mix(tally(up.map((n) => (n.api.version || '?').split('-')[0])))}</div>
     <div class="glass"><div class="label">Edges</div>${mix(tally(up.map((n) => n.api.edge)))}</div>
     <div class="glass"><div class="label">Hyperion</div><div class="v">${new Set(hy.map((n) => n.producer)).size}</div>${mix(tally(hy.map((n) => n.hyperion.version || '?')))}</div>
     <div class="glass"><div class="label">AtomicAssets API</div><div class="v">${new Set(at.map((n) => n.producer)).size}</div><div class="l">producers serving it</div></div>
+    <div class="glass"><div class="label">Not producers</div><div class="v">${nodes.filter((n) => n.unregistered).length}</div><div class="l">public APIs outside any bp.json</div></div>
     <div class="glass"><div class="label">P2P peers</div><div class="v">${p2pUp.length}<span style="color:var(--muted);font-size:14px"> / ${p2p.length}</span></div><div class="l">accepting connections</div></div>`;
   $('inf-tools').innerHTML = FILTERS.map(([k, l]) => `<button class="chipbtn" aria-pressed="${infraFilter === k}" data-f="${k}">${l}</button>`).join('') + `<input id="inf-q" placeholder="search producer or URL" value="${esc(infraQuery)}" aria-label="Search nodes">`;
   $('inf-tools').querySelectorAll('.chipbtn').forEach((b) => b.onclick = () => { infraFilter = b.dataset.f; renderInfra(); });
@@ -761,12 +794,22 @@ function renderInfra() {
       if (ql && !(`${n.producer} ${n.org?.name || ''} ${n.url || ''} ${n.p2p || ''}`.toLowerCase().includes(ql))) return false;
       switch (infraFilter) {
         case 'api': return !!n.url; case 'producer': return n.types?.includes('producer'); case 'p2p': return !!n.p2p;
-        case 'hyperion': return !!n.hyperion; case 'atomic': return !!n.atomic; case 'problems': return problem(n); default: return true;
+        case 'hyperion': return !!n.hyperion; case 'nonprod': return !!n.unregistered; case 'atomic': return !!n.atomic; case 'problems': return problem(n); default: return true;
       }
     });
     const dot = (ok, warn) => `<span class="sd ${ok ? (warn ? 'warn' : 'ok') : 'bad'}"></span>`;
     $('inf-rows').innerHTML = rows.slice(0, 400).map((n) => {
       const logo = n.org?.logo ? `<img src="${esc(n.org.logo)}" alt="" loading="lazy" onerror="this.remove()">` : '';
+      if (n.unregistered) { const a = n.api, h = n.hyperion;
+        return `<tr><td><div class="who2"><div class="logo"><span>${esc(initials(n.operator || '?'))}</span></div><div><b>${esc(n.operator || '—')}</b><div style="font-size:11px"><span class="tp" title="Not a registered producer: listed by ${esc((n.sources || []).map((u) => u.split('/').slice(3, 5).join('/')).join(', '))}" style="color:var(--warn);border-color:color-mix(in srgb,var(--warn) 40%,transparent)">not a producer</span>${n.note ? ` <span style="color:var(--muted)">${esc(n.note)}</span>` : ''}</div></div></div></td>
+        <td data-l="node"><span class="tp api">api</span></td>
+        <td data-l="endpoint"><a class="url" href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${esc(n.url.replace(/^https?:\/\//, ''))}</a></td>
+        <td data-l="api"><span class="st2">${dot(a.ok)}${a.ms} ms</span></td>
+        <td data-l="version" class="mono">${a?.version ? esc(a.version.split('-')[0]) : '—'}</td>
+        <td data-l="lag" class="mono">${a?.lag != null ? fmt(a.lag) : '—'}</td>
+        <td data-l="edge">${esc(a?.edge || '—')}</td>
+        <td data-l="hyperion">${h ? esc(h.version || 'up') : '<span style="color:var(--dim)">—</span>'}</td>
+        <td data-l="atomic"><span style="color:var(--dim)">—</span></td><td data-l="p2p"><span style="color:var(--dim)">—</span></td></tr>`; }
       if (n.missing_bp_json) return `<tr><td><div class="who2"><div class="logo"><span>${esc(initials(n.producer))}</span>${logo}</div><b>${esc(n.org?.name || n.producer)}</b></div></td><td colspan="9" data-l="bp.json" style="color:var(--bad)">no bp.json published: nodes unknown</td></tr>`;
       const a = n.api, h = n.hyperion, at = n.atomic, pp = n.p2p_probe;
       return `<tr class="clickable" data-p="${esc(n.producer)}">
@@ -821,11 +864,15 @@ const ICP = {
   radio: '<circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.5M7.8 16.2a6 6 0 0 1 0-8.5M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2"/>',
   trophy: '<path d="M6 9H4a2 2 0 0 1 0-4h2M18 9h2a2 2 0 0 0 0-4h-2M6 3h12v7a6 6 0 0 1-12 0z"/><path d="M12 16v4M8 22h8"/>',
   list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
+  ext: '<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+  back: '<path d="M19 12H5M12 19l-7-7 7-7"/>',
+  code: '<path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/>',
+  activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
 };
 const ic = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICP[n] || ICP.server}</svg>`;
 const CHECK_ICON = { source_api: 'globe', chain_id: 'key', producer_api: 'cpu', freeze_height: 'lock', freeze_lead_blocks: 'lock',
   staged_snapshot_absent: 'camera', disk_free: 'hdd', hook_on_freeze: 'lock', hook_post_ignite: 'zap', hook_on_live: 'arrow',
-  hook_on_abort: 'undo', validator_running: 'hex' };
+  hook_on_abort: 'undo', validator_running: 'hex', metal_synced: 'hex', metal_reachable: 'radio' };
 const ROLE_ICON = { producer: 'cpu', history: 'db', api: 'globe', seed: 'link', query: 'db', full: 'globe' };
 const ROLE_NAME = { producer: 'Block producer node', history: 'History / Hyperion node', api: 'Public API node' };
 /* ---------------- producer detail drawer ---------------- */
@@ -881,7 +928,8 @@ function renderDrawer() {
             <div class="srv-h"><div class="srv-ic">${ic(ROLE_ICON[b.role] || 'server', 'lg')}</div>
               <div style="min-width:0"><h5>${esc(b.node)}</h5><div class="meta"><span>${esc(ROLE_NAME[b.role] || b.role || 'node')}</span><span>${ic('clock')}${b.silent ? 'silent' : ago(b.age_ms)}</span><span>${ic('radio')}beacon v${esc(rp.agent_version)}</span></div></div>
               <span class="pill ${st}">${ic(st === 'ok' ? 'ok' : st === 'bad' ? 'bad' : 'todo')}${txt}</span></div>
-            <div class="srv-kv"><div><span>head</span>${rp.source?.head ? fmt(rp.source.head) : '—'}</div><div><span>irreversible</span>${rp.source?.lib ? fmt(rp.source.lib) : '—'}</div>
+            <div style="padding:8px 16px 0 18px"><button class="openfull" data-node="${esc(b.node)}">${ic('ext')}Open full page</button></div>
+            <div class="srv-kv" style="margin-top:8px"><div><span>head</span>${rp.source?.head ? fmt(rp.source.head) : '—'}</div><div><span>irreversible</span>${rp.source?.lib ? fmt(rp.source.lib) : '—'}</div>
               <div><span>behind chain</span>${lag == null ? '—' : lag <= 30 ? '<span style="color:var(--ok)">in sync</span>' : fmt(lag) + ' blocks'}</div></div>
             <div class="srv-grp"><h6>${ic('wrench')}Cutover setup <em>${done}/${k.setup.length}</em><span class="pbar"><i style="width:${k.setup.length ? Math.round(100 * done / k.setup.length) : 0}%"></i></span></h6>${k.setup.map((x) => row(x, 'todo')).join('')}</div>
             <div class="srv-grp"><h6>${ic('shield')}Node health <em>${k.health.length - k.sick.length}/${k.health.length}</em></h6>${k.health.map((x) => row(x, 'no')).join('')}</div>
@@ -904,7 +952,7 @@ function renderDrawer() {
         const head = `<div class="ep-h"><div class="srv-ic">${ic(icn)}</div><div class="t"><b>${n.url ? `<a href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${esc(host)}</a>` : esc(host)}</b>
           <small>${n.types.map((x) => `<span class="tp ${esc(x)}">${esc(x)}</span>`).join('')} ${n.location ? ic('pin') + esc(n.location) : ''}</small></div>${pill}</div>`;
         if (!n.api && !n.hyperion && !n.atomic) return `<div class="ep mini">${head}</div>`;
-        return `<div class="ep">${head}
+        return `<div class="ep">${head}<div style="margin-top:8px"><button class="openfull" data-ep="${esc(n.url)}">${ic('ext')}Open full page</button></div>
           <div class="ep-m">
             <div><span>nodeos</span>${esc(n.api?.version?.split('-')[0] || '—')}</div><div><span>behind</span>${n.api?.lag != null ? (n.api.lag <= 4 ? 'in sync' : fmt(n.api.lag)) : '—'}</div><div><span>edge</span>${esc(n.api?.edge || '—')}</div>
             ${n.hyperion ? `<div><span>hyperion</span>${n.hyperion.ok ? esc(n.hyperion.version) : '<span style="color:var(--bad)">down</span>'}</div><div><span>indexed lag</span>${n.hyperion.lag != null ? fmt(n.hyperion.lag) : '—'}</div><div><span>hyperion ms</span>${n.hyperion.ms ?? '—'}</div>` : ''}
@@ -919,8 +967,92 @@ function renderDrawer() {
       ${r?.ceremony?.evidence && Object.keys(r.ceremony.evidence).length ? `<div class="dr-sec"><h4>Evidence</h4><dl class="evk">${Object.entries(r.ceremony.evidence).map(([k, v]) => `<dt>${esc(k.replace(/_/g, ' '))}</dt><dd>${esc(typeof v === 'string' ? v : JSON.stringify(v))}</dd>`).join('')}</dl></div>` : ''}
     </div>`;
   $('dr-x').onclick = closeProducer;
+  dr.querySelectorAll('.openfull').forEach((x) => x.onclick = () => openPage(x.dataset.node ? { node: x.dataset.node } : { ep: x.dataset.ep }));
   dr.querySelectorAll('.gl').forEach((g) => g.onclick = (e) => { e.preventDefault(); dr.querySelector('#srv-' + g.dataset.srv)?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
   dr.classList.add('on'); sc.classList.add('on'); dr.setAttribute('aria-hidden', 'false');
+}
+
+
+/* ---------------- full page: one server (beacon) or one public endpoint ---------------- */
+let pageSel = null; try { const q = new URLSearchParams(location.search); if (q.get('node')) pageSel = { node: q.get('node') }; else if (q.get('ep')) pageSel = { ep: q.get('ep') }; } catch {}
+let pageData = null, pageFetchT = 0;
+function setQ(k, v) { try { const u = new URL(location); ['node', 'ep'].forEach((x) => u.searchParams.delete(x)); if (k) u.searchParams.set(k, v); history.replaceState(null, '', u); } catch {} }
+function openPage(sel) { pageSel = sel; pageData = null; pageFetchT = 0; setQ(sel.node ? 'node' : 'ep', sel.node || sel.ep); renderPage(); $('page').scrollTop = 0; }
+function closePage() { pageSel = null; setQ(null); renderPage(); }
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && pageSel) { e.stopImmediatePropagation(); closePage(); } }, true);
+const copyBtn = (v) => `<button class="cp" data-copy="${esc(v)}">copy</button>`;
+function sparkLine(vals, color) {
+  const v = vals.filter((x) => x != null); if (v.length < 2) return '<div style="color:var(--dim);font-size:12px">collecting… (history builds while this page is open on the server)</div>';
+  const mn = Math.min(...v), mx = Math.max(...v), W = 400, H = 64, pts = vals.map((x, i) => x == null ? null : [i / (vals.length - 1) * W, H - 6 - (mx === mn ? 0.5 : (x - mn) / (mx - mn)) * (H - 12)]).filter(Boolean);
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><polyline fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke" points="${pts.map((p) => p.join(',')).join(' ')}"/></svg><div style="display:flex;justify-content:space-between;color:var(--dim);font:11px var(--mono)"><span>min ${fmt(mn)}</span><span>now ${fmt(v.at(-1))}</span><span>max ${fmt(mx)}</span></div>`;
+}
+async function renderPage() {
+  const pg = $('page');
+  const p = openName && net?.producers.find((x) => x.name === openName);
+  if (!pageSel || !p) { pg.classList.remove('on'); document.body.style.overflow = ''; return; }
+  pg.classList.add('on'); document.body.style.overflow = 'hidden';
+  const o = p.org || {}, c = net.chain || {};
+  const crumb = `<div class="crumb"><a id="pg-back">${ic('back')} Back</a><span>·</span><span>${esc(net.name)} ${esc(net.label || '')}</span><span>›</span><a id="pg-prod">${esc(o.name || p.name)}</a><span>›</span><b style="color:var(--ink)">${esc(pageSel.node || (pageSel.ep || '').replace(/^https?:\/\//, ''))}</b></div>`;
+  let body = '';
+  if (pageSel.node) {
+    if (Date.now() - pageFetchT > 9000) { pageFetchT = Date.now(); fetch(`/api/node/${encodeURIComponent(net.id)}/${encodeURIComponent(p.name)}/${encodeURIComponent(pageSel.node)}`, { cache: 'no-store' }).then((r) => r.ok ? r.json() : null).then((d) => { pageData = d; renderPage(); }).catch(() => {}); }
+    const d = pageData, rp = d?.report;
+    if (!rp) body = `<div class="card2">${d === null && pageFetchT ? 'Loading…' : 'This server is not reporting.'}</div>`;
+    else {
+      const k = splitChecks(rp.checks || []), done = k.setup.length - k.todo.length;
+      const st = d.silent ? ['bad', 'silent'] : k.sick.length ? ['bad', `${k.sick.length} issue${k.sick.length > 1 ? 's' : ''}`] : k.todo.length ? ['warn', `${k.todo.length} to set up`] : ['ok', 'ready'];
+      const lag = c.head && rp.source?.head ? c.head - rp.source.head : null, m = rp.metal;
+      const row = (x, bad) => `<div class="ck"><span class="st ${x.ok ? 'ok' : bad}">${ic(x.ok ? 'ok' : bad === 'no' ? 'bad' : 'todo')}</span><span class="ci">${ic(CHECK_ICON[x.name] || 'wrench')}</span><div><b>${esc(label(x))}</b><span>${x.ok ? esc(x.detail || 'ok') : esc((CHECKS[x.name] || [])[2] || x.detail || '')}${!x.ok && (CHECKS[x.name] || [])[2] && x.detail ? ` · <i>${esc(x.detail)}</i>` : ''}</span></div></div>`;
+      const yn = (v, t, f) => v == null ? '<span style="color:var(--dim)">unknown</span>' : v ? `<span style="color:var(--ok)">${t}</span>` : `<span style="color:var(--warn)">${f}</span>`;
+      const h = d.history || [];
+      body = `
+      <div class="pg-h"><div class="srv-ic" style="color:${{ ok: 'var(--ok)', warn: 'var(--warn)', bad: 'var(--bad)' }[st[0]]}">${ic(ROLE_ICON[rp.role] || 'server', 'lg')}</div>
+        <div><h2>${esc(rp.node)}</h2><div class="meta"><span>${esc(ROLE_NAME[rp.role] || rp.role)}</span><span>${flag(o.country)} ${esc(o.name || p.name)}</span><span>${ic('clock')}${d.silent ? 'silent' : Math.round(d.age_ms / 1000) + 's ago'}</span><span>${ic('radio')}beacon v${esc(rp.agent_version)}</span></div></div>
+        <span class="pill ${st[0]}">${ic(st[0] === 'ok' ? 'ok' : st[0] === 'bad' ? 'bad' : 'todo')}${st[1]}</span></div>
+      <div class="pg-grid">
+        <div class="card2"><h3>${ic('activity')}XPR chain position</h3>
+          <div class="big3"><div><span>head</span>${fmt(rp.source?.head)}</div><div><span>irreversible</span>${fmt(rp.source?.lib)}</div><div><span>behind chain</span>${lag == null ? '—' : lag <= 30 ? '<span style="color:var(--ok)">in sync</span>' : fmt(lag)}</div></div>
+          <div style="color:var(--muted);font-size:11px;margin-bottom:4px">blocks behind the network, last ${h.length} reports</div>${sparkLine(h.map((x) => x.lag), 'var(--cut)')}
+          <dl class="kv" style="margin-top:12px"><dt>chain_id</dt><dd>${esc((rp.source?.chain_id || '').slice(0, 16))}…</dd><dt>mode</dt><dd>${esc(rp.mode)}</dd></dl></div>
+        <div class="card2"><h3>${ic('hex')}Metal node</h3>
+          ${m ? `<div class="big3"><div><span>peers</span>${fmt(m.peers)}</div><div><span>P-Chain</span>${yn(m.bootstrapped?.P, 'synced', 'syncing')}</div><div><span>port 9651</span>${yn(m.staking_reachable, 'open', 'closed')}</div></div>
+          <dl class="kv"><dt>NodeID</dt><dd>${esc(m.node_id)}${copyBtn(m.node_id)}</dd>
+            <dt>BLS public key</dt><dd title="${esc(m.bls_public_key)}">${esc(String(m.bls_public_key || '').slice(0, 22))}…${copyBtn(m.bls_public_key)}</dd>
+            <dt>version</dt><dd>${esc(m.version)}</dd><dt>plugin protocol</dt><dd>${esc(m.rpcchainvm)}</dd>
+            <dt>network id</dt><dd>${esc(m.network_id)}${m.network_id === 5 ? ' (Tahoe)' : m.network_id === 1 ? ' (Metal mainnet)' : ''}</dd>
+            <dt>X / C chains</dt><dd>${yn(m.bootstrapped?.X, 'synced', 'syncing')} / ${yn(m.bootstrapped?.C, 'synced', 'syncing')}</dd>
+            <dt>health</dt><dd>${yn(m.healthy, 'healthy', 'unhealthy')}</dd></dl>
+          <div style="color:var(--muted);font-size:11px;margin:10px 0 4px">peers, last ${h.length} reports</div>${sparkLine(h.map((x) => x.peers), 'var(--ok)')}`
+          : `<div class="ev-empty">No Metal node details yet. Either metalgo isn't running here, or this beacon predates v0.5.0-rc.4. Setup: <b>docs/METAL-QUICKSTART.md</b>.</div>`}</div>
+        <div class="card2"><h3>${ic('wrench')}Cutover setup<span class="cnt">${done}/${k.setup.length}</span></h3>${k.setup.map((x) => row(x, 'todo')).join('')}</div>
+        <div class="card2"><h3>${ic('shield')}Node health<span class="cnt">${k.health.length - k.sick.length}/${k.health.length}</span></h3>${k.health.map((x) => row(x, 'no')).join('')}</div>
+        ${rp.ceremony?.state || rp.coord ? `<div class="card2 span"><h3>${ic('zap')}Ceremony</h3><dl class="kv"><dt>state</dt><dd>${esc(rp.ceremony?.state || 'idle')}</dd>${rp.coord ? `<dt>coordinated event</dt><dd>${esc(rp.coord.event_id || '—')} · ${rp.coord.accepted ? 'accepted' : 'not accepted'}${rp.coord.armed ? ' · armed' : ''}</dd>` : ''}${Object.entries(rp.ceremony?.evidence || {}).map(([kk, v]) => `<dt>${esc(kk.replace(/_/g, ' '))}</dt><dd>${esc(typeof v === 'string' ? v : JSON.stringify(v))}</dd>`).join('')}</dl></div>` : ''}
+        <div class="card2 span"><h3>${ic('code')}Raw report<span class="cnt"><a href="/api/node/${encodeURIComponent(net.id)}/${encodeURIComponent(p.name)}/${encodeURIComponent(rp.node)}" target="_blank" style="color:var(--muted)">JSON API ${ic('ext')}</a></span></h3><pre class="raw">${esc(JSON.stringify(rp, null, 2))}</pre></div>
+      </div>`;
+    }
+  } else {
+    const n = (infraData[active]?.nodes || []).find((x) => x.url === pageSel.ep);
+    if (!n) body = `<div class="card2">Endpoint not found in the latest survey.</div>`;
+    else {
+      const a = n.api, hy = n.hyperion, up = a?.ok && a.chain_ok !== false;
+      body = `
+      <div class="pg-h"><div class="srv-ic">${ic(hy ? 'db' : ROLE_ICON[n.types[0]] || 'globe', 'lg')}</div>
+        <div><h2 style="font-family:var(--mono);font-size:22px">${esc(n.url.replace(/^https?:\/\//, ''))}</h2><div class="meta"><span>${n.types.map((t) => `<span class="tp ${esc(t)}">${esc(t)}</span>`).join('')}</span>${n.location ? `<span>${ic('pin')}${esc(n.location)}</span>` : ''}<span>${flag(o.country)} ${esc(o.name || p.name)}</span><span>${ic('clock')}surveyed ${infraData[active]?.ts ? Math.round((Date.now() - infraData[active].ts) / 60000) + ' min ago' : '—'}</span></div></div>
+        <span class="pill ${up ? 'ok' : 'bad'}">${ic(up ? 'ok' : 'bad')}${up ? 'answering' : 'down'}</span></div>
+      <div class="pg-grid">
+        <div class="card2"><h3>${ic('globe')}Chain API</h3>${a ? `<div class="big3"><div><span>latency</span>${a.ms ?? '—'} ms</div><div><span>behind</span>${a.lag != null ? (a.lag <= 30 ? '<span style="color:var(--ok)">in sync</span>' : fmt(a.lag)) : '—'}</div><div><span>chain</span>${a.chain_ok === false ? '<span style="color:var(--bad)">wrong</span>' : '<span style="color:var(--ok)">ok</span>'}</div></div>
+          <dl class="kv"><dt>nodeos</dt><dd>${esc(a.version || '—')}</dd><dt>edge / proxy</dt><dd>${esc(a.edge || '—')}</dd><dt>head</dt><dd>${fmt(a.head)}</dd>${a.error ? `<dt>error</dt><dd style="color:var(--bad)">${esc(a.error)}</dd>` : ''}</dl>
+          <div style="margin-top:12px"><a class="openfull" href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${ic('ext')}get_info</a></div>` : '<div class="ev-empty">No API on this node.</div>'}</div>
+        <div class="card2"><h3>${ic('db')}History &amp; services</h3>${hy ? `<dl class="kv"><dt>hyperion</dt><dd>${esc(hy.version || '—')}</dd><dt>indexed</dt><dd>${fmt(hy.indexed)}</dd><dt>index lag</dt><dd>${fmt(hy.lag)}</dd><dt>latency</dt><dd>${hy.ms} ms</dd></dl><div class="chips">${(hy.services || []).map((x) => `<span class="pill ${x.ok ? 'ok' : 'bad'}">${ic(x.ok ? 'ok' : 'bad')}${esc(x.s)}</span>`).join('')}</div>` : '<div class="ev-empty">No Hyperion detected.</div>'}
+          ${n.atomic ? `<dl class="kv" style="margin-top:12px"><dt>atomicassets</dt><dd>${n.atomic.ok ? esc(n.atomic.version || 'up') : 'down'}</dd></dl>` : ''}
+          ${n.features?.length ? `<div class="chips">${n.features.map((f) => `<span class="pill mute">${esc(f)}</span>`).join('')}</div>` : ''}</div>
+        <div class="card2 span"><h3>${ic('radio')}Cutover coverage</h3><div style="font-size:13px;color:var(--muted)">Public endpoints don't report readiness themselves. To cover this endpoint in a cutover, install the beacon on the server behind it (one command: <b>docs/OPERATOR-QUICKSTART.md</b>). It then appears under this producer as its own server page.</div></div>
+      </div>`;
+    }
+  }
+  pg.innerHTML = `<div class="pg">${crumb}${body}</div>`;
+  $('pg-back').onclick = closePage; $('pg-prod').onclick = closePage;
+  pg.querySelectorAll('[data-copy]').forEach((b) => b.onclick = () => { navigator.clipboard?.writeText(b.dataset.copy).then(() => { b.textContent = 'copied'; setTimeout(() => (b.textContent = 'copy'), 1200); }).catch(() => {}); });
 }
 
 let lastHead = {};
@@ -930,7 +1062,7 @@ async function poll() {
     const n = data.networks.find((x) => x.id === (active || data.networks[0].id));
     if (n?.chain?.head && lastHead[n.id] && n.chain.head > lastHead[n.id]) fireBlock(n.chain.head_producer);
     if (n?.chain?.head) lastHead[n.id] = n.chain.head;
-    render();
+    render(); if (pageSel) renderPage();
     $('clock').textContent = new Date(data.generated_at).toISOString().slice(11, 19) + ' UTC';
   } catch { $('clock').textContent = 'reconnecting'; }
 }

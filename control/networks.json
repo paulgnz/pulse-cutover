@@ -136,5 +136,214 @@
       }
     }
   ],
-  "manifest_updated": "2026-09-29"
+  "manifest_updated": "2026-09-29",
+  "known_endpoints": [
+    {
+      "url": "https://proton.greymass.com",
+      "operator": "Greymass",
+      "sources": [
+        "https://github.com/XPRNetwork/proton-wallet-rn/blob/main/web/services/ProtonWebConstants.tsx",
+        "https://github.com/XPRNetwork/proton-cli/blob/master/settings.json"
+      ],
+      "note": "default endpoint of the XPR wallet and proton-cli"
+    },
+    {
+      "url": "https://protontestnet.greymass.com",
+      "operator": "Greymass",
+      "sources": [
+        "https://github.com/XPRNetwork/proton-wallet-rn/blob/main/web/services/ProtonWebConstants.tsx"
+      ],
+      "note": "default testnet endpoint of the XPR wallet"
+    },
+    {
+      "url": "https://proton-public.neftyblocks.com",
+      "operator": "NeftyBlocks",
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://api-proton.eosarabia.net",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://api-proton.nodeone.network:8344",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://api-xprnetwork-main.saltant.io",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://api-xprnetwork-test.saltant.io",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://api.luminaryvisn.com",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://api.protonnz.com",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://api.totalproton.tech",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://mainnet.brotonbp.com",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://proton-api.eosiomadrid.io",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://proton-testnet.cryptolions.io",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://proton.cryptolions.io",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://proton.eoscafeblock.com",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://proton-testnet.eoscafeblock.com",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://proton.eosusa.io",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://proton.eu.eosamsterdam.net",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://proton.genereos.io",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://proton.protonuk.io",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://protonapi.blocksindia.com",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://protonapi.ledgerwise.io",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://protontest.eu.eosamsterdam.net",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://test.proton.eosusa.io",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://testnet-api.alvosec.com",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://testnet-api.xprcore.com",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://testnet-api.xprdata.org",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://testnet.brotonbp.com",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    },
+    {
+      "url": "https://testnet.rockerone.io",
+      "operator": null,
+      "sources": [
+        "https://github.com/XPRNetwork/ts-smart-contract-docs/blob/main/src/client-sdks/endpoints.md"
+      ]
+    }
+  ],
+  "known_endpoints_note": "Endpoints that apps, wallets and official docs point users at. The survey keeps those on each network's chain that no active producer's bp.json lists, so they are visible before a cutover."
 }

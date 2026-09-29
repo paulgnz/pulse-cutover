@@ -34,6 +34,67 @@ fn post_json(a: &ureq::Agent, url: &str, body: Value) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
+
+/// Base URL of the local metalgo HTTP API, derived from the target rpc_url (…:9650/ext/bc/<id>/rpc).
+fn metal_base(cfg: &Config) -> String {
+    let u = &cfg.target.rpc_url;
+    match u.find("/ext/") { Some(i) => u[..i].to_string(), None => "http://127.0.0.1:9650".into() }
+}
+
+fn metal_rpc(a: &ureq::Agent, base: &str, path: &str, method: &str, params: Value) -> Option<Value> {
+    post_json(a, &format!("{base}{path}"), json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))
+        .ok()
+        .and_then(|v| v.get("result").cloned())
+}
+
+/// Last port-reachability verdict from mission control (it dials this server's IP on 9651 only).
+/// Asked at most every 10 minutes; `None` until the first answer.
+static REACH: std::sync::Mutex<Option<(std::time::Instant, bool)>> = std::sync::Mutex::new(None);
+
+fn staking_reachable(cfg: &Config) -> Option<bool> {
+    let url = cfg.beacon.as_ref().map(|b| b.url.clone()).unwrap_or_default();
+    let base = url.trim_end_matches("/api/report");
+    if base.is_empty() || base == url {
+        return None;
+    }
+    let mut g = REACH.lock().ok()?;
+    if let Some((t, ok)) = *g {
+        if t.elapsed() < Duration::from_secs(600) {
+            return Some(ok);
+        }
+    }
+    let a = ureq::AgentBuilder::new().timeout(Duration::from_secs(8)).build();
+    let ok = a.get(&format!("{base}/api/reach")).call().ok()?.into_json::<Value>().ok()?["reachable"].as_bool()?;
+    *g = Some((std::time::Instant::now(), ok));
+    Some(ok)
+}
+
+/// Public facts about the local Metal node. NodeID, BLS key and version are public on the P-Chain anyway;
+/// never the IP address (mission control's page is public).
+fn metal_info(cfg: &Config) -> Value {
+    let a = agent();
+    let base = metal_base(cfg);
+    let id = metal_rpc(&a, &base, "/ext/info", "info.getNodeID", json!({}));
+    let Some(id) = id else { return Value::Null };
+    let ver = metal_rpc(&a, &base, "/ext/info", "info.getNodeVersion", json!({}));
+    let net = metal_rpc(&a, &base, "/ext/info", "info.getNetworkID", json!({}));
+    let peers = metal_rpc(&a, &base, "/ext/info", "info.peers", json!({}));
+    let boot = |c: &str| metal_rpc(&a, &base, "/ext/info", "info.isBootstrapped", json!({"chain": c})).and_then(|v| v["isBootstrapped"].as_bool());
+    let health = a.get(&format!("{base}/ext/health")).call().ok().and_then(|r| r.into_json::<Value>().ok()).and_then(|v| v["healthy"].as_bool());
+    let peer_n = peers.as_ref().and_then(|p| p["numPeers"].as_str().and_then(|n| n.parse::<u64>().ok()).or_else(|| p["peers"].as_array().map(|x| x.len() as u64)));
+    json!({
+        "node_id": id["nodeID"],
+        "bls_public_key": id["nodePOP"]["publicKey"],
+        "version": ver.as_ref().map(|v| v["version"].clone()).unwrap_or(Value::Null),
+        "rpcchainvm": ver.as_ref().map(|v| v["rpcProtocolVersion"].clone()).unwrap_or(Value::Null),
+        "network_id": net.as_ref().map(|v| v["networkID"].clone()).unwrap_or(Value::Null),
+        "peers": peer_n,
+        "bootstrapped": {"P": boot("P"), "X": boot("X"), "C": boot("C")},
+        "healthy": health,
+        "staking_reachable": staking_reachable(cfg),
+    })
+}
+
 /// First word of a hook command is the program; a hook is ready when it exists
 /// and is executable (the run-5 rehearsal stalled on a hook without +x).
 fn hook_ready(cmd: &str) -> (bool, String) {
@@ -186,7 +247,23 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     checks.push(check("staged_snapshot_absent", staged_ok, if past_verify { "staged by the ceremony (expected)".to_string() } else if staged_ok { "not pre-staged".to_string() } else { "a snapshot is already staged (would boot the target from a stale cut)".to_string() }));
     let unit = &cfg.target.metalgo_unit;
     let active = unit_active(unit);
-    checks.push(check("validator_running", active || in_ignite, if active { "running" } else if in_ignite { "restarting for ignition" } else { "not running" }));
+    let metal = if active { metal_info(cfg) } else { Value::Null };
+    let vdetail = match metal["version"].as_str() {
+        Some(v) if active => format!("running · {}", v.trim_start_matches("metalgo/")),
+        _ if active => "running".to_string(),
+        _ if in_ignite => "restarting for ignition".to_string(),
+        _ => "not running".to_string(),
+    };
+    checks.push(check("validator_running", active || in_ignite, vdetail));
+    if active && !metal.is_null() {
+        let p = metal["bootstrapped"]["P"].as_bool().unwrap_or(false);
+        let peers = metal["peers"].as_u64().unwrap_or(0);
+        checks.push(check("metal_synced", p, if p { format!("P-Chain synced · {peers} peers") } else { format!("P-Chain syncing · {peers} peers") }));
+        match metal["staking_reachable"].as_bool() {
+            Some(r) => checks.push(check("metal_reachable", r, if r { "port 9651 reachable from the internet" } else { "port 9651 not reachable from the internet" })),
+            None => {}
+        }
+    }
     if let Some(dir) = cfg.snapshot.dir.as_ref().or(staged.parent().map(|p| p.to_path_buf()).as_ref()) {
         let gb = free_gb(dir);
         checks.push(check("disk_free", gb.map(|g| g >= 5.0).unwrap_or(false), gb.map(|g| format!("{:.0} GB free", g.floor())).unwrap_or_else(|| "unknown".into())));
@@ -224,6 +301,7 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         "source": {"head": head, "lib": lib, "chain_id": chain_id},
         "ceremony": journal,
         "coord": crate::coord::read_state(cfg),
+        "metal": metal,
     })
 }
 

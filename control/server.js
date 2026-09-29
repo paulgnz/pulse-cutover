@@ -207,7 +207,20 @@ async function surveyInfra(n) {
       nodes.push(e);
     }
   } catch (err) { console.error(`infra ${n.id} ${p.owner}:`, err?.stack || err); nodes.push({ producer: p.owner, rank: p.rank, survey_error: String(err?.message || err).slice(0, 120) }); } });
-  nodes.sort((a, b) => (a.rank || 999) - (b.rank || 999));
+  // Endpoints apps and wallets point at that no active producer's bp.json lists (e.g. wallet defaults run by
+  // non-producers). Probed like any other node, kept only when they serve THIS network's chain.
+  const host = (u) => { try { return new URL(u).host.toLowerCase(); } catch { return ''; } };
+  const listed = new Set(nodes.filter((x) => x.url).map((x) => host(x.url)));
+  await pool((cfg.known_endpoints || []).filter((k) => safeUrl(k.url) && !listed.has(host(k.url))), 6, async (k) => {
+    const url = safeUrl(k.url);
+    const api = await probeApi(url, n.chain_id, c.head).catch(() => null);
+    if (!api?.ok || api.chain_ok !== true) return;
+    const e = { producer: null, unregistered: true, operator: k.operator || host(url), note: k.note || null, sources: k.sources || [],
+      rank: null, types: ['api'], features: [], url, p2p: null, location: null, api };
+    const hy = await probeHyperion(url, c.head).catch(() => null); if (hy?.ok) e.hyperion = hy;
+    nodes.push(e);
+  });
+  nodes.sort((a, b) => (a.unregistered ? 1 : 0) - (b.unregistered ? 1 : 0) || (a.rank || 999) - (b.rank || 999));
   infra[n.id] = { ts: Date.now(), running: false, head: c.head, nodes };
   console.log(`infra ${n.id}: ${nodes.length} nodes surveyed`);
   } catch (err) { console.error(`infra ${n.id} failed:`, err?.stack || err); }
@@ -342,6 +355,15 @@ http.createServer(async (req, res) => {
       sk.once('connect', () => { sk.destroy(); done(true); }); sk.once('timeout', () => { sk.destroy(); done(false); }); sk.once('error', () => done(false)); });
     return send(res, 200, { ip, port: 9651, reachable: ok, ms: Date.now() - t0 });
   }
+  const nm = url.pathname.match(/^\/api\/node\/([a-z0-9-]+)\/([a-z1-5.]{1,12})\/([^/]{1,64})$/);
+  if (nm && req.method === 'GET') {
+    // One server's latest beacon report + short history. Same public data as /api/status, per server, for agents.
+    const [, netId, prod, nd] = nm.map(decodeURIComponent);
+    const e = nodes[netId]?.[prod]?.[nd];
+    if (!e) return send(res, 404, { error: 'no such server' });
+    const age = Date.now() - e.received;
+    return send(res, 200, { network: netId, producer: prod, node: nd, age_ms: age, silent: age > SILENT_AFTER_MS, report: e.report, history: e.hist || [] });
+  }
   const mm = url.pathname.match(/^\/api\/manifest(?:\/([a-z0-9-]+))?$/);
   if (mm && req.method === 'GET') {
     // Network manifest: which Metal network, subnet, blockchain and VM each XPR network maps to, plus pinned
@@ -385,7 +407,11 @@ http.createServer(async (req, res) => {
     // One token = one box: if this token reported under another name before, that was a rename, not a second node.
     for (const [nd, v] of Object.entries(byNode)) if (nd !== nodeName && v.token === tokenHash) delete byNode[nd];
     const prev = byNode[nodeName]?.report;
-    byNode[nodeName] = { report: r, received: Date.now(), token: tokenHash };
+    // Short in-memory history (about 2 h at a 10 s interval) for the per-server page's charts.
+    const hist = (byNode[nodeName]?.hist || []).slice(-719);
+    const lagNow = chain[r.network]?.head && r.source?.head ? chain[r.network].head - r.source.head : null;
+    hist.push({ t: Date.now(), head: r.source?.head ?? null, lag: lagNow, peers: r.metal?.peers ?? null, ok: (r.checks || []).filter((c) => c.ok).length, n: (r.checks || []).length });
+    byNode[nodeName] = { report: r, received: Date.now(), token: tokenHash, hist };
     const who = Object.keys(byNode).length > 1 || r.node ? `${r.producer} · ${nodeName}` : r.producer;
     const was = prev?.ceremony?.state, is = r.ceremony?.state;
     if (!prev) pushEvent(r.network, who, `started reporting (${r.role || 'node'}, agent ${r.agent_version})`);

@@ -20,7 +20,7 @@
 #          [--version v0.5.0-rc.1] [--api http://127.0.0.1:8888] [--producer-api <url>]
 #          [--snapshots-dir <dir>] [--interval 10] [--dry-run] [--uninstall]
 set -euo pipefail
-NETWORK=""; PRODUCER=""; NODE=""; ROLE=""; CFG_PRODUCER=""; URL="https://control-rehearsal.protonnz.com"; VERSION="v0.5.0-rc.3"
+NETWORK=""; PRODUCER=""; NODE=""; ROLE=""; CFG_PRODUCER=""; URL="https://control-rehearsal.protonnz.com"; VERSION="v0.5.0-rc.4"
 API=""; PAPI=""; SNAPDIR=""; INTERVAL=10; DRY=0; UNINSTALL=0
 while [ $# -gt 0 ]; do case "$1" in
   --network) NETWORK=$2; shift 2;; --producer) PRODUCER=$2; shift 2;; --node) NODE=$2; shift 2;; --role) ROLE=$2; shift 2;; --url) URL=$2; shift 2;;
