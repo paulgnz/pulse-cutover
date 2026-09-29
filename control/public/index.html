@@ -979,14 +979,14 @@ function renderDrawer() {
       ${r?.ceremony?.evidence && Object.keys(r.ceremony.evidence).length ? `<div class="dr-sec"><h4>Evidence</h4><dl class="evk">${Object.entries(r.ceremony.evidence).map(([k, v]) => `<dt>${esc(k.replace(/_/g, ' '))}</dt><dd>${esc(typeof v === 'string' ? v : JSON.stringify(v))}</dd>`).join('')}</dl></div>` : ''}
     </div>`;
   $('dr-x').onclick = closeProducer; $('dr-full').onclick = () => openPage({ producer: true });
-  dr.querySelectorAll('.openfull').forEach((x) => x.onclick = () => openPage(x.dataset.node ? { node: x.dataset.node } : { ep: x.dataset.ep }));
+  dr.querySelectorAll('.openfull[data-node], .openfull[data-ep]').forEach((x) => x.onclick = () => openPage(x.dataset.node ? { node: x.dataset.node } : { ep: x.dataset.ep }));
   dr.querySelectorAll('.gl').forEach((g) => g.onclick = (e) => { e.preventDefault(); dr.querySelector('#srv-' + g.dataset.srv)?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
   dr.classList.add('on'); sc.classList.add('on'); dr.setAttribute('aria-hidden', 'false');
 }
 
 
 /* ---------------- full page: one server (beacon) or one public endpoint ---------------- */
-let pageSel = null; try { const q = new URLSearchParams(location.search); if (q.get('view') === 'producer') pageSel = { producer: true }; else if (q.get('node')) pageSel = { node: q.get('node') }; else if (q.get('ep')) pageSel = { ep: q.get('ep') }; } catch {}
+let pageSel = null; try { const q = new URLSearchParams(location.search); const bad = (v) => !v || v === 'undefined' || v === 'null'; if (q.get('view') === 'producer' || (q.has('ep') && bad(q.get('ep'))) || (q.has('node') && bad(q.get('node')))) pageSel = { producer: true }; else if (q.get('node')) pageSel = { node: q.get('node') }; else if (q.get('ep')) pageSel = { ep: q.get('ep') }; } catch {}
 let pageData = null, pageFetchT = 0;
 function setQ(k, v) { try { const u = new URL(location); ['node', 'ep', 'view'].forEach((x) => u.searchParams.delete(x)); if (k) u.searchParams.set(k, v); history.replaceState(null, '', u); } catch {} }
 function openPage(sel) { pageSel = sel; pageData = null; pageFetchT = 0; if (sel.producer) setQ('view', 'producer'); else setQ(sel.node ? 'node' : 'ep', sel.node || sel.ep); renderPage(); $('page').scrollTop = 0; }
