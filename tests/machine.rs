@@ -113,6 +113,12 @@ struct MockOps {
     ignite_fails: Cell<bool>,
     /// Extra mock-clock time each target_info poll takes (RPC latency).
     target_latency_ms: Cell<u64>,
+    /// The producer resume call fails (rollback must report it).
+    resume_fails: Cell<bool>,
+    /// Ordered log of resume / hooks / orphan-kill calls (rollback ordering tests).
+    events: RefCell<Vec<String>>,
+    /// kill_orphan_hooks answer (None = default Ok(None)).
+    orphan: RefCell<Option<Result<Option<String>, String>>>,
 }
 
 impl MockOps {
@@ -152,6 +158,9 @@ impl MockOps {
             source_calls: Cell::new(0),
             ignite_fails: Cell::new(false),
             target_latency_ms: Cell::new(0),
+            resume_fails: Cell::new(false),
+            events: RefCell::new(Vec::new()),
+            orphan: RefCell::new(None),
         }
     }
 
@@ -211,9 +220,18 @@ impl ChainOps for MockOps {
     }
 
     fn resume(&self) -> Result<(), String> {
+        self.events.borrow_mut().push("resume".into());
+        if self.resume_fails.get() {
+            return Err("http://mock/v1/producer/resume: connection refused".into());
+        }
         self.resumes.set(self.resumes.get() + 1);
         self.paused.set(false);
         Ok(())
+    }
+
+    fn kill_orphan_hooks(&self) -> Result<Option<String>, String> {
+        self.events.borrow_mut().push("kill-orphans".into());
+        self.orphan.borrow().clone().unwrap_or(Ok(None))
     }
 
     fn create_snapshot(&self) -> Result<SnapshotResult, String> {
@@ -310,6 +328,7 @@ impl ChainOps for MockOps {
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
         self.hooks.borrow_mut().push(cmd.to_string());
+        self.events.borrow_mut().push(format!("hook:{cmd}"));
         if cmd.starts_with("fail-") {
             return Err(format!("`{cmd}` exited 1"));
         }
@@ -2279,6 +2298,8 @@ fn r3_rollback_refuses_without_affirmative_evidence() {
     let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
     assert_eq!(out.status.code(), Some(3), "missing journal is not proof that ignition never started: {}", String::from_utf8_lossy(&out.stderr));
     assert!(!dir.path().join("journal.jsonl").exists());
+    let (url, _hits) = stub_http(|_m, _p| (200, "{}".into()));
+    point_producer_at(dir.path(), &url);
     let out = run_bin(&["rollback", "--wait", "1", "--no-journal-i-know"], &cfgp);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
@@ -2295,6 +2316,9 @@ fn r3_rollback_refuses_after_ignition_started_unless_forced() {
     let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
     assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(std::fs::read_to_string(&cfg.journal_path).unwrap(), before, "a refused rollback changes nothing");
+    let (url, _hits) = stub_http(|_m, _p| (200, "{}".into()));
+    point_producer_at(dir.path(), &url);
+    set_target_line(dir.path(), "stop_cmd = \"true\"");
     let out = run_bin(&["rollback", "--wait", "1", "--force-after-ignite"], &cfgp);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
@@ -2313,9 +2337,12 @@ fn r3_rollback_before_ignition_is_journaled_and_waits_for_the_lock() {
     // Another process (a still-running agent) holds the journal: rollback must not decide.
     let held = Journal::open(&cfg.journal_path).unwrap();
     let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(3), "a lock still held after --wait is a refusal (exit 3)");
     assert!(String::from_utf8_lossy(&out.stderr).contains("holds"), "{}", String::from_utf8_lossy(&out.stderr));
     drop(held);
+    // The binary talks to a real producer API: serve one that accepts the resume.
+    let (url, _hits) = stub_http(|_m, _p| (200, "{}".into()));
+    point_producer_at(dir.path(), &url);
     let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
@@ -2353,7 +2380,7 @@ fn r3_recovered_flip_side_effect_is_reverted_by_a_forced_rollback() {
     let mut m = Machine::new(&cfg, &ops, journal, rec);
     assert!(m.operator_rollback(false).is_err(), "ignition started: refused without force");
     assert!(!ops.hooks.borrow().iter().any(|h| h == "revert-nginx"));
-    assert_eq!(m.operator_rollback(true).unwrap(), State::Aborted);
+    assert_eq!(m.operator_rollback(true).unwrap().state, State::Aborted);
     assert!(ops.hooks.borrow().iter().any(|h| h == "revert-nginx"), "the recovered flip was reverted: {:?}", ops.hooks.borrow());
 }
 
@@ -2376,4 +2403,333 @@ fn r3_crash_mid_copy_restages_a_truncated_staged_snapshot() {
     let st = run_machine_result(&cfg, &ops);
     assert_eq!(st, Ok(State::Live), "{}", std::fs::read_to_string(&cfg.journal_path).unwrap());
     assert_eq!(std::fs::read(&cfg.snapshot.staged_path).unwrap(), full, "the partial copy was replaced by a full restage");
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Round 4 (Fable review of rc.7): rollback must never claim success it did not achieve.
+// ---------------------------------------------------------------------------------------------
+
+/// Minimal HTTP stub on 127.0.0.1: `handler(method, path) -> (status, body)`. Returns the base
+/// URL and a hit counter per request.
+fn stub_http(handler: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static)
+    -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h2 = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = vec![0u8; 65536];
+            let mut got = 0;
+            // Read headers (+ a small body): enough for these tests.
+            loop {
+                let n = match stream.read(&mut buf[got..]) { Ok(0) | Err(_) => break, Ok(n) => n };
+                got += n;
+                let text = String::from_utf8_lossy(&buf[..got]);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end].lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                    if got >= end + 4 + len { break; }
+                }
+            }
+            let text = String::from_utf8_lossy(&buf[..got]).to_string();
+            let mut first = text.lines().next().unwrap_or("").split_whitespace();
+            let (m, p) = (first.next().unwrap_or("").to_string(), first.next().unwrap_or("").to_string());
+            h2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (code, body) = handler(&m, &p);
+            let _ = write!(stream, "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// Point ceremony.toml's source APIs at `url` (the binary tests use real HTTP).
+fn point_producer_at(dir: &std::path::Path, url: &str) {
+    let p = dir.join("ceremony.toml");
+    let t = std::fs::read_to_string(&p).unwrap()
+        .replace("producer_api_url = \"http://mock\"", &format!("producer_api_url = \"{url}\""));
+    std::fs::write(&p, t).unwrap();
+}
+
+/// Add a line to ceremony.toml's [target] section.
+fn set_target_line(dir: &std::path::Path, line: &str) {
+    let p = dir.join("ceremony.toml");
+    let t = std::fs::read_to_string(&p).unwrap().replacen("[target]\n", &format!("[target]\n{line}\n"), 1);
+    std::fs::write(&p, t).unwrap();
+}
+
+/// A producer journal cut right before SNAPSHOTTED (ignition provably not started) with the
+/// staged snapshot still on disk from the full run.
+fn pre_ignite_journal(dir: &std::path::Path) -> Config {
+    let cfg = test_config(dir, 120);
+    assert_eq!(run_machine(&cfg, &MockOps::new(dir, 110)), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let keep: Vec<&str> = text.lines().take_while(|l| !l.contains(r#""kind":"transition","state":"SNAPSHOTTED""#)).collect();
+    std::fs::write(&cfg.journal_path, keep.join("\n") + "\n").unwrap();
+    cfg
+}
+
+#[test]
+fn r4_rollback_with_a_failed_resume_exits_4_and_names_the_step() {
+    // Fable §2.1: `rollback` printed "rolled back" and exited 0 when the producer resume FAILED.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_journal(dir.path());
+    point_producer_at(dir.path(), "http://127.0.0.1:1"); // closed port
+    let out = run_bin(&["rollback", "--wait", "1"], &dir.path().join("ceremony.toml"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "a failed resume is an INCOMPLETE rollback: {err}");
+    assert!(err.contains("resume the source producer"), "names the failed step: {err}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("rolled back:"), "never claims success");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("rollback_incomplete") && text.contains(r#""rollback_complete":false"#), "{text}");
+}
+
+#[test]
+fn r4_a_second_rollback_after_a_complete_one_does_nothing() {
+    // Fable §2.7: repeat rollbacks re-resumed and re-ran on_abort.
+    let dir = tempfile::tempdir().unwrap();
+    let _cfg = pre_ignite_journal(dir.path());
+    let (url, hits) = stub_http(|_m, _p| (200, "{}".into()));
+    point_producer_at(dir.path(), &url);
+    let cfgp = dir.path().join("ceremony.toml");
+    let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let after_first = hits.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(after_first, 1, "one resume call");
+    let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("already rolled back"), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "no second resume");
+}
+
+#[test]
+fn r4_forced_rollback_fences_the_target_before_resuming_the_source() {
+    // Fable §2.2: --force-after-ignite resumed the source while this box's target kept running.
+    let dir = tempfile::tempdir().unwrap();
+    let base = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.target_fork.set(true);
+    assert!(run_machine_result(&base, &ops).unwrap_err().starts_with("HALTED"));
+    // Fence that fails: the source must NOT be resumed and the journal stays HALTED.
+    set_target_line(dir.path(), "stop_cmd = \"fail-stop-target\"");
+    let cfg = Config::load(&dir.path().join("ceremony.toml")).unwrap();
+    let ops = MockOps::new(dir.path(), 200);
+    let (j, rec) = Journal::open(&cfg.journal_path).unwrap();
+    let mut m = Machine::new(&cfg, &ops, j, rec);
+    let out = m.operator_rollback(true).unwrap();
+    assert!(!out.failed.is_empty() && out.failed[0].contains("target fence failed"), "{out:?}");
+    assert_eq!(ops.resumes.get(), 0, "never resume the source while the target may run");
+    assert_eq!(out.state, State::Halted);
+    drop(m);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("forced_rollback_blocked"), "{text}");
+    // Fence that succeeds: it runs FIRST, then the source is resumed.
+    let t = std::fs::read_to_string(dir.path().join("ceremony.toml")).unwrap().replace("fail-stop-target", "stop-target");
+    std::fs::write(dir.path().join("ceremony.toml"), t).unwrap();
+    let cfg = Config::load(&dir.path().join("ceremony.toml")).unwrap();
+    let ops = MockOps::new(dir.path(), 200);
+    let (j, rec) = Journal::open(&cfg.journal_path).unwrap();
+    let mut m = Machine::new(&cfg, &ops, j, rec);
+    let out = m.operator_rollback(true).unwrap();
+    assert!(out.failed.is_empty(), "{out:?}");
+    assert_eq!(out.state, State::Aborted);
+    let ev = ops.events.borrow().clone();
+    let fence = ev.iter().position(|e| e == "hook:stop-target").expect("fence ran");
+    let resume = ev.iter().position(|e| e == "resume").expect("source resumed");
+    assert!(fence < resume, "fence before resume: {ev:?}");
+}
+
+#[test]
+fn r4_every_rollback_refusal_exits_3() {
+    // Fable §2.3: lock timeout and corrupt journal exited 1, so cutover.sh skipped its guidance.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_journal(dir.path());
+    let cfgp = dir.path().join("ceremony.toml");
+    let held = Journal::open(&cfg.journal_path).unwrap();
+    assert_eq!(run_bin(&["rollback", "--wait", "1"], &cfgp).status.code(), Some(3), "lock held past --wait");
+    drop(held);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.insert(1, "{not json");
+    std::fs::write(&cfg.journal_path, lines.join("\n") + "\n").unwrap();
+    let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
+    assert_eq!(out.status.code(), Some(3), "corrupt journal: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn r4_rollback_moves_the_staged_snapshot_aside() {
+    // Fable §2.4: the staged snapshot stayed; the next preflight refused and a metalgo restart
+    // would have imported the abandoned cut.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_journal(dir.path());
+    assert!(cfg.snapshot.staged_path.exists(), "fixture: staged file present");
+    let ops = MockOps::new(dir.path(), 200);
+    let (j, rec) = Journal::open(&cfg.journal_path).unwrap();
+    let mut m = Machine::new(&cfg, &ops, j, rec);
+    let out = m.operator_rollback(false).unwrap();
+    assert!(out.failed.is_empty(), "{out:?}");
+    assert!(!cfg.snapshot.staged_path.exists(), "unstaged");
+    let aside = std::fs::read_dir(dir.path()).unwrap().filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().starts_with("staged.bin.rolled-back-"));
+    assert!(aside, "moved aside, not deleted");
+    drop(m);
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("\"unstaged\""));
+}
+
+#[test]
+fn r4_no_journal_rollback_leaves_no_ceremony_journal_behind() {
+    // Fable §2.5: --no-journal-i-know created a terminal ABORTED journal, so the next `run` on
+    // that box did nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let _ = test_config(dir.path(), 120);
+    let (url, _hits) = stub_http(|_m, _p| (200, "{}".into()));
+    point_producer_at(dir.path(), &url);
+    let cfgp = dir.path().join("ceremony.toml");
+    let out = run_bin(&["rollback", "--wait", "1", "--no-journal-i-know"], &cfgp);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!dir.path().join("journal.jsonl").exists(), "the ceremony journal is not created");
+    let audit = std::fs::read_dir(dir.path()).unwrap().filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().starts_with("journal.jsonl.rollback-"));
+    assert!(audit, "a separate audit record is written");
+    let st = run_bin(&["status"], &cfgp);
+    assert!(String::from_utf8_lossy(&st.stdout).contains("no journal"), "next run starts fresh");
+}
+
+#[test]
+fn r4_rollback_stops_an_orphaned_hook_before_anything_else() {
+    // Fable §2.6: an on_freeze left running by a killed agent could close writes again after
+    // on_abort reopened them.
+    let dir = tempfile::tempdir().unwrap();
+    let _ = pre_ignite_journal(dir.path());
+    let t = std::fs::read_to_string(dir.path().join("ceremony.toml")).unwrap()
+        .replace("on_live = \"flip-gateway\"", "on_live = \"flip-gateway\"\non_abort = \"reopen-writes\"");
+    std::fs::write(dir.path().join("ceremony.toml"), t).unwrap();
+    let cfg = Config::load(&dir.path().join("ceremony.toml")).unwrap();
+    let ops = MockOps::new(dir.path(), 200);
+    *ops.orphan.borrow_mut() = Some(Ok(Some("killed orphaned hook process group 4242 (SIGTERM): `freeze-writes`".into())));
+    let (j, rec) = Journal::open(&cfg.journal_path).unwrap();
+    let mut m = Machine::new(&cfg, &ops, j, rec);
+    let out = m.operator_rollback(false).unwrap();
+    assert!(out.failed.is_empty(), "{out:?}");
+    let ev = ops.events.borrow().clone();
+    assert_eq!(ev.first().map(String::as_str), Some("kill-orphans"), "{ev:?}");
+    let resume = ev.iter().position(|e| e == "resume").unwrap();
+    let on_abort = ev.iter().position(|e| e == "hook:reopen-writes").unwrap();
+    assert!(resume < on_abort, "{ev:?}");
+    drop(m);
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("orphan_hook_killed"));
+    // An orphan that cannot be stopped blocks the whole rollback.
+    let dir2 = tempfile::tempdir().unwrap();
+    let cfg2 = pre_ignite_journal(dir2.path());
+    let ops2 = MockOps::new(dir2.path(), 200);
+    *ops2.orphan.borrow_mut() = Some(Err("survived SIGKILL".into()));
+    let (j, rec) = Journal::open(&cfg2.journal_path).unwrap();
+    let out = Machine::new(&cfg2, &ops2, j, rec).operator_rollback(false).unwrap();
+    assert!(!out.failed.is_empty());
+    assert_eq!(ops2.resumes.get(), 0, "nothing rolled back while an orphaned hook still runs");
+}
+
+#[test]
+fn r4_recorded_hook_group_is_killed_for_real() {
+    // The real mechanism behind kill_orphan_hooks: a tracked hook records its process group and a
+    // separate caller can kill it (as `rollback` does after `pkill` stopped the agent).
+    let dir = tempfile::tempdir().unwrap();
+    let pg = dir.path().join("journal.jsonl.hook.pgid");
+    let pg2 = pg.clone();
+    let started = std::time::Instant::now();
+    let t = std::thread::spawn(move || pulse_cutover::ops::run_shell_timeout_tracked("sleep 30", std::time::Duration::from_secs(60), Some(&pg2)));
+    while !pg.exists() && started.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(pg.exists(), "the running hook's group is recorded");
+    let killed = pulse_cutover::ops::kill_recorded_hook_group(&pg, std::time::Duration::from_secs(2)).unwrap();
+    assert!(killed.unwrap_or_default().contains("killed orphaned hook process group"));
+    let res = t.join().unwrap();
+    assert!(res.is_err(), "the hook died: {res:?}");
+    assert!(started.elapsed().as_secs() < 15, "killed, not waited out");
+    assert!(!pg.exists(), "record removed");
+    assert_eq!(pulse_cutover::ops::kill_recorded_hook_group(&pg, std::time::Duration::from_secs(1)).unwrap(), None);
+}
+
+#[test]
+fn r4_fleet_gate_ignores_reports_with_failing_health_but_not_setup_checks() {
+    // Fable #5 residual: the gate counted reports whose health checks were failing.
+    let probe = tempfile::tempdir().unwrap();
+    let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
+    let ours = pulse_cutover::beacon::journal_summary(&probe.path().join("journal.jsonl"))["evidence"].clone();
+    let rep = |id: &str, checks: serde_json::Value| serde_json::json!({"instance_id": id, "checks": checks,
+        "coord": {"event_id": "e1"}, "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}});
+    let sick = serde_json::json!([{"name": "source_api", "ok": false, "detail": "unreachable"}]);
+    let setup_only = serde_json::json!([{"name": "hook_on_live", "ok": false, "detail": "not configured"},
+                                        {"name": "source_api", "ok": true, "detail": "ok"}]);
+    let d = tempfile::tempdir().unwrap();
+    let cfg = roster_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aa", sick.clone())}]},
+        {"name": "bp2", "beacons": [{"age_ms": 1000, "report": rep("bb", setup_only.clone())}]}]}]}));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted, "bp1's failing health check excludes it: 1 of 2");
+    let d2 = tempfile::tempdir().unwrap();
+    let cfg2 = roster_config(d2.path());
+    let ops2 = MockOps::new(d2.path(), 110);
+    *ops2.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aa", setup_only.clone())}]},
+        {"name": "bp2", "beacons": [{"age_ms": 1000, "report": rep("bb", setup_only)}]}]}]}));
+    assert_eq!(run_machine(&cfg2, &ops2), State::Live, "failing SETUP checks (hooks) do not exclude a report");
+}
+
+#[test]
+fn r4_await_never_launches_the_ceremony_for_an_arm_with_the_wrong_event_hash() {
+    // Fable #4 residual: the arm-hash check was only unit-tested through check_arm.
+    fn run_await_against(dir: &std::path::Path, wrong_hash: bool) -> String {
+        let _ = coord_config(dir, 120, 0, 60);
+        let ev = signed(serde_json::json!({"type": "event", "event_id": "e1", "network": "rehearsal", "h": 5000u64}));
+        let good = pulse_cutover::coord::payload_hash(&ev).unwrap();
+        let hash = if wrong_hash { "00".repeat(32) } else { good };
+        let arm = signed(serde_json::json!({"type": "arm", "event_id": "e1", "network": "rehearsal", "event_hash": hash,
+            "issued_at_ms": chrono::Utc::now().timestamp_millis()}));
+        let doc = serde_json::json!({"event": ev, "arm": arm}).to_string();
+        let (url, _hits) = stub_http(move |_m, p| {
+            if p.starts_with("/api/coord/") { (200, doc.clone()) }
+            else { (200, r#"{"head_block_num": 100}"#.into()) }
+        });
+        let t = std::fs::read_to_string(dir.join("ceremony-coord.toml")).unwrap()
+            .replace("url = \"http://mc\"", &format!("url = \"{url}\"\nauto_arm = true"))
+            .replace("rpc_url = \"http://mock\"\nproducer_api_url", &format!("rpc_url = \"{url}\"\nproducer_api_url"));
+        std::fs::write(dir.join("ceremony-coord.toml"), t).unwrap();
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pulse-cutover"))
+            .args(["await", "--config"]).arg(dir.join("ceremony-coord.toml"))
+            .stderr(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let _ = child.kill();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stderr).to_string()
+    }
+    let good = tempfile::tempdir().unwrap();
+    let err = run_await_against(good.path(), false);
+    assert!(err.contains("ARMED by signed coordinator message"), "control: the right hash arms: {err}");
+    let bad = tempfile::tempdir().unwrap();
+    let err = run_await_against(bad.path(), true);
+    assert!(!err.contains("ARMED by signed"), "a wrong event_hash must never launch the ceremony: {err}");
+    assert!(err.contains("event_hash does not match"), "{err}");
+    assert!(!bad.path().join("ceremony-e1.toml").exists(), "no derived ceremony config was written");
+}
+
+#[test]
+fn r4_beacon_summary_marks_a_forced_rollback_after_ignition() {
+    // Fable §2.9: after a forced rollback the beacon judged the box as pre-ceremony.
+    let dir = tempfile::tempdir().unwrap();
+    let base = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.target_fork.set(true);
+    assert!(run_machine_result(&base, &ops).unwrap_err().starts_with("HALTED"));
+    let ops = MockOps::new(dir.path(), 200);
+    let (j, rec) = Journal::open(&base.journal_path).unwrap();
+    Machine::new(&base, &ops, j, rec).operator_rollback(true).unwrap();
+    let s = pulse_cutover::beacon::journal_summary(&base.journal_path);
+    assert_eq!(s["state"], "ABORTED");
+    assert_eq!(s["ignition_started"], true);
+    assert_eq!(s["forced_rollback"], true);
 }

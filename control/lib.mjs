@@ -327,6 +327,10 @@ export function projectReport(r) {
         : (typeof ce.last_error_class === 'string' && ce.last_error_class.length <= 400 ? redact(ce.last_error_class, 120) : bad('ceremony.last_error_class', 'must be a string ≤ 400')),
       last_error: ce.last_error == null ? null : (typeof ce.last_error === 'string' ? `error (see local journal): ${redact(ce.last_error, 60)}` : bad('ceremony.last_error', 'must be a string')),
       armed_ts_ms: int(ce.armed_ts_ms, 'ceremony.armed_ts_ms'),
+      // rc.7+: ignition may have started on this box / the last ABORTED was a forced rollback after
+      // ignition. An ABORTED with ignition_started is not "pre-ceremony": its target may still run.
+      ignition_started: bool(ce.ignition_started, 'ceremony.ignition_started'),
+      forced_rollback: bool(ce.forced_rollback, 'ceremony.forced_rollback'),
     };
   }
   const co = r.coord ?? null;
