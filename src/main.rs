@@ -306,6 +306,7 @@ fn load_config(args: &[String]) -> Result<Config, String> {
 
 fn cmd_run(args: &[String]) -> Result<(), String> {
     let cfg = load_config(args)?;
+    cfg.ensure_ceremony_profile()?;
     let ignite_cmd = cfg
         .target
         .ignite_cmd
@@ -317,13 +318,25 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         &cfg.target.rpc_url,
         &ignite_cmd,
         cfg.source.snapshot_timeout_secs,
-    );
+    )
+    .with_hook_timeout(cfg.hooks.timeout_secs);
     let (journal, recovered) = Journal::open(&cfg.journal_path)?;
     if let Some(state) = recovered.state {
         eprintln!("resuming ceremony from journaled state {state}");
     }
     let mut machine = Machine::new(&cfg, &ops, journal, recovered);
-    let terminal = machine.run()?;
+    let terminal = match machine.run() {
+        Ok(t) => t,
+        Err(e) if e.starts_with("HALTED") => {
+            return Err(format!(
+                "{e}\nThe ceremony is SEALED: this node's target was already ignited, so the source was \
+                 NOT resumed and writes were NOT re-opened (that could create a second writable \
+                 history). A human decides what happens next; the journal {} has the evidence.",
+                cfg.journal_path.display()
+            ))
+        }
+        Err(e) => return Err(e),
+    };
     println!("{terminal}");
     if terminal == state::State::Live {
         Ok(())
@@ -339,6 +352,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
 
 fn cmd_loop(args: &[String]) -> Result<(), String> {
     let cfg = load_config(args)?;
+    cfg.ensure_ceremony_profile()?;
     let runs: u32 = arg(args, "--runs")
         .ok_or("missing --runs")?
         .parse()
@@ -354,7 +368,8 @@ fn cmd_loop(args: &[String]) -> Result<(), String> {
         &cfg.target.rpc_url,
         &ignite_cmd,
         cfg.source.snapshot_timeout_secs,
-    );
+    )
+    .with_hook_timeout(cfg.hooks.timeout_secs);
     pulse_cutover::looper::run_loop(&cfg, &ops, runs)
 }
 
@@ -367,6 +382,7 @@ fn cmd_beacon(args: &[String]) -> Result<(), String> {
 fn cmd_await(args: &[String]) -> Result<(), String> {
     let path = PathBuf::from(arg(args, "--config").ok_or("--config <ceremony.toml> is required")?);
     let cfg = Config::load(&path)?;
+    cfg.ensure_ceremony_profile()?;
     let code = pulse_cutover::coord::run_await(&cfg, &path)?;
     std::process::exit(code);
 }

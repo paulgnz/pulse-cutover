@@ -36,6 +36,7 @@ freeze_height = 0
 # Rehearsal-only H: "freeze N blocks from now". At start the agent takes the
 # last final block and adds this. 240 blocks ≈ 2 minutes on XPR.      [LEAVE for rehearsals]
 freeze_margin = 240
+derive_h_at_arm = true      # rehearsal only: H derived at arm (a real event takes H from the signed event)
 
 # Rehearsal-only: a live chain you don't control will NOT actually freeze,
 # so proceed once H is final. Real event: remove this line.           [LEAVE for rehearsals]

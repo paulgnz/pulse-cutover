@@ -105,6 +105,29 @@ pub struct Coordination {
     /// Set by `await` in the derived config: the event this ceremony belongs to (enables signed aborts).
     #[serde(default)]
     pub event_id: Option<String>,
+    /// Set by `await` from the signed event: the servers that MUST agree before ignition.
+    /// When non-empty the fleet gate counts only these members (matched by beacon
+    /// `instance_id` when given, else by producer account), only with FRESH reports, and
+    /// ignores everything else the relay says. Empty = legacy quorum-of-anyone gate.
+    #[serde(default)]
+    pub roster: Vec<RosterMember>,
+    /// Max age of a roster member's beacon report for the fleet gate to count it.
+    #[serde(default = "default_report_max_age")]
+    pub report_max_age_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RosterMember {
+    pub producer: String,
+    /// The beacon's persisted instance id (`beacon.instance`). Optional: without it any
+    /// fresh report from that producer's servers counts.
+    #[serde(default)]
+    pub instance_id: Option<String>,
+}
+
+fn default_report_max_age() -> u64 {
+    60
 }
 
 fn default_min_lead() -> u64 {
@@ -121,6 +144,15 @@ fn default_beacon_interval() -> u64 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ceremony {
+    /// What this config file is FOR:
+    /// - "ceremony" (default): a real ceremony config; `run`/`loop`/`await` accept it.
+    /// - "readiness": a beacon-only config (what `beacon-install.sh` writes). `beacon`,
+    ///   `doctor` and `status` work; every ceremony-mutating command (`run`, `loop`,
+    ///   `await`) REFUSES it before touching anything. Ceremony-only validation (flip
+    ///   section, stop_cmd, H) is skipped, so a readiness file never needs placeholders
+    ///   that could accidentally drive a cut.
+    #[serde(default)]
+    pub profile: Profile,
     /// Who this agent is in the ceremony:
     /// - "producer": the node PRODUCES the source chain — freeze = stop
     ///   writes, pause production (order per R1/R2). The rehearsed v1 path.
@@ -144,6 +176,18 @@ pub struct Ceremony {
     /// trusts the declared H either way.
     #[serde(default)]
     pub freeze_margin: Option<u64>,
+    /// Rehearsal/loop only: allow `freeze_height = 0` + `freeze_margin` to DERIVE H at ARM
+    /// (H := LIB-at-ARM + margin). Without this explicit opt-in a config with no H is
+    /// rejected: a real ceremony's H comes from the signed coordinator event (`await`
+    /// writes it into the derived config) or is typed in, never guessed.
+    #[serde(default)]
+    pub derive_h_at_arm: bool,
+    /// Rehearsal only: accept a cut that is NOT exactly H (pause_at_h landing at H+1 on a
+    /// single-producer stand-in). Default false: every mode must snapshot exactly H, and a
+    /// snapshot at any other height aborts. `simulate_freeze` implies this (a live chain that
+    /// will not stop cannot be cut at an exact height by an API node) and is journaled as such.
+    #[serde(default)]
+    pub allow_inexact_cut: bool,
     /// api mode against a LIVE source chain that will NOT actually freeze
     /// (rehearsals on the real testnet): when LIB >= H the agent PROCEEDS as
     /// if frozen — the snapshot lands at ~finality near H and the journal
@@ -201,6 +245,14 @@ pub struct Ceremony {
     ///   explanation of what remains).
     #[serde(default)]
     pub import_backend: ImportBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Profile {
+    #[default]
+    Ceremony,
+    Readiness,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -488,12 +540,37 @@ pub struct Target {
     /// resumes the source producer — the source chain stays authoritative.
     #[serde(default = "default_quorum_timeout")]
     pub quorum_timeout_secs: u64,
-    /// On abort, automatically resume the source chain producer.
+    /// On abort, automatically resume the source chain producer. Only ever applies BEFORE
+    /// IGNITED: once this node's target is ignited a local failure seals (halts and alerts)
+    /// instead — resuming the source then could create a second writable history.
     #[serde(default = "default_true")]
     pub auto_rollback: bool,
+    /// LIVE gate, sustained: after head passes `cut + live_blocks`, keep watching for this
+    /// many seconds; the chain must keep producing (no gap longer than `live_max_gap_secs`).
+    /// 0 disables (single-block smoke runs).
+    #[serde(default = "default_live_sustain")]
+    pub live_sustain_secs: u64,
+    #[serde(default = "default_live_max_gap")]
+    pub live_max_gap_secs: u64,
+    /// Require the target's block id AT the cut height to equal the source's (lineage), not
+    /// just height + chain_id. Default true; if the target RPC cannot show block H the
+    /// ceremony aborts before IGNITED. false = journaled as unverified (rehearsals only).
+    #[serde(default = "default_true")]
+    pub require_lineage_check: bool,
+    /// Optional: the installed PulseVM plugin binary. When set and a coordinated event pins a
+    /// `release_sha256`, `await` rejects the event unless this file hashes to it.
+    #[serde(default)]
+    pub plugin_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+fn default_live_sustain() -> u64 {
+    60
+}
+fn default_live_max_gap() -> u64 {
+    20
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Hooks {
     /// Runs at freeze time, BEFORE the snapshot is requested: this is the
@@ -517,6 +594,24 @@ pub struct Hooks {
     /// gateway, page the operator).
     #[serde(default)]
     pub on_abort: Option<String>,
+    /// Runs when the ceremony HALTS after IGNITED (sealed: the source is NOT resumed and
+    /// writes are NOT re-opened). Use it to page humans — it must not undo anything.
+    #[serde(default)]
+    pub on_halt: Option<String>,
+    /// Every hook (and flip/stop/start command) is killed after this many seconds and
+    /// treated as failed. Required hooks failing abort before IGNITED and halt after it.
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_hook_timeout() -> u64 {
+    300
+}
+
+impl Default for Hooks {
+    fn default() -> Self {
+        Hooks { on_freeze: None, post_ignite: None, on_live: None, on_abort: None, on_halt: None, timeout_secs: default_hook_timeout() }
+    }
 }
 
 fn default_poll_ms() -> u64 {
@@ -570,9 +665,33 @@ impl Config {
         if config.snapshot.path_map_from.is_some() != config.snapshot.path_map_to.is_some() {
             return Err("snapshot.path_map_from and path_map_to must be set together".into());
         }
-        if config.ceremony.freeze_height == 0 && config.ceremony.freeze_margin.is_none() {
-            return Err("either ceremony.freeze_height (> 0) or ceremony.freeze_margin \
-                        (H := LIB-at-ARM + margin) must be set"
+        if let Some(b) = &config.beacon {
+            check_beacon_url(&b.url)?;
+        }
+        if config.ceremony.profile == Profile::Readiness {
+            // Beacon/doctor/status only: none of the ceremony requirements apply, and every
+            // mutating command refuses this file (see `ensure_ceremony_profile`).
+            return Ok(config);
+        }
+        if config.ceremony.freeze_height == 0 {
+            if config.ceremony.freeze_margin.is_none() {
+                return Err("ceremony.freeze_height is 0: set the event's H (or use `await`, which \
+                            takes H from the signed coordinator event)"
+                    .into());
+            }
+            if !config.ceremony.derive_h_at_arm {
+                return Err("ceremony.freeze_height = 0 with freeze_margin would DERIVE H at arm time. \
+                            That is a rehearsal/loop feature only: set derive_h_at_arm = true to opt \
+                            in explicitly, or set freeze_height to the event's H"
+                    .into());
+            }
+        }
+        if config.ceremony.mode == Mode::Api
+            && !config.ceremony.simulate_freeze
+            && config.snapshot.dir.is_none()
+        {
+            return Err("api mode (without simulate_freeze) cuts at exactly H via schedule_snapshot and \
+                        needs snapshot.dir (where nodeos writes snapshot-<block_id_at_H>.bin)"
                 .into());
         }
         if config.ceremony.mode == Mode::Api {
@@ -614,6 +733,18 @@ impl Config {
         Ok(config)
     }
 
+    /// Mutating commands (`run`, `loop`, `await`) call this first: a readiness-only config
+    /// can never drive a ceremony, whatever else it contains.
+    pub fn ensure_ceremony_profile(&self) -> Result<(), String> {
+        if self.ceremony.profile == Profile::Readiness {
+            return Err("this config is a READINESS-ONLY profile ([ceremony] profile = \"readiness\", \
+                        written by beacon-install.sh): it reports readiness to mission control and \
+                        cannot run a ceremony. Use the ceremony config staged for the event."
+                .into());
+        }
+        Ok(())
+    }
+
     /// Remap a nodeos-reported snapshot path into the agent's filesystem view.
     pub fn map_snapshot_path(&self, reported: &str) -> PathBuf {
         match (&self.snapshot.path_map_from, &self.snapshot.path_map_to) {
@@ -622,5 +753,29 @@ impl Config {
             }
             _ => PathBuf::from(reported),
         }
+    }
+}
+
+/// The beacon sends a bearer token with every report: only over HTTPS, except to this machine.
+pub fn check_beacon_url(url: &str) -> Result<(), String> {
+    if url.is_empty() || url.starts_with("https://") {
+        return Ok(());
+    }
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("beacon.url {url:?} must be https://"))?;
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    if matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        Ok(())
+    } else {
+        Err(format!(
+            "beacon.url {url:?} is plain http to a remote host: the bearer token would travel \
+             unencrypted. Use https:// (http is allowed only to localhost)"
+        ))
     }
 }

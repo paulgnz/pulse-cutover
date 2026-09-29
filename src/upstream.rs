@@ -149,7 +149,7 @@ pub fn run_pipeline<O: ChainOps>(
             progress(json!({"upstream_export_cmd": cmd}));
             let started = ops.now_ms();
             let out = ops
-                .run_hook(&cmd)
+                .run_long(&cmd)
                 .map_err(|e| format!("upstream export_cmd failed: {e}"))?;
             let log = find_file(&export_dir, "chain_state_history.log").ok_or(
                 "export_cmd succeeded but no chain_state_history.log found under the export dir",
@@ -201,7 +201,7 @@ pub fn run_pipeline<O: ChainOps>(
     let _ = std::fs::remove_file(manifest_json_path(&checkpoint_path));
     let started = ops.now_ms();
     let import_out = ops
-        .run_hook(&format!(
+        .run_long(&format!(
             "'{}' '{}' '{}' '{}' '{}'",
             up.import_bin.display(),
             ship_log.display(),
@@ -263,7 +263,7 @@ pub fn run_pipeline<O: ChainOps>(
             // A non-zero exit (any nodeos-vs-Arena table difference) is a
             // verification FAILURE — run_hook errors and we propagate.
             let out = ops
-                .run_hook(&format!(
+                .run_long(&format!(
                     "'{}' '{}' '{}' '{}' '{}' '{}' '{}'",
                     bin.display(),
                     ship_log.display(),
@@ -301,7 +301,7 @@ pub fn run_pipeline<O: ChainOps>(
     let arena_fp = up.work_dir.join(format!("arena-fingerprint-{cut_height}"));
     fresh_dir(&arena_fp)?;
     let fp_out = ops
-        .run_hook(&format!(
+        .run_long(&format!(
             "'{}' '{}' '{}'",
             up.fingerprint_bin.display(),
             checkpoint_path.display(),

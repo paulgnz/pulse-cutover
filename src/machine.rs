@@ -53,6 +53,9 @@ pub struct Machine<'a, O: ChainOps> {
     scheduled: bool,
     /// Last time the coordinator's abort signal was polled (rate limit).
     last_coord_check_ms: u64,
+    /// This node's target has been ignited (IGNITED journaled, now or in a previous run).
+    /// From here on a local failure SEALS (halt + alert) instead of resuming the source.
+    reached_ignited: bool,
 }
 
 /// Hydration predicate over a hyperion-rs /v2/health document. Two ways in:
@@ -103,8 +106,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     pub fn new(cfg: &'a Config, ops: &'a O, journal: Journal, recovered: Recovered) -> Self {
         let resumed = recovered.state.is_some();
         let state = recovered.state.unwrap_or(State::Armed);
-        // A resumed agent in/past FLIPPED must assume the flip command ran.
-        let flip_ran = matches!(state, State::Flipped | State::Live);
+        // A resumed agent must assume any side effect it journaled as STARTED may have applied
+        // (the flip runs inside IGNITED, before FLIPPED is journaled).
+        let started = |name: &str| recovered.side_effects.iter().any(|s| s == name);
+        let flip_ran = matches!(state, State::Flipped | State::Live) || started("flip_cmd");
+        let hyperion_flip_ran = matches!(state, State::Flipped | State::Live) || started("hyperion_flip_cmd");
+        let source_stopped = started("source_stop_cmd");
+        let scheduled = recovered.scheduled;
+        let reached_ignited = recovered.reached_ignited;
         Machine {
             cfg,
             ops,
@@ -124,10 +133,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             frozen_ts_ms: recovered.frozen_ts_ms,
             last_source_block_time: recovered.last_source_block_time,
             flip_ran,
-            hyperion_flip_ran: flip_ran,
-            source_stopped: false,
-            scheduled: false,
+            hyperion_flip_ran,
+            source_stopped,
+            scheduled,
             last_coord_check_ms: 0,
+            reached_ignited,
         }
     }
 
@@ -138,6 +148,27 @@ impl<'a, O: ChainOps> Machine<'a, O> {
 
     /// Drive the ceremony to a terminal state. Returns the terminal state.
     pub fn run(&mut self) -> Result<State, String> {
+        // Defense in depth (main.rs checks too): a readiness-only config never drives anything.
+        self.cfg.ensure_ceremony_profile()?;
+        if self.resumed && !matches!(self.state, State::Live | State::Aborted) {
+            // A recovered run gets the same invariant checks as a fresh one (minus the ones
+            // that are legitimately stale mid-ceremony, like "H is in the future").
+            let info = self.ops.source_info();
+            match info {
+                Ok(info) => self.preflight(&info, true)?,
+                Err(e) if self.reached_ignited || matches!(self.state, State::Ignited | State::Flipped) => {
+                    // The source may be stopped by design after the flip; that is not a failure.
+                    self.journal.evidence(self.state, json!({"resume_preflight": "source unreachable (expected after IGNITED)", "error": e}))?;
+                }
+                Err(e) => {
+                    self.abort("resume preflight: source chain unreachable", json!({"error": e}))?;
+                    return Ok(self.state);
+                }
+            }
+            if self.state == State::Aborted {
+                return Ok(self.state);
+            }
+        }
         if !self.resumed {
             // Fresh ceremony: journal the arming evidence once.
             let info = self.ops.source_info()?;
@@ -165,7 +196,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     "import_cpu_scale": self.cfg.ceremony.import_cpu_scale,
                 }),
             )?;
-            self.preflight(&info)?;
+            self.preflight(&info, false)?;
         }
         loop {
             match self.state {
@@ -180,9 +211,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
     }
 
-    fn preflight(&mut self, info: &crate::ops::ChainInfo) -> Result<(), String> {
+    fn preflight(&mut self, info: &crate::ops::ChainInfo, resumed: bool) -> Result<(), String> {
         let mut problems = Vec::new();
         let h = self.h();
+        let pre_verify = matches!(self.state, State::Armed | State::Frozen | State::Snapshotted);
         // "H is in the future" means different things per mode: a producer
         // freezes at head >= H, an api node proceeds at LIB >= H (H is a
         // FINALITY target there — on a live DPoS chain head runs ~2*21*6
@@ -191,7 +223,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             Mode::Producer => info.head_block_num,
             Mode::Api => info.last_irreversible_block_num,
         };
-        if reference >= h {
+        if !resumed && reference >= h {
             problems.push(format!(
                 "freeze height {} is not in the future ({} {})",
                 h,
@@ -211,16 +243,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // api mode: this node does not produce; we only need producer_api
             // reachable for create_snapshot — its paused flag is irrelevant.
             Ok(paused) => {
-                if paused && self.cfg.ceremony.mode == Mode::Producer {
+                if !resumed && paused && self.cfg.ceremony.mode == Mode::Producer {
                     problems.push("producer already paused at arm time".into());
                 }
             }
-            Err(e) => problems.push(format!("producer_api unreachable: {e}")),
+            Err(e) if !(resumed && self.reached_ignited) => problems.push(format!("producer_api unreachable: {e}")),
+            Err(_) => {}
         }
         // api mode: the public URL must be serving the SOURCE chain now —
         // proves the nginx -> nodeos path the ceremony will flip actually
         // works before anything is committed.
-        if let Some(flip) = &self.cfg.flip {
+        if let Some(flip) = self.cfg.flip.as_ref().filter(|_| !self.flip_ran && !self.reached_ignited) {
             match self.ops.public_info(&flip.public_url) {
                 Ok(Some(pubinfo)) if pubinfo.chain_id == info.chain_id => {}
                 Ok(Some(pubinfo)) => problems.push(format!(
@@ -243,7 +276,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // from an earlier ceremony pins the chain to the WRONG cut before this
         // ceremony even freezes — the file must not exist until VERIFIED stages
         // the verified one.
-        if self.cfg.snapshot.staged_path.exists() {
+        if pre_verify && self.cfg.snapshot.staged_path.exists() {
             problems.push(format!(
                 "staged_path {} already exists — stale snapshot from a previous ceremony? \
                  the target would import it prematurely; remove it (and re-create the target \
@@ -255,6 +288,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             if !g.exists() {
                 problems.push(format!("golden_roots {} missing", g.display()));
             }
+        }
+        if problems.is_empty() && resumed {
+            self.journal.evidence(self.state, json!({"resume_preflight": "ok"}))?;
+            return Ok(());
         }
         if problems.is_empty() {
             self.journal
@@ -275,8 +312,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             Ok(())
         } else {
-            self.abort("preflight failed", json!({"problems": problems}))?;
-            Err(format!("preflight failed: {}", problems.join("; ")))
+            let what = if resumed { "resume preflight failed" } else { "preflight failed" };
+            self.abort(what, json!({"problems": problems}))?;
+            Err(format!("{what}: {}", problems.join("; ")))
         }
     }
 
@@ -357,44 +395,91 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let ours = crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"].clone();
         let deadline = self.ops.now_ms() + co.fleet_timeout_secs * 1000;
         let status_url = format!("{}/api/status", co.url.trim_end_matches('/'));
-        let mut last_seen = 0usize;
+        let mut last_seen = usize::MAX;
         loop {
             if self.coordinator_aborted(true) {
                 self.abort("coordinator aborted the event (signed) before ignition", json!({"event_id": co.event_id}))?;
                 return Ok(false);
             }
-            if co.fleet_quorum == 0 {
+            if co.fleet_quorum == 0 && co.roster.is_empty() {
                 return Ok(true);
             }
-            let agreeing = match self.ops.get_json(&status_url) {
-                Ok(Some(st)) => st["networks"].as_array().and_then(|nets| nets.iter().find(|n| n["id"].as_str() == Some(co.network.as_str())))
-                    .and_then(|n| n["producers"].as_array())
-                    .map(|ps| ps.iter().filter(|p| {
-                        let c = &p["report"]["ceremony"];
-                        matches!(c["state"].as_str(), Some("VERIFIED" | "IGNITED" | "FLIPPED" | "LIVE"))
-                            && c["evidence"]["snapshot_sha256"] == ours["snapshot_sha256"]
-                            && c["evidence"]["fingerprints_digest"] == ours["fingerprints_digest"]
-                    }).count())
-                    .unwrap_or(0),
-                _ => 0,
+            let agrees = |r: &serde_json::Value| {
+                let c = &r["ceremony"];
+                matches!(c["state"].as_str(), Some("VERIFIED" | "IGNITED" | "FLIPPED" | "LIVE"))
+                    && !ours["snapshot_sha256"].is_null()
+                    && c["evidence"]["snapshot_sha256"] == ours["snapshot_sha256"]
+                    && c["evidence"]["fingerprints_digest"] == ours["fingerprints_digest"]
             };
+            let producers = match self.ops.get_json(&status_url) {
+                Ok(Some(st)) => st["networks"].as_array()
+                    .and_then(|nets| nets.iter().find(|n| n["id"].as_str() == Some(co.network.as_str())))
+                    .and_then(|n| n["producers"].as_array().cloned())
+                    .unwrap_or_default(),
+                _ => vec![],
+            };
+            let agreeing = if co.roster.is_empty() {
+                // Legacy gate: any producers the relay lists (unbound roster — see coord.rs).
+                producers.iter().filter(|p| agrees(&p["report"])).count()
+            } else {
+                // Roster gate: only the event's required members, only FRESH per-server reports
+                // (a stale report cannot vouch for a cut it never saw).
+                let max_age_ms = co.report_max_age_secs * 1000;
+                co.roster.iter().filter(|m| {
+                    let Some(p) = producers.iter().find(|p| p["name"].as_str() == Some(m.producer.as_str())) else { return false };
+                    let mut reports: Vec<(serde_json::Value, Option<u64>)> = p["beacons"].as_array().map(|bs| bs.iter()
+                        .map(|b| (b["report"].clone(), b["age_ms"].as_u64())).collect()).unwrap_or_default();
+                    if reports.is_empty() && !p["report"].is_null() {
+                        reports.push((p["report"].clone(), p["age_ms"].as_u64()));
+                    }
+                    reports.iter().any(|(r, age)| {
+                        let id_ok = m.instance_id.as_deref().map(|id| r["instance_id"].as_str() == Some(id)).unwrap_or(true);
+                        let fresh = age.map(|a| a <= max_age_ms).unwrap_or(false);
+                        id_ok && fresh && agrees(r)
+                    })
+                }).count()
+            };
+            let quorum = if co.fleet_quorum > 0 { co.fleet_quorum } else { co.roster.len() };
             if agreeing != last_seen {
-                self.journal.evidence(State::Verified, json!({"fleet_gate": {"agreeing": agreeing, "quorum": co.fleet_quorum}}))?;
+                self.journal.evidence(State::Verified, json!({"fleet_gate": {"agreeing": agreeing, "quorum": quorum,
+                    "roster": if co.roster.is_empty() { json!("unbound (any producer)") } else { json!(co.roster.len()) }}}))?;
                 last_seen = agreeing;
             }
-            if agreeing >= co.fleet_quorum {
+            if agreeing >= quorum {
                 return Ok(true);
             }
             if self.ops.now_ms() > deadline {
                 self.abort("fleet did not reach verified agreement before fleet_timeout",
-                    json!({"agreeing": agreeing, "quorum": co.fleet_quorum, "fleet_timeout_secs": co.fleet_timeout_secs}))?;
+                    json!({"agreeing": agreeing, "quorum": quorum, "fleet_timeout_secs": co.fleet_timeout_secs}))?;
                 return Ok(false);
             }
             self.ops.sleep_ms(2000);
         }
     }
 
+    /// Sealed stop after IGNITED: this node's target is running (and peers' may be producing),
+    /// so resuming the source or reverting public routing could create a second writable
+    /// history. Journal it, page humans via `on_halt`, change nothing, and return an error
+    /// starting with "HALTED" (the run ends; a human decides).
+    fn halt(&mut self, reason: &str, detail: serde_json::Value) -> Result<(), String> {
+        self.journal.error(
+            self.state,
+            &format!("HALTED: {reason}"),
+            json!({"detail": detail, "sealed": true, "source_resumed": false,
+                   "public_routing_reverted": false, "writes_reopened": false,
+                   "why": "the target was already ignited; a local failure must not resume the source"}),
+        )?;
+        if let Some(hook) = &self.cfg.hooks.on_halt {
+            let result = self.ops.run_hook(hook);
+            self.journal.evidence(self.state, json!({"on_halt_hook": format!("{result:?}")}))?;
+        }
+        Err(format!("HALTED at {}: {reason}", self.state))
+    }
+
     fn abort(&mut self, reason: &str, detail: serde_json::Value) -> Result<(), String> {
+        if self.reached_ignited || matches!(self.state, State::Ignited | State::Flipped | State::Live) {
+            return self.halt(reason, detail);
+        }
         self.journal.error(self.state, reason, detail)?;
         let mut rollback = json!({"reason": reason, "auto_rollback": self.cfg.target.auto_rollback});
         if self.cfg.target.auto_rollback {
@@ -476,10 +561,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     )?;
                 }
                 Err(e) => {
-                    self.journal.evidence(
-                        State::Armed,
-                        json!({"schedule_snapshot_unavailable": e, "fallback": "pause_at_h"}),
+                    // No fallback: an immediate snapshot would cut at whatever head is current,
+                    // not at H, and different producers would cut at different blocks.
+                    self.abort(
+                        "schedule_snapshot(H) failed: exact-H cut cannot be guaranteed",
+                        json!({"error": e, "h": self.h(),
+                               "fix": "enable the producer_api snapshot scheduler (Leap 4+) and re-run"}),
                     )?;
+                    return Ok(());
                 }
             }
         }
@@ -550,6 +639,23 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// LIB reaches H; under `simulate_freeze` the live chain simply advances
     /// past H and we proceed as if frozen, journaling the actual cut later.
     fn step_armed_api(&mut self) -> Result<(), String> {
+        // Exact H: unless rehearsing against a live chain (simulate_freeze), the API node pins
+        // its snapshot to H with the scheduler — never "whatever head is when LIB passes H".
+        if !self.cfg.ceremony.simulate_freeze && !self.scheduled {
+            match self.ops.schedule_snapshot(self.h()) {
+                Ok(()) => {
+                    self.scheduled = true;
+                    self.journal.evidence(State::Armed, json!({"snapshot_scheduled_at": self.h()}))?;
+                }
+                Err(e) => {
+                    self.abort(
+                        "schedule_snapshot(H) failed: api mode cannot cut at exactly H",
+                        json!({"error": e, "h": self.h()}),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
         let mut last_heartbeat = 0u64;
         let info = loop {
             let info = self.ops.source_info()?;
@@ -572,7 +678,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // cannot freeze the network's writes; that happened (or is simulated
         // to have happened) at the BP edge.
         let freeze_hook = if let Some(hook) = &self.cfg.hooks.on_freeze {
-            format!("{:?}", self.ops.run_hook(hook))
+            // Required hook: a failed write-freeze must not be shrugged off (run-5 lesson).
+            match self.ops.run_hook(hook) {
+                Ok(o) => o,
+                Err(e) => {
+                    self.abort("write-freeze hook failed", json!({"error": e}))?;
+                    return Ok(());
+                }
+            }
         } else {
             "none configured".into()
         };
@@ -606,15 +719,26 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// chain's view of that height.
     fn step_frozen_api(&mut self) -> Result<(), String> {
         let started = self.ops.now_ms();
-        let snap = match self.ops.create_snapshot() {
-            Ok(s) => s,
-            Err(e) => {
-                self.abort("create_snapshot failed", json!({"error": e}))?;
-                return Ok(());
+        let snap = if self.scheduled {
+            match self.await_scheduled_snapshot()? {
+                Some(s) => s,
+                None => return Ok(()), // aborted inside, with evidence
+            }
+        } else {
+            // simulate_freeze only (validated): a live chain, an inexact cut, journaled as such.
+            match self.ops.create_snapshot() {
+                Ok(s) => s,
+                Err(e) => {
+                    self.abort("create_snapshot failed", json!({"error": e}))?;
+                    return Ok(());
+                }
             }
         };
         let snapshot_wall_ms = self.ops.now_ms() - started;
         let cut_height = snap.head_block_num;
+        if !self.cut_is_exact(cut_height)? {
+            return Ok(()); // aborted inside
+        }
         let (chain_view_id, cut_block_time) = self.ops.source_block_id(cut_height)?;
         if !snap.head_block_id.eq_ignore_ascii_case(&chain_view_id) {
             self.abort(
@@ -663,6 +787,30 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }),
         )?;
         Ok(())
+    }
+
+    /// Exact-H rule: the cut must be H. Only `allow_inexact_cut` (single-producer pause_at_h
+    /// rehearsals) or `simulate_freeze` (live-chain API rehearsals) may accept another height,
+    /// and then it is journaled loudly. Returns Ok(false) after aborting.
+    fn cut_is_exact(&mut self, cut: u64) -> Result<bool, String> {
+        let h = self.h();
+        if cut == h {
+            return Ok(true);
+        }
+        if self.cfg.ceremony.allow_inexact_cut || self.cfg.ceremony.simulate_freeze {
+            self.journal.evidence(
+                State::Frozen,
+                json!({"inexact_cut": {"h": h, "cut": cut, "offset": cut as i64 - h as i64,
+                       "allowed_by": if self.cfg.ceremony.simulate_freeze { "simulate_freeze" } else { "allow_inexact_cut" },
+                       "note": "REHEARSAL ONLY: producers cutting at different heights would diverge"}}),
+            )?;
+            return Ok(true);
+        }
+        self.abort(
+            "snapshot is not at H: the cut must be exactly the event's H",
+            json!({"h": h, "snapshot_height": cut}),
+        )?;
+        Ok(false)
     }
 
     /// `schedule_at_h` (producer mode): the snapshot was scheduled at ARM to
@@ -767,6 +915,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         };
         let snapshot_wall_ms = self.ops.now_ms() - started;
+        if !self.cut_is_exact(snap.head_block_num)? {
+            return Ok(()); // aborted inside (production never paused)
+        }
 
         // Stop production and require quiescence (R4: catches producers that
         // ignored the pause and late blocks arriving over p2p).
@@ -1163,6 +1314,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(()); // aborted inside, with evidence
         }
         let started = self.ops.now_ms();
+        self.journal.evidence(State::Verified, json!({"side_effect": "ignite"}))?;
         let output = match self.ops.ignite() {
             Ok(o) => o,
             Err(e) => {
@@ -1172,6 +1324,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         };
         let deadline = started + self.cfg.target.quorum_timeout_secs * 1000;
         let cut_height = self.cut_height.expect("cut pinned");
+        let mut observed_at_cut: Option<String> = None;
         let info = loop {
             if self.ops.now_ms() > deadline {
                 self.abort(
@@ -1181,6 +1334,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(());
             }
             if let Some(info) = self.ops.target_info()? {
+                if info.head_block_num == cut_height {
+                    observed_at_cut = Some(info.head_block_id.clone());
+                }
                 if info.head_block_num >= cut_height {
                     break info;
                 }
@@ -1200,6 +1356,33 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(());
             }
         }
+        // Lineage at H: the target's block AT the cut must be the source's block at the cut
+        // (height + chain_id alone would accept a target imported from a different fork/cut).
+        let target_id_at_cut = match self.ops.target_block_id(cut_height)? {
+            Some(id) => Some(id),
+            None => observed_at_cut,
+        };
+        let cut_block_id = self.cut_block_id.clone().unwrap_or_default();
+        let lineage = match &target_id_at_cut {
+            Some(id) if id.eq_ignore_ascii_case(&cut_block_id) => "verified",
+            Some(id) => {
+                self.abort(
+                    "target block id at the cut != source block id at the cut (wrong lineage)",
+                    json!({"cut_height": cut_height, "target_block_id": id, "source_block_id": cut_block_id}),
+                )?;
+                return Ok(());
+            }
+            None if self.cfg.target.require_lineage_check => {
+                self.abort(
+                    "cannot verify the target's block id at the cut height (target RPC did not show block H)",
+                    json!({"cut_height": cut_height,
+                           "fix": "target RPC must answer pulsevm.getBlock(H), or set target.require_lineage_check = false (rehearsals only)"}),
+                )?;
+                return Ok(());
+            }
+            None => "UNVERIFIED (require_lineage_check = false)",
+        };
+        self.reached_ignited = true;
         self.state = State::Ignited;
         self.journal.transition(
             State::Ignited,
@@ -1209,10 +1392,68 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "target_head": info.head_block_num,
                 "target_head_id": info.head_block_id,
                 "cut_height": cut_height,
+                "target_block_id_at_cut": target_id_at_cut,
+                "lineage_at_cut": lineage,
                 "ignite_wall_ms": self.ops.now_ms() - started,
             }),
         )?;
         Ok(())
+    }
+
+    /// Required post-ignite hook. After IGNITED a failure halts (sealed) — never "journaled and
+    /// carried on" (run 5: a non-executable hook let the ceremony continue without its checks).
+    fn run_post_ignite(&mut self) -> Result<bool, String> {
+        let Some(hook) = self.cfg.hooks.post_ignite.clone() else { return Ok(true) };
+        match self.ops.run_hook(&hook) {
+            Ok(o) => {
+                self.journal.evidence(State::Ignited, json!({"post_ignite_hook": o}))?;
+                Ok(true)
+            }
+            Err(e) => {
+                self.abort("post_ignite hook failed", json!({"error": e}))?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Sustained LIVE gate: after the head passed `cut + live_blocks`, the target must keep
+    /// producing for `live_sustain_secs` with no gap longer than `live_max_gap_secs`. A stall
+    /// is journaled (the ~50 s post-LIVE stall of runs 4-6) and halts the ceremony.
+    fn sustain_live(&mut self, state: State) -> Result<serde_json::Value, String> {
+        let sustain_ms = self.cfg.target.live_sustain_secs * 1000;
+        if sustain_ms == 0 {
+            return Ok(json!({"sustain_secs": 0}));
+        }
+        let max_gap_ms = self.cfg.target.live_max_gap_secs * 1000;
+        let start = self.ops.now_ms();
+        let (mut last_head, mut last_change, mut worst_gap) = (0u64, start, 0u64);
+        loop {
+            let now = self.ops.now_ms();
+            if let Some(i) = self.ops.target_info()? {
+                if i.head_block_num > last_head {
+                    if last_head != 0 {
+                        worst_gap = worst_gap.max(now - last_change);
+                    }
+                    last_head = i.head_block_num;
+                    last_change = now;
+                }
+            }
+            let gap = now.saturating_sub(last_change);
+            if gap > max_gap_ms {
+                self.journal.evidence(state, json!({"live_stall": {"head": last_head, "gap_ms": gap,
+                    "max_gap_ms": max_gap_ms, "into_sustain_ms": now - start}}))?;
+                self.abort(
+                    "target stalled during the sustained LIVE window",
+                    json!({"head": last_head, "gap_ms": gap, "live_max_gap_secs": self.cfg.target.live_max_gap_secs}),
+                )?;
+                return Ok(serde_json::Value::Null); // unreachable: abort after IGNITED halts
+            }
+            if now - start >= sustain_ms {
+                return Ok(json!({"sustain_secs": self.cfg.target.live_sustain_secs,
+                                 "worst_gap_ms": worst_gap.max(gap), "head_at_end": last_head}));
+            }
+            self.ops.sleep_ms(self.cfg.poll_ms);
+        }
     }
 
     /// Poll the PUBLIC URL until it demonstrably serves the TARGET chain:
@@ -1266,12 +1507,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// serves the target, and only then move to FLIPPED. The source nodeos
     /// is STILL RUNNING — reads never gap; it stops in the FLIPPED step.
     fn step_ignited_api(&mut self) -> Result<(), String> {
-        if let Some(hook) = &self.cfg.hooks.post_ignite {
-            let result = self.ops.run_hook(hook);
-            self.journal.evidence(
-                State::Ignited,
-                json!({"post_ignite_hook": format!("{result:?}")}),
-            )?;
+        if !self.run_post_ignite()? {
+            return Ok(());
         }
         // hyperion mode: stand up hyperion-rs against the new chain's SHiP,
         // stage the history boundary for the federating router, and gate on
@@ -1282,6 +1519,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         let started = self.ops.now_ms();
         let flip_cmd = self.cfg.flip.as_ref().expect("validated").cmd.clone();
+        self.journal.evidence(State::Ignited, json!({"side_effect": "flip_cmd"}))?;
         self.flip_ran = true; // even a failing cmd may have half-applied
         let flip_out = match self.ops.run_hook(&flip_cmd) {
             Ok(o) => o,
@@ -1294,6 +1532,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // federating router — one user-visible moment for both surfaces.
         let mut v2_flip_out = serde_json::Value::Null;
         if let Some(hyp) = self.cfg.hyperion.clone() {
+            self.journal.evidence(State::Ignited, json!({"side_effect": "hyperion_flip_cmd"}))?;
             self.hyperion_flip_ran = true;
             match self.ops.run_hook(&hyp.flip_cmd) {
                 Ok(o) => v2_flip_out = json!(o),
@@ -1465,6 +1704,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         let stop_cmd = self.cfg.source.stop_cmd.clone().expect("validated");
         let started = self.ops.now_ms();
+        self.journal.evidence(State::Flipped, json!({"side_effect": "source_stop_cmd"}))?;
         self.source_stopped = true; // even a failing stop may have half-applied
         let stop_out = match self.ops.run_hook(&stop_cmd) {
             Ok(o) => o,
@@ -1495,12 +1735,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(());
             }
         };
+        let sustained = self.sustain_live(State::Flipped)?;
         let live_ts = self.ops.now_ms();
         let write_gap_ms = self.frozen_ts_ms.map(|f| live_ts - f);
         self.state = State::Live;
         self.journal.transition(
             State::Live,
             json!({
+                "sustained": sustained,
                 "source_stop_output": stop_out,
                 "stop_wall_ms": self.ops.now_ms() - started,
                 "public_health": health,
@@ -1525,12 +1767,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.cfg.ceremony.mode == Mode::Api {
             return self.step_ignited_api();
         }
-        if let Some(hook) = &self.cfg.hooks.post_ignite {
-            let result = self.ops.run_hook(hook);
-            self.journal.evidence(
-                State::Ignited,
-                json!({"post_ignite_hook": format!("{result:?}")}),
-            )?;
+        if !self.run_post_ignite()? {
+            return Ok(());
         }
         let started = self.ops.now_ms();
         let deadline = started + self.cfg.target.quorum_timeout_secs * 1000;
@@ -1551,12 +1789,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             self.ops.sleep_ms(self.cfg.poll_ms);
         };
+        let reached_goal_ts = self.ops.now_ms();
+        let sustained = self.sustain_live(State::Ignited)?;
         let live_ts = self.ops.now_ms();
-        let write_gap_ms = self.frozen_ts_ms.map(|f| live_ts - f);
+        let write_gap_ms = self.frozen_ts_ms.map(|f| reached_goal_ts - f);
         self.state = State::Live;
         self.journal.transition(
             State::Live,
             json!({
+                "sustained": sustained,
+                "live_declared_after_sustain_ms": live_ts - reached_goal_ts,
                 "target_head": info.head_block_num,
                 "target_head_id": info.head_block_id,
                 "first_post_cut_block_time": info.head_block_time,

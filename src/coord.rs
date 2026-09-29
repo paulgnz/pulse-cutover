@@ -16,6 +16,17 @@
 //!
 //! Wire format: `{"payload": "<json string>", "sig": "<128 hex>", "key": "<64 hex>"}`. The
 //! signature covers the payload string's exact bytes (no canonicalization ambiguity).
+//!
+//! Event binding (optional fields, all covered by the signature):
+//!   roster          [{"producer", "instance_id"?}] — the servers that must agree before ignition;
+//!                   `await` writes it into the derived config and the fleet gate counts ONLY
+//!                   these members, with fresh reports (see machine.rs `fleet_gate`)
+//!   quorum          how many roster members must agree (default: all)
+//!   release_sha256  the PulseVM plugin build; rejected if `target.plugin_path` hashes differently
+//!   snapshot_sha256 the expected cut snapshot hash, once known (becomes snapshot.expected_sha256)
+//! Still NOT done (next step): per-BP SIGNED acknowledgements. Today the fleet gate reads beacon
+//! reports through the relay; a roster bounds WHO counts and freshness bounds WHEN, but a
+//! compromised relay could still misreport them.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -58,6 +69,24 @@ pub fn validate_event(ev: &Value, cfg: &Config, network: &str, head: Option<u64>
     if let Some(head) = head {
         if h < head + min_lead { return Err(format!("H {h} is only {} blocks ahead of head {head} (minimum {min_lead})", h.saturating_sub(head))); }
     }
+    if let Some(roster) = ev.get("roster").filter(|r| !r.is_null()) {
+        let members: Vec<crate::config::RosterMember> =
+            serde_json::from_value(roster.clone()).map_err(|e| format!("event roster is malformed: {e}"))?;
+        if members.is_empty() { return Err("event roster is empty".into()); }
+        if let Some(q) = ev["quorum"].as_u64() {
+            if q == 0 || q as usize > members.len() { return Err(format!("event quorum {q} is not within 1..={}", members.len())); }
+        }
+    }
+    if let Some(want) = ev["release_sha256"].as_str() {
+        if let Some(path) = &cfg.target.plugin_path {
+            let (got, _) = crate::verify::sha256_file(path).map_err(|e| format!("cannot hash plugin {}: {e}", path.display()))?;
+            if !got.eq_ignore_ascii_case(want) {
+                return Err(format!("event release_sha256 {}… ≠ installed plugin {}…", &want[..12.min(want.len())], &got[..12]));
+            }
+        } else {
+            eprintln!("await: event pins release_sha256 but target.plugin_path is not set: plugin NOT verified");
+        }
+    }
     Ok(h)
 }
 
@@ -79,15 +108,38 @@ pub fn read_state(cfg: &Config) -> Value {
 }
 
 fn write_state(cfg: &Config, v: &Value) {
+    let mut v = v.clone();
+    if let Some(r) = v.get("reason").and_then(|r| r.as_str()).map(crate::beacon::sanitize_short) {
+        v["reason"] = json!(r);
+    }
+    let v = &v;
     let _ = std::fs::write(state_file(cfg), serde_json::to_string_pretty(v).unwrap_or_default());
 }
 
-/// Derived ceremony config for one event: H from the signed event, event_id recorded.
-fn derived_config(src: &Path, h: u64, event_id: &str, out: &Path) -> Result<(), String> {
+/// Derived ceremony config for one event: H, event_id and the event's bindings (roster, quorum,
+/// expected snapshot hash) from the signed event. H derivation is switched OFF: H is the event's.
+pub fn derived_config(src: &Path, ev: &Value, out: &Path) -> Result<(), String> {
+    let h = ev["h"].as_u64().ok_or("event has no H")?;
+    let event_id = ev["event_id"].as_str().ok_or("event has no event_id")?;
     let text = std::fs::read_to_string(src).map_err(|e| e.to_string())?;
     let mut doc: toml::Value = toml::from_str(&text).map_err(|e| e.to_string())?;
-    doc["ceremony"].as_table_mut().ok_or("config has no [ceremony]")?.insert("freeze_height".into(), toml::Value::Integer(h as i64));
-    doc["coordination"].as_table_mut().ok_or("config has no [coordination]")?.insert("event_id".into(), toml::Value::String(event_id.into()));
+    let cer = doc["ceremony"].as_table_mut().ok_or("config has no [ceremony]")?;
+    cer.insert("freeze_height".into(), toml::Value::Integer(h as i64));
+    cer.remove("derive_h_at_arm");
+    let co = doc["coordination"].as_table_mut().ok_or("config has no [coordination]")?;
+    co.insert("event_id".into(), toml::Value::String(event_id.into()));
+    if let Some(roster) = ev.get("roster").filter(|r| r.is_array()) {
+        let t: toml::Value = toml::Value::try_from(roster).map_err(|e| format!("roster: {e}"))?;
+        co.insert("roster".into(), t);
+        if let Some(q) = ev["quorum"].as_u64() {
+            co.insert("fleet_quorum".into(), toml::Value::Integer(q as i64));
+        }
+    }
+    if let Some(sha) = ev["snapshot_sha256"].as_str() {
+        if let Some(snap) = doc.get_mut("snapshot").and_then(|v| v.as_table_mut()) {
+            snap.insert("expected_sha256".into(), toml::Value::String(sha.into()));
+        }
+    }
     std::fs::write(out, toml::to_string(&doc).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
@@ -98,6 +150,7 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
     let a = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
     let base = co.url.trim_end_matches('/');
     let mut accepted: Option<(String, u64)> = None;
+    let mut accepted_ev: Value = Value::Null;
     let mut last_note = String::new();
     let note = |s: &str, last: &mut String| { if s != last { eprintln!("await: {s}"); *last = s.to_string(); } };
     loop {
@@ -115,6 +168,7 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
                     match validate_event(&ev, cfg, &co.network, head, co.min_lead_blocks) {
                         Ok(h) => {
                             accepted = Some((id.clone(), h));
+                            accepted_ev = ev.clone();
                             write_state(cfg, &json!({"event_id": id, "h": h, "accepted": true, "armed": false, "at": chrono::Utc::now().to_rfc3339()}));
                             note(&format!("accepted event {id}: cut at H = {h}"), &mut last_note);
                         }
@@ -149,7 +203,7 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
                     note(&format!("ARM received but H {h} is too close to head {head:?}; not starting"), &mut last_note);
                 } else {
                     let derived = cfg.journal_path.parent().unwrap_or(Path::new(".")).join(format!("ceremony-{id}.toml"));
-                    derived_config(config_path, *h, id, &derived)?;
+                    derived_config(config_path, &accepted_ev, &derived)?;
                     write_state(cfg, &json!({"event_id": id, "h": h, "accepted": true, "armed": true, "at": chrono::Utc::now().to_rfc3339()}));
                     eprintln!("await: ARMED by signed coordinator message for {id}: running the ceremony at H = {h}");
                     let status = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
@@ -185,6 +239,25 @@ mod tests {
         let mut t = m.clone();
         t["payload"] = json!(m["payload"].as_str().unwrap().replace("100", "999"));
         assert!(verify(&t, &keys).unwrap_err().contains("does not verify"));
+    }
+
+    #[test]
+    fn derived_config_binds_h_roster_quorum_and_snapshot_and_drops_derivation() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("c.toml");
+        std::fs::write(&src, "journal_path = \"/j\"\n[ceremony]\nfreeze_height = 0\nfreeze_margin = 10\nderive_h_at_arm = true\n[snapshot]\nstaged_path = \"/s\"\n[coordination]\nurl = \"https://mc\"\nnetwork = \"testnet\"\n").unwrap();
+        let ev = json!({"type": "event", "event_id": "e7", "h": 900,
+            "roster": [{"producer": "bp1", "instance_id": "aa"}, {"producer": "bp2"}], "quorum": 2,
+            "snapshot_sha256": "ff00"});
+        let out = dir.path().join("d.toml");
+        derived_config(&src, &ev, &out).unwrap();
+        let d: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(d["ceremony"]["freeze_height"].as_integer(), Some(900));
+        assert!(d["ceremony"].get("derive_h_at_arm").is_none(), "H must come from the event, not be derived");
+        assert_eq!(d["coordination"]["event_id"].as_str(), Some("e7"));
+        assert_eq!(d["coordination"]["fleet_quorum"].as_integer(), Some(2));
+        assert_eq!(d["coordination"]["roster"].as_array().unwrap().len(), 2);
+        assert_eq!(d["snapshot"]["expected_sha256"].as_str(), Some("ff00"));
     }
 
     #[test]

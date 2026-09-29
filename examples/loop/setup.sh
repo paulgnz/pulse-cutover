@@ -78,6 +78,7 @@ poll_ms = 250
 mode = "api"
 freeze_height = 0
 freeze_margin = 60
+derive_h_at_arm = true
 simulate_freeze = true
 chain_id = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
 import_cpu_scale = 143
