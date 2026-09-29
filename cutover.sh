@@ -3,7 +3,8 @@
 #
 #   ./cutover.sh --manifest ceremony.json    # validate + run to LIVE (exit 0) or ABORT (exit 1)
 #   ./cutover.sh status                      # current journaled state
-#   ./cutover.sh abort                       # stop the agent + roll the public edge back
+#   ./cutover.sh abort                       # stop the agent + roll back (refused after IGNITED)
+#   ./cutover.sh abort --force-after-ignite  # roll back after IGNITED (coordinator-confirmed only)
 #
 # Plain-language streaming: every state transition the agent journals is echoed
 # as one operator-readable line. The full evidence is always in the JSONL journal.
@@ -23,6 +24,23 @@ case "$CMD" in
   abort)
     echo "aborting: stopping the agent (the ratchet means nothing user-visible ran unless FLIPPED/LIVE printed)"
     pkill -f 'pulse-cutover run' || echo "  (no running agent)"
+    # After IGNITED this node's target is running (and other producers' may be producing):
+    # resuming the source or reverting public routing could create a second writable history.
+    # That is a human, fleet-wide decision — never the default of a local abort.
+    STATE=$(pulse-cutover status --config "$CONFIG" 2>/dev/null | sed -n 's/^state: //p' || true)
+    case "$STATE" in
+      IGNITED|FLIPPED|LIVE)
+        if [ "${2:-}" != "--force-after-ignite" ]; then
+          echo "  NOT rolling back: the journal says $STATE — this node's PulseVM target is already running."
+          echo "  The agent is stopped; the source was NOT resumed and public routing was NOT reverted."
+          echo "  Only if the coordinator has confirmed a fleet-wide rollback, run:"
+          echo "    ./cutover.sh abort --force-after-ignite"
+          echo "journal: $(tomlget journal_path)"
+          exit 3
+        fi
+        echo "  --force-after-ignite: rolling back AFTER $STATE on operator instruction"
+        ;;
+    esac
     MODE=$(tomlget mode); MODE=${MODE:-producer}
     if [ "$MODE" = "api" ]; then
       # Revert EVERY staged flip ([flip].revert_cmd and, in hyperion mode,
@@ -45,7 +63,8 @@ case "$CMD" in
   *)
     echo "usage: ./cutover.sh [--manifest ceremony.json]   run the ceremony (exit 0 = LIVE)"
     echo "       ./cutover.sh status                       show how far the ceremony got"
-    echo "       ./cutover.sh abort                        stop safely + undo any public change"
+    echo "       ./cutover.sh abort                        stop safely + undo any public change (before IGNITED)"
+    echo "       ./cutover.sh abort --force-after-ignite   roll back after IGNITED (coordinator-confirmed only)"
     exit 2;;
 esac
 
@@ -95,7 +114,7 @@ fi
 MODE=$(tomlget mode); MODE=${MODE:-producer}
 JOURNAL=$(tomlget journal_path)
 echo "ceremony starting — journal: $JOURNAL"
-echo "(the source chain stays authoritative until the last step; ^C + './cutover.sh abort' is always safe before FLIPPED)"
+echo "(^C + './cutover.sh abort' rolls back safely before IGNITED; after IGNITED a failure SEALS — nothing is resumed without a human)"
 
 # ---------- run, translating journal lines to plain language ----------
 if [ "$MODE" = "api" ]; then
@@ -124,8 +143,11 @@ if [ "$RC" = 0 ]; then
   echo "LIVE. Evidence journal: $JOURNAL"
 else
   echo ""
-  echo "Ceremony did NOT reach LIVE (exit $RC) — it stopped safely; your source chain is untouched"
-  echo "unless FLIPPED printed above (and an abort at FLIPPED reverts the swap automatically)."
+  echo "Ceremony did NOT reach LIVE (exit $RC)."
+  echo "  - If ABORTED printed: it stopped before IGNITED and rolled back; the source chain is the real one."
+  echo "  - If it HALTED (IGNITED printed, no ABORTED): it is SEALED. This node's target was already"
+  echo "    running, so nothing was resumed or reverted. Do not restart the source on your own:"
+  echo "    the coordinator decides for the whole fleet (then './cutover.sh abort --force-after-ignite')."
   echo "Full evidence: $JOURNAL"
   echo "Next: run 'pulse-cutover report' — it builds a sanitized bundle (journal + doctor survey +"
   echo "service logs, keys auto-redacted) to attach to a GitHub issue or post in the Telegram group."
