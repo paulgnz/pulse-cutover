@@ -71,6 +71,7 @@ jobs:
             dist/pulse-cutover-*
             dist/sha256sums.txt
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             Static musl binaries — run on Ubuntu 20.04/22.04/24.04 (any glibc).
             Verify: `sha256sum -c sha256sums.txt --ignore-missing`.
