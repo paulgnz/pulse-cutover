@@ -49,9 +49,22 @@ Everything is also saved in `/etc/metalgo/identity.txt`, and machine-readable fo
    | `signer.key` | your BLS signing key (what the proof of possession proves) | you must register a new BLS key + PoP |
 
    Chain data doesn't need backing up: it re-syncs. **Never run two nodes with the same keys at the same time.**
-2. **Open 9651/tcp to the internet.** Peers reach you there. The script opens it in `ufw` if ufw is active.
-   Cloud firewalls (Vultr, Hetzner, AWS security groups) you must open yourself. The HTTP API (9650) stays on
-   127.0.0.1.
+2. **Open 9651/tcp to the internet.** Peers reach you there. The installer tests it from outside (mission
+   control dials back to your server's IP on 9651 only) and, if it's closed, tells you **which** firewall blocks it
+   and the exact fix:
+
+   | Blocked by | Fix it prints |
+   |---|---|
+   | ufw on this server | `sudo ufw allow 9651/tcp` |
+   | firewalld | `sudo firewall-cmd --permanent --add-port=9651/tcp && sudo firewall-cmd --reload` |
+   | iptables (default-drop) | `sudo iptables -I INPUT -p tcp --dport 9651 -j ACCEPT` + how to keep it after reboot |
+   | nftables (policy drop) | add `tcp dport 9651 accept` to the input chain |
+   | nothing local: your provider's firewall | allow inbound TCP 9651 in the provider's panel (Vultr firewall group, Hetzner Firewalls, AWS security group, …) |
+   | metalgo not listening / localhost only | restart metalgo / remove the listen override |
+
+   Re-check any time without changing anything: `… | sudo bash -s -- --check`. Add `--open-port` to have it
+   add the rule to this server's own firewall for you (it can't change your provider's).
+   The HTTP API (9650) stays on 127.0.0.1.
 3. **Stay on the pinned version.** Tahoe activated Granite on 2026-09-21. Nodes older than `v1.14.2-tahoe`
    fall off the network. To upgrade, re-run the same command: it keeps your keys.
 

@@ -14,14 +14,14 @@
 #   + backs up your staking keys to a root-only archive and tells you to copy it off the box
 #   - never stakes, funds, registers or changes nodeos; never prints private keys
 #
-# Options: [--metal tahoe|mainnet] [--manifest-url URL] [--build] [--method binary|compat|docker|build] [--dry-run] [--uninstall]
+# Options: [--check] (re-test port 9651 + print identity; changes nothing) [--open-port] (also add the local firewall rule)
+#          [--metal tahoe|mainnet] [--manifest-url URL] [--build] [--method binary|compat|docker|build] [--dry-run] [--uninstall]
 # Re-running is safe: it keeps the node identity, re-applies the pinned version and prints the IDs again.
 set -euo pipefail
-METAL=""; MANIFEST_URL=""; METHOD=""; BUILD=0; DRY=0; UNINSTALL=0
-CONTROL="https://control-rehearsal.protonnz.com"
+METAL=""; MANIFEST_URL=""; METHOD=""; CHECK=0; OPEN_PORT=0; BUILD=0; DRY=0; UNINSTALL=0
 while [ $# -gt 0 ]; do case "$1" in
   --metal) METAL=$2; shift 2;; --manifest-url) MANIFEST_URL=$2; shift 2;; --build) BUILD=1; shift;; --method) METHOD=$2; shift 2;;
-  --dry-run) DRY=1; shift;; --uninstall) UNINSTALL=1; shift;;
+  --dry-run) DRY=1; shift;; --check) CHECK=1; shift;; --open-port) OPEN_PORT=1; shift;; --uninstall) UNINSTALL=1; shift;;
   *) echo "unknown option $1" >&2; exit 2;; esac; done
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[!]\033[0m %s\n' "$*"; }
@@ -32,6 +32,105 @@ DATA=/var/lib/metalgo; ETC=/etc/metalgo
 if [ "$UNINSTALL" = 1 ]; then
   systemctl disable --now metalgo 2>/dev/null || true; rm -f /etc/systemd/system/metalgo.service; systemctl daemon-reload
   say "metalgo service removed. Your node identity and chain data are KEPT in $DATA (delete them yourself only after backing up $DATA/staking)."
+  exit 0
+fi
+
+G='\033[32m'; Y='\033[33m'; B='\033[1m'; N='\033[0m'
+CONTROL="https://control-rehearsal.protonnz.com"
+
+# ---- port 9651: test from outside; if closed, work out WHICH firewall blocks it ----------------------
+# Mission control dials back to this server's IP on 9651 only. If that fails, look at what this box can see:
+# is metalgo listening publicly, and do ufw / firewalld / iptables / nftables here drop it? If every local
+# layer allows it, the block is upstream (provider firewall / security group), which no script here can change.
+port_diag() {
+  REACH=""
+  for _ in 1 2; do   # one retry: mission control rate-limits to one probe per 5 s per IP
+    REACH=$(curl -4 -fsS -m10 "$CONTROL/api/reach" 2>/dev/null | sed -n 's/.*"reachable":\(true\|false\).*/\1/p' || true)
+    [ -n "$REACH" ] && break; sleep 6
+  done
+  CAUSE=""; FIX=""; FIX2=""
+  [ "$REACH" = false ] || return 0
+  LISTEN=$(ss -ltnH "sport = :9651" 2>/dev/null | awk '{print $4}' | head -1 || true)
+  if [ -z "$LISTEN" ]; then
+    CAUSE="metalgo is not listening on port 9651 (it may still be starting, or crashed)"
+    FIX="sudo systemctl restart metalgo && journalctl -u metalgo -n 50"; return 0
+  fi
+  case "$LISTEN" in 127.*|"[::1]"*)
+    CAUSE="metalgo only listens on $LISTEN (localhost), not on the public interface"
+    FIX="remove any staking-host / listen override from $ETC/config.json, then: sudo systemctl restart metalgo"; return 0;;
+  esac
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ! ufw status 2>/dev/null | grep -qE "^9651(/tcp)?[[:space:]].*ALLOW"; then
+      CAUSE="ufw (this server's firewall) is on and has no rule for 9651"
+      FIX="sudo ufw allow 9651/tcp"; return 0
+    fi
+  fi
+  if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    if ! firewall-cmd --list-ports 2>/dev/null | grep -qw "9651/tcp"; then
+      CAUSE="firewalld (this server's firewall) is running and does not allow 9651"
+      FIX="sudo firewall-cmd --permanent --add-port=9651/tcp && sudo firewall-cmd --reload"; return 0
+    fi
+  fi
+  if command -v iptables >/dev/null; then
+    RULES=$(iptables -S INPUT 2>/dev/null || true)
+    POL=$(printf '%s\n' "$RULES" | sed -n 's/^-P INPUT //p')
+    if ! printf '%s\n' "$RULES" | grep -qE -- "--dport 9651 .*-j ACCEPT" && \
+       { [ "$POL" = DROP ] || printf '%s\n' "$RULES" | grep -qE -- "-j (DROP|REJECT)"; }; then
+      CAUSE="iptables on this server drops inbound ports that aren't listed, and 9651 isn't listed"
+      FIX="sudo iptables -I INPUT -p tcp --dport 9651 -j ACCEPT"
+      if command -v netfilter-persistent >/dev/null; then FIX2="make it survive reboots: sudo netfilter-persistent save"
+      else FIX2="make it survive reboots: add the same rule to whatever loads your firewall at boot (e.g. /etc/iptables/rules.v4)"; fi
+      return 0
+    fi
+  fi
+  if command -v nft >/dev/null && nft list ruleset 2>/dev/null | grep -qE "hook input .*policy drop" && \
+     ! nft list ruleset 2>/dev/null | grep -q "dport 9651"; then
+    CAUSE="nftables (this server's firewall) drops inbound by default and has no rule for 9651"
+    FIX="add 'tcp dport 9651 accept' to the input chain in /etc/nftables.conf, then: sudo systemctl reload nftables"; return 0
+  fi
+  CAUSE="nothing on this server blocks 9651, so the block is in front of it: your hosting provider's firewall"
+  FIX="in your provider's control panel, allow inbound TCP 9651 from anywhere (0.0.0.0/0) to this server"
+  FIX2="where: Vultr = Firewall group · Hetzner = Firewalls · AWS = Security group · OVH = Network firewall · DigitalOcean = Networking > Firewalls"
+}
+
+# --open-port: add the local rule for whichever firewall is active (never touches the provider's).
+open_port_local() {
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow 9651/tcp >/dev/null && say "ufw: allowed 9651/tcp"
+  elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port=9651/tcp >/dev/null && firewall-cmd --reload >/dev/null && say "firewalld: allowed 9651/tcp"
+  elif command -v iptables >/dev/null; then
+    iptables -C INPUT -p tcp --dport 9651 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 9651 -j ACCEPT
+    say "iptables: allowed 9651/tcp"
+    if command -v netfilter-persistent >/dev/null; then netfilter-persistent save >/dev/null 2>&1 && say "iptables: rule saved for reboots"
+    else warn "iptables rule is live but not saved for reboots: add it to your boot-time firewall rules"; fi
+  fi
+}
+
+print_port() {
+  if [ "$REACH" = true ]; then printf "  ${G}✓${N} 1. Staking port 9651 is reachable from the internet. Nothing to do.\n"
+  elif [ "$REACH" = false ]; then
+    printf "  ${Y}✗${N} 1. ${B}Port 9651/tcp is closed to the internet.${N} Other nodes can't connect in (you only have outbound peers).\n"
+    echo "       Why:  $CAUSE"
+    echo "       Fix:  $FIX"
+    [ -n "$FIX2" ] && echo "             $FIX2"
+    echo "       Then re-check (changes nothing):"
+    echo "         curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/metal-install.sh | sudo bash -s -- --check"
+  else printf "  ${Y}?${N} 1. Could not test port 9651 (mission control unreachable). Make sure inbound TCP 9651 is open.\n"; fi
+}
+
+if [ "$CHECK" = 1 ]; then
+  systemctl is-active --quiet metalgo || die "metalgo is not running here (install it first: run without --check)"
+  [ "$OPEN_PORT" = 1 ] && open_port_local
+  port_diag
+  echo
+  [ -f "$ETC/identity.txt" ] && sed 's/^/  /' "$ETC/identity.txt" && echo
+  PEERS=$(curl -fsS -m3 -X POST -H 'content-type:application/json' -d '{"jsonrpc":"2.0","id":1,"method":"info.peers"}' http://127.0.0.1:9650/ext/info 2>/dev/null | sed -n 's/.*"numPeers":"\([0-9]*\)".*/\1/p' || true)
+  PB=$(curl -fsS -m3 -X POST -H 'content-type:application/json' -d '{"jsonrpc":"2.0","id":1,"method":"info.isBootstrapped","params":{"chain":"P"}}' http://127.0.0.1:9650/ext/info 2>/dev/null | sed -n 's/.*"isBootstrapped":\(true\|false\).*/\1/p' || true)
+  echo "  metalgo: $(systemctl is-active metalgo) · peers ${PEERS:-?} · P-Chain synced: ${PB:-?}"
+  echo
+  print_port
+  echo
   exit 0
 fi
 
@@ -192,7 +291,8 @@ PRODUCER=$(sed -n 's/^producer *= *"\([a-z1-5.]*\)".*/\1/p' /etc/pulse-cutover/b
 
 # Is the staking port reachable from the internet? Mission control dials back to THIS server's IP on 9651 only.
 sleep 3
-REACH=$(curl -4 -fsS -m10 "$CONTROL/api/reach" 2>/dev/null | sed -n 's/.*"reachable":\(true\|false\).*/\1/p' || true)
+[ "$OPEN_PORT" = 1 ] && open_port_local
+port_diag
 
 # Put a copy of the key archive where the sudo user can scp it (root-only /root is awkward to copy from).
 BK_USER=""
@@ -210,7 +310,6 @@ cat > "$ETC/identity.json" <<JSON
 JSON
 chmod 644 "$ETC/identity.json"
 
-G='\033[32m'; Y='\033[33m'; B='\033[1m'; N='\033[0m'
 echo
 printf "  ${G}✓${N} ${B}Metal node installed and running${N} ($METHOD, metalgo $VERSION, $METAL)\n"
 echo
@@ -223,14 +322,7 @@ echo "  (also in $ETC/identity.txt and, for scripts/agents, $ETC/identity.json)"
 echo
 printf "  ${B}── NEXT STEPS ──────────────────────────────────────────────────────────────────────────────${N}\n"
 echo
-if [ "$REACH" = true ]; then printf "  ${G}✓${N} 1. Staking port 9651 is reachable from the internet. Nothing to do.\n"
-elif [ "$REACH" = false ]; then
-  printf "  ${Y}✗${N} 1. ${B}Open port 9651/tcp.${N} Mission control could not connect to ${PUBIP:-this server}.\n"
-  echo "       Peers can't reach you, so the node only has outbound peers. Check, in order:"
-  echo "         • your provider's cloud firewall / security group: allow inbound TCP 9651"
-  echo "         • this server:  sudo ufw allow 9651/tcp   (or: sudo iptables -I INPUT -p tcp --dport 9651 -j ACCEPT)"
-  echo "       Re-check any time:  curl -s $CONTROL/api/reach"
-else printf "  ${Y}?${N} 1. Could not test port 9651 (mission control unreachable). Make sure inbound TCP 9651 is open.\n"; fi
+print_port
 echo
 printf "  ${Y}!${N} 2. ${B}Back up your keys off this server.${N} They ARE your validator; chain data is not needed.\n"
 echo "       staker.key + staker.crt = your NodeID · signer.key = your BLS key  (all three in one archive)"
