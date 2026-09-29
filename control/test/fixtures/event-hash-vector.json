@@ -1,0 +1,6 @@
+{
+ "description": "event_hash = lowercase hex sha256 over the UTF-8 bytes of the exact signed event payload string, as stored by the relay (no parsing, no re-serialization, no whitespace or key-order normalization)",
+ "payload": "{\"v\":1,\"type\":\"event\",\"network\":\"rehearsal\",\"event_id\":\"ev-vector-1\",\"chain_id\":\"5a2f222a174ac4f1350ff599ea38f9a1217df8f8fba33bd9f939803abba521da\",\"h\":9000,\"freeze_lead_blocks\":24,\"import_cpu_scale\":143,\"issued_at_ms\":1790700000000,\"note\":\"ünïcode ✓\"}",
+ "event_hash": "6664e24c5d536045c37b2a3750400f3529eccb73cdfc71dd1e846145bb6cd547",
+ "payload_utf8_bytes": 255
+}

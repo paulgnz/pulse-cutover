@@ -72,6 +72,12 @@ export function limiter(max) {
   const next = () => { if (active >= max || !q.length) return; active++; const [fn, ok, ko] = q.shift(); fn().then(ok, ko).finally(() => { active--; next(); }); };
   return (fn) => new Promise((ok, ko) => { q.push([fn, ok, ko]); next(); });
 }
+/** Reject with a TimeoutError if `p` hasn't settled within `ms` (≤ 0 → immediately). */
+export function withDeadline(p, ms) {
+  const to = () => Object.assign(new Error('timeout'), { name: 'TimeoutError' });
+  if (!(ms > 0)) { p.catch(() => {}); return Promise.reject(to()); }
+  let t; return Promise.race([p, new Promise((_, ko) => { t = setTimeout(() => ko(to()), ms); })]).finally(() => clearTimeout(t));
+}
 export const UA = 'pulse-cutover-mission-control/1.0 (+https://control-rehearsal.protonnz.com)';
 
 /**
@@ -125,7 +131,9 @@ export async function safeRequest(url, { method = 'GET', headers = {}, body = nu
   for (let hop = 0; ; hop++) {
     if (!/^https?:$/.test(u.protocol)) throw new Error('blocked scheme');
     if (u.username || u.password) throw new Error('blocked credentials in URL');
-    const ip = await resolvePublic(u.hostname, lookup);
+    // DNS resolution counts against the same deadline: a stalled resolver must not hold a concurrency slot longer
+    // than the request's own timeout (the lookup may finish later in the background; its result is ignored).
+    const ip = await withDeadline(resolvePublic(u.hostname, lookup), deadline - Date.now());
     const left = deadline - Date.now(); if (left <= 0) throw Object.assign(new Error('timeout'), { name: 'TimeoutError' });
     const r = await requestPinned(u, ip, { method: m, headers, body: b, timeoutMs: left, maxBytes, onConnect });
     const loc = r.headers.get('location');

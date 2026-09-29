@@ -48,14 +48,31 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   Issue one: `t=$(openssl rand -hex 32)`; give `t` to the producer (file, mode 600); add `sha256(t)` here. The file is
   re-read automatically.
 - **Coordination** (`COORD_FILE`): the relay is an acceptance boundary. A signed event/arm/abort counts as relayed only
-  once it is on disk (written to a temp file, fsynced, renamed); if the write fails the server answers 503 and nothing
-  changes. A corrupt store stops startup (exit 3) rather than starting empty and forgetting a live event: restore it
-  from a backup, or delete it only if no event is live. While an event is active and not aborted, a *different* event
-  is refused (409). **Event ids are single-use**, even after an abort. `arm` must carry `event_hash` = sha256 of the
-  published event payload (`abort` is checked too when it carries one); `control/coord.mjs` adds it for you.
-- **Replay state** (`REPLAY_FILE`, default `replay.json` next to `COORD_FILE`): the last accepted report timestamp per
-  server survives restarts, so a captured report can't be replayed after mission control restarts.
-- **Operator clear** (identity conflicts): on the mission-control host itself,
+  once it is on disk (temp file written and fsynced, renamed, then the **directory fsynced** so the rename itself is
+  durable); if any step fails the server answers 503 and nothing changes. On startup every network entry is validated
+  (signed-message shape, JSON payloads with an event_id, `history` array, `used` map; no arm/abort without an event):
+  a corrupt or invalid store, including a well-formed one like `{"testnet": null}`, stops startup (exit 3) rather than
+  starting empty and forgetting a live event. Restore it from a backup, or delete it only if no event is live.
+  While an event is active and not aborted, a *different* event is refused (409). **Event ids are single-use**, even
+  after an abort. Stores written by rc.5 (no `used` map) are migrated on start: the active event and every event id in
+  their history count as used.
+- **event_hash (the contract every signer and verifier must share):** `event_hash` = lowercase hex sha256 over the
+  **UTF-8 bytes of the exact `payload` string** of the signed event message, byte for byte as signed and as stored by
+  the relay: no JSON parsing, re-serialization, whitespace or key-order normalization. Test vector:
+  `control/test/fixtures/event-hash-vector.json` (the Rust agent tests against the same file). `arm` must carry it
+  (409 otherwise); `abort` is checked when it carries one. `control/coord.mjs event` saves the signed event to
+  `<event_id>.event.json` and checks the relay reports the same hash; `arm`/`abort` hash **your saved copy**
+  (`--event-file`) and refuse if the relay serves a different payload (`--trust-relay yes` to sign the relay's copy).
+- **Server state** (`STATE_FILE`, default `servers.json` next to `COORD_FILE`): the replay watermark (last accepted
+  report timestamp per server) and every server entry (latest report, first seen, instance id, conflict flag) are
+  written synchronously (fsync + rename + directory fsync) **before** a report or an operator change is acknowledged.
+  A crash right after a 200 can therefore neither accept a replay of that report nor forget an identity conflict;
+  a failed write answers 503 and the report is not accepted. Only the per-server chart history is memory-only.
+  A corrupt state file stops startup (exit 3). rc.6's `replay.json` watermark is migrated on first start.
+- **Identity conflicts:** every entry of one token is flagged while that token has more than one instance. Conflicted
+  servers never count as prepared and their evidence never counts toward agreement (shown as `conflicted`).
+- **Operator clear** (identity conflicts): removes only the selected instance; the token's remaining instances stay
+  flagged while more than one remains. On the mission-control host itself,
   `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-server?net=<net>&producer=<acct>&sid=<sid>'`. Accepted only on
   loopback without `X-Real-IP`/`X-Forwarded-For`, i.e. never through the public proxy (which always sets X-Real-IP).
 - **Tokens file reload** is validated before it replaces the current set (a bad edit keeps the old set and logs);

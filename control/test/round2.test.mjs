@@ -105,8 +105,8 @@ test('relay: persisted across restart, event ids single-use, arm bound to the ev
   assert.equal((await postC(base, signed({ type: 'arm', network: 'testnet', event_id: 'ev-a', event_hash: sha(ev.payload) }))).status, 200);
   const rep = fresh();
   assert.equal((await postR(base, rep)).status, 200);
-  await new Promise((r) => setTimeout(r, 1300));                  // replay state is written within ~1 s
-  await stop(proc);
+  // crash immediately after the 200s: acknowledged state must already be durable (no grace for deferred writes)
+  await new Promise((ok) => { proc.once('exit', ok); proc.kill('SIGKILL'); });
   ({ base, proc } = await start(dir));
   const c = await (await fetch(`${base}/api/coord/testnet`)).json();
   assert.equal(c.event.payload, ev.payload);

@@ -956,6 +956,23 @@ const b64u = (t) => btoa(String.fromCharCode(...new TextEncoder().encode(t))).re
 const unb64u = (t) => { try { if (!/^[A-Za-z0-9_-]{4,600}$/.test(t)) return null; const b = atob(t.replace(/-/g, '+').replace(/_/g, '/')); return new TextDecoder().decode(Uint8Array.from(b, (ch) => ch.charCodeAt(0))); } catch { return null; } };
 const epFromRef = (ref) => { const id = unb64u(ref); return id && epId(id) === id ? id : null; };
 const hostOf = (u) => { try { return new URL(u).host; } catch { return String(u || ''); } };
+/* pure:begin — no DOM; exercised directly by control/test/round3.test.mjs */
+// Servers are addressed by sid everywhere (links, tiles, API); a label is only accepted for old links, and only
+// when it names exactly one server. Returns the beacon or null.
+function resolveServer(beacons, ref) {
+  const bs = beacons || [];
+  const bySid = bs.find((b) => b.sid && b.sid === ref); if (bySid) return bySid;
+  const byLabel = bs.filter((b) => b.node === ref); return byLabel.length === 1 ? byLabel[0] : null;
+}
+// One URL can be listed several times in bp.json (e.g. 'full' and 'query'). Merge the roles, but health is the
+// WORST of the records (a failing probe on any listing shows as failing), and every record is kept for display.
+function mergeEndpointRecords(recs) {
+  if (!recs.length) return null;
+  const worst = (f) => { const has = recs.filter((r) => r[f]); return has.find((r) => r[f].ok === false || r[f].chain_ok === false || r[f].degraded) ?.[f] || has[0]?.[f]; };
+  return { ...recs[0], api: worst('api'), hyperion: worst('hyperion'), atomic: worst('atomic'), p2p_probe: worst('p2p_probe'),
+    types: [...new Set(recs.flatMap((x) => x.types || []))], features: [...new Set(recs.flatMap((x) => x.features || []))], listings: recs };
+}
+/* pure:end */
 const pathFor = (net, prod, sel) => '/' + [net, prod, ...(sel?.node ? [sel.node] : sel?.ep ? ['endpoint', b64u(epId(sel.ep) || sel.ep)] : [])].filter(Boolean).map(enc).join('/');
 function readRoute() {
   const q = new URLSearchParams(location.search);
@@ -998,11 +1015,11 @@ function renderChrome() {
   if (dl.dataset.sig !== sig) { dl.dataset.sig = sig; dl.innerHTML = net.producers.map((p) => `<option value="${esc(p.name)}">${esc(p.org?.name || p.name)}</option>`).join(''); }
   const cr = $('crumbs'), p = openName && net.producers.find((x) => x.name === openName);
   cr.hidden = !openName;
-  document.title = openName ? `${p?.org?.name || openName}${pageSel?.node ? ' · ' + pageSel.node : pageSel?.ep ? ' · ' + pageSel.ep : ''} · ${net.label} · Mission Control` : `${net.name} ${net.label} · Mission Control`;
+  document.title = openName ? `${p?.org?.name || openName}${pageSel?.node ? ' · ' + (resolveServer(p?.beacons, pageSel.node)?.node || pageSel.node) : pageSel?.ep ? ' · ' + pageSel.ep : ''} · ${net.label} · Mission Control` : `${net.name} ${net.label} · Mission Control`;
   if (!openName) return;
   const parts = [`<a data-nav href="${pathFor(net.id)}">${esc(net.name)} ${esc(net.label)}</a>`];
   parts.push(pageSel?.producer ? `<span class="cur">${esc(p?.org?.name || openName)}</span>` : `<a data-nav href="${pathFor(net.id, openName)}">${esc(p?.org?.name || openName)}</a>`);
-  if (pageSel?.node) parts.push(`<span class="cur">${ic('server')} ${esc(pageSel.node)}</span>`);
+  if (pageSel?.node) parts.push(`<span class="cur">${ic('server')} ${esc(resolveServer(p?.beacons, pageSel.node)?.node || pageSel.node)}</span>`);
   if (pageSel?.ep) parts.push(`<span class="cur">${ic('globe')} ${esc(pageSel.ep)}</span>`);
   const up = pageSel?.producer ? pathFor(net.id) : pathFor(net.id, openName);
   const html = `<a data-nav class="bk" href="${up}">${ic('back')} ${pageSel?.producer ? 'Overview' : esc(p?.org?.name || openName)}</a>` + parts.join('<span class="sep">›</span>');
@@ -1034,7 +1051,7 @@ async function renderPage() {
     const yn = (v, t, f) => v == null ? '<span style="color:var(--dim)">—</span>' : v ? `<span style="color:var(--ok)">${t}</span>` : `<span style="color:var(--warn)">${f}</span>`;
     const tiles = bs.map((b) => { const rp = b.report, k = splitChecks(rp.checks || []), [st, txt] = stOf(b), m = rp.metal, done = k.setup.length - k.todo.length;
       const lag = c.head && rp.source?.head ? Math.max(0, c.head - rp.source.head) : null;
-      return `<div class="srv ptile clickable" data-go-node="${esc(b.node)}" style="--st:${col[st]}">
+      return `<div class="srv ptile clickable" data-go-node="${esc(b.sid || b.node)}" style="--st:${col[st]}">
         <div class="srv-h"><div class="srv-ic">${ic(ROLE_ICON[b.role] || 'server', 'lg')}</div><div style="min-width:0"><h5>${esc(b.node)}</h5><div class="meta"><span>${esc(ROLE_NAME[b.role] || b.role || 'node')}</span><span>${ic('clock')}${b.silent ? 'silent' : `<span data-ts="${Date.parse(b.report.ts) || ''}"></span>`}</span></div></div><span class="pill ${st}">${ic(st === 'ok' ? 'ok' : st === 'bad' ? 'bad' : 'todo')}${txt}</span></div>
         <div class="srv-kv"><div><span>XPR head</span>${lag == null ? '—' : lag <= 30 ? '<span style="color:var(--ok)">in sync</span>' : fmt(lag) + ' behind'}</div><div><span>metal</span>${m ? esc(String(m.version || '').replace('metalgo/', '')) : '<span style="color:var(--dim)">—</span>'}</div><div><span>peers</span>${m ? fmt(m.peers) : '—'}</div>
           <div><span>P-Chain</span>${m ? yn(m.bootstrapped?.P, 'synced', 'syncing') : '—'}</div><div><span>port 9651</span>${m ? yn(m.staking_reachable, 'open', 'closed') : '—'}</div><div><span>setup</span>${done}/${k.setup.length}</div></div>
@@ -1068,7 +1085,7 @@ async function renderPage() {
     // the server's sid, so two servers with similar labels can never be confused.
     const routeKey = `${net.id}/${p.name}/${pageSel.node}`;
     if (pageData?.key !== routeKey) pageData = null;
-    const bcn = (p.beacons || []).find((b) => b.node === pageSel.node);
+    const bcn = resolveServer(p.beacons, pageSel.node);
     const ref = bcn?.sid || pageSel.node;
     if (Date.now() - pageFetchT > 9000 || !pageData) {
       pageFetchT = Date.now(); const seq = ++pageSeq;
@@ -1129,7 +1146,7 @@ async function renderPage() {
     }
     const same = (infraData[active]?.nodes || []).filter((x) => x.producer === p.name && x.url && pageSel.ep && epId(x.url) === pageSel.ep);
     // one URL can be listed several times in bp.json (e.g. as both 'full' and 'query'): show it once with all its roles
-    const n = same.length ? { ...same[0], types: [...new Set(same.flatMap((x) => x.types || []))], features: [...new Set(same.flatMap((x) => x.features || []))] } : null;
+    const n = mergeEndpointRecords(same);
     if (!n) body = `<div class="card2" style="margin-top:14px">${infraData[active] ? `<b>${esc(pageSel.ep || pageSel.legacy || '')}</b> is not in ${esc(p.org?.name || p.name)}'s bp.json as of the latest survey. <a data-nav href="${pathFor(net.id, p.name)}">See its endpoints</a>` : 'Loading the endpoint survey…'}</div>`;
     else {
       const a = n.api, hy = n.hyperion, up = a?.ok && a.chain_ok !== false;
@@ -1144,6 +1161,7 @@ async function renderPage() {
         <div class="card2"><h3>${ic('db')}History &amp; services</h3>${hy ? `<dl class="kv"><dt>hyperion</dt><dd>${esc(hy.version || '—')}</dd><dt>indexed</dt><dd>${fmt(hy.indexed)}</dd><dt>index lag</dt><dd>${fmt(hy.lag)}</dd><dt>latency</dt><dd>${hy.ms} ms</dd></dl><div class="chips">${(hy.services || []).map((x) => `<span class="pill ${x.ok ? 'ok' : 'bad'}">${ic(x.ok ? 'ok' : 'bad')}${esc(x.s)}</span>`).join('')}</div>` : '<div class="ev-empty">No Hyperion detected.</div>'}
           ${n.atomic ? `<dl class="kv" style="margin-top:12px"><dt>atomicassets</dt><dd>${n.atomic.ok ? esc(n.atomic.version || 'up') : 'down'}</dd></dl>` : ''}
           ${n.features?.length ? `<div class="chips">${n.features.map((f) => `<span class="pill mute">${esc(f)}</span>`).join('')}</div>` : ''}</div>
+        ${n.listings.length > 1 ? `<div class="card2 span"><h3>${ic('list')}bp.json listings<span class="cnt">${n.listings.length}</span></h3><dl class="kv">${n.listings.map((x) => `<dt>${esc((x.types || []).join(', ') || 'node')}</dt><dd>${x.api ? (x.api.ok && x.api.chain_ok !== false ? `api ok ${x.api.ms} ms` : `<span style="color:var(--bad)">api ${esc(x.api.error || 'down')}</span>`) : 'no api probe'}${x.hyperion ? ` · hyperion ${x.hyperion.ok && !x.hyperion.degraded ? 'ok' : '<span style="color:var(--bad)">not ok</span>'}` : ''}</dd>`).join('')}</dl></div>` : ''}
         <div class="card2 span"><h3>${ic('radio')}Cutover coverage</h3><div style="font-size:13px;color:var(--muted)">Public endpoints don't report readiness themselves. To cover this endpoint in a cutover, install the beacon on the server behind it (one command: <b>docs/OPERATOR-QUICKSTART.md</b>). It then appears under this producer as its own server page.</div></div>
       </div>`;
     }
