@@ -126,6 +126,25 @@ pub struct RosterMember {
     pub instance_id: Option<String>,
 }
 
+/// A roster must name each member once: a duplicate would let one report count twice toward
+/// the quorum. Two entries for one producer are fine only with distinct instance ids.
+pub fn check_roster(roster: &[RosterMember]) -> Result<(), String> {
+    for (i, m) in roster.iter().enumerate() {
+        for other in &roster[i + 1..] {
+            // Same producer twice is a duplicate unless BOTH name distinct instances.
+            let dup = m.producer == other.producer
+                && match (&m.instance_id, &other.instance_id) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                };
+            if dup {
+                return Err(format!("roster lists {} more than once (each member may count once toward the quorum)", m.producer));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn default_report_max_age() -> u64 {
     60
 }
@@ -668,6 +687,9 @@ impl Config {
         if let Some(b) = &config.beacon {
             check_beacon_url(&b.url)?;
         }
+        if let Some(co) = &config.coordination {
+            check_roster(&co.roster)?;
+        }
         if config.ceremony.profile == Profile::Readiness {
             // Beacon/doctor/status only: none of the ceremony requirements apply, and every
             // mutating command refuses this file (see `ensure_ceremony_profile`).
@@ -757,25 +779,30 @@ impl Config {
 }
 
 /// The beacon sends a bearer token with every report: only over HTTPS, except to this machine.
-pub fn check_beacon_url(url: &str) -> Result<(), String> {
-    if url.is_empty() || url.starts_with("https://") {
+/// Parsed with a real URL parser: userinfo is rejected outright (`http://localhost:80@example.org`
+/// addresses example.org), and http is allowed only when the PARSED host is exactly
+/// localhost / 127.0.0.1 / ::1 (not `localhost.example.org`, not `127.0.0.1.nip.io`).
+pub fn check_beacon_url(raw: &str) -> Result<(), String> {
+    if raw.is_empty() {
         return Ok(());
     }
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| format!("beacon.url {url:?} must be https://"))?;
-    let authority = rest.split(['/', '?']).next().unwrap_or("");
-    let host = if let Some(v6) = authority.strip_prefix('[') {
-        v6.split(']').next().unwrap_or("")
-    } else {
-        authority.split(':').next().unwrap_or("")
+    let u = url::Url::parse(raw).map_err(|e| format!("beacon.url {raw:?} is not a valid URL: {e}"))?;
+    if !u.username().is_empty() || u.password().is_some() {
+        return Err(format!("beacon.url {raw:?} contains userinfo (user@host): refused, the real destination would be ambiguous"));
+    }
+    let host_ok = match u.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() && ip == std::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+        None => false,
     };
-    if matches!(host, "localhost" | "127.0.0.1" | "::1") {
-        Ok(())
-    } else {
-        Err(format!(
-            "beacon.url {url:?} is plain http to a remote host: the bearer token would travel \
+    match u.scheme() {
+        "https" if u.host().is_some() => Ok(()),
+        "http" if host_ok => Ok(()),
+        "http" => Err(format!(
+            "beacon.url {raw:?} is plain http to a remote host: the bearer token would travel \
              unencrypted. Use https:// (http is allowed only to localhost)"
-        ))
+        )),
+        other => Err(format!("beacon.url {raw:?}: scheme {other:?} is not allowed (https only)")),
     }
 }

@@ -240,6 +240,12 @@ pub fn instance_id(cfg: &Config) -> String {
     }
     let mut buf = [0u8; 16];
     let random = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_ok();
+    // A preview (`beacon --once` with no url: installer dry-runs) must not write anything: it
+    // gets an ephemeral id and persists nothing.
+    let persist = cfg.beacon.as_ref().map(|b| !b.url.is_empty()).unwrap_or(false);
+    if random && !persist {
+        return hex::encode(buf);
+    }
     if random {
         let id = hex::encode(buf);
         if let Some(dir) = journal_dir.as_ref() {
@@ -387,7 +393,8 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     let mut checks = vec![];
     let journal = journal_summary(&cfg.journal_path);
     let state = journal["state"].as_str().unwrap_or("").to_string();
-    let past_ignite = matches!(state.as_str(), "IGNITED" | "FLIPPED" | "LIVE");
+    // HALTED: ignition may have started (the target may be running), so judge like post-ignite.
+    let past_ignite = matches!(state.as_str(), "IGNITED" | "FLIPPED" | "LIVE" | "HALTED");
     // From VERIFIED on, the staged snapshot is supposed to exist, and ignition restarts the
     // validator: judge those checks by phase, not by the pre-ceremony rule.
     let past_verify = past_ignite || state == "VERIFIED";

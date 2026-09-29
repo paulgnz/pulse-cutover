@@ -1,7 +1,8 @@
 //! The cutover ceremony state machine.
 //!
 //! Forward-only: ARMED -> FROZEN -> SNAPSHOTTED -> VERIFIED -> IGNITED ->
-//! LIVE, ABORTED terminal from anywhere. Each state's step is idempotent so a
+//! LIVE, ABORTED terminal from anywhere before ignition may have started, HALTED (sealed,
+//! durable) after it. Each state's step is idempotent so a
 //! crashed agent resumes from the journal and simply re-runs the step it died
 //! in. Every transition carries evidence (heights, block ids, hashes,
 //! durations) into the journal.
@@ -53,9 +54,14 @@ pub struct Machine<'a, O: ChainOps> {
     scheduled: bool,
     /// Last time the coordinator's abort signal was polled (rate limit).
     last_coord_check_ms: u64,
-    /// This node's target has been ignited (IGNITED journaled, now or in a previous run).
-    /// From here on a local failure SEALS (halt + alert) instead of resuming the source.
+    /// Ignition may have started on this node (`ignite_started` journaled BEFORE the ignite
+    /// command runs, or IGNITED or later, now or in a previous run). From here on a local
+    /// failure SEALS (HALTED + alert) instead of resuming the source.
     reached_ignited: bool,
+    /// Identity of the snapshot this ceremony staged (journaled `staged_artifact`).
+    staged_sha256: Option<String>,
+    /// An operator cleared a previous HALT: continue forward instead of halting on resume.
+    unhalted: bool,
 }
 
 /// Hydration predicate over a hyperion-rs /v2/health document. Two ways in:
@@ -114,6 +120,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let source_stopped = started("source_stop_cmd");
         let scheduled = recovered.scheduled;
         let reached_ignited = recovered.reached_ignited;
+        let staged_sha256 = recovered.staged_sha256.clone();
+        let unhalted = recovered.unhalted;
         Machine {
             cfg,
             ops,
@@ -138,6 +146,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             scheduled,
             last_coord_check_ms: 0,
             reached_ignited,
+            staged_sha256,
+            unhalted,
         }
     }
 
@@ -150,6 +160,22 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     pub fn run(&mut self) -> Result<State, String> {
         // Defense in depth (main.rs checks too): a readiness-only config never drives anything.
         self.cfg.ensure_ceremony_profile()?;
+        if self.state == State::Halted {
+            return Err(format!(
+                "HALTED (journaled): this ceremony was sealed after ignition may have started. It will \
+                 not continue or roll back on its own. After a fleet-wide decision, an operator clears \
+                 it with `pulse-cutover unhalt --config <file> --i-understand` (journaled). Journal: {}",
+                self.journal.path().display()
+            ));
+        }
+        if self.resumed && self.reached_ignited && !self.unhalted && matches!(self.state, State::Armed | State::Frozen | State::Snapshotted | State::Verified) {
+            // The previous run journaled `ignite_started` and died before IGNITED: the target may
+            // be running. Continuing (re-igniting) or rolling back are both unsafe to decide locally.
+            self.halt(
+                "resumed after ignition may have started (ignite_started journaled, no IGNITED)",
+                json!({"recovered_state": self.state.as_str()}),
+            )?;
+        }
         if self.resumed && !matches!(self.state, State::Live | State::Aborted) {
             // A recovered run gets the same invariant checks as a fresh one (minus the ones
             // that are legitimately stale mid-ceremony, like "H is in the future").
@@ -207,6 +233,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 State::Ignited => self.step_ignited()?,
                 State::Flipped => self.step_flipped()?,
                 State::Live | State::Aborted => return Ok(self.state),
+                State::Halted => return Err(format!("HALTED at {}", self.state)),
             }
         }
     }
@@ -276,7 +303,21 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // from an earlier ceremony pins the chain to the WRONG cut before this
         // ceremony even freezes — the file must not exist until VERIFIED stages
         // the verified one.
-        if pre_verify && self.cfg.snapshot.staged_path.exists() {
+        let staged_is_ours = resumed
+            && self.cfg.snapshot.staged_path.exists()
+            && self.staged_sha256.as_deref().is_some_and(|want| {
+                verify::sha256_file(&self.cfg.snapshot.staged_path)
+                    .map(|(got, _)| got.eq_ignore_ascii_case(want))
+                    .unwrap_or(false)
+            });
+        if pre_verify && resumed && self.cfg.snapshot.staged_path.exists() && self.staged_sha256.is_some() && !staged_is_ours {
+            // This ceremony journaled a staging intent and died mid-copy: the file is our own
+            // partial artifact (the target only imports it at ignition, which has not started).
+            // It is re-staged when the SNAPSHOTTED step re-runs.
+            self.journal.evidence(self.state, json!({"resume_preflight_staged": "partial copy of this ceremony's artifact; will be re-staged"}))?;
+        } else if staged_is_ours {
+            self.journal.evidence(self.state, json!({"resume_preflight_staged": "matches this ceremony's journaled staged_artifact"}))?;
+        } else if pre_verify && self.cfg.snapshot.staged_path.exists() {
             problems.push(format!(
                 "staged_path {} already exists — stale snapshot from a previous ceremony? \
                  the target would import it prematurely; remove it (and re-create the target \
@@ -404,12 +445,20 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             if co.fleet_quorum == 0 && co.roster.is_empty() {
                 return Ok(true);
             }
+            let event_id = co.event_id.clone();
             let agrees = |r: &serde_json::Value| {
                 let c = &r["ceremony"];
+                // Absent evidence never "agrees" (null == null must not count), and with an event
+                // the report must be about THIS event.
+                let same = |k: &str| !ours[k].is_null() && !c["evidence"][k].is_null() && c["evidence"][k] == ours[k];
+                let event_ok = match &event_id {
+                    Some(id) => r["coord"]["event_id"].as_str() == Some(id.as_str()),
+                    None => true,
+                };
                 matches!(c["state"].as_str(), Some("VERIFIED" | "IGNITED" | "FLIPPED" | "LIVE"))
-                    && !ours["snapshot_sha256"].is_null()
-                    && c["evidence"]["snapshot_sha256"] == ours["snapshot_sha256"]
-                    && c["evidence"]["fingerprints_digest"] == ours["fingerprints_digest"]
+                    && same("snapshot_sha256")
+                    && same("fingerprints_digest")
+                    && event_ok
             };
             let producers = match self.ops.get_json(&status_url) {
                 Ok(Some(st)) => st["networks"].as_array()
@@ -462,22 +511,27 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// history. Journal it, page humans via `on_halt`, change nothing, and return an error
     /// starting with "HALTED" (the run ends; a human decides).
     fn halt(&mut self, reason: &str, detail: serde_json::Value) -> Result<(), String> {
+        let from = self.state;
         self.journal.error(
-            self.state,
+            from,
             &format!("HALTED: {reason}"),
             json!({"detail": detail, "sealed": true, "source_resumed": false,
                    "public_routing_reverted": false, "writes_reopened": false,
-                   "why": "the target was already ignited; a local failure must not resume the source"}),
+                   "why": "ignition may have started; a local failure must not resume the source"}),
         )?;
+        // Durable: a restarted run sees HALTED and refuses to continue or roll back.
+        self.state = State::Halted;
+        self.journal.transition(State::Halted, json!({"halted_from": from.as_str(), "reason": reason,
+            "clear_with": "pulse-cutover unhalt --config <file> --i-understand"}))?;
         if let Some(hook) = &self.cfg.hooks.on_halt {
             let result = self.ops.run_hook(hook);
-            self.journal.evidence(self.state, json!({"on_halt_hook": format!("{result:?}")}))?;
+            self.journal.evidence(State::Halted, json!({"on_halt_hook": format!("{result:?}")}))?;
         }
-        Err(format!("HALTED at {}: {reason}", self.state))
+        Err(format!("HALTED at {from}: {reason}"))
     }
 
     fn abort(&mut self, reason: &str, detail: serde_json::Value) -> Result<(), String> {
-        if self.reached_ignited || matches!(self.state, State::Ignited | State::Flipped | State::Live) {
+        if self.reached_ignited || matches!(self.state, State::Ignited | State::Flipped | State::Live | State::Halted) {
             return self.halt(reason, detail);
         }
         self.journal.error(self.state, reason, detail)?;
@@ -1232,7 +1286,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             .map_err(|e| format!("write captured goldens: {e}"))?;
             golden_mode = "captured";
         }
-        // Stage the verified file where the pulsevm chain config expects it.
+        // Stage the verified file where the pulsevm chain config expects it. The artifact's
+        // identity is journaled FIRST, so a crash mid-copy is recognizable as our own file.
+        self.journal.evidence(State::Snapshotted, json!({"staged_artifact": {
+            "sha256": outcome.sha256, "cut_height": outcome.head_block_num,
+            "path": self.cfg.snapshot.staged_path.display().to_string()}}))?;
+        self.staged_sha256 = Some(outcome.sha256.clone());
         if path != self.cfg.snapshot.staged_path {
             std::fs::copy(&path, &self.cfg.snapshot.staged_path)
                 .map_err(|e| format!("stage snapshot: {e}"))?;
@@ -1314,7 +1373,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(()); // aborted inside, with evidence
         }
         let started = self.ops.now_ms();
-        self.journal.evidence(State::Verified, json!({"side_effect": "ignite"}))?;
+        // Point of no return (locally): journaled BEFORE the command runs. From here any failure
+        // (ignite error, timeout, wrong or unverifiable lineage) seals instead of resuming the
+        // source, because the target may already be running; recovery reads this record too.
+        self.journal.evidence(State::Verified, json!({"side_effect": "ignite_started"}))?;
+        self.reached_ignited = true;
         let output = match self.ops.ignite() {
             Ok(o) => o,
             Err(e) => {
@@ -1428,31 +1491,56 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let start = self.ops.now_ms();
         let (mut last_head, mut last_change, mut worst_gap) = (0u64, start, 0u64);
         loop {
-            let now = self.ops.now_ms();
-            if let Some(i) = self.ops.target_info()? {
-                if i.head_block_num > last_head {
-                    if last_head != 0 {
-                        worst_gap = worst_gap.max(now - last_change);
-                    }
-                    last_head = i.head_block_num;
-                    last_change = now;
-                }
+            // A gap is measured between OBSERVATIONS of progress, including RPC latency: a poll
+            // that itself took longer than max_gap is a gap, and progress seen after a long gap
+            // is checked against the limit BEFORE it resets the clock.
+            let t0 = self.ops.now_ms();
+            let info = self.ops.target_info()?;
+            let t1 = self.ops.now_ms();
+            let poll_ms = t1.saturating_sub(t0);
+            let mut gap = t1.saturating_sub(last_change);
+            let advanced = info.as_ref().is_some_and(|i| i.head_block_num > last_head);
+            if poll_ms > max_gap_ms {
+                gap = gap.max(poll_ms);
             }
-            let gap = now.saturating_sub(last_change);
             if gap > max_gap_ms {
                 self.journal.evidence(state, json!({"live_stall": {"head": last_head, "gap_ms": gap,
-                    "max_gap_ms": max_gap_ms, "into_sustain_ms": now - start}}))?;
+                    "poll_ms": poll_ms, "max_gap_ms": max_gap_ms, "into_sustain_ms": t1 - start}}))?;
                 self.abort(
                     "target stalled during the sustained LIVE window",
                     json!({"head": last_head, "gap_ms": gap, "live_max_gap_secs": self.cfg.target.live_max_gap_secs}),
                 )?;
-                return Ok(serde_json::Value::Null); // unreachable: abort after IGNITED halts
+                return Ok(serde_json::Value::Null); // unreachable: abort after ignition halts
             }
-            if now - start >= sustain_ms {
+            if advanced {
+                if last_head != 0 {
+                    worst_gap = worst_gap.max(gap);
+                }
+                last_head = info.map(|i| i.head_block_num).unwrap_or(last_head);
+                last_change = t1;
+            }
+            if t1 - start >= sustain_ms {
                 return Ok(json!({"sustain_secs": self.cfg.target.live_sustain_secs,
-                                 "worst_gap_ms": worst_gap.max(gap), "head_at_end": last_head}));
+                                 "worst_gap_ms": worst_gap.max(t1.saturating_sub(last_change)), "head_at_end": last_head}));
             }
             self.ops.sleep_ms(self.cfg.poll_ms);
+        }
+    }
+
+    /// on_live is part of going live (producer mode: it re-opens writes on the new chain), so it
+    /// runs BEFORE LIVE is journaled; a failure halts (sealed) instead of recording a LIVE that
+    /// never reached users.
+    fn run_on_live(&mut self, state: State) -> Result<Option<serde_json::Value>, String> {
+        let Some(hook) = self.cfg.hooks.on_live.clone() else { return Ok(Some(serde_json::Value::Null)) };
+        match self.ops.run_hook(&hook) {
+            Ok(o) => {
+                self.journal.evidence(state, json!({"on_live_hook": o}))?;
+                Ok(Some(json!(o)))
+            }
+            Err(e) => {
+                self.abort("on_live hook failed (writes may not be open on the new chain)", json!({"error": e}))?;
+                Ok(None)
+            }
         }
     }
 
@@ -1736,6 +1824,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         };
         let sustained = self.sustain_live(State::Flipped)?;
+        let Some(on_live) = self.run_on_live(State::Flipped)? else { return Ok(()) };
         let live_ts = self.ops.now_ms();
         let write_gap_ms = self.frozen_ts_ms.map(|f| live_ts - f);
         self.state = State::Live;
@@ -1750,14 +1839,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "cut_height": self.cut_height,
                 "last_source_block_time": self.last_source_block_time,
                 "ceremony_gap_ms_wallclock": write_gap_ms,
-                "note": "api-node cutover complete: same URL, same chain_id, PulseVM serving; nodeos stopped LAST",
+                "on_live_hook": on_live,
+                "note": "api-node cutover complete: same URL, same chain_id, PulseVM serving; nodeos stopped LAST; the gap includes the sustain window and on_live",
             }),
         )?;
-        if let Some(hook) = &self.cfg.hooks.on_live {
-            let result = self.ops.run_hook(hook);
-            self.journal
-                .evidence(State::Live, json!({"on_live_hook": format!("{result:?}")}))?;
-        }
         Ok(())
     }
 
@@ -1791,8 +1876,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         };
         let reached_goal_ts = self.ops.now_ms();
         let sustained = self.sustain_live(State::Ignited)?;
+        let Some(on_live) = self.run_on_live(State::Ignited)? else { return Ok(()) };
         let live_ts = self.ops.now_ms();
-        let write_gap_ms = self.frozen_ts_ms.map(|f| reached_goal_ts - f);
+        // Outage = freeze to LIVE declared (after the sustain window and on_live). The older
+        // "first progress" figure is kept for comparison with runs 1-6.
+        let write_gap_ms = self.frozen_ts_ms.map(|f| live_ts - f);
+        let first_progress_gap_ms = self.frozen_ts_ms.map(|f| reached_goal_ts - f);
         self.state = State::Live;
         self.journal.transition(
             State::Live,
@@ -1805,13 +1894,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "last_source_block_time": self.last_source_block_time,
                 "cut_height": cut_height,
                 "write_gap_ms_wallclock": write_gap_ms,
+                "first_progress_gap_ms_wallclock": first_progress_gap_ms,
+                "on_live_hook": on_live,
             }),
         )?;
-        if let Some(hook) = &self.cfg.hooks.on_live {
-            let result = self.ops.run_hook(hook);
-            self.journal
-                .evidence(State::Live, json!({"on_live_hook": format!("{result:?}")}))?;
-        }
         Ok(())
     }
 }
