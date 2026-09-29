@@ -292,6 +292,13 @@ fn file_ident(m: &std::fs::Metadata) -> (u64, u64) {
 fn apply_line(acc: &mut Acc, v: &Value) {
     acc.seq = v["seq"].as_u64().unwrap_or(acc.seq);
     let d = &v["data"];
+    // Evidence only ever ACCUMULATES: a record that lacks a field (e.g. the VERIFIED transition
+    // written by `unhalt`) must not erase what an earlier record established.
+    fn put(ev: &mut serde_json::Map<String, Value>, k: &str, val: &Value) {
+        if !val.is_null() {
+            ev.insert(k.into(), val.clone());
+        }
+    }
     match v["kind"].as_str() {
         Some("transition") => {
             acc.state = v["state"].clone();
@@ -301,19 +308,17 @@ fn apply_line(acc: &mut Acc, v: &Value) {
             match v["state"].as_str() {
                 Some("ARMED") => {
                     acc.armed_ts_ms = v["ts_ms"].as_u64();
-                    ev.insert("h".into(), d["resolved_h"].clone());
-                    ev.insert("chain_id".into(), d["chain_id"].clone());
+                    put(ev, "h", &d["resolved_h"]);
+                    put(ev, "chain_id", &d["chain_id"]);
                 }
-                Some("FROZEN") => {
-                    ev.insert("freeze_at".into(), d["freeze_at"].clone());
-                }
+                Some("FROZEN") => put(ev, "freeze_at", &d["freeze_at"]),
                 Some("SNAPSHOTTED") => {
-                    ev.insert("cut_height".into(), d["cut_height"].clone());
-                    ev.insert("cut_block_id".into(), d["cut_block_id"].clone());
-                    ev.insert("burnoff_transactions".into(), d["burnoff_transactions"].clone());
+                    put(ev, "cut_height", &d["cut_height"]);
+                    put(ev, "cut_block_id", &d["cut_block_id"]);
+                    put(ev, "burnoff_transactions", &d["burnoff_transactions"]);
                 }
                 Some("VERIFIED") => {
-                    ev.insert("snapshot_sha256".into(), d["sha256"].clone());
+                    put(ev, "snapshot_sha256", &d["sha256"]);
                     if d["fingerprints"].is_object() {
                         let canon = serde_json::to_string(&d["fingerprints"]).unwrap_or_default();
                         // Full 256-bit digest: a shortened one would let different state collide.
@@ -321,11 +326,15 @@ fn apply_line(acc: &mut Acc, v: &Value) {
                     }
                 }
                 Some("IGNITED") => {
-                    ev.insert("target_head_id".into(), d["target_head_id"].clone());
-                    ev.insert("lineage_at_cut".into(), d["lineage_at_cut"].clone());
+                    put(ev, "target_head_id", &d["target_head_id"]);
+                    put(ev, "lineage_at_cut", &d["lineage_at_cut"]);
                 }
-                Some("LIVE") => {
-                    ev.insert("write_gap_ms".into(), d["write_gap_ms_wallclock"].clone());
+                Some("LIVE") => put(ev, "write_gap_ms", &d["write_gap_ms_wallclock"]),
+                // rc.7: the HALTED transition itself carries the reason (one durable record).
+                Some("HALTED") => {
+                    if let Some(m) = d["message"].as_str() {
+                        acc.last_error = Some(m.to_string());
+                    }
                 }
                 _ => {}
             }

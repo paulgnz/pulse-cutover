@@ -43,7 +43,8 @@ read-only, safe anywhere (including production):
 mutating (normally driven by install.sh / cutover.sh):
   run             run the ceremony to LIVE (exit 0), ABORTED or HALTED (exit 1)
   loop            run N ceremonies back to back with a reset between (rehearsal boxes)
-  unhalt          clear a HALTED (sealed) journal after a fleet-wide decision (--i-understand)";
+  unhalt          clear a HALTED (sealed) journal after a fleet-wide decision (--i-understand)
+  rollback        roll this node back, only if ignition provably has not started (what cutover.sh abort runs)";
 
 const HELP_RUN: &str = "\
 pulse-cutover run --config ceremony.toml
@@ -71,6 +72,22 @@ fleet-wide decision, this clears the seal: it journals who/when and returns the
 journal to the state it halted from, so the next `run` resumes from there (a
 resumed run with ignition started halts again unless the cause is fixed).
 It never resumes the source chain or reverts routing itself.";
+
+const HELP_ROLLBACK: &str = "\
+pulse-cutover rollback --config ceremony.toml [--wait SECS] [--force-after-ignite] [--no-journal-i-know]
+
+What `./cutover.sh abort` runs. It takes the journal's exclusive lock (waiting up to --wait
+seconds, default 30, for a stopping agent to let go; it never decides while another process
+holds the journal), replays it, and rolls this node back (resume the paused source producer;
+api mode: revert the flips, restart the source if the agent stopped it) ONLY when the journal
+positively shows ignition has not started.
+
+Refuses (exit 3, nothing changed) when:
+  - there is no journal (absence is not proof: pass --no-journal-i-know only on a box that
+    never ran a ceremony);
+  - ignition may have started (ignite_started journaled, IGNITED or later, HALTED):
+    --force-after-ignite performs it anyway, for a fleet-wide rollback the coordinator confirmed.
+Every rollback is journaled (ABORTED, `operator_rollback`, `force_after_ignite`).";
 
 const HELP_BEACON: &str = "\
 pulse-cutover beacon --config ceremony.toml [--once]
@@ -197,6 +214,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "beacon" => Some(HELP_BEACON),
         "await" => Some(HELP_AWAIT),
         "unhalt" => Some(HELP_UNHALT),
+        "rollback" => Some(HELP_ROLLBACK),
         _ => None,
     }
 }
@@ -240,6 +258,7 @@ fn main() {
         "beacon" => cmd_beacon(&args),
         "await" => cmd_await(&args),
         "unhalt" => cmd_unhalt(&args),
+        "rollback" => cmd_rollback(&args),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -416,10 +435,63 @@ fn cmd_unhalt(args: &[String]) -> Result<(), String> {
     let back = recovered.halted_from.unwrap_or(state::State::Verified);
     let who = std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "unknown".into());
     journal.evidence(state::State::Halted, serde_json::json!({"unhalted_by": who, "returning_to": back.as_str()}))?;
-    journal.transition(back, serde_json::json!({"unhalted": true, "by": who,
-        "note": "seal cleared by operator; ignition-started is still recorded, so a failure halts again"}))?;
+    // Carry the established evidence forward on the transition, so nothing that reads "the
+    // latest <state> record" (beacon summary, fleet gate) sees it as erased.
+    let mut data = serde_json::json!({"unhalted": true, "by": who,
+        "note": "seal cleared by operator; ignition-started is still recorded, so a failure halts again"});
+    for (k, v) in [("sha256", &recovered.sha256), ("chain_id", &recovered.chain_id), ("cut_block_id", &recovered.cut_block_id),
+                   ("snapshot_file", &recovered.snapshot_file)] {
+        if let Some(v) = v {
+            data[k] = serde_json::json!(v);
+        }
+    }
+    if let Some(h) = recovered.cut_height {
+        data["cut_height"] = serde_json::json!(h);
+    }
+    journal.transition(back, data)?;
     println!("unhalted: journal returned to {back}");
     Ok(())
+}
+
+fn cmd_rollback(args: &[String]) -> Result<(), String> {
+    let cfg = load_config(args)?;
+    cfg.ensure_ceremony_profile()?;
+    let force = flag(args, "--force-after-ignite");
+    let wait: u64 = arg(args, "--wait").map(|s| s.parse().map_err(|e| format!("bad --wait: {e}"))).transpose()?.unwrap_or(30);
+    let refuse = |msg: String| -> ! {
+        eprintln!("pulse-cutover rollback: REFUSED — {msg}");
+        eprintln!("Nothing was changed: the source was NOT resumed and public routing was NOT reverted.");
+        std::process::exit(3);
+    };
+    if !cfg.journal_path.exists() && !flag(args, "--no-journal-i-know") {
+        refuse(format!(
+            "no journal at {}. A missing journal is not proof that ignition never started (wrong path, \
+             deleted, unreadable). If this box never ran a ceremony, re-run with --no-journal-i-know.",
+            cfg.journal_path.display()));
+    }
+    // Hold the journal's exclusive lock while deciding: a still-running agent must not race us.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+    let (journal, recovered) = loop {
+        match Journal::open(&cfg.journal_path) {
+            Ok(x) => break x,
+            Err(e) if e.contains("holds") && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(e) => return Err(format!("cannot take the journal lock to decide safely: {e}")),
+        }
+    };
+    let ignite_cmd = cfg.target.ignite_cmd.clone().unwrap_or_else(|| format!("systemctl restart {}", cfg.target.metalgo_unit));
+    let ops = HttpOps::new(&cfg.source.rpc_url, &cfg.source.producer_api_url, &cfg.target.rpc_url, &ignite_cmd,
+        cfg.source.snapshot_timeout_secs).with_hook_timeout(cfg.hooks.timeout_secs);
+    let mut machine = Machine::new(&cfg, &ops, journal, recovered);
+    match machine.operator_rollback(force) {
+        Ok(st) => {
+            println!("rolled back: journal now {st} (see {})", cfg.journal_path.display());
+            Ok(())
+        }
+        Err(e) if e.starts_with("refusing") => refuse(e),
+        Err(e) => Err(e),
+    }
 }
 
 fn cmd_status(args: &[String]) -> Result<(), String> {
