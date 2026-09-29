@@ -21,8 +21,9 @@
 //!   roster          [{"producer", "instance_id"?}] — the servers that must agree before ignition;
 //!                   `await` writes it into the derived config and the fleet gate counts ONLY
 //!                   these members, with fresh reports (see machine.rs `fleet_gate`)
-//!   quorum          how many roster members must agree (default: all)
+//!   quorum          how many roster members must agree (default: all; never the local config's)
 //!   release_sha256  the PulseVM plugin build; rejected if `target.plugin_path` hashes differently
+//!                   or is not set (an unverifiable plugin refuses the event)
 //!   snapshot_sha256 the expected cut snapshot hash, once known (becomes snapshot.expected_sha256)
 //! Still NOT done (next step): per-BP SIGNED acknowledgements. Today the fleet gate reads beacon
 //! reports through the relay; a roster bounds WHO counts and freshness bounds WHEN, but a
@@ -73,6 +74,7 @@ pub fn validate_event(ev: &Value, cfg: &Config, network: &str, head: Option<u64>
         let members: Vec<crate::config::RosterMember> =
             serde_json::from_value(roster.clone()).map_err(|e| format!("event roster is malformed: {e}"))?;
         if members.is_empty() { return Err("event roster is empty".into()); }
+        crate::config::check_roster(&members).map_err(|e| format!("event {e}"))?;
         if let Some(q) = ev["quorum"].as_u64() {
             if q == 0 || q as usize > members.len() { return Err(format!("event quorum {q} is not within 1..={}", members.len())); }
         }
@@ -84,7 +86,8 @@ pub fn validate_event(ev: &Value, cfg: &Config, network: &str, head: Option<u64>
                 return Err(format!("event release_sha256 {}… ≠ installed plugin {}…", &want[..12.min(want.len())], &got[..12]));
             }
         } else {
-            eprintln!("await: event pins release_sha256 but target.plugin_path is not set: plugin NOT verified");
+            return Err("event pins release_sha256 but this node has no target.plugin_path: the installed \
+                        plugin cannot be verified, so the event is refused (set target.plugin_path)".into());
         }
     }
     Ok(h)
@@ -131,9 +134,10 @@ pub fn derived_config(src: &Path, ev: &Value, out: &Path) -> Result<(), String> 
     if let Some(roster) = ev.get("roster").filter(|r| r.is_array()) {
         let t: toml::Value = toml::Value::try_from(roster).map_err(|e| format!("roster: {e}"))?;
         co.insert("roster".into(), t);
-        if let Some(q) = ev["quorum"].as_u64() {
-            co.insert("fleet_quorum".into(), toml::Value::Integer(q as i64));
-        }
+        // The event decides the quorum; a local fleet_quorum is never inherited. No quorum in the
+        // event means every roster member must agree.
+        let q = ev["quorum"].as_u64().unwrap_or(roster.as_array().map(|a| a.len()).unwrap_or(0) as u64);
+        co.insert("fleet_quorum".into(), toml::Value::Integer(q as i64));
     }
     if let Some(sha) = ev["snapshot_sha256"].as_str() {
         if let Some(snap) = doc.get_mut("snapshot").and_then(|v| v.as_table_mut()) {

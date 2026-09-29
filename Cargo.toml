@@ -1,6 +1,6 @@
 [package]
 name = "pulse-cutover"
-version = "0.5.0-rc.5"
+version = "0.5.0-rc.6"
 edition = "2021"
 description = "Programmatic zero-read-downtime XPR -> PulseVM cutover ceremony agent"
 license = "MIT"
@@ -12,6 +12,7 @@ toml = "0.8"
 sha2 = "0.10"
 hex = "0.4"
 ureq = { version = "2", features = ["json"] }
+url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex = "1"
 wasmparser = "0.245"
