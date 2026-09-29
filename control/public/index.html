@@ -220,7 +220,7 @@ footer a{color:var(--muted)}
 .dr-head .logo{width:58px;height:58px;border-radius:16px;font-size:18px}
 .dr-head h3{margin:0;font:700 22px/1.1 var(--display)}
 .dr-head .sub2{color:var(--muted);font-size:12.5px;margin-top:4px}
-.dr-x{margin-left:auto;align-self:flex-start;border:1px solid var(--line);background:rgba(255,255,255,.04);color:var(--ink);width:36px;height:36px;border-radius:12px;font-size:18px;cursor:pointer}
+.dr-x{align-self:flex-start;border:1px solid var(--line);background:rgba(255,255,255,.04);color:var(--ink);width:36px;height:36px;border-radius:12px;font-size:18px;cursor:pointer}
 .dr-body{padding:4px 22px 40px}
 .dr-sec{margin-top:20px}
 .dr-sec h4{margin:0 0 10px;font:600 11px var(--sans);letter-spacing:1.6px;text-transform:uppercase;color:var(--muted)}
@@ -315,6 +315,18 @@ footer a{color:var(--muted)}
 pre.raw{margin:0;max-height:360px;overflow:auto;font:12px/1.5 var(--mono);color:var(--muted);background:rgba(0,0,0,.25);border-radius:12px;padding:12px}
 .openfull{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--muted);text-decoration:none;border:1px solid var(--line);border-radius:999px;padding:3px 10px;cursor:pointer;background:none}
 .openfull:hover{color:var(--ink);border-color:rgba(255,255,255,.2)}
+
+.ptiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(320px,100%),1fr));gap:14px;margin-bottom:16px}
+.ptiles .srv{margin:0}.ptile{transition:border-color .2s,transform .2s}.ptile:hover{border-color:rgba(255,255,255,.2);transform:translateY(-1px)}
+.tiles2{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(300px,100%),1fr));gap:10px}
+.ep.clickable:hover{border-color:rgba(255,255,255,.2)}
+table.mx{border-collapse:collapse;width:100%;font-size:12.5px}
+table.mx th{font:600 11px var(--sans);color:var(--muted);text-align:center;padding:6px 10px;white-space:nowrap;border-bottom:1px solid var(--line)}
+table.mx th:first-child{text-align:left}
+table.mx td{padding:7px 10px;border-bottom:1px dashed var(--line);text-align:center;white-space:nowrap}
+table.mx td:first-child{text-align:left;color:var(--ink)}table.mx td:first-child .ic{color:var(--muted)}
+table.mx .kind{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-left:6px}
+table.mx .st.ok{color:var(--ok)}table.mx .st.no{color:var(--bad)}table.mx .st.todo{color:var(--warn)}
 @media (max-width:760px){.pg-grid{grid-template-columns:minmax(0,1fr)}.big3{grid-template-columns:repeat(2,minmax(0,1fr))}.pg-h h2{font-size:22px}.pg-h .pill{margin-left:0}}
 @media (max-width:1100px){.hero{grid-template-columns:minmax(0,1fr)}.globe-card{min-height:440px}.duo{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:640px){
@@ -894,7 +906,7 @@ function renderDrawer() {
   dr.innerHTML = `
     <div class="dr-head"><div class="logo"><span>${esc(initials(o.name || p.name))}</span>${logo}</div>
       <div style="min-width:0"><h3 id="dr-title">${esc(o.name || p.name)}</h3><div class="sub2">${flag(o.country)} ${esc(p.name)}${o.city ? ' · ' + esc(o.city) : ''}${o.website ? ` · <a href="${esc(o.website)}" target="_blank" rel="noopener noreferrer">website</a>` : ''}</div></div>
-      <button class="dr-x" id="dr-x" aria-label="Close">×</button></div>
+      <button class="openfull" id="dr-full" style="align-self:flex-start;margin-left:auto">${ic('ext')}Full page</button><button class="dr-x" id="dr-x" aria-label="Close" style="margin-left:8px">×</button></div>
     <div class="dr-body">
       <div class="facts">
         <div class="fact"><b>${p.rank ? '#' + p.rank : '—'}</b><span>vote rank</span></div>
@@ -928,7 +940,7 @@ function renderDrawer() {
             <div class="srv-h"><div class="srv-ic">${ic(ROLE_ICON[b.role] || 'server', 'lg')}</div>
               <div style="min-width:0"><h5>${esc(b.node)}</h5><div class="meta"><span>${esc(ROLE_NAME[b.role] || b.role || 'node')}</span><span>${ic('clock')}${b.silent ? 'silent' : ago(b.age_ms)}</span><span>${ic('radio')}beacon v${esc(rp.agent_version)}</span></div></div>
               <span class="pill ${st}">${ic(st === 'ok' ? 'ok' : st === 'bad' ? 'bad' : 'todo')}${txt}</span></div>
-            <div style="padding:8px 16px 0 18px"><button class="openfull" data-node="${esc(b.node)}">${ic('ext')}Open full page</button></div>
+            <div style="padding:8px 16px 0 18px"><button class="openfull" data-node="${esc(b.node)}">${ic('ext')}Server page</button></div>
             <div class="srv-kv" style="margin-top:8px"><div><span>head</span>${rp.source?.head ? fmt(rp.source.head) : '—'}</div><div><span>irreversible</span>${rp.source?.lib ? fmt(rp.source.lib) : '—'}</div>
               <div><span>behind chain</span>${lag == null ? '—' : lag <= 30 ? '<span style="color:var(--ok)">in sync</span>' : fmt(lag) + ' blocks'}</div></div>
             <div class="srv-grp"><h6>${ic('wrench')}Cutover setup <em>${done}/${k.setup.length}</em><span class="pbar"><i style="width:${k.setup.length ? Math.round(100 * done / k.setup.length) : 0}%"></i></span></h6>${k.setup.map((x) => row(x, 'todo')).join('')}</div>
@@ -952,7 +964,7 @@ function renderDrawer() {
         const head = `<div class="ep-h"><div class="srv-ic">${ic(icn)}</div><div class="t"><b>${n.url ? `<a href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${esc(host)}</a>` : esc(host)}</b>
           <small>${n.types.map((x) => `<span class="tp ${esc(x)}">${esc(x)}</span>`).join('')} ${n.location ? ic('pin') + esc(n.location) : ''}</small></div>${pill}</div>`;
         if (!n.api && !n.hyperion && !n.atomic) return `<div class="ep mini">${head}</div>`;
-        return `<div class="ep">${head}<div style="margin-top:8px"><button class="openfull" data-ep="${esc(n.url)}">${ic('ext')}Open full page</button></div>
+        return `<div class="ep">${head}<div style="margin-top:8px"><button class="openfull" data-ep="${esc(n.url)}">${ic('ext')}Endpoint page</button></div>
           <div class="ep-m">
             <div><span>nodeos</span>${esc(n.api?.version?.split('-')[0] || '—')}</div><div><span>behind</span>${n.api?.lag != null ? (n.api.lag <= 4 ? 'in sync' : fmt(n.api.lag)) : '—'}</div><div><span>edge</span>${esc(n.api?.edge || '—')}</div>
             ${n.hyperion ? `<div><span>hyperion</span>${n.hyperion.ok ? esc(n.hyperion.version) : '<span style="color:var(--bad)">down</span>'}</div><div><span>indexed lag</span>${n.hyperion.lag != null ? fmt(n.hyperion.lag) : '—'}</div><div><span>hyperion ms</span>${n.hyperion.ms ?? '—'}</div>` : ''}
@@ -966,7 +978,7 @@ function renderDrawer() {
       ${r?.ceremony?.transitions?.length ? `<div class="dr-sec"><h4>Ceremony</h4><ul class="tl">${r.ceremony.transitions.map((t) => `<li><time>${esc(String(t.ts).slice(11, 23))}</time><b>${esc(t.state)}</b></li>`).join('')}</ul>${r.ceremony.last_error ? `<div class="fail" style="margin-top:6px">✗ ${esc(r.ceremony.last_error)}</div>` : ''}</div>` : ''}
       ${r?.ceremony?.evidence && Object.keys(r.ceremony.evidence).length ? `<div class="dr-sec"><h4>Evidence</h4><dl class="evk">${Object.entries(r.ceremony.evidence).map(([k, v]) => `<dt>${esc(k.replace(/_/g, ' '))}</dt><dd>${esc(typeof v === 'string' ? v : JSON.stringify(v))}</dd>`).join('')}</dl></div>` : ''}
     </div>`;
-  $('dr-x').onclick = closeProducer;
+  $('dr-x').onclick = closeProducer; $('dr-full').onclick = () => openPage({ producer: true });
   dr.querySelectorAll('.openfull').forEach((x) => x.onclick = () => openPage(x.dataset.node ? { node: x.dataset.node } : { ep: x.dataset.ep }));
   dr.querySelectorAll('.gl').forEach((g) => g.onclick = (e) => { e.preventDefault(); dr.querySelector('#srv-' + g.dataset.srv)?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
   dr.classList.add('on'); sc.classList.add('on'); dr.setAttribute('aria-hidden', 'false');
@@ -974,10 +986,10 @@ function renderDrawer() {
 
 
 /* ---------------- full page: one server (beacon) or one public endpoint ---------------- */
-let pageSel = null; try { const q = new URLSearchParams(location.search); if (q.get('node')) pageSel = { node: q.get('node') }; else if (q.get('ep')) pageSel = { ep: q.get('ep') }; } catch {}
+let pageSel = null; try { const q = new URLSearchParams(location.search); if (q.get('view') === 'producer') pageSel = { producer: true }; else if (q.get('node')) pageSel = { node: q.get('node') }; else if (q.get('ep')) pageSel = { ep: q.get('ep') }; } catch {}
 let pageData = null, pageFetchT = 0;
-function setQ(k, v) { try { const u = new URL(location); ['node', 'ep'].forEach((x) => u.searchParams.delete(x)); if (k) u.searchParams.set(k, v); history.replaceState(null, '', u); } catch {} }
-function openPage(sel) { pageSel = sel; pageData = null; pageFetchT = 0; setQ(sel.node ? 'node' : 'ep', sel.node || sel.ep); renderPage(); $('page').scrollTop = 0; }
+function setQ(k, v) { try { const u = new URL(location); ['node', 'ep', 'view'].forEach((x) => u.searchParams.delete(x)); if (k) u.searchParams.set(k, v); history.replaceState(null, '', u); } catch {} }
+function openPage(sel) { pageSel = sel; pageData = null; pageFetchT = 0; if (sel.producer) setQ('view', 'producer'); else setQ(sel.node ? 'node' : 'ep', sel.node || sel.ep); renderPage(); $('page').scrollTop = 0; }
 function closePage() { pageSel = null; setQ(null); renderPage(); }
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && pageSel) { e.stopImmediatePropagation(); closePage(); } }, true);
 const copyBtn = (v) => `<button class="cp" data-copy="${esc(v)}">copy</button>`;
@@ -992,9 +1004,43 @@ async function renderPage() {
   if (!pageSel || !p) { pg.classList.remove('on'); document.body.style.overflow = ''; return; }
   pg.classList.add('on'); document.body.style.overflow = 'hidden';
   const o = p.org || {}, c = net.chain || {};
-  const crumb = `<div class="crumb"><a id="pg-back">${ic('back')} Back</a><span>·</span><span>${esc(net.name)} ${esc(net.label || '')}</span><span>›</span><a id="pg-prod">${esc(o.name || p.name)}</a><span>›</span><b style="color:var(--ink)">${esc(pageSel.node || (pageSel.ep || '').replace(/^https?:\/\//, ''))}</b></div>`;
+  const crumb = `<div class="crumb"><a id="pg-back">${ic('back')} Back</a><span>·</span><span>${esc(net.name)} ${esc(net.label || '')}</span><span>›</span><a id="pg-prod">${esc(o.name || p.name)}</a>${pageSel.producer ? '' : `<span>›</span><b style="color:var(--ink)">${esc(pageSel.node || (pageSel.ep || '').replace(/^https?:\/\//, ''))}</b>`}</div>`;
   let body = '';
-  if (pageSel.node) {
+
+  if (pageSel.producer) {
+    const bs = p.beacons || [], eps = (infraData[active]?.nodes || []).filter((x) => x.producer === p.name);
+    const col = { ok: 'var(--ok)', warn: 'var(--warn)', bad: 'var(--bad)' };
+    const stOf = (b) => { const k = splitChecks(b.report.checks || []); return b.silent ? ['bad', 'silent'] : k.sick.length ? ['bad', `${k.sick.length} issue${k.sick.length > 1 ? 's' : ''}`] : k.todo.length ? ['warn', `${k.todo.length} to set up`] : ['ok', 'ready']; };
+    const yn = (v, t, f) => v == null ? '<span style="color:var(--dim)">—</span>' : v ? `<span style="color:var(--ok)">${t}</span>` : `<span style="color:var(--warn)">${f}</span>`;
+    const tiles = bs.map((b) => { const rp = b.report, k = splitChecks(rp.checks || []), [st, txt] = stOf(b), m = rp.metal, done = k.setup.length - k.todo.length;
+      const lag = c.head && rp.source?.head ? Math.max(0, c.head - rp.source.head) : null;
+      return `<div class="srv ptile clickable" data-go-node="${esc(b.node)}" style="--st:${col[st]}">
+        <div class="srv-h"><div class="srv-ic">${ic(ROLE_ICON[b.role] || 'server', 'lg')}</div><div style="min-width:0"><h5>${esc(b.node)}</h5><div class="meta"><span>${esc(ROLE_NAME[b.role] || b.role || 'node')}</span><span>${ic('clock')}${b.silent ? 'silent' : Math.round(b.age_ms / 1000) + 's'}</span></div></div><span class="pill ${st}">${ic(st === 'ok' ? 'ok' : st === 'bad' ? 'bad' : 'todo')}${txt}</span></div>
+        <div class="srv-kv"><div><span>XPR head</span>${lag == null ? '—' : lag <= 30 ? '<span style="color:var(--ok)">in sync</span>' : fmt(lag) + ' behind'}</div><div><span>metal</span>${m ? esc(String(m.version || '').replace('metalgo/', '')) : '<span style="color:var(--dim)">—</span>'}</div><div><span>peers</span>${m ? fmt(m.peers) : '—'}</div>
+          <div><span>P-Chain</span>${m ? yn(m.bootstrapped?.P, 'synced', 'syncing') : '—'}</div><div><span>port 9651</span>${m ? yn(m.staking_reachable, 'open', 'closed') : '—'}</div><div><span>setup</span>${done}/${k.setup.length}</div></div>
+        <div style="padding:10px 16px 12px 18px;color:var(--muted);font-size:11.5px;display:flex;align-items:center;gap:6px">${m?.node_id ? `${ic('hex')}<span style="font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.node_id)}</span>` : ''}<span style="margin-left:auto;display:inline-flex;gap:4px;align-items:center">details ${ic('arrow')}</span></div></div>`; }).join('');
+    const epTiles = eps.map((n) => { const t = n.types[0] || 'node', up = n.api ? n.api.ok && n.api.chain_ok !== false : n.p2p_probe ? n.p2p_probe.ok : null;
+      const host = n.url ? n.url.replace(/^https?:\/\//, '') : n.p2p || (t + ' node');
+      return `<div class="ep ${n.url ? 'clickable' : ''}" ${n.url ? `data-go-ep="${esc(n.url)}"` : ''}><div class="ep-h"><div class="srv-ic">${ic(n.hyperion ? 'db' : ROLE_ICON[t] || 'server')}</div><div class="t"><b>${esc(host)}</b><small>${n.types.map((x) => `<span class="tp ${esc(x)}">${esc(x)}</span>`).join('')} ${n.location ? ic('pin') + esc(n.location) : ''}</small></div>
+        ${up == null ? `<span class="pill mute">${t === 'producer' ? ic('lock') + 'private' : '—'}</span>` : `<span class="pill ${up ? 'ok' : 'bad'}">${ic(up ? 'ok' : 'bad')}${n.api ? (up ? n.api.ms + ' ms' : 'down') : up ? 'open' : 'closed'}</span>`}</div>
+        ${n.api ? `<div class="ep-m"><div><span>nodeos</span>${esc(n.api.version?.split('-')[0] || '—')}</div><div><span>behind</span>${n.api.lag != null ? (n.api.lag <= 30 ? 'in sync' : fmt(n.api.lag)) : '—'}</div><div><span>${n.hyperion ? 'hyperion' : 'edge'}</span>${esc(n.hyperion ? n.hyperion.version || (n.hyperion.ok ? 'up' : 'down') : n.api.edge || '—')}</div></div>` : ''}</div>`; }).join('');
+    // checks × servers matrix
+    const names = [...new Set(bs.flatMap((b) => (b.report.checks || []).map((x) => x.name)))].sort((a, b) => (kind({ name: a }) === 'setup') - (kind({ name: b }) === 'setup'));
+    const matrix = bs.length ? `<div class="card2 span"><h3>${ic('list')}Every check, every server</h3><div style="overflow-x:auto"><table class="mx"><thead><tr><th></th>${bs.map((b) => `<th>${esc(b.node)}</th>`).join('')}</tr></thead><tbody>
+      ${names.map((nm) => `<tr><td>${ic(CHECK_ICON[nm] || 'wrench')} ${esc(label({ name: nm }))} <span class="kind">${kind({ name: nm }) === 'setup' ? 'setup' : 'health'}</span></td>${bs.map((b) => { const x = (b.report.checks || []).find((y) => y.name === nm); return `<td title="${esc(x?.detail || '')}">${!x ? '<span style="color:var(--dim)">n/a</span>' : x.ok ? `<span class="st ok">${ic('ok')}</span>` : `<span class="st ${kind(x) === 'setup' ? 'todo' : 'no'}">${ic(kind(x) === 'setup' ? 'todo' : 'bad')}</span>`}</td>`; }).join('')}</tr>`).join('')}
+      </tbody></table></div></div>` : '';
+    const withUrl = eps.filter((n) => n.url).length;
+    body = `
+      <div class="pg-h"><div class="logo" style="width:64px;height:64px;border-radius:18px;font-size:20px"><span>${esc(initials(o.name || p.name))}</span>${o.logo ? `<img src="${esc(o.logo)}" alt="" onerror="this.remove()">` : ''}</div>
+        <div><h2>${esc(o.name || p.name)}</h2><div class="meta"><span>${flag(o.country)} ${esc(p.name)}</span>${o.city ? `<span>${ic('pin')}${esc(o.city)}</span>` : ''}<span>${ic('trophy')}${p.rank ? 'rank #' + p.rank : 'unranked'}</span><span>${p.scheduled ? 'in active schedule' : 'standby'}</span>${o.website ? `<span><a href="${esc(o.website)}" target="_blank" rel="noopener noreferrer" style="color:var(--muted)">website</a></span>` : ''}</div></div>
+        <span class="pill ${statusOf(p).dot || 'mute'}">${esc(statusOf(p).text)}</span></div>
+      <div class="big3" style="grid-template-columns:repeat(4,minmax(0,1fr))"><div><span>servers with a beacon</span>${bs.length}</div><div><span>ready</span>${bs.filter((b) => stOf(b)[0] === 'ok').length}/${bs.length}</div><div><span>public endpoints</span>${eps.filter((n) => n.api?.ok).length}/${withUrl} up</div><div><span>metal nodes</span>${bs.filter((b) => b.report.metal).length}</div></div>
+      ${bs.length ? '' : `<div class="card2" style="margin-bottom:16px">None of this producer's servers report yet. One command connects each server: <b>docs/OPERATOR-QUICKSTART.md</b>.</div>`}
+      <div class="ptiles">${tiles}</div>
+      ${withUrl > bs.length ? `<div class="next" style="margin:0 0 16px">${ic('radio')}<div>${bs.length} of ${withUrl} public endpoints have a beacon. Every server that serves users needs one before a cutover.</div></div>` : ''}
+      <div class="pg-grid">${matrix}
+        <div class="card2 span"><h3>${ic('globe')}Public endpoints<span class="cnt">bp.json · probed every 10 min</span></h3><div class="tiles2">${epTiles || '<div class="ev-empty">No bp.json endpoints surveyed.</div>'}</div></div></div>`;
+  } else if (pageSel.node) {
     if (Date.now() - pageFetchT > 9000) { pageFetchT = Date.now(); fetch(`/api/node/${encodeURIComponent(net.id)}/${encodeURIComponent(p.name)}/${encodeURIComponent(pageSel.node)}`, { cache: 'no-store' }).then((r) => r.ok ? r.json() : null).then((d) => { pageData = d; renderPage(); }).catch(() => {}); }
     const d = pageData, rp = d?.report;
     if (!rp) body = `<div class="card2">${d === null && pageFetchT ? 'Loading…' : 'This server is not reporting.'}</div>`;
@@ -1051,7 +1097,10 @@ async function renderPage() {
     }
   }
   pg.innerHTML = `<div class="pg">${crumb}${body}</div>`;
-  $('pg-back').onclick = closePage; $('pg-prod').onclick = closePage;
+  $('pg-back').onclick = () => pageSel.producer ? closePage() : openPage({ producer: true });
+  $('pg-prod').onclick = () => openPage({ producer: true });
+  pg.querySelectorAll('[data-go-node]').forEach((x) => x.onclick = () => openPage({ node: x.dataset.goNode }));
+  pg.querySelectorAll('[data-go-ep]').forEach((x) => x.onclick = () => openPage({ ep: x.dataset.goEp }));
   pg.querySelectorAll('[data-copy]').forEach((b) => b.onclick = () => { navigator.clipboard?.writeText(b.dataset.copy).then(() => { b.textContent = 'copied'; setTimeout(() => (b.textContent = 'copy'), 1200); }).catch(() => {}); });
 }
 
