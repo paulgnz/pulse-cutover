@@ -66,6 +66,7 @@ pub struct Machine<'a, O: ChainOps> {
     aborted_rollback_complete: bool,
     /// Rollback steps already journaled as done in this abort episode (resumable rollback).
     rollback_steps_done: Vec<String>,
+    rollback_pending: bool,
 }
 
 /// What `pulse-cutover rollback` did. `failed` lists every step that did not succeed; the
@@ -139,6 +140,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let unhalted = recovered.unhalted;
         let aborted_rollback_complete = recovered.aborted_rollback_complete;
         let rollback_steps_done = recovered.rollback_steps_done.clone();
+        let rollback_pending = recovered.rollback_pending;
         Machine {
             cfg,
             ops,
@@ -167,6 +169,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             unhalted,
             aborted_rollback_complete,
             rollback_steps_done,
+            rollback_pending,
         }
     }
 
@@ -179,6 +182,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     pub fn run(&mut self) -> Result<State, String> {
         // Defense in depth (main.rs checks too): a readiness-only config never drives anything.
         self.cfg.ensure_ceremony_profile()?;
+        if self.rollback_pending {
+            return Err("refusing to run: an operator `pulse-cutover rollback` was started on this journal and \
+                 did not finish (it recorded `rollback_requested` but never reached ABORTED). The operator \
+                 asked to go back, not to carry on: re-run `pulse-cutover rollback` to finish it."
+                .into());
+        }
         // A previous agent that died mid-hook (or mid pipeline step) left that process group
         // running: stop it before this run does anything, or it would race the resumed step (e.g.
         // a still-running on_freeze beside on_abort). Refuse to resume if it cannot be stopped.
@@ -661,6 +670,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.state
             ));
         }
+        // Intent first: if this rollback dies before its ABORTED transition, a later `run` must not
+        // resume the ceremony (see `rollback_pending`); re-running `rollback` finishes the job.
+        self.journal.evidence(self.state, json!({"rollback_requested": true, "force_after_ignite": force && past}))?;
+        self.rollback_pending = true;
         if force && past && !self.step_done("target_fence") {
             // Local fence FIRST: resuming the source while this box's target still runs would
             // create two writable histories under one chain_id, by our own hand.

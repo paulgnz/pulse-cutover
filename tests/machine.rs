@@ -2975,3 +2975,36 @@ fn r5_setup_check_names_are_shared_with_mission_control() {
     ours.sort();
     assert_eq!(ours, shared);
 }
+
+#[test]
+fn r5b_run_refuses_a_journal_whose_operator_rollback_died_before_aborted() {
+    // A `rollback` killed after recording its intent but before its ABORTED transition left a
+    // pre-ignition journal: a later `run` resumed the ceremony the operator had asked to abandon.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_journal(dir.path());
+    {
+        let (mut j, rec) = Journal::open(&cfg.journal_path).unwrap();
+        let st = rec.state.unwrap();
+        j.evidence(st, serde_json::json!({"rollback_requested": true, "force_after_ignite": false})).unwrap();
+    }
+    let ops = MockOps::new(dir.path(), 200);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("rollback") && err.contains("did not finish"), "{err}");
+    assert!(ops.events.borrow().iter().all(|e| e == "kill-orphans"), "run did nothing: {:?}", ops.events.borrow());
+    // Re-running rollback finishes it; after that the journal is a normal ABORTED.
+    let out = rollback_with(&cfg, &MockOps::new(dir.path(), 200), false).unwrap();
+    assert!(out.failed.is_empty() && !out.already, "{out:?}");
+    let (_, rec) = Journal::open(&cfg.journal_path).unwrap();
+    assert!(!rec.rollback_pending && rec.state == Some(State::Aborted), "{rec:?}");
+}
+
+#[test]
+fn r5b_operator_rollback_records_its_intent_before_any_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_journal(dir.path());
+    assert!(rollback_with(&cfg, &MockOps::new(dir.path(), 200), false).unwrap().failed.is_empty());
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let intent = text.find("rollback_requested").expect("intent recorded");
+    let first_step = text.find("rollback_step").expect("a step recorded");
+    assert!(intent < first_step, "intent must precede every step");
+}

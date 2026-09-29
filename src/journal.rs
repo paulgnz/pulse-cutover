@@ -96,6 +96,10 @@ pub struct Recovered {
     /// Rollback steps journaled as done (`rollback_step` records) in the current abort episode
     /// (since the last non-ABORTED transition): a rollback that died part-way redoes only the rest.
     pub rollback_steps_done: Vec<String>,
+    /// An operator `rollback` recorded its intent (`rollback_requested`) and no ABORTED transition
+    /// followed: it died before finishing. `run` must refuse (the operator asked to go back, not to
+    /// carry on); re-running `rollback` finishes it.
+    pub rollback_pending: bool,
 }
 
 impl Journal {
@@ -342,6 +346,9 @@ impl Journal {
                 // Every ABORTED transition (re)opens the rollback; only a later `rollback_done` closes
                 // it. Leaving ABORTED (a new ceremony on this journal) forgets the episode's steps.
                 out.aborted_rollback_complete = false;
+                if st == State::Aborted {
+                    out.rollback_pending = false;
+                }
                 if st != State::Aborted {
                     out.rollback_steps_done.clear();
                 }
@@ -373,6 +380,9 @@ impl Journal {
                 if se == "ignite_started" || se == "ignite" {
                     out.reached_ignited = true;
                 }
+            }
+            if entry.data.get("rollback_requested").and_then(|v| v.as_bool()) == Some(true) {
+                out.rollback_pending = true;
             }
             if entry.data.get("rollback_incomplete").is_some() {
                 out.aborted_rollback_complete = false;
