@@ -3,7 +3,7 @@
 #
 #   ./cutover.sh --manifest ceremony.json    # validate + run to LIVE (exit 0) or ABORT (exit 1)
 #   ./cutover.sh status                      # current journaled state
-#   ./cutover.sh abort                       # stop the agent + roll back (refused after IGNITED)
+#   ./cutover.sh abort                       # stop the agent + roll back (refused once ignition may have started)
 #   ./cutover.sh abort --force-after-ignite  # roll back after IGNITED (coordinator-confirmed only)
 #
 # Plain-language streaming: every state transition the agent journals is echoed
@@ -27,20 +27,31 @@ case "$CMD" in
     # After IGNITED this node's target is running (and other producers' may be producing):
     # resuming the source or reverting public routing could create a second writable history.
     # That is a human, fleet-wide decision — never the default of a local abort.
-    STATE=$(pulse-cutover status --config "$CONFIG" 2>/dev/null | sed -n 's/^state: //p' || true)
-    case "$STATE" in
-      IGNITED|FLIPPED|LIVE)
-        if [ "${2:-}" != "--force-after-ignite" ]; then
-          echo "  NOT rolling back: the journal says $STATE — this node's PulseVM target is already running."
-          echo "  The agent is stopped; the source was NOT resumed and public routing was NOT reverted."
-          echo "  Only if the coordinator has confirmed a fleet-wide rollback, run:"
-          echo "    ./cutover.sh abort --force-after-ignite"
-          echo "journal: $(tomlget journal_path)"
-          exit 3
-        fi
-        echo "  --force-after-ignite: rolling back AFTER $STATE on operator instruction"
-        ;;
-    esac
+    # Fail CLOSED: roll back only when the journal positively says ignition has NOT started.
+    # A missing, unreadable or unfamiliar status (corrupt journal, old binary, unknown state)
+    # is treated like "the target may be running".
+    STATUS=$(pulse-cutover status --config "$CONFIG" 2>&1) && STATUS_OK=1 || STATUS_OK=0
+    STATE=$(printf '%s\n' "$STATUS" | sed -n 's/^state: //p')
+    IGN=$(printf '%s\n' "$STATUS" | sed -n 's/^ignition_started: //p')
+    SAFE=0
+    if [ "$STATUS_OK" = 1 ] && [ "$IGN" = "no" ]; then
+      case "$STATE" in
+        ARMED|FROZEN|SNAPSHOTTED|VERIFIED|ABORTED|"(no transitions)") SAFE=1 ;;
+      esac
+    fi
+    if printf '%s\n' "$STATUS" | grep -q '^no journal at'; then SAFE=1; STATE="(not started)"; fi
+    if [ "$SAFE" != 1 ]; then
+      if [ "${2:-}" != "--force-after-ignite" ]; then
+        echo "  NOT rolling back: journal state '${STATE:-unknown}', ignition_started '${IGN:-unknown}'."
+        [ "$STATUS_OK" = 1 ] || echo "  (could not read the journal status: treating it as 'the target may be running')"
+        echo "  The agent is stopped; the source was NOT resumed and public routing was NOT reverted."
+        echo "  Only if the coordinator has confirmed a fleet-wide rollback, run:"
+        echo "    ./cutover.sh abort --force-after-ignite"
+        echo "journal: $(tomlget journal_path)"
+        exit 3
+      fi
+      echo "  --force-after-ignite: rolling back with journal state '${STATE:-unknown}' on operator instruction"
+    fi
     MODE=$(tomlget mode); MODE=${MODE:-producer}
     if [ "$MODE" = "api" ]; then
       # Revert EVERY staged flip ([flip].revert_cmd and, in hyperion mode,
@@ -132,7 +143,8 @@ pulse-cutover run --config "$CONFIG" 2>&1 | while IFS= read -r line; do
     *"-> IGNITED"*)     echo "[IGNITED]     PulseVM is up, serving the SAME chain_id, continuing at the cut block." ;;
     *"-> FLIPPED"*)     echo "[FLIPPED]     public /v1 now answered by PulseVM — this was the only user-visible change." ;;
     *"-> LIVE"*)        echo "[LIVE]        ceremony complete. Source retired. Same URL, same chain, new engine." ;;
-    *"-> ABORTED"*)     echo "[ABORTED]     ceremony stopped safely and rolled back — the source chain is still the real one. The journal has the reason." ;;
+    *"-> ABORTED"*)     echo "[ABORTED]     ceremony stopped before ignition and rolled back — the source chain is still the real one. The journal has the reason." ;;
+    *"-> HALTED"*)      echo "[HALTED]      SEALED: ignition may have started, so nothing was rolled back. The coordinator decides for the fleet." ;;
     *) echo "  $line" ;;
   esac
 done
@@ -144,10 +156,12 @@ if [ "$RC" = 0 ]; then
 else
   echo ""
   echo "Ceremony did NOT reach LIVE (exit $RC)."
-  echo "  - If ABORTED printed: it stopped before IGNITED and rolled back; the source chain is the real one."
-  echo "  - If it HALTED (IGNITED printed, no ABORTED): it is SEALED. This node's target was already"
-  echo "    running, so nothing was resumed or reverted. Do not restart the source on your own:"
-  echo "    the coordinator decides for the whole fleet (then './cutover.sh abort --force-after-ignite')."
+  echo "  - If ABORTED printed: it stopped before ignition started and rolled back; the source chain is the real one."
+  echo "  - If HALTED printed: it is SEALED. Ignition may have started on this node, so nothing was"
+  echo "    resumed or reverted, and re-running will not continue until an operator clears it. Do not"
+  echo "    restart the source on your own: the coordinator decides for the whole fleet, then either"
+  echo "    'pulse-cutover unhalt --config $CONFIG --i-understand' (carry on) or"
+  echo "    './cutover.sh abort --force-after-ignite' (fleet-wide rollback)."
   echo "Full evidence: $JOURNAL"
   echo "Next: run 'pulse-cutover report' — it builds a sanitized bundle (journal + doctor survey +"
   echo "service logs, keys auto-redacted) to attach to a GitHub issue or post in the Telegram group."

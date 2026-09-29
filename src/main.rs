@@ -41,16 +41,18 @@ read-only, safe anywhere (including production):
   verify          hash + dual-import fingerprint a snapshot (heavy but touches nothing)
 
 mutating (normally driven by install.sh / cutover.sh):
-  run             run the ceremony to LIVE (exit 0) or ABORTED (exit 1)
-  loop            run N ceremonies back to back with a reset between (rehearsal boxes)";
+  run             run the ceremony to LIVE (exit 0), ABORTED or HALTED (exit 1)
+  loop            run N ceremonies back to back with a reset between (rehearsal boxes)
+  unhalt          clear a HALTED (sealed) journal after a fleet-wide decision (--i-understand)";
 
 const HELP_RUN: &str = "\
 pulse-cutover run --config ceremony.toml
 
 Runs the cutover ceremony described by the config, journaling every step:
 ARMED -> FROZEN -> SNAPSHOTTED -> VERIFIED -> IGNITED [-> FLIPPED] -> LIVE.
-Nothing user-visible changes before FLIPPED; an abort at any point is safe
-and rolls back automatically. Most operators run ./cutover.sh instead, which
+Before ignition starts, a failure ABORTS and rolls this node back. Once ignition
+has started (journaled before the ignite command runs), a failure HALTS: nothing
+is rolled back and the journal is sealed until an operator runs `unhalt`. Most operators run ./cutover.sh instead, which
 wraps this with preflight checks and plain-language output.
 
 Exit codes: 0 = LIVE, 1 = did not reach LIVE (journal has the reason).
@@ -59,6 +61,16 @@ If the process dies, re-run the same command — it resumes from the journal.
 EXAMPLES
   pulse-cutover run --config /etc/pulse-cutover/ceremony.toml
   ./cutover.sh --manifest ceremony.json     # the friendly wrapper";
+
+const HELP_UNHALT: &str = "\
+pulse-cutover unhalt --config ceremony.toml --i-understand
+
+A HALTED journal is sealed: ignition may have started on this node, so the agent
+refused to continue or roll back on its own. After the coordinator has made the
+fleet-wide decision, this clears the seal: it journals who/when and returns the
+journal to the state it halted from, so the next `run` resumes from there (a
+resumed run with ignition started halts again unless the cause is fixed).
+It never resumes the source chain or reverts routing itself.";
 
 const HELP_BEACON: &str = "\
 pulse-cutover beacon --config ceremony.toml [--once]
@@ -184,6 +196,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "report" => Some(HELP_REPORT),
         "beacon" => Some(HELP_BEACON),
         "await" => Some(HELP_AWAIT),
+        "unhalt" => Some(HELP_UNHALT),
         _ => None,
     }
 }
@@ -226,6 +239,7 @@ fn main() {
         "report" => cmd_report(&args),
         "beacon" => cmd_beacon(&args),
         "await" => cmd_await(&args),
+        "unhalt" => cmd_unhalt(&args),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -327,7 +341,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let mut machine = Machine::new(&cfg, &ops, journal, recovered);
     let terminal = match machine.run() {
         Ok(t) => t,
-        Err(e) if e.starts_with("HALTED") => {
+        Err(e) if e.starts_with("HALTED") || e.contains("HALTED (journaled)") => {
             return Err(format!(
                 "{e}\nThe ceremony is SEALED: this node's target was already ignited, so the source was \
                  NOT resumed and writes were NOT re-opened (that could create a second writable \
@@ -387,6 +401,27 @@ fn cmd_await(args: &[String]) -> Result<(), String> {
     std::process::exit(code);
 }
 
+fn cmd_unhalt(args: &[String]) -> Result<(), String> {
+    if !flag(args, "--i-understand") {
+        return Err("unhalt clears a SEALED ceremony (ignition may have started). Only after a \
+                    fleet-wide decision: re-run with --i-understand"
+            .into());
+    }
+    let cfg = load_config(args)?;
+    cfg.ensure_ceremony_profile()?;
+    let (mut journal, recovered) = Journal::open(&cfg.journal_path)?;
+    if recovered.state != Some(state::State::Halted) {
+        return Err(format!("journal state is {:?}, not HALTED: nothing to clear", recovered.state.map(|s| s.to_string())));
+    }
+    let back = recovered.halted_from.unwrap_or(state::State::Verified);
+    let who = std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "unknown".into());
+    journal.evidence(state::State::Halted, serde_json::json!({"unhalted_by": who, "returning_to": back.as_str()}))?;
+    journal.transition(back, serde_json::json!({"unhalted": true, "by": who,
+        "note": "seal cleared by operator; ignition-started is still recorded, so a failure halts again"}))?;
+    println!("unhalted: journal returned to {back}");
+    Ok(())
+}
+
 fn cmd_status(args: &[String]) -> Result<(), String> {
     let cfg = load_config(args)?;
     if !cfg.journal_path.exists() {
@@ -415,6 +450,8 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     if let Some(h) = recovered.cut_height {
         println!("cut_height: {h}");
     }
+    // cutover.sh reads this: once ignition may have started, a local rollback is refused.
+    println!("ignition_started: {}", if recovered.reached_ignited { "yes" } else { "no" });
     Ok(())
 }
 
