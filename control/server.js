@@ -185,7 +185,7 @@ async function probeApi(url, chainId, head) {
 async function probeHyperion(url, head) {
   return timed(async () => {
     const h = await (await fetch(`${url}/v2/health`, { signal: AbortSignal.timeout(6000) })).json();
-    if (!Array.isArray(h.health) || !h.version) throw new Error('not a Hyperion health document');
+    if (!Array.isArray(h.health) || !h.version) throw new Error('not Hyperion');
     const idx = (h.health || []).map((x) => x.service_data?.last_indexed_block).filter((v) => v > 0).sort((x, y) => y - x)[0];
     return { version: h.version || null, indexed: idx || null, lag: head && idx ? Math.max(0, head - idx) : null,
       services: (h.health || []).map((x) => ({ s: x.service, ok: x.status === 'OK' })) };
@@ -214,8 +214,11 @@ async function surveyInfra(n) {
       const e = { producer: p.owner, rank: p.rank, types, features, url, p2p: nd.p2p_endpoint || null,
         location: nd.location?.name || nd.location?.country || null };
       const jobs = [];
+      // bp.json "query" nodes whose only feature is a non-chain service (e.g. atomic-assets-api) are not chain APIs:
+      // probing /v1/chain on them just reports a false 404.
+      const serviceOnly = features.length && !features.some((f) => /chain-api|hyperion|history|push-api/.test(f));
       if (url) {
-        jobs.push(probeApi(url, n.chain_id, c.head).then((r) => (e.api = r)));
+        if (!serviceOnly) jobs.push(probeApi(url, n.chain_id, c.head).then((r) => (e.api = r)));
         if (features.includes('hyperion-v2') || types.includes('query')) jobs.push(probeHyperion(url, c.head).then((r) => { if (r.ok || features.includes('hyperion-v2')) e.hyperion = r; }));
         if (features.some((f) => /atomic/i.test(f))) jobs.push(probeAtomic(url).then((r) => (e.atomic = r)));
       }
