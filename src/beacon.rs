@@ -393,7 +393,8 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     let mut checks = vec![];
     let journal = journal_summary(&cfg.journal_path);
     let state = journal["state"].as_str().unwrap_or("").to_string();
-    let past_ignite = matches!(state.as_str(), "IGNITED" | "FLIPPED" | "LIVE");
+    // HALTED: ignition may have started (the target may be running), so judge like post-ignite.
+    let past_ignite = matches!(state.as_str(), "IGNITED" | "FLIPPED" | "LIVE" | "HALTED");
     // From VERIFIED on, the staged snapshot is supposed to exist, and ignition restarts the
     // validator: judge those checks by phase, not by the pre-ceremony rule.
     let past_verify = past_ignite || state == "VERIFIED";
