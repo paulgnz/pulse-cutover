@@ -90,6 +90,16 @@ expect_die "adopt: env AVAGO_STAKING_EPHEMERAL_SIGNER_ENABLED=true refused"     
 expect_die "adopt: env AVAGO_STAKING_SIGNER_KEY_FILE elsewhere refused"               identity_paths_ok /var/lib/metalgo "" "$EX" "HOME=/root AVAGO_STAKING_SIGNER_KEY_FILE=/etc/signer.key"
 expect_ok  "adopt: unrelated env accepted"                                             identity_paths_ok /var/lib/metalgo "" "$EX" "AVAGO_HTTP_HOST=127.0.0.1"
 
+# --- glibc detection must be a single clean version under pipefail (it used to become "2.39\n0") ---------
+(
+  set -euo pipefail
+  getconf() { return 1; }
+  ldd() { echo "ldd (Ubuntu GLIBC 2.39-0ubuntu8.4) 2.39"; for i in $(seq 1 3000); do echo "Copyright line $i"; done; }
+  v=$(glibc_version); [ "$v" = 2.39 ]
+) && ok "glibc: ldd fallback yields exactly 2.39 under pipefail" || bad "glibc: ldd fallback under pipefail"
+( set -euo pipefail; getconf() { echo "glibc 2.31"; }; [ "$(glibc_version)" = 2.31 ] ) && ok "glibc: getconf path" || bad "glibc: getconf path"
+( set -euo pipefail; getconf() { return 1; }; ldd() { return 1; }; [ "$(glibc_version)" = 0 ] ) && ok "glibc: unknown → 0" || bad "glibc: unknown → 0"
+
 # --- --build needs a pinned commit ---------------------------------------------------------------------
 MF_COMMIT=""; expect_die "build: refused without metalgo_commit" require_build_commit
 MF_COMMIT=$(rep a 40); expect_ok "build: pinned commit accepted" require_build_commit

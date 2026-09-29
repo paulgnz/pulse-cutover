@@ -252,6 +252,17 @@ builtin_manifest() {
 J
 }
 
+# glibc_version → "2.39" (or 0). No pipe into head: under pipefail, ldd dying of SIGPIPE when head closes early
+# used to append the "|| echo 0" fallback ("2.39\n0"), which refused every install at random.
+glibc_version() {
+  local v out
+  v=$(getconf GNU_LIBC_VERSION 2>/dev/null || true); v=${v##* }
+  if ! printf '%s' "$v" | grep -qE '^[0-9]+\.[0-9]+$'; then
+    out=$(ldd --version 2>/dev/null || true)
+    v=$(printf '%s\n' "$out" | sed -n '1s/.* \([0-9][0-9]*\.[0-9][0-9]*\)$/\1/p')
+  fi
+  printf '%s\n' "${v:-0}"
+}
 # version_matches "metalgo/1.14.2 [..]" v1.14.2-tahoe   → 0 when the numeric release matches
 version_matches() { local got want; got=$(printf '%s' "$1" | sed -n 's|^metalgo/\([0-9][0-9.]*\).*|\1|p'); want=$(printf '%s' "$2" | sed -n 's|^v\([0-9][0-9.]*\).*|\1|p'); [ -n "$got" ] && [ "$got" = "$want" ]; }
 
@@ -746,7 +757,7 @@ main() {
   ram=$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo)
   probe=$DATA; [ -d "$probe" ] || probe=$(dirname "$DATA")
   free=$(df -Pk "$probe" | awk 'NR==2{printf "%d", $4/1024/1024}')
-  glibc=$(ldd --version 2>/dev/null | head -1 | grep -o '[0-9]\+\.[0-9]\+$' || echo 0)
+  glibc=$(glibc_version)
   say "box: ${ram} GB RAM · ${free} GB free for $DATA · glibc $glibc · $ARCH"
   [ "$ram" -ge 8 ] || warn "less than 8 GB RAM: metalgo next to nodeos will be tight"
   [ "$free" -ge 100 ] || warn "less than 100 GB free: the primary network (P/X/C chains) can outgrow this"
