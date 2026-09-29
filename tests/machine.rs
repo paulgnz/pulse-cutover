@@ -100,6 +100,15 @@ struct MockOps {
     fleet_agree: Cell<usize>,
     fleet_agree_after: Cell<u32>,
     fleet_polls: Cell<u32>,
+    /// Override for GET /api/status (roster fleet-gate tests).
+    status_doc: RefCell<Option<serde_json::Value>>,
+    // --- fault injection ---
+    /// The ignited target presents a DIFFERENT block id at the cut (wrong lineage).
+    target_fork: Cell<bool>,
+    /// Target head stops advancing after this many target polls (post-LIVE stall).
+    target_stall_after: Cell<u64>,
+    /// Source info calls (a readiness refusal must make none).
+    source_calls: Cell<u32>,
 }
 
 impl MockOps {
@@ -133,6 +142,10 @@ impl MockOps {
             fleet_agree: Cell::new(0),
             fleet_agree_after: Cell::new(0),
             fleet_polls: Cell::new(0),
+            status_doc: RefCell::new(None),
+            target_fork: Cell::new(false),
+            target_stall_after: Cell::new(u64::MAX),
+            source_calls: Cell::new(0),
         }
     }
 
@@ -154,6 +167,7 @@ impl MockOps {
 
 impl ChainOps for MockOps {
     fn source_info(&self) -> Result<ChainInfo, String> {
+        self.source_calls.set(self.source_calls.get() + 1);
         if self.stopped.get() {
             return Err("connection refused (nodeos stopped)".into());
         }
@@ -242,19 +256,25 @@ impl ChainOps for MockOps {
         }
         let polls = self.target_polls.get() + 1;
         self.target_polls.set(polls);
-        let traffic_resumed = self
-            .hooks
-            .borrow()
-            .iter()
-            .any(|h| h.contains("resume-traffic"));
+        let traffic_resumed = self.flipped.get()
+            || self
+                .hooks
+                .borrow()
+                .iter()
+                .any(|h| h.contains("resume-traffic"));
         // The imported chain presents the cut height; it only mints past it
-        // once transactions flow again (post_ignite traffic hook).
+        // once transactions flow again (post_ignite traffic hook / public flip),
+        // and keeps producing unless a stall is injected.
         let head = if traffic_resumed {
-            self.target_head.get() + polls.min(5)
+            self.target_head.get() + polls.min(self.target_stall_after.get())
         } else {
             self.target_head.get()
         };
-        Ok(Some(self.info(head)))
+        let mut info = self.info(head);
+        if self.target_fork.get() {
+            info.head_block_id = format!("ff{}", &info.head_block_id[2..]);
+        }
+        Ok(Some(info))
     }
 
     fn public_info(&self, _public_url: &str) -> Result<Option<ChainInfo>, String> {
@@ -280,6 +300,9 @@ impl ChainOps for MockOps {
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
         self.hooks.borrow_mut().push(cmd.to_string());
+        if cmd.starts_with("fail-") {
+            return Err(format!("`{cmd}` exited 1"));
+        }
         if cmd == "freeze-writes" {
             self.freeze_head.set(self.head.get());
         }
@@ -317,6 +340,9 @@ impl ChainOps for MockOps {
         if url.ends_with("/api/status") {
             let polls = self.fleet_polls.get() + 1;
             self.fleet_polls.set(polls);
+            if let Some(doc) = self.status_doc.borrow().clone() {
+                return Ok(Some(doc));
+            }
             let ours = pulse_cutover::beacon::journal_summary(&self.dir.join("journal.jsonl"))["evidence"].clone();
             let n = if polls >= self.fleet_agree_after.get() { self.fleet_agree.get() } else { 1 };
             let producers: Vec<_> = (0..n).map(|i| serde_json::json!({"name": format!("bp{i}"),
@@ -454,9 +480,19 @@ on_live = "announce-live"
 }
 
 fn run_machine(cfg: &Config, ops: &MockOps) -> State {
+    run_machine_result(cfg, ops).unwrap()
+}
+
+fn run_machine_result(cfg: &Config, ops: &MockOps) -> Result<State, String> {
     let (journal, recovered) = Journal::open(&cfg.journal_path).unwrap();
     let mut machine = Machine::new(cfg, ops, journal, recovered);
-    machine.run().unwrap()
+    machine.run()
+}
+
+fn load_toml(dir: &std::path::Path, name: &str, text: &str) -> Result<Config, String> {
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    Config::load(&path)
 }
 
 #[test]
@@ -759,32 +795,30 @@ fn api_mode_flips_before_stopping_source_and_reads_never_gap() {
 }
 
 #[test]
-fn api_mode_flip_health_failure_aborts_without_stopping_source() {
+fn api_mode_flip_health_failure_after_ignition_seals_without_stopping_source() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = api_test_config(dir.path(), 120);
     let ops = MockOps::new(dir.path(), 110);
     ops.drift.set(5);
     ops.flip_breaks_public.set(true); // nginx swaps to a dead upstream
 
-    let terminal = run_machine(&cfg, &ops);
-    assert_eq!(terminal, State::Aborted);
+    // The target was already ignited: a local failure SEALS (HALTED) instead of rolling back.
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.starts_with("HALTED"), "{err}");
 
-    // THE invariant: the source nodeos was never stopped — reads survive the
-    // failed flip; and the flip was reverted so the public URL points back
-    // at nodeos.
+    // The source nodeos was never stopped, and nothing was undone automatically: reverting
+    // public routing after ignition is a human decision (cutover.sh abort --force-after-ignite).
     assert!(!ops.stopped.get(), "source must NOT be stopped on a failed flip");
     let hooks = ops.hooks.borrow();
-    assert!(hooks.iter().any(|h| h == "revert-nginx"), "flip must be reverted");
+    assert!(!hooks.iter().any(|h| h == "revert-nginx"), "no automatic revert after IGNITED");
     assert!(!hooks.iter().any(|h| h == "stop-nodeos"));
     assert!(!hooks.iter().any(|h| h == "announce-live"));
-    // Producer-mode rollback (resume) must not fire in api mode.
     assert_eq!(ops.resumes.get(), 0);
 
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
-    assert!(text.contains("public URL did not serve the target"));
-    assert!(text.contains("flip_reverted"));
-    // Reads still served by nodeos after the abort.
-    assert!(ops.public_info("http://mock-public").unwrap().is_some());
+    assert!(text.contains("HALTED: public URL did not serve the target"));
+    assert!(text.contains(r#""sealed":true"#));
+    assert!(!text.contains(r#""state":"ABORTED""#), "sealed, not rolled back");
 }
 
 /// hyperion-mode ceremony config: api mode + [hyperion] — /v2 history
@@ -902,8 +936,9 @@ fn hyperion_hydration_timeout_aborts_before_any_flip() {
     ops.drift.set(5);
     ops.hyperion_ready_after.set(u32::MAX); // indexer never catches up
 
-    let terminal = run_machine(&cfg, &ops);
-    assert_eq!(terminal, State::Aborted);
+    // After IGNITED a failure seals (HALTED) — and nothing user-visible was done.
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.starts_with("HALTED"), "{err}");
 
     // The ratchet held: hyperion was started, but NOTHING user-visible
     // happened — no /v1 flip, no /v2 flip, source still serving.
@@ -1455,7 +1490,7 @@ fn fleet_gate_holds_ignite_until_quorum_agrees() {
     ops.fleet_agree_after.set(4);
     assert_eq!(run_machine(&cfg, &ops), State::Live);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
-    assert!(text.contains(r#""fleet_gate":{"agreeing":3,"quorum":3}"#), "gate journaled the agreeing count");
+    assert!(text.contains(r#""fleet_gate":{"agreeing":3,"quorum":3,"#), "gate journaled the agreeing count");
     assert!(ops.fleet_polls.get() >= 4, "ignite waited for the fleet");
 }
 
@@ -1469,4 +1504,346 @@ fn fleet_gate_times_out_and_rolls_back() {
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(text.contains("fleet did not reach verified agreement"));
     assert!(ops.resumes.get() >= 1, "source producer resumed");
+}
+
+
+// ---- Astra review fixes (2026-09-29) ---------------------------------------------------------------
+
+#[test]
+fn readiness_profile_refuses_to_run_before_any_side_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    // What beacon-install.sh writes: api mode, no flip/stop_cmd, no H — valid only as readiness.
+    let text = format!(r#"
+journal_path = "{dir}/journal.jsonl"
+[ceremony]
+profile = "readiness"
+mode = "api"
+[source]
+rpc_url = "http://mock"
+producer_api_url = "http://mock"
+[snapshot]
+staged_path = "{dir}/staged.bin"
+[target]
+metalgo_unit = "metalgo"
+rpc_url = "http://127.0.0.1:9650/ext/bc/NOT-CONFIGURED/rpc"
+[beacon]
+url = "https://mc.example/api/report"
+producer = "bp1"
+network = "testnet"
+"#, dir = dir.path().display());
+    let cfg = load_toml(dir.path(), "beacon.toml", &text).expect("readiness config loads for the beacon");
+    assert!(cfg.ensure_ceremony_profile().is_err());
+    let ops = MockOps::new(dir.path(), 110);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("READINESS-ONLY"), "{err}");
+    assert_eq!(ops.source_calls.get(), 0, "refused before touching the chain");
+    assert!(ops.hooks.borrow().is_empty(), "no hook ran");
+    assert!(!ops.paused.get());
+    // The same file WITHOUT the readiness profile is not a valid ceremony config.
+    let as_ceremony = text.replace("profile = \"readiness\"\n", "");
+    assert!(load_toml(dir.path(), "beacon2.toml", &as_ceremony).is_err());
+}
+
+#[test]
+fn derived_h_requires_explicit_opt_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::read_to_string({ test_config(dir.path(), 120); dir.path().join("ceremony.toml") }).unwrap();
+    let margin = base.replace("freeze_height = 120", "freeze_height = 0\nfreeze_margin = 10");
+    let err = load_toml(dir.path(), "m.toml", &margin).unwrap_err();
+    assert!(err.contains("derive_h_at_arm"), "{err}");
+    let opted = margin.replace("freeze_margin = 10", "freeze_margin = 10\nderive_h_at_arm = true");
+    assert!(load_toml(dir.path(), "m2.toml", &opted).is_ok());
+}
+
+#[test]
+fn beacon_url_must_be_https_unless_local() {
+    use pulse_cutover::config::check_beacon_url;
+    assert!(check_beacon_url("https://mc.example/api/report").is_ok());
+    assert!(check_beacon_url("http://127.0.0.1:8787/api/report").is_ok());
+    assert!(check_beacon_url("http://localhost/api/report").is_ok());
+    assert!(check_beacon_url("http://[::1]:8787/api/report").is_ok());
+    assert!(check_beacon_url("http://mc.example/api/report").is_err());
+    assert!(check_beacon_url("").is_ok(), "empty = print-only --once");
+}
+
+#[test]
+fn pause_at_h_snapshot_past_h_aborts_unless_rehearsal_allows_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.drift.set(3); // head jumps past H: create_snapshot lands at 121, not 120
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("snapshot is not at H"));
+    assert!(!text.contains(r#""state":"SNAPSHOTTED""#));
+    assert!(ops.resumes.get() == 0 || !ops.paused.get(), "source left producing");
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let base = std::fs::read_to_string({ test_config(dir2.path(), 120); dir2.path().join("ceremony.toml") }).unwrap();
+    let cfg2 = load_toml(dir2.path(), "i.toml", &base.replace("quiescence_polls = 3", "quiescence_polls = 3\nallow_inexact_cut = true")).unwrap();
+    let ops2 = MockOps::new(dir2.path(), 110);
+    ops2.drift.set(3);
+    assert_eq!(run_machine(&cfg2, &ops2), State::Live);
+    assert!(std::fs::read_to_string(&cfg2.journal_path).unwrap().contains("inexact_cut"));
+}
+
+fn sched_config(dir: &std::path::Path) -> Config {
+    let text = format!(r#"
+journal_path = "{dir}/journal.jsonl"
+poll_ms = 1
+[ceremony]
+freeze_height = 120
+freeze_strategy = "schedule_at_h"
+quiescence_polls = 3
+[source]
+rpc_url = "http://mock"
+producer_api_url = "http://mock"
+[snapshot]
+staged_path = "{dir}/staged.bin"
+capture_roots = "{dir}/captured-roots.txt"
+dir = "{dir}"
+[target]
+metalgo_unit = "mock.service"
+rpc_url = "http://mock"
+quorum_timeout_secs = 60
+[hooks]
+on_freeze = "freeze-writes"
+post_ignite = "resume-traffic"
+"#, dir = dir.display());
+    load_toml(dir, "sched.toml", &text).unwrap()
+}
+
+#[test]
+fn schedule_at_h_without_scheduler_aborts_instead_of_falling_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = sched_config(dir.path());
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(false);
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("exact-H cut cannot be guaranteed"));
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "freeze-writes"), "aborted before freezing");
+}
+
+#[test]
+fn resumed_frozen_run_keeps_waiting_for_the_scheduled_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = sched_config(dir.path());
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    ops.schedule_snapshot(120).unwrap(); // the crashed run scheduled it and staged the file
+    let entries = [
+        serde_json::json!({"seq": 0, "ts_ms": 1, "ts": "t", "kind": "transition", "state": "ARMED",
+            "data": {"chain_id": hex::encode(CHAIN_ID), "resolved_h": 120}}),
+        serde_json::json!({"seq": 1, "ts_ms": 2, "ts": "t", "kind": "evidence", "state": "ARMED",
+            "data": {"snapshot_scheduled_at": 120}}),
+        serde_json::json!({"seq": 2, "ts_ms": 3, "ts": "t", "kind": "transition", "state": "FROZEN",
+            "data": {"chain_id": hex::encode(CHAIN_ID)}}),
+    ];
+    std::fs::write(&cfg.journal_path, entries.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+    ops.head.set(125);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("scheduled_snapshot_file"), "resume used the scheduled snapshot");
+    let snapped: serde_json::Value = text.lines().map(|l| serde_json::from_str(l).unwrap())
+        .find(|v: &serde_json::Value| v["state"] == "SNAPSHOTTED" && v["kind"] == "transition").unwrap();
+    assert_eq!(snapped["data"]["cut_height"], 120, "cut stays exactly H after a crash");
+}
+
+#[test]
+fn api_mode_without_simulate_cuts_exactly_h_via_scheduler() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::read_to_string({ api_test_config(dir.path(), 120); dir.path().join("ceremony-api.toml") }).unwrap();
+    let exact = base.replace("simulate_freeze = true", "")
+        .replace("capture_roots", &format!("dir = \"{}\"\ncapture_roots", dir.path().display()));
+    let cfg = load_toml(dir.path(), "api-exact.toml", &exact).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    ops.drift.set(5);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let snapped: serde_json::Value = text.lines().map(|l| serde_json::from_str(l).unwrap())
+        .find(|v: &serde_json::Value| v["state"] == "SNAPSHOTTED" && v["kind"] == "transition").unwrap();
+    assert_eq!(snapped["data"]["cut_height"], 120);
+    assert_eq!(snapped["data"]["cut_vs_declared_h"], 0);
+    // ...and without the scheduler it refuses rather than cutting at "whatever LIB is".
+    let dir2 = tempfile::tempdir().unwrap();
+    let exact2 = exact.replace(&dir.path().display().to_string(), &dir2.path().display().to_string());
+    let cfg2 = load_toml(dir2.path(), "api-exact.toml", &exact2).unwrap();
+    let ops2 = MockOps::new(dir2.path(), 110);
+    assert_eq!(run_machine(&cfg2, &ops2), State::Aborted);
+    assert!(std::fs::read_to_string(&cfg2.journal_path).unwrap().contains("api mode cannot cut at exactly H"));
+    // api without simulate_freeze and without snapshot.dir is a config error.
+    assert!(load_toml(dir2.path(), "bad.toml", &base.replace("simulate_freeze = true", "")).is_err());
+}
+
+#[test]
+fn target_with_wrong_lineage_at_the_cut_aborts_before_ignited() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.target_fork.set(true);
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("wrong lineage"));
+    assert!(!text.contains(r#""state":"IGNITED""#));
+    assert!(ops.resumes.get() >= 1, "pre-IGNITED abort still rolls the source back");
+}
+
+#[test]
+fn happy_path_journals_verified_lineage_and_sustained_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""lineage_at_cut":"verified""#));
+    let live: serde_json::Value = text.lines().map(|l| serde_json::from_str(l).unwrap())
+        .find(|v: &serde_json::Value| v["state"] == "LIVE" && v["kind"] == "transition").unwrap();
+    assert_eq!(live["data"]["sustained"]["sustain_secs"], 60);
+    assert!(text.contains(r#""side_effect":"ignite""#));
+}
+
+#[test]
+fn post_live_stall_halts_sealed_without_resuming_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.target_stall_after.set(8); // produces a few blocks past the goal, then stops
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.starts_with("HALTED"), "{err}");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("live_stall"));
+    assert!(text.contains("target stalled during the sustained LIVE window"));
+    assert!(!text.contains(r#""state":"LIVE""#));
+    assert_eq!(ops.resumes.get(), 0, "sealed: the paused source producer was NOT resumed");
+    assert!(ops.paused.get());
+}
+
+#[test]
+fn quorum_timeout_after_ignited_halts_instead_of_resuming_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::read_to_string({ test_config(dir.path(), 120); dir.path().join("ceremony.toml") }).unwrap();
+    // No traffic hook: the ignited target never mints past the cut.
+    let cfg = load_toml(dir.path(), "q.toml", &base.replace("post_ignite = \"resume-traffic\"\n", "")
+        .replace("quorum_timeout_secs = 60", "quorum_timeout_secs = 2")).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.starts_with("HALTED"), "{err}");
+    assert_eq!(ops.resumes.get(), 0);
+    assert!(!ops.hooks.borrow().iter().any(|h| h.contains("abort")), "on_abort (re-open writes) must not run");
+}
+
+#[test]
+fn failing_required_hooks_abort_before_ignition_and_halt_after() {
+    // on_freeze failing in api mode used to be journaled and ignored.
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::read_to_string({ api_test_config(dir.path(), 120); dir.path().join("ceremony-api.toml") }).unwrap();
+    let cfg = load_toml(dir.path(), "f.toml", &base.replace("on_freeze = \"freeze-writes\"", "on_freeze = \"fail-freeze\"")).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("write-freeze hook failed"));
+
+    // post_ignite failing (the run-5 non-executable hook) halts, sealed.
+    let dir2 = tempfile::tempdir().unwrap();
+    let base2 = std::fs::read_to_string({ test_config(dir2.path(), 120); dir2.path().join("ceremony.toml") }).unwrap();
+    let cfg2 = load_toml(dir2.path(), "p.toml", &base2.replace("post_ignite = \"resume-traffic\"", "post_ignite = \"fail-post-ignite\"")).unwrap();
+    let ops2 = MockOps::new(dir2.path(), 110);
+    let err = run_machine_result(&cfg2, &ops2).unwrap_err();
+    assert!(err.contains("post_ignite hook failed"), "{err}");
+    assert_eq!(ops2.resumes.get(), 0);
+}
+
+#[test]
+fn second_process_on_the_same_journal_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    let (_j, _) = Journal::open(&path).unwrap();
+    let err = Journal::open(&path).err().expect("second open must fail while the first is held");
+    assert!(err.contains("already running"), "{err}");
+    drop(_j);
+    assert!(Journal::open(&path).is_ok(), "lock released on drop");
+}
+
+#[test]
+fn torn_last_line_is_set_aside_but_a_corrupt_middle_line_is_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    let good = serde_json::json!({"seq": 0, "ts_ms": 1, "ts": "t", "kind": "transition", "state": "ARMED",
+        "data": {"chain_id": "ab", "resolved_h": 120}}).to_string();
+    std::fs::write(&path, format!("{good}\n{{\"seq\":1,\"ts_ms\":2,\"kin")).unwrap();
+    let (mut j, rec) = Journal::open(&path).unwrap();
+    assert!(rec.torn_tail);
+    assert_eq!(rec.state, Some(State::Armed));
+    assert_eq!(rec.resolved_h, Some(120));
+    j.evidence(State::Armed, serde_json::json!({"after": "repair"})).unwrap();
+    drop(j);
+    // The next append landed on a clean line: the whole journal parses again.
+    assert!(Journal::replay(&path).is_ok());
+    assert!(std::fs::read_dir(dir.path()).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains(".torn-")));
+
+    let bad = dir.path().join("bad.jsonl");
+    std::fs::write(&bad, format!("{good}\nnot json at all\n{good}\n")).unwrap();
+    let err = Journal::replay(&bad).unwrap_err();
+    assert!(err.contains("corrupt journal line 2"), "{err}");
+}
+
+#[test]
+fn side_effects_started_before_a_crash_are_recovered() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    let lines = [
+        serde_json::json!({"seq": 0, "ts_ms": 1, "ts": "t", "kind": "transition", "state": "IGNITED", "data": {}}),
+        serde_json::json!({"seq": 1, "ts_ms": 2, "ts": "t", "kind": "evidence", "state": "IGNITED", "data": {"side_effect": "flip_cmd"}}),
+    ];
+    std::fs::write(&path, lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+    let rec = Journal::replay(&path).unwrap();
+    assert!(rec.reached_ignited);
+    assert_eq!(rec.side_effects, vec!["flip_cmd".to_string()]);
+}
+
+#[test]
+fn hook_commands_are_killed_at_the_timeout() {
+    let t0 = std::time::Instant::now();
+    let err = pulse_cutover::ops::run_shell_timeout("sleep 30", std::time::Duration::from_secs(1)).unwrap_err();
+    assert!(err.contains("timed out"), "{err}");
+    assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(pulse_cutover::ops::run_shell_timeout("echo hi", std::time::Duration::from_secs(5)).unwrap(), "hi");
+}
+
+fn roster_config(dir: &std::path::Path) -> Config {
+    let base = std::fs::read_to_string({ coord_config(dir, 120, 0, 5); dir.join("ceremony-coord.toml") }).unwrap();
+    let text = base.replace("fleet_quorum = 0", "fleet_quorum = 2\nreport_max_age_secs = 60")
+        + "\n[[coordination.roster]]\nproducer = \"bp1\"\ninstance_id = \"aa\"\n\n[[coordination.roster]]\nproducer = \"bp2\"\n";
+    load_toml(dir, "roster.toml", &text).unwrap()
+}
+
+#[test]
+fn roster_fleet_gate_counts_only_fresh_roster_members() {
+    // The mock's snapshot is deterministic, so a probe run yields exactly the evidence the gated
+    // run will journal at VERIFIED (same sha256 + fingerprints digest).
+    let probe = tempfile::tempdir().unwrap();
+    let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
+    let ours = pulse_cutover::beacon::journal_summary(&probe.path().join("journal.jsonl"))["evidence"].clone();
+    assert!(!ours["snapshot_sha256"].is_null());
+    let rep = |id: &str| serde_json::json!({"instance_id": id, "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}});
+    let run = |good: bool| -> (State, String) {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = roster_config(d.path());
+        let ops = MockOps::new(d.path(), 110);
+        // Plenty of agreeing NON-members; roster members are only good when `good`.
+        *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
+            {"name": "outsider1", "beacons": [{"age_ms": 1000, "report": rep("x1")}]},
+            {"name": "outsider2", "beacons": [{"age_ms": 1000, "report": rep("x2")}]},
+            {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep(if good { "aa" } else { "zz" })}]},
+            {"name": "bp2", "beacons": [{"age_ms": if good { 1000 } else { 999_000 }, "report": rep("bb")}]},
+        ]}]}));
+        let st = run_machine(&cfg, &ops);
+        (st, std::fs::read_to_string(d.path().join("journal.jsonl")).unwrap())
+    };
+    let (st, text) = run(false);
+    assert_eq!(st, State::Aborted, "outsiders + a stale member + a wrong instance must not satisfy the roster");
+    assert!(text.contains("fleet did not reach verified agreement"));
+    let (st, text) = run(true);
+    assert_eq!(st, State::Live, "{text}");
 }
