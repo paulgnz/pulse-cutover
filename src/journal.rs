@@ -198,40 +198,68 @@ impl Journal {
     }
 
     /// A crash mid-write can leave a partial last line. Appending after it would glue the next
-    /// entry onto garbage and turn a harmless torn TAIL into a corrupt MIDDLE line. So: if the
-    /// last line does not parse, move it to `<journal>.torn-<ms>` (forensics) and truncate the
-    /// journal back to the last complete line. Returns whether a tail was set aside.
+    /// entry onto garbage and turn a harmless torn TAIL into a corrupt MIDDLE line.
+    ///
+    /// The physical boundary is the LAST LF. Everything before it is complete records (each was
+    /// finished by its writer); the bytes after it are the only candidate for a torn write:
+    /// - only whitespace/CR after the last LF: not a record, trimmed;
+    /// - a non-whitespace fragment after the last LF that parses: a complete entry missing its
+    ///   newline, which is added;
+    /// - a non-whitespace fragment that does not parse: torn, moved to `<journal>.torn-<ms>`
+    ///   (fsynced, including its directory, BEFORE the journal is truncated).
+    /// The last LF-terminated record must parse: a complete record that does not is corruption,
+    /// never silently dropped (that could roll recovery backward). Returns whether a torn tail
+    /// was set aside.
     fn repair_torn_tail(path: &Path) -> Result<bool, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("read journal {}: {e}", path.display()))?;
         if bytes.is_empty() {
             return Ok(false);
         }
-        // Start of the last non-empty line.
-        let trimmed_end = bytes.iter().rposition(|b| *b != b'\n' && *b != b'\r').map(|i| i + 1).unwrap_or(0);
-        if trimmed_end == 0 {
+        let last_lf = bytes.iter().rposition(|b| *b == b'\n');
+        let tail_start = last_lf.map(|i| i + 1).unwrap_or(0);
+        let tail = &bytes[tail_start..];
+        let is_ws = |b: &u8| b.is_ascii_whitespace();
+        // The last COMPLETE (LF-terminated) non-blank record must parse.
+        if let Some(lf) = last_lf {
+            let complete = &bytes[..lf];
+            let mut end = complete.len();
+            loop {
+                let start = complete[..end].iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+                let rec = &complete[start..end];
+                if rec.iter().all(is_ws) {
+                    if start == 0 {
+                        break;
+                    }
+                    end = start - 1;
+                    continue;
+                }
+                let rec = rec.strip_suffix(b"\r").unwrap_or(rec);
+                if serde_json::from_slice::<Entry>(rec).is_err() {
+                    return Err(format!(
+                        "journal {} has a corrupt last complete (LF-terminated) record: corruption, \
+                         not a torn write. Refusing to resume; inspect the journal by hand.",
+                        path.display()
+                    ));
+                }
+                break;
+            }
+        }
+        if tail.is_empty() {
             return Ok(false);
         }
-        let start = bytes[..trimmed_end].iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
-        let last = &bytes[start..trimmed_end];
-        let ends_with_newline = bytes.last() == Some(&b'\n');
-        let parses = serde_json::from_slice::<Entry>(last).is_ok();
-        if !parses && ends_with_newline {
-            // A complete (newline-terminated) line that does not parse is not a torn write: the
-            // writer finished it. That is corruption, and recovering past it could roll the
-            // ceremony backward (e.g. lose an authority-relevant last record). Refuse.
-            return Err(format!(
-                "journal {} ends with a complete but unparsable line: corruption, not a torn \
-                 write. Refusing to resume; inspect the journal by hand.",
-                path.display()
-            ));
+        if tail.iter().all(is_ws) {
+            // Stray CR/blank bytes after the last LF: not a record. Trim so appends start clean.
+            let f = OpenOptions::new().write(true).open(path).map_err(|e| e.to_string())?;
+            f.set_len(tail_start as u64).map_err(|e| format!("trim journal tail: {e}"))?;
+            f.sync_data().map_err(|e| e.to_string())?;
+            return Ok(false);
         }
-        if parses {
-            if !ends_with_newline {
-                // Complete entry but missing its newline: add it so the next append starts clean.
-                let mut f = OpenOptions::new().append(true).open(path).map_err(|e| e.to_string())?;
-                f.write_all(b"\n").map_err(|e| e.to_string())?;
-                f.sync_data().map_err(|e| e.to_string())?;
-            }
+        let frag = tail.strip_suffix(b"\r").unwrap_or(tail);
+        if serde_json::from_slice::<Entry>(frag).is_ok() {
+            // Complete entry, only its newline missing: add it so the next append starts clean.
+            let mut f = OpenOptions::new().append(true).open(path).map_err(|e| e.to_string())?;
+            f.write_all(b"\n").map_err(|e| e.to_string())?;
+            f.sync_data().map_err(|e| e.to_string())?;
             return Ok(false);
         }
         let aside = PathBuf::from(format!(
@@ -240,18 +268,17 @@ impl Journal {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
         ));
         {
-            // The forensic copy must be durable BEFORE the journal is truncated.
+            // The forensic copy (and its directory entry) must be durable BEFORE truncation.
             let mut f = File::create(&aside).map_err(|e| format!("save torn tail: {e}"))?;
-            f.write_all(last).map_err(|e| format!("save torn tail: {e}"))?;
+            f.write_all(tail).map_err(|e| format!("save torn tail: {e}"))?;
             f.sync_all().map_err(|e| format!("fsync torn tail copy: {e}"))?;
-            if let Some(dir) = aside.parent() {
-                if let Ok(d) = File::open(dir) {
-                    let _ = d.sync_all();
-                }
-            }
+            let dir = aside.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            File::open(dir)
+                .and_then(|d| d.sync_all())
+                .map_err(|e| format!("fsync directory of torn tail copy {}: {e}", dir.display()))?;
         }
         let f = OpenOptions::new().write(true).open(path).map_err(|e| e.to_string())?;
-        f.set_len(start as u64).map_err(|e| format!("truncate torn tail: {e}"))?;
+        f.set_len(tail_start as u64).map_err(|e| format!("truncate torn tail: {e}"))?;
         f.sync_data().map_err(|e| e.to_string())?;
         eprintln!(
             "journal: WARNING a partial last line (crash mid-write) was set aside to {} and \
@@ -271,15 +298,17 @@ impl Journal {
             .lines()
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
+        // Only the bytes after the LAST LF can be a torn write (see repair_torn_tail): with
+        // `lines()`, that fragment is the final element exactly when the file does not end in LF.
         let ends_with_newline = std::fs::read(path).map(|b| b.last() == Some(&b'\n')).unwrap_or(true);
-        let last_nonempty = lines.iter().rposition(|l| !l.trim().is_empty());
+        let tail_index = if ends_with_newline { None } else { lines.len().checked_sub(1) };
         for (i, line) in lines.iter().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: Entry = match serde_json::from_str(line) {
+            let entry: Entry = match serde_json::from_str(line.trim_end_matches('\r')) {
                 Ok(e) => e,
-                Err(e) if Some(i) == last_nonempty && !ends_with_newline => {
+                Err(e) if Some(i) == tail_index => {
                     eprintln!("journal: WARNING ignoring a partial last line (crash mid-write): {e}");
                     out.torn_tail = true;
                     continue;
@@ -305,6 +334,18 @@ impl Journal {
                 if entry.state == State::Frozen.as_str() {
                     out.frozen_ts_ms = Some(entry.ts_ms);
                 }
+            }
+            // A halt-intent record (rc.7: `halting: true`; rc.6 wrote an error whose detail was
+            // `sealed: true` BEFORE its HALTED transition) is HALTED even if the process died before
+            // anything else was written: the decision was made and must not be lost.
+            if entry.kind == "error"
+                && (entry.data.get("halting").and_then(|v| v.as_bool()) == Some(true)
+                    || entry.data.get("detail").and_then(|d| d.get("sealed")).and_then(|v| v.as_bool()) == Some(true))
+            {
+                out.halted_from = entry.state.parse().ok().filter(|s: &State| *s != State::Halted).or(out.halted_from);
+                out.state = Some(State::Halted);
+                out.reached_ignited = true;
+                out.unhalted = false;
             }
             if entry.data.get("snapshot_scheduled_at").and_then(|v| v.as_u64()).is_some() {
                 out.scheduled = true;

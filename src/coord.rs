@@ -25,6 +25,9 @@
 //!   release_sha256  the PulseVM plugin build; rejected if `target.plugin_path` hashes differently
 //!                   or is not set (an unverifiable plugin refuses the event)
 //!   snapshot_sha256 the expected cut snapshot hash, once known (becomes snapshot.expected_sha256)
+//! Arm binding: an arm must carry `event_hash` = sha256 of the accepted event's exact signed payload
+//! string (the relay enforces this too; the agent checks it itself in `check_arm`). An event is
+//! identified by id AND payload hash: a different body under the same id is validated from scratch.
 //! Still NOT done (next step): per-BP SIGNED acknowledgements. Today the fleet gate reads beacon
 //! reports through the relay; a roster bounds WHO counts and freshness bounds WHEN, but a
 //! compromised relay could still misreport them.
@@ -93,6 +96,27 @@ pub fn validate_event(ev: &Value, cfg: &Config, network: &str, head: Option<u64>
     Ok(h)
 }
 
+/// sha256 (hex) of a signed message's exact payload string: the relay's `event_hash`.
+pub fn payload_hash(msg: &Value) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    msg["payload"].as_str().map(|p| hex::encode(Sha256::digest(p.as_bytes())))
+}
+
+/// An (already signature-verified) arm payload applies to THIS accepted event.
+pub fn check_arm(arm: &Value, event_id: &str, network: &str, event_hash: &str) -> Result<(), String> {
+    if arm["type"] != "arm" { return Err("not an arm message".into()); }
+    if arm["event_id"].as_str() != Some(event_id) { return Err("arm is for another event".into()); }
+    if arm["network"].as_str() != Some(network) { return Err("arm is for another network".into()); }
+    // The arm must name the exact event payload it authorizes (sha256 of the signed payload
+    // string, as the relay computes it): an arm can never be replayed onto a different event body
+    // published under the same id.
+    match arm["event_hash"].as_str() {
+        Some(h) if h.eq_ignore_ascii_case(event_hash) => Ok(()),
+        Some(_) => Err("arm event_hash does not match the accepted event's payload".into()),
+        None => Err("arm carries no event_hash: it is not bound to an event payload".into()),
+    }
+}
+
 /// True when `doc` (GET /api/coord/<network>) carries a valid signed abort for `event_id`.
 pub fn aborted(doc: &Value, keys: &[String], network: &str, event_id: &str) -> bool {
     doc.get("abort").filter(|m| !m.is_null())
@@ -153,7 +177,9 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
     if co.coordinator_keys.is_empty() { return Err("[coordination] coordinator_keys is empty: refusing to trust anyone".into()); }
     let a = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
     let base = co.url.trim_end_matches('/');
-    let mut accepted: Option<(String, u64)> = None;
+    // (event_id, H, sha256 of the event's signed payload): an event is identified by BOTH id and
+    // body; a changed body under the same id is a different event and is validated again.
+    let mut accepted: Option<(String, u64, String)> = None;
     let mut accepted_ev: Value = Value::Null;
     let mut last_note = String::new();
     let note = |s: &str, last: &mut String| { if s != last { eprintln!("await: {s}"); *last = s.to_string(); } };
@@ -168,10 +194,12 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
         match doc.get("event").filter(|m| !m.is_null()).map(|m| verify(m, &co.coordinator_keys)) {
             Some(Ok(ev)) => {
                 let id = ev["event_id"].as_str().unwrap_or("").to_string();
-                if accepted.as_ref().map(|(x, _)| x != &id).unwrap_or(true) {
+                let hash = doc["event"].get("payload").and_then(|_| payload_hash(&doc["event"])).unwrap_or_default();
+                if accepted.as_ref().map(|(x, _, hx)| x != &id || hx != &hash).unwrap_or(true) {
+                    accepted = None;
                     match validate_event(&ev, cfg, &co.network, head, co.min_lead_blocks) {
                         Ok(h) => {
-                            accepted = Some((id.clone(), h));
+                            accepted = Some((id.clone(), h, hash.clone()));
                             accepted_ev = ev.clone();
                             write_state(cfg, &json!({"event_id": id, "h": h, "accepted": true, "armed": false, "at": chrono::Utc::now().to_rfc3339()}));
                             note(&format!("accepted event {id}: cut at H = {h}"), &mut last_note);
@@ -187,7 +215,7 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
             None => note("no event published; waiting", &mut last_note),
         }
         // 2. abort before arming
-        if let Some((id, _)) = &accepted {
+        if let Some((id, _, _)) = &accepted {
             if aborted(&doc, &co.coordinator_keys, &co.network, id) {
                 write_state(cfg, &json!({"event_id": id, "accepted": true, "armed": false, "aborted": true}));
                 note(&format!("event {id} aborted by the coordinator (signed) before arming"), &mut last_note);
@@ -195,8 +223,14 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
             }
         }
         // 3. arm
-        if let (Some((id, h)), Some(Ok(arm))) = (&accepted, doc.get("arm").filter(|m| !m.is_null()).map(|m| verify(m, &co.coordinator_keys))) {
-            if arm["type"] == "arm" && arm["event_id"].as_str() == Some(id.as_str()) && arm["network"].as_str() == Some(co.network.as_str()) {
+        if let (Some((id, h, ev_hash)), Some(Ok(arm))) = (&accepted, doc.get("arm").filter(|m| !m.is_null()).map(|m| verify(m, &co.coordinator_keys))) {
+            let bound = check_arm(&arm, id, &co.network, ev_hash);
+            if let Err(e) = &bound {
+                if arm["event_id"].as_str() == Some(id.as_str()) {
+                    note(&format!("ignoring arm for {id}: {e}"), &mut last_note);
+                }
+            }
+            if bound.is_ok() {
                 let fresh = arm["issued_at_ms"].as_u64().map(|t| (chrono::Utc::now().timestamp_millis() as u64).saturating_sub(t) < 15 * 60_000).unwrap_or(false);
                 let confirm = cfg.journal_path.parent().unwrap_or(Path::new(".")).join(format!("confirm-{id}"));
                 if !fresh {
@@ -262,6 +296,20 @@ mod tests {
         assert_eq!(d["coordination"]["fleet_quorum"].as_integer(), Some(2));
         assert_eq!(d["coordination"]["roster"].as_array().unwrap().len(), 2);
         assert_eq!(d["snapshot"]["expected_sha256"].as_str(), Some("ff00"));
+    }
+
+    #[test]
+    fn arm_must_bind_the_exact_event_payload() {
+        // Astra verify2 #4: a correctly signed arm carrying the WRONG event_hash started the ceremony.
+        let arm = |h: &str| json!({"type": "arm", "network": "testnet", "event_id": "e1", "event_hash": h});
+        assert!(check_arm(&arm("aa"), "e1", "testnet", "aa").is_ok());
+        assert!(check_arm(&arm("bb"), "e1", "testnet", "aa").unwrap_err().contains("event_hash"));
+        assert!(check_arm(&json!({"type": "arm", "network": "testnet", "event_id": "e1"}), "e1", "testnet", "aa").is_err(),
+            "an arm without event_hash is not bound to any payload");
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let ev = signed(&sk, &json!({"type": "event", "event_id": "e1"}));
+        use sha2::{Digest, Sha256};
+        assert_eq!(payload_hash(&ev).unwrap(), hex::encode(Sha256::digest(ev["payload"].as_str().unwrap().as_bytes())));
     }
 
     #[test]

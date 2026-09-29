@@ -689,6 +689,20 @@ impl Config {
         }
         if let Some(co) = &config.coordination {
             check_roster(&co.roster)?;
+            if !co.roster.is_empty() {
+                // A roster with quorum 0 used to skip the fleet gate entirely (no event id): an
+                // explicit quorum is required, and it must be reachable.
+                if co.fleet_quorum == 0 {
+                    return Err(format!(
+                        "[coordination] has a roster of {} but fleet_quorum = 0: set fleet_quorum explicitly \
+                         (1..={}); a roster without a quorum would skip the fleet gate",
+                        co.roster.len(), co.roster.len()));
+                }
+                if co.fleet_quorum > co.roster.len() {
+                    return Err(format!("[coordination] fleet_quorum {} exceeds the roster of {}: it can never be met",
+                        co.fleet_quorum, co.roster.len()));
+                }
+            }
         }
         if config.ceremony.profile == Profile::Readiness {
             // Beacon/doctor/status only: none of the ceremony requirements apply, and every

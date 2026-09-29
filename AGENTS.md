@@ -25,8 +25,9 @@ Human-oriented docs: **[docs/PROCESS.md](docs/PROCESS.md)** (the process, step b
    from v0.5.0-rc.5 they refuse it, but rc.4 and earlier did not.
 4. **Never change H or the target config yourself.** H, the target genesis, `import_cpu_scale` and pinned
    versions come from the coordinator and must be identical on every producer. A mismatch = stop and tell the human.
-5. **Never skip or reorder gates.** Never ignite before VERIFIED, never flip public traffic before LIVE, never
-   edit the journal, never delete a non-terminal journal. ABORTED is a safe, designed outcome: report it, do not "fix" it by retrying blindly.
+5. **Never skip or reorder gates.** Never ignite before VERIFIED, never flip public traffic outside the agent's
+   own flip step (producer mode: the `on_live` hook, which runs *before* LIVE is journaled; api mode: the
+   FLIPPED step), never edit the journal, never delete a non-terminal journal. ABORTED is a safe, designed outcome: report it, do not "fix" it by retrying blindly.
 6. **Never handle key material in the open.** Do not print, echo, log, commit or paste `PVT_…`, WIF keys,
    staker keys, signer keys, API tokens or wallet passwords. Share diagnostics only via `pulse-cutover report`
    (it redacts).
@@ -34,9 +35,12 @@ Human-oriented docs: **[docs/PROCESS.md](docs/PROCESS.md)** (the process, step b
    on the new chain. Apps and scripts must build a *fresh* transaction for every retry.
 8. **Rehearsals stay in the sandbox.** Test bots, oracle feeders and keepers must point only at the rehearsal
    endpoints. Many scripts default to real public endpoints; always pass them explicitly, and use test keys only.
-9. **Hooks must be executable, fast and idempotent.** A hook that is missing its execute bit or blocks for minutes
-   stalls the ceremony (a real rehearsal failure; see [hooks](#hook-contract)). The agent does not yet stop on a
-   failing required hook and hooks have no deadline, so check them yourself (`test -x`, a dry run) before arming.
+9. **Hooks must be executable, fast and idempotent.** Every hook runs in its own process group and is killed at
+   `hooks.timeout_secs` (default 300); a killed or failing required hook stops the ceremony: `on_freeze` (api
+   mode) and `post_ignite` abort before ignition / halt after it, and a failing `on_live` HALTS (LIVE is never
+   journaled). A hook that leaves a background child attached to its stdout/stderr has that child killed ~5 s
+   after the hook exits: detach long work with `setsid cmd >log 2>&1 &`. Check hooks before arming (`test -x`,
+   a dry run): a missing execute bit was a real rehearsal failure (see [hooks](#hook-contract)).
 10. **Evidence or it didn't happen.** Every run ends with the evidence bundle in [§ Evidence to hand back](#evidence-to-hand-back),
     whether it went LIVE or ABORTED.
 
@@ -88,12 +92,15 @@ snapshot, edit `ceremony.toml`, change the edge config, or send transactions of 
 | Hook | Fires | Must do | Rehearsal reference |
 |---|---|---|---|
 | `on_freeze` | head ≥ H − `freeze_lead_blocks` | close writes at the public edge (reads stay open), return in < 5 s | nginx flag file → 503; HAProxy `add map … frozen 1` |
-| `post_ignite` | after IGNITED | give the new chain its first transactions (it builds blocks on demand); optionally run `state-diff` first (it only shows this box's view; it cannot stop peers that have already started producing) | background a few local transfers, return immediately |
-| `on_live` | after LIVE | flip the edge backend to PulseVM and reopen writes | nginx upstream swap + reload; HAProxy `enable/disable server` (0 reloads) |
-| `on_abort` | on ABORTED | undo `on_freeze`/flip; the agent resumes the producer itself | restore backend, reopen writes |
+| `post_ignite` | after IGNITED | give the new chain its first transactions (it builds blocks on demand); optionally run `state-diff` first (it only shows this box's view; it cannot stop peers that have already started producing). **Required: a failure halts.** | `setsid` a few local transfers with output to a log, return immediately |
+| `on_live` | producer mode: after the sustained-progress window, **before** LIVE is journaled | flip the edge backend to PulseVM and reopen writes. **Must succeed:** a failure HALTS and LIVE is never journaled | nginx upstream swap + reload; HAProxy `enable/disable server` (0 reloads) |
+| `on_abort` | on ABORTED (only possible before ignition starts) | undo `on_freeze`/flip; the agent resumes the producer itself | restore backend, reopen writes |
+| `on_halt` | on HALTED (after ignition started) | page a human; change nothing | send an alert |
 
 Every hook: executable (`chmod +x`), idempotent (safe to run twice), exits 0 on success, prints one line
-(it is journaled), and never blocks the ceremony for long work (background it).
+(it is journaled), finishes well within `hooks.timeout_secs` (default 300 s; the whole process group is killed at
+the deadline), and never blocks the ceremony for long work. Detach long work so it does not hold the hook's
+output: `setsid cmd >/var/log/x.log 2>&1 &` (a child left attached is killed ~5 s after the hook exits).
 
 ### Proving atomicity (A1–A5)
 
@@ -181,9 +188,12 @@ Mutating (see SAFETY RAILS before running):
   target chain, FLIP public traffic (api modes) and run the manifest's
   source stop command. Exit 0 = LIVE; non-zero = did not reach LIVE
   (journal has the evidence).
-- `./cutover.sh abort` — stops a running agent and, only when `status` proves ignition has NOT
-  started, reverts any staged flip / resumes the source producer. If ignition started, the state is
-  unknown or the journal is corrupt, it refuses (exit 3): read the journal and escalate; do not force.
+- `./cutover.sh abort` — stops a running agent, then runs `pulse-cutover rollback`: it takes the
+  journal's exclusive lock (waits for the stopping agent; never decides while another process holds the
+  journal) and rolls back (reverts flips / resumes the source producer) ONLY when the journal proves
+  ignition has NOT started. A missing, corrupt or unreadable journal, or ignition started, is refused
+  (exit 3, nothing changed): read the journal and escalate; do not force. `--no-journal-i-know` is only
+  for a box that never ran a ceremony; `--force-after-ignite` only on the coordinator's fleet-wide order.
 - `pulse-cutover unhalt --config c.toml --i-understand` — clears a durable HALTED (journaled with
   who ran it). Only after a human has decided; never as a retry.
 - `pulse-cutover loop --config c.toml --runs N` — repeated ceremonies with a

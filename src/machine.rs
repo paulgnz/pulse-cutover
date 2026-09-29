@@ -430,7 +430,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// Returns Ok(false) after aborting (signed abort or timeout).
     fn fleet_gate(&mut self) -> Result<bool, String> {
         let Some(co) = self.cfg.coordination.clone() else { return Ok(true) };
-        if co.fleet_quorum == 0 && co.event_id.is_none() {
+        if co.fleet_quorum == 0 && co.event_id.is_none() && co.roster.is_empty() {
             return Ok(true);
         }
         let ours = crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"].clone();
@@ -467,24 +467,33 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     .unwrap_or_default(),
                 _ => vec![],
             };
+            // Every report the gate may count: per-server beacons (with the relay's identity-conflict
+            // flag and age), or the producer-level report of an older relay. A conflicted report (one
+            // token reporting from two machines) or a stale one never counts.
+            let max_age_ms = co.report_max_age_secs * 1000;
+            let reports_of = |p: &serde_json::Value| -> Vec<serde_json::Value> {
+                let mut v: Vec<(serde_json::Value, Option<u64>, bool)> = p["beacons"].as_array().map(|bs| bs.iter()
+                    .map(|b| (b["report"].clone(), b["age_ms"].as_u64(), b["conflict"].as_bool().unwrap_or(false)))
+                    .collect()).unwrap_or_default();
+                if v.is_empty() && !p["report"].is_null() {
+                    v.push((p["report"].clone(), p["age_ms"].as_u64(), p["conflict"].as_bool().unwrap_or(false)));
+                }
+                v.into_iter()
+                    .filter(|(_, age, conflict)| !conflict && age.map(|a| a <= max_age_ms).unwrap_or(false))
+                    .map(|(r, _, _)| r)
+                    .collect()
+            };
             let agreeing = if co.roster.is_empty() {
-                // Legacy gate: any producers the relay lists (unbound roster — see coord.rs).
-                producers.iter().filter(|p| agrees(&p["report"])).count()
+                // Legacy gate: any producer the relay lists (unbound roster — see coord.rs), one count
+                // per producer, only with a fresh, non-conflicted agreeing report.
+                producers.iter().filter(|p| reports_of(p).iter().any(|r| agrees(r))).count()
             } else {
-                // Roster gate: only the event's required members, only FRESH per-server reports
-                // (a stale report cannot vouch for a cut it never saw).
-                let max_age_ms = co.report_max_age_secs * 1000;
+                // Roster gate: only the event's required members.
                 co.roster.iter().filter(|m| {
                     let Some(p) = producers.iter().find(|p| p["name"].as_str() == Some(m.producer.as_str())) else { return false };
-                    let mut reports: Vec<(serde_json::Value, Option<u64>)> = p["beacons"].as_array().map(|bs| bs.iter()
-                        .map(|b| (b["report"].clone(), b["age_ms"].as_u64())).collect()).unwrap_or_default();
-                    if reports.is_empty() && !p["report"].is_null() {
-                        reports.push((p["report"].clone(), p["age_ms"].as_u64()));
-                    }
-                    reports.iter().any(|(r, age)| {
+                    reports_of(p).iter().any(|r| {
                         let id_ok = m.instance_id.as_deref().map(|id| r["instance_id"].as_str() == Some(id)).unwrap_or(true);
-                        let fresh = age.map(|a| a <= max_age_ms).unwrap_or(false);
-                        id_ok && fresh && agrees(r)
+                        id_ok && agrees(r)
                     })
                 }).count()
             };
@@ -512,17 +521,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// starting with "HALTED" (the run ends; a human decides).
     fn halt(&mut self, reason: &str, detail: serde_json::Value) -> Result<(), String> {
         let from = self.state;
-        self.journal.error(
-            from,
-            &format!("HALTED: {reason}"),
-            json!({"detail": detail, "sealed": true, "source_resumed": false,
-                   "public_routing_reverted": false, "writes_reopened": false,
-                   "why": "ignition may have started; a local failure must not resume the source"}),
-        )?;
-        // Durable: a restarted run sees HALTED and refuses to continue or roll back.
+        // ONE durable record: the HALTED transition carries the decision and its reason. (rc.6 wrote
+        // an error and then the transition; a crash between the two left a journal that replayed as
+        // still-IGNITED and a restart ran on. Replay also still honours that older shape.)
         self.state = State::Halted;
-        self.journal.transition(State::Halted, json!({"halted_from": from.as_str(), "reason": reason,
+        self.journal.transition(State::Halted, json!({
+            "halted_from": from.as_str(), "reason": reason, "message": format!("HALTED: {reason}"),
+            "detail": detail, "sealed": true, "source_resumed": false,
+            "public_routing_reverted": false, "writes_reopened": false,
+            "why": "ignition may have started; a local failure must not resume the source",
             "clear_with": "pulse-cutover unhalt --config <file> --i-understand"}))?;
+        eprintln!("HALTED at {from}: {reason}");
         if let Some(hook) = &self.cfg.hooks.on_halt {
             let result = self.ops.run_hook(hook);
             self.journal.evidence(State::Halted, json!({"on_halt_hook": format!("{result:?}")}))?;
@@ -530,13 +539,48 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Err(format!("HALTED at {from}: {reason}"))
     }
 
+    /// True once this node's target may be running: IGNITED or later, or `ignite_started` journaled.
+    fn past_point_of_no_return(&self) -> bool {
+        self.reached_ignited || matches!(self.state, State::Ignited | State::Flipped | State::Live | State::Halted)
+    }
+
+    /// `pulse-cutover rollback` (what `cutover.sh abort` runs), holding the journal lock: undo
+    /// this node's changes and resume the source, but ONLY while ignition has provably not started.
+    /// After that point it refuses unless `force` (a coordinator-confirmed, fleet-wide rollback),
+    /// which is journaled as such. Always performs the rollback actions (not gated on
+    /// `target.auto_rollback`: the operator asked for them).
+    pub fn operator_rollback(&mut self, force: bool) -> Result<State, String> {
+        if self.past_point_of_no_return() && !force {
+            return Err(format!(
+                "refusing to roll back: journal state {} and ignition may have started (the target may \
+                 be running). Nothing was changed. A fleet-wide rollback confirmed by the coordinator \
+                 uses --force-after-ignite.",
+                self.state
+            ));
+        }
+        if force && self.past_point_of_no_return() {
+            // Operator decision: every configured flip revert runs (a flip may have half-applied).
+            self.flip_ran = self.flip_ran || self.cfg.flip.is_some();
+            self.hyperion_flip_ran = self.hyperion_flip_ran || self.cfg.hyperion.is_some();
+        }
+        let detail = json!({"by": "operator_rollback", "force_after_ignite": force && self.past_point_of_no_return(),
+                            "state_before": self.state.as_str()});
+        self.rollback("operator rollback (pulse-cutover rollback)", detail, true)?;
+        Ok(self.state)
+    }
+
     fn abort(&mut self, reason: &str, detail: serde_json::Value) -> Result<(), String> {
-        if self.reached_ignited || matches!(self.state, State::Ignited | State::Flipped | State::Live | State::Halted) {
+        if self.past_point_of_no_return() {
             return self.halt(reason, detail);
         }
+        let perform = self.cfg.target.auto_rollback;
+        self.rollback(reason, detail, perform)
+    }
+
+    fn rollback(&mut self, reason: &str, detail: serde_json::Value, perform: bool) -> Result<(), String> {
         self.journal.error(self.state, reason, detail)?;
-        let mut rollback = json!({"reason": reason, "auto_rollback": self.cfg.target.auto_rollback});
-        if self.cfg.target.auto_rollback {
+        let mut rollback = json!({"reason": reason, "auto_rollback": self.cfg.target.auto_rollback, "rollback_performed": perform});
+        if perform {
             match self.cfg.ceremony.mode {
                 // Producer mode: un-pausing nodeos IS the entire rollback.
                 Mode::Producer => match self.ops.resume() {

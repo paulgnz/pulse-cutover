@@ -3,14 +3,16 @@
 #
 #   ./cutover.sh --manifest ceremony.json    # validate + run to LIVE (exit 0) or ABORT (exit 1)
 #   ./cutover.sh status                      # current journaled state
-#   ./cutover.sh abort                       # stop the agent + roll back (refused once ignition may have started)
+#   ./cutover.sh abort                       # stop the agent + roll back (refused unless the journal proves
+#                                            #   ignition has not started; see `pulse-cutover help rollback`)
 #   ./cutover.sh abort --force-after-ignite  # roll back after IGNITED (coordinator-confirmed only)
+#   ./cutover.sh abort --no-journal-i-know   # roll back a box that never ran a ceremony (no journal)
 #
 # Plain-language streaming: every state transition the agent journals is echoed
 # as one operator-readable line. The full evidence is always in the JSONL journal.
 set -euo pipefail
 
-CONFIG=/etc/pulse-cutover/ceremony.toml
+CONFIG=${PULSE_CUTOVER_CONFIG:-/etc/pulse-cutover/ceremony.toml}
 CMD="${1:-}"
 
 # Read a key from the staged toml; empty (not a failure) when absent — this
@@ -24,50 +26,26 @@ case "$CMD" in
   abort)
     echo "aborting: stopping the agent (the ratchet means nothing user-visible ran unless FLIPPED/LIVE printed)"
     pkill -f 'pulse-cutover run' || echo "  (no running agent)"
-    # After IGNITED this node's target is running (and other producers' may be producing):
-    # resuming the source or reverting public routing could create a second writable history.
-    # That is a human, fleet-wide decision — never the default of a local abort.
-    # Fail CLOSED: roll back only when the journal positively says ignition has NOT started.
-    # A missing, unreadable or unfamiliar status (corrupt journal, old binary, unknown state)
-    # is treated like "the target may be running".
-    STATUS=$(pulse-cutover status --config "$CONFIG" 2>&1) && STATUS_OK=1 || STATUS_OK=0
-    STATE=$(printf '%s\n' "$STATUS" | sed -n 's/^state: //p')
-    IGN=$(printf '%s\n' "$STATUS" | sed -n 's/^ignition_started: //p')
-    SAFE=0
-    if [ "$STATUS_OK" = 1 ] && [ "$IGN" = "no" ]; then
-      case "$STATE" in
-        ARMED|FROZEN|SNAPSHOTTED|VERIFIED|ABORTED|"(no transitions)") SAFE=1 ;;
-      esac
-    fi
-    if printf '%s\n' "$STATUS" | grep -q '^no journal at'; then SAFE=1; STATE="(not started)"; fi
-    if [ "$SAFE" != 1 ]; then
-      if [ "${2:-}" != "--force-after-ignite" ]; then
-        echo "  NOT rolling back: journal state '${STATE:-unknown}', ignition_started '${IGN:-unknown}'."
-        [ "$STATUS_OK" = 1 ] || echo "  (could not read the journal status: treating it as 'the target may be running')"
-        echo "  The agent is stopped; the source was NOT resumed and public routing was NOT reverted."
-        echo "  Only if the coordinator has confirmed a fleet-wide rollback, run:"
-        echo "    ./cutover.sh abort --force-after-ignite"
-        echo "journal: $(tomlget journal_path)"
-        exit 3
-      fi
-      echo "  --force-after-ignite: rolling back with journal state '${STATE:-unknown}' on operator instruction"
-    fi
-    MODE=$(tomlget mode); MODE=${MODE:-producer}
-    if [ "$MODE" = "api" ]; then
-      # Revert EVERY staged flip ([flip].revert_cmd and, in hyperion mode,
-      # [hyperion].revert_cmd — the /v2 swap back to the pre-cut upstream).
-      { grep -E '^revert_cmd *= *' "$CONFIG" || true; } | sed -E 's/^[^=]+= *"?([^"]*)"?.*/\1/' | while IFS= read -r REVERT; do
-        [ -n "$REVERT" ] && { echo "  reverting: $REVERT"; sh -c "$REVERT" || true; }
-      done
-      echo "  source nodeos was never paused by the agent; if your stop command already ran, restart it:"
-      echo "    $(tomlget start_cmd)"
-    else
-      PROD=$(tomlget producer_api_url)
-      echo "  resuming source producer at $PROD"
-      curl -s -X POST "$PROD/v1/producer/resume" >/dev/null || true
+    # The decision is made by `pulse-cutover rollback`, which takes the journal's exclusive lock
+    # (so it cannot race an agent that is still shutting down), replays it, and rolls back ONLY when
+    # the journal positively shows ignition has not started. It refuses (exit 3) on a missing,
+    # corrupt or unreadable journal, and once ignition may have started: after that point resuming
+    # the source or reverting routing could create a second writable history, which is a human,
+    # fleet-wide decision (--force-after-ignite).
+    shift
+    set +e
+    pulse-cutover rollback --config "$CONFIG" --wait "${PULSE_CUTOVER_ABORT_WAIT:-30}" "$@"
+    RC=$?
+    set -e
+    if [ "$RC" = 3 ]; then
+      echo "  NOT rolled back. The agent is stopped; the source was NOT resumed and public routing was NOT reverted."
+      echo "  Only if the coordinator has confirmed a fleet-wide rollback, run:"
+      echo "    ./cutover.sh abort --force-after-ignite"
+    elif [ "$RC" = 0 ] && [ "$(tomlget mode)" = "api" ]; then
+      echo "  api mode: if you stopped the source yourself, restart it: $(tomlget start_cmd)"
     fi
     echo "journal: $(tomlget journal_path)"
-    exit 0
+    exit "$RC"
     ;;
   ""|--manifest)
     ;;
