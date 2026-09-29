@@ -119,6 +119,8 @@ struct MockOps {
     events: RefCell<Vec<String>>,
     /// kill_orphan_hooks answer (None = default Ok(None)).
     orphan: RefCell<Option<Result<Option<String>, String>>>,
+    /// A hook command that makes the mock panic (simulates the agent dying mid-hook).
+    panic_on_hook: RefCell<Option<String>>,
 }
 
 impl MockOps {
@@ -161,6 +163,7 @@ impl MockOps {
             resume_fails: Cell::new(false),
             events: RefCell::new(Vec::new()),
             orphan: RefCell::new(None),
+            panic_on_hook: RefCell::new(None),
         }
     }
 
@@ -329,6 +332,9 @@ impl ChainOps for MockOps {
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
         self.hooks.borrow_mut().push(cmd.to_string());
         self.events.borrow_mut().push(format!("hook:{cmd}"));
+        if self.panic_on_hook.borrow().as_deref() == Some(cmd) {
+            panic!("simulated crash inside hook `{cmd}`");
+        }
         if cmd.starts_with("fail-") {
             return Err(format!("`{cmd}` exited 1"));
         }
@@ -2626,8 +2632,9 @@ fn r4_rollback_stops_an_orphaned_hook_before_anything_else() {
     let ops2 = MockOps::new(dir2.path(), 200);
     *ops2.orphan.borrow_mut() = Some(Err("survived SIGKILL".into()));
     let (j, rec) = Journal::open(&cfg2.journal_path).unwrap();
-    let out = Machine::new(&cfg2, &ops2, j, rec).operator_rollback(false).unwrap();
-    assert!(!out.failed.is_empty());
+    // Round 5 (Fable N5): nothing changed, so this is a refusal (exit 3), not an incomplete rollback.
+    let err = Machine::new(&cfg2, &ops2, j, rec).operator_rollback(false).expect_err("refused");
+    assert!(err.starts_with("refusing"), "{err}");
     assert_eq!(ops2.resumes.get(), 0, "nothing rolled back while an orphaned hook still runs");
 }
 
@@ -2732,4 +2739,239 @@ fn r4_beacon_summary_marks_a_forced_rollback_after_ignition() {
     assert_eq!(s["state"], "ABORTED");
     assert_eq!(s["ignition_started"], true);
     assert_eq!(s["forced_rollback"], true);
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Round 5 (Fable re-check of rc.7, N1–N10): rollback completion, orphans on every path.
+// ---------------------------------------------------------------------------------------------
+
+/// pre_ignite_journal + an on_abort hook.
+fn pre_ignite_with_on_abort(dir: &std::path::Path) -> Config {
+    let _ = pre_ignite_journal(dir);
+    let t = std::fs::read_to_string(dir.join("ceremony.toml")).unwrap()
+        .replace("on_live = \"flip-gateway\"", "on_live = \"flip-gateway\"\non_abort = \"reopen-writes\"");
+    std::fs::write(dir.join("ceremony.toml"), t).unwrap();
+    Config::load(&dir.join("ceremony.toml")).unwrap()
+}
+
+fn rollback_with(cfg: &Config, ops: &MockOps, force: bool) -> Result<pulse_cutover::machine::RollbackOutcome, String> {
+    let (j, rec) = Journal::open(&cfg.journal_path).unwrap();
+    Machine::new(cfg, ops, j, rec).operator_rollback(force)
+}
+
+#[test]
+fn r5_rollback_killed_inside_on_abort_reruns_only_the_missing_steps() {
+    // Fable N1 (P9): rollback_complete was journaled BEFORE on_abort; a rollback killed inside
+    // on_abort replayed as complete and every later rollback was a no-op with writes still closed.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_with_on_abort(dir.path());
+    let ops = MockOps::new(dir.path(), 200);
+    *ops.panic_on_hook.borrow_mut() = Some("reopen-writes".into());
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rollback_with(&cfg, &ops, false)));
+    assert!(crashed.is_err(), "fixture: the rollback died inside on_abort");
+    assert_eq!(ops.resumes.get(), 1, "the resume step completed before the crash");
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["rollback_complete"], serde_json::json!(false),
+        "mission control is told the rollback is unfinished");
+    // Second rollback: not "already rolled back"; it re-runs on_abort and does NOT resume again.
+    let ops2 = MockOps::new(dir.path(), 200);
+    let out = rollback_with(&cfg, &ops2, false).unwrap();
+    assert!(!out.already, "a rollback that died inside on_abort is not complete: {out:?}");
+    assert!(out.failed.is_empty(), "{out:?}");
+    assert!(ops2.events.borrow().iter().any(|e| e == "hook:reopen-writes"), "on_abort re-run: {:?}", ops2.events.borrow());
+    assert_eq!(ops2.resumes.get(), 0, "the resume step already succeeded: not repeated");
+    // Now the journal proves every step: a third rollback is a no-op.
+    let ops3 = MockOps::new(dir.path(), 200);
+    let out = rollback_with(&cfg, &ops3, false).unwrap();
+    assert!(out.already, "{out:?}");
+    assert!(!ops3.events.borrow().iter().any(|e| e.starts_with("hook:") || e == "resume"), "{:?}", ops3.events.borrow());
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["rollback_complete"], serde_json::json!(true));
+}
+
+#[test]
+fn r5_already_rolled_back_still_unstages_and_kills_orphans() {
+    // Fable N2 (P4, P8d): the "already rolled back" no-op returned before the orphan kill and the
+    // unstage, so a late staged file and an orphaned hook both survived.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_journal(dir.path());
+    assert!(rollback_with(&cfg, &MockOps::new(dir.path(), 200), false).unwrap().failed.is_empty());
+    std::fs::write(&cfg.snapshot.staged_path, b"late artifact").unwrap(); // e.g. a late import write
+    let ops = MockOps::new(dir.path(), 200);
+    *ops.orphan.borrow_mut() = Some(Ok(Some("killed orphaned hook process group 4242 (SIGTERM): `freeze-writes`".into())));
+    let out = rollback_with(&cfg, &ops, false).unwrap();
+    assert!(out.already, "{out:?}");
+    assert_eq!(ops.events.borrow().first().map(String::as_str), Some("kill-orphans"), "{:?}", ops.events.borrow());
+    assert!(!cfg.snapshot.staged_path.exists(), "the late staged file is moved aside even on the no-op path");
+    assert_eq!(ops.resumes.get(), 0, "no second resume");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("orphan_hook_killed"), "{text}");
+}
+
+#[test]
+fn r5_automatic_abort_after_staging_moves_its_own_snapshot_aside() {
+    // Fable N2 (P4): the agent's own abort (here: fleet gate short of quorum, after staging)
+    // left staged.bin; the next preflight refused and a metalgo restart would import it.
+    let probe = tempfile::tempdir().unwrap();
+    let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
+    let ours = pulse_cutover::beacon::journal_summary(&probe.path().join("journal.jsonl"))["evidence"].clone();
+    let d = tempfile::tempdir().unwrap();
+    let cfg = roster_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    let rep = serde_json::json!({"instance_id": "aa", "checks": [], "coord": {"event_id": "e1"},
+        "ceremony": {"state": "VERIFIED", "evidence": ours}});
+    *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep}]}]}]}));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    assert!(!cfg.snapshot.staged_path.exists(), "the agent's own abort unstages the snapshot it staged");
+    let aside = std::fs::read_dir(d.path()).unwrap().filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().starts_with("staged.bin.rolled-back-"));
+    assert!(aside, "moved aside, not deleted");
+}
+
+#[test]
+fn r5_orphan_that_cannot_be_stopped_is_a_refusal() {
+    // Fable N5: an orphan that could not be killed exited 4 ("incomplete") although nothing changed.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_journal(dir.path());
+    let ops = MockOps::new(dir.path(), 200);
+    *ops.orphan.borrow_mut() = Some(Err("survived SIGKILL".into()));
+    let err = rollback_with(&cfg, &ops, false).expect_err("a refusal, not an incomplete rollback");
+    assert!(err.starts_with("refusing"), "{err}");
+    assert_eq!(ops.resumes.get(), 0);
+}
+
+/// Spawn a real long-running command in its own process group (like a hook a dead agent left).
+/// A background thread reaps it, as init reaps a dead agent's orphans (an unreaped zombie would
+/// still show in its process group). Returns (pid, exited flag).
+#[cfg(unix)]
+fn spawn_group(cmd: &str) -> (u32, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new("sh").arg("-c").arg(cmd).process_group(0)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let pid = child.id();
+    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let e2 = exited.clone();
+    std::thread::spawn(move || { let _ = child.wait(); e2.store(true, std::sync::atomic::Ordering::SeqCst); });
+    (pid, exited)
+}
+
+#[cfg(unix)]
+fn wait_exited(exited: &std::sync::atomic::AtomicBool, pid: u32) -> bool {
+    let dead = (0..60).any(|_| { std::thread::sleep(std::time::Duration::from_millis(100)); exited.load(std::sync::atomic::Ordering::SeqCst) });
+    if !dead {
+        let _ = std::process::Command::new("kill").arg("-KILL").arg(format!("-{pid}")).status();
+    }
+    dead
+}
+
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    std::process::Command::new("kill").arg("-0").arg(pid.to_string()).status().map(|s| s.success()).unwrap_or(false)
+}
+
+#[test]
+#[cfg(unix)]
+fn r5_run_resume_kills_a_recorded_orphan_before_anything_else() {
+    // Fable N3 (P10): a resumed `run` neither killed the orphan left by a crashed agent nor kept
+    // its record (the next hook overwrote it and deleted it on completion).
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_journal(dir.path());
+    let (pid, exited) = spawn_group("sleep 300");
+    let pg = pulse_cutover::ops::hook_pgid_path(&cfg.journal_path);
+    std::fs::write(&pg, format!("{pid}\nsleep 300\n")).unwrap();
+    let out = run_bin(&["run"], &dir.path().join("ceremony.toml")); // source is unreachable: it aborts
+    let dead = wait_exited(&exited, pid);
+    assert!(dead, "the resumed run killed the orphaned hook group {pid}: {}", String::from_utf8_lossy(&out.stderr));
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("orphan_hook_killed"), "journaled: {text}");
+}
+
+#[test]
+#[cfg(unix)]
+fn r5_run_long_pipeline_steps_are_tracked_and_killable() {
+    // Fable N4: run_long (upstream export/import) ran untracked, outside its own process group:
+    // it survived `pkill` and could re-create the staged artifact after "rolled back".
+    use pulse_cutover::ops::ChainOps;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.jsonl");
+    let pg = pulse_cutover::ops::hook_pgid_path(&journal);
+    let j2 = journal.clone();
+    let started = std::time::Instant::now();
+    let t = std::thread::spawn(move || {
+        let ops = pulse_cutover::ops::HttpOps::new("http://127.0.0.1:1", "http://127.0.0.1:1", "http://127.0.0.1:1", "true", 5)
+            .with_pgid_file_for(&j2);
+        ops.run_long("sleep 30")
+    });
+    while !pg.exists() && started.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(pg.exists(), "a running pipeline step records its process group");
+    let killed = pulse_cutover::ops::kill_recorded_hook_group(&pg, std::time::Duration::from_secs(2)).unwrap();
+    assert!(killed.unwrap_or_default().contains("killed"), "killable by rollback/resume");
+    assert!(t.join().unwrap().is_err());
+    assert!(started.elapsed().as_secs() < 15);
+}
+
+#[test]
+#[cfg(unix)]
+fn r5_recycled_pid_guard_compares_the_process_start_time() {
+    // Fable N10: the guard accepted any `sh -c …` leader, so a compound hook's record could kill an
+    // unrelated `sh -c` group that inherited the pid. The record now carries the start time.
+    let dir = tempfile::tempdir().unwrap();
+    let pg = dir.path().join("journal.jsonl.hook.pgid");
+    let (pid, exited) = spawn_group("sleep 30; true"); // compound: sh stays the group leader
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::fs::write(&pg, format!("{pid}\nstart=Mon Jan  1 00:00:00 2001\nsleep 30; true\n")).unwrap();
+    let res = pulse_cutover::ops::kill_recorded_hook_group(&pg, std::time::Duration::from_secs(1));
+    assert!(res.is_err(), "a start-time mismatch means a different process: {res:?}");
+    assert!(alive(pid), "the unrelated group was not touched");
+    let start = pulse_cutover::ops::process_start(pid).expect("start time of a live pid");
+    std::fs::write(&pg, format!("{pid}\nstart={start}\nsleep 30; true\n")).unwrap();
+    let res = pulse_cutover::ops::kill_recorded_hook_group(&pg, std::time::Duration::from_secs(2)).unwrap();
+    assert!(res.unwrap_or_default().contains("killed"));
+    assert!(wait_exited(&exited, pid));
+}
+
+#[test]
+fn r5_no_journal_rollback_leaves_no_lock_file_litter() {
+    // Fable N7: --no-journal-i-know left <journal>.rollback-<ms>.jsonl.lock behind.
+    let dir = tempfile::tempdir().unwrap();
+    let _ = test_config(dir.path(), 120);
+    let (url, _hits) = stub_http(|_m, _p| (200, "{}".into()));
+    point_producer_at(dir.path(), &url);
+    let out = run_bin(&["rollback", "--wait", "1", "--no-journal-i-know"], &dir.path().join("ceremony.toml"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let litter: Vec<String> = std::fs::read_dir(dir.path()).unwrap().filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.ends_with(".lock")).collect();
+    assert!(litter.is_empty(), "no lock files left: {litter:?}");
+}
+
+#[test]
+fn r5_fleet_gate_journals_why_each_report_was_excluded() {
+    // Fable N9: excluded reports left no per-producer reason in the journal.
+    let probe = tempfile::tempdir().unwrap();
+    let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
+    let ours = pulse_cutover::beacon::journal_summary(&probe.path().join("journal.jsonl"))["evidence"].clone();
+    let d = tempfile::tempdir().unwrap();
+    let cfg = roster_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    let rep = |id: &str, checks: serde_json::Value| serde_json::json!({"instance_id": id, "checks": checks,
+        "coord": {"event_id": "e1"}, "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}});
+    *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aa", serde_json::json!([{"name": "disk_free", "ok": false, "detail": "2 GB free"}]))}]},
+        {"name": "bp2", "beacons": [{"age_ms": 1000, "report": rep("bb", serde_json::json!([]))}]}]}]}));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("fleet_gate_excluded") && text.contains("disk_free"), "per-report reason journaled: {text}");
+}
+
+#[test]
+fn r5_setup_check_names_are_shared_with_mission_control() {
+    // Fable N9: the agent's health/setup split must be the dashboard's, from one shared list.
+    let v: serde_json::Value = serde_json::from_str(include_str!("../control/check-kinds.json")).unwrap();
+    let mut shared: Vec<String> = v["setup"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    let mut ours: Vec<String> = pulse_cutover::beacon::SETUP_CHECKS.iter().map(|s| s.to_string()).collect();
+    shared.sort();
+    ours.sort();
+    assert_eq!(ours, shared);
 }

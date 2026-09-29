@@ -1,0 +1,4 @@
+{
+  "description": "Beacon check names that are PREPARATION ('setup') checks. Every other check name is a HEALTH check. Shared by the Rust fleet gate (src/beacon.rs SETUP_CHECKS), mission control (control/lib.mjs) and the dashboard (control/public/index.html CHECKS map); tests on both sides assert they match this file.",
+  "setup": ["hook_on_freeze", "hook_post_ignite", "hook_on_live", "hook_on_abort", "validator_running", "metal_synced", "metal_reachable"]
+}
