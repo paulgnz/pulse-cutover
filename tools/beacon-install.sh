@@ -35,6 +35,14 @@ if [ "$UNINSTALL" = 1 ]; then
   systemctl daemon-reload; say "beacon removed (kept /etc/pulse-cutover for your records)"; exit 0
 fi
 
+# Re-run = upgrade: keep what the existing config already says (flags still win).
+OLD=/etc/pulse-cutover/beacon.toml
+if [ -f "$OLD" ]; then
+  oldv() { sed -n "/^\[beacon\]/,/^\[/s/^$1 *= *\"\([^\"]*\)\".*/\1/p" "$OLD" | head -1 || true; }
+  [ -n "$PRODUCER" ] || PRODUCER=$(oldv producer); [ -n "$NETWORK" ] || NETWORK=$(oldv network)
+  [ -n "$NODE" ] || NODE=$(oldv node); [ -n "$ROLE" ] || ROLE=$(oldv role)
+  [ -n "$PRODUCER" ] && say "existing beacon found: upgrading in place (producer $PRODUCER, node ${NODE:-?}, same token)"
+fi
 ARCH=$(uname -m); case "$ARCH" in x86_64) T=x86_64-unknown-linux-musl;; aarch64|arm64) T=aarch64-unknown-linux-musl;; *) echo "unsupported arch $ARCH"; exit 1;; esac
 BIN=/usr/local/bin/pulse-cutover; REL="https://github.com/paulgnz/pulse-cutover/releases/download/$VERSION"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
