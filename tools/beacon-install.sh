@@ -61,7 +61,9 @@ if [ -z "$SNAPDIR" ]; then
   CFG=$(jqget '.nodeos.config_dir'); [ -n "$CFG" ] && SNAPDIR=$(sed -n 's/^\s*snapshots-dir\s*=\s*//p' "$CFG/config.ini" 2>/dev/null | tail -1)
   [ -n "$SNAPDIR" ] || SNAPDIR=/var/lib/pulse-cutover/snapshots
 fi
-say "nodeos: $API · chain ${CHAIN_ID:0:16}… · head $HEAD · snapshots $SNAPDIR"
+MG_UNIT=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -m1 -iE '^(metalgo|avalanchego)[^ ]*\.service$' | sed 's/\.service$//' || true)
+[ -n "$MG_UNIT" ] || MG_UNIT=metalgo
+say "nodeos: $API · chain ${CHAIN_ID:0:16}… · head $HEAD · snapshots $SNAPDIR · validator unit $MG_UNIT"
 
 mkdir -p "$ETC" && chmod 750 "$ETC"
 if [ ! -s "$ETC/beacon.token" ]; then (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ETC/beacon.token"); fi
@@ -90,7 +92,7 @@ staged_path = "/var/lib/pulse-cutover/snapshot-cut.bin"
 dir = "$SNAPDIR"
 
 [target]
-metalgo_unit = "metalgo"
+metalgo_unit = "$MG_UNIT"
 rpc_url = "http://127.0.0.1:9650/ext/bc/NOT-CONFIGURED/rpc"
 
 [beacon]
