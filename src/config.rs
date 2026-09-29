@@ -64,6 +64,14 @@ pub struct Beacon {
     pub producer: String,
     /// Network id as mission control knows it: "mainnet", "testnet", "rehearsal"…
     pub network: String,
+    /// This machine's name on the board (default: its hostname). One producer usually runs several
+    /// nodes (producer, API, history); each reports separately so a missing one is visible.
+    #[serde(default)]
+    pub node: Option<String>,
+    /// What this node does for the producer: "producer", "api", "history", "seed" (default: "producer"
+    /// in producer mode, otherwise "api").
+    #[serde(default)]
+    pub role: Option<String>,
     /// File holding this producer's bearer token (one line, mode 600). Never
     /// put the token itself in the config.
     #[serde(default)]

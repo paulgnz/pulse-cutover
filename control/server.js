@@ -232,7 +232,7 @@ function coordView(n) {
   const c = coord[n.id] || {};
   const ev = c.event ? JSON.parse(c.event.payload) : null;
   if (!ev) return null;
-  const reps = Object.entries(nodes[n.id] || {});
+  const reps = Object.entries(nodes[n.id] || {}).map(([p, byNode]) => [p, Object.values(byNode)[0]]);
   return { event: ev, armed: !!c.arm, aborted: !!c.abort,
     arm_at: c.arm ? JSON.parse(c.arm.payload).issued_at_ms : null,
     accepted: reps.filter(([, r]) => r.report?.coord?.event_id === ev.event_id && r.report?.coord?.accepted).map(([p]) => p),
@@ -247,7 +247,7 @@ const EVIDENCE_KEYS = [
 ];
 function agreement(netId) {
   const rows = [];
-  const list = Object.entries(nodes[netId] || {});
+  const list = Object.entries(nodes[netId] || {}).flatMap(([p, byNode]) => Object.entries(byNode).filter(([, v]) => (v.report.role || 'producer') === 'producer').map(([nd, v]) => [Object.keys(byNode).length > 1 ? `${p}/${nd}` : p, v]));
   for (const [key, label] of EVIDENCE_KEYS) {
     const vals = list.map(([p, n]) => [p, n.report?.ceremony?.evidence?.[key]]).filter(([, v]) => v !== undefined && v !== null);
     if (!vals.length) continue;
@@ -271,14 +271,16 @@ function status() {
       const names = [...new Set([...Object.keys(reg), ...(c.schedule || []), ...Object.keys(reported)])];
       const geo = n.geo || {};
       const producers = names.map((name) => {
-        const r = reported[name];
+        const beacons = Object.entries(reported[name] || {}).map(([node, v]) => ({ node, role: v.report.role || null, age_ms: now - v.received,
+          silent: now - v.received > SILENT_AFTER_MS, report: v.report })).sort((x, y) => (x.role === 'producer' ? -1 : 0) - (y.role === 'producer' ? -1 : 0));
+        const r = beacons.length ? { report: beacons[0].report, received: now - beacons[0].age_ms } : null;
         const age = r ? now - r.received : null;
         const g = reg[name] || {};
         const org = g.org || (geo[name] ? { name: geo[name].name || name, city: geo[name].city, country: geo[name].country, lat: geo[name].lat, lon: geo[name].lon } : { name });
         return { name, org: { ...org, logo: org.logo ? `/api/logo/${encodeURIComponent(n.id)}/${encodeURIComponent(name)}` : null },
           rank: g.rank || null, votes: g.votes || null, active: !!reg[name] || !!geo[name],
           scheduled: (c.schedule || []).includes(name), reporting: !!r,
-          silent: r ? age > SILENT_AFTER_MS : null, age_ms: age, report: r?.report || null };
+          silent: r ? age > SILENT_AFTER_MS : null, age_ms: age, report: r?.report || null, beacons };
       }).sort((a, b) => (b.scheduled - a.scheduled) || ((a.rank || 999) - (b.rank || 999)) || a.name.localeCompare(b.name));
       const live = producers.filter((p) => p.reporting && !p.silent);
       return { id: n.id, name: n.name, label: n.label, priority: n.priority ?? 9, description: n.description || '',
@@ -303,6 +305,10 @@ http.createServer(async (req, res) => {
     return send(res, 200, readFileSync(join(HERE, 'public', 'index.html'), 'utf8'), 'text/html; charset=utf-8');
   if (req.method === 'GET' && url.pathname === '/api/status') return send(res, 200, status());
   if (req.method === 'GET' && url.pathname === '/healthz') return send(res, 200, { ok: true });
+  if (req.method === 'GET' && (url.pathname === '/favicon.ico' || url.pathname === '/favicon.svg')) {
+    res.writeHead(200, { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400' });
+    return res.end('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f5a524"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs><rect width="64" height="64" rx="16" fill="url(#g)"/><rect x="14" y="14" width="36" height="36" rx="9" fill="#070a16"/><rect x="31" y="12" width="3" height="40" rx="1.5" fill="url(#g)"/></svg>');
+  }
   const im = url.pathname.match(/^\/api\/infra\/([a-z0-9-]+)$/);
   if (im && req.method === 'GET') {
     const x = infra[im[1]]; const reg = registry[im[1]]?.producers || {};
@@ -312,7 +318,12 @@ http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname.startsWith('/api/logo/')) {
     const [, , , net, owner] = url.pathname.split('/').map(decodeURIComponent);
     const l = await logo(net, owner);
-    if (!l) return send(res, 404, { error: 'no logo' });
+    if (!l) {
+      const name = registry[net]?.producers?.[owner]?.org?.name || owner || '?';
+      const ini = String(name).replace(/[^A-Za-z0-9 ]/g, '').split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join('').toUpperCase() || '?';
+      res.writeHead(200, { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=3600' });
+      return res.end(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#141b38"/><text x="32" y="40" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="22" font-weight="700" fill="#c9cdf0">${ini.replace(/[<&>]/g, '')}</text></svg>`);
+    }
     res.writeHead(200, { 'content-type': l.type, 'cache-control': 'public, max-age=21600', 'x-content-type-options': 'nosniff',
       'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox" });
     return res.end(l.buf);
@@ -345,12 +356,15 @@ http.createServer(async (req, res) => {
     let r; try { r = JSON.parse(raw); } catch { return send(res, 400, { error: 'bad json' }); }
     if (r.network !== bind.network || r.producer !== bind.producer)
       return send(res, 403, { error: `token is bound to ${bind.producer}@${bind.network}` });
-    const prev = nodes[r.network]?.[r.producer]?.report;
-    (nodes[r.network] ||= {})[r.producer] = { report: r, received: Date.now() };
+    const nodeName = String(r.node || 'node').slice(0, 64);
+    const byNode = ((nodes[r.network] ||= {})[r.producer] ||= {});
+    const prev = byNode[nodeName]?.report;
+    byNode[nodeName] = { report: r, received: Date.now() };
+    const who = Object.keys(byNode).length > 1 || r.node ? `${r.producer} · ${nodeName}` : r.producer;
     const was = prev?.ceremony?.state, is = r.ceremony?.state;
-    if (!prev) pushEvent(r.network, r.producer, `started reporting (agent ${r.agent_version})`);
-    if (is && is !== was) pushEvent(r.network, r.producer, `→ ${is}`);
-    if (prev && prev.ready !== r.ready) pushEvent(r.network, r.producer, r.ready ? 'READY' : `not ready: ${(r.checks || []).filter((c) => !c.ok).map((c) => c.name).join(', ')}`);
+    if (!prev) pushEvent(r.network, who, `started reporting (${r.role || 'node'}, agent ${r.agent_version})`);
+    if (is && is !== was) pushEvent(r.network, who, `→ ${is}`);
+    if (prev && prev.ready !== r.ready) pushEvent(r.network, who, r.ready ? 'READY' : `not ready: ${(r.checks || []).filter((c) => !c.ok).map((c) => c.name).join(', ')}`);
     return send(res, 200, { ok: true });
   }
   send(res, 404, { error: 'not found' });

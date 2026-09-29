@@ -20,10 +20,10 @@
 #          [--version v0.5.0-rc.1] [--api http://127.0.0.1:8888] [--producer-api <url>]
 #          [--snapshots-dir <dir>] [--interval 10] [--dry-run] [--uninstall]
 set -euo pipefail
-NETWORK=""; PRODUCER=""; URL="https://control-rehearsal.protonnz.com"; VERSION="v0.5.0-rc.1"
+NETWORK=""; PRODUCER=""; NODE=""; ROLE=""; CFG_PRODUCER=""; URL="https://control-rehearsal.protonnz.com"; VERSION="v0.5.0-rc.2"
 API=""; PAPI=""; SNAPDIR=""; INTERVAL=10; DRY=0; UNINSTALL=0
 while [ $# -gt 0 ]; do case "$1" in
-  --network) NETWORK=$2; shift 2;; --producer) PRODUCER=$2; shift 2;; --url) URL=$2; shift 2;;
+  --network) NETWORK=$2; shift 2;; --producer) PRODUCER=$2; shift 2;; --node) NODE=$2; shift 2;; --role) ROLE=$2; shift 2;; --url) URL=$2; shift 2;;
   --version) VERSION=$2; shift 2;; --api) API=$2; shift 2;; --producer-api) PAPI=$2; shift 2;;
   --snapshots-dir) SNAPDIR=$2; shift 2;; --interval) INTERVAL=$2; shift 2;;
   --dry-run) DRY=1; shift;; --uninstall) UNINSTALL=1; shift;;
@@ -71,14 +71,24 @@ if [ -z "$NETWORK" ]; then case "$CHAIN_ID" in
   384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0) NETWORK=mainnet;;
   71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd) NETWORK=testnet;;
   *) echo "unknown chain ${CHAIN_ID:0:16}…: pass --network <id>" >&2; exit 2;; esac; fi
+CFG=${CFG:-$(jqget '.nodeos.config_dir')}
+for f in "$CFG/config.ini" $(ps -o args= -C nodeos 2>/dev/null | grep -o -- '--config-dir[= ][^ ]*' | awk '{print $NF}' | sed 's/.*=//; s|$|/config.ini|'); do
+  [ -f "$f" ] && CFG_PRODUCER=$(sed -n 's/^\s*producer-name\s*=\s*\([a-z1-5.]\{1,12\}\).*/\1/p' "$f" | head -1) && [ -n "$CFG_PRODUCER" ] && break
+done
 if [ -z "$PRODUCER" ]; then
-  CFG=${CFG:-$(jqget '.nodeos.config_dir')}
   for f in "$CFG/config.ini" $(ps -o args= -C nodeos 2>/dev/null | grep -o -- '--config-dir[= ][^ ]*' | awk '{print $NF}' | sed 's/.*=//; s|$|/config.ini|'); do
     [ -f "$f" ] && PRODUCER=$(sed -n 's/^\s*producer-name\s*=\s*\([a-z1-5.]\{1,12\}\).*/\1/p' "$f" | head -1) && [ -n "$PRODUCER" ] && break
   done
   [ -n "$PRODUCER" ] || { echo "could not find producer-name in nodeos config: pass --producer <your-account>" >&2; exit 2; }
 fi
 [[ "$PRODUCER" =~ ^[a-z1-5.]{1,12}$ ]] || { echo "--producer must be an Antelope account name" >&2; exit 2; }
+[ -n "$NODE" ] || NODE=$(hostname -f 2>/dev/null || hostname)
+if [ -z "$ROLE" ]; then
+  if [ -n "$CFG_PRODUCER" ]; then ROLE=producer
+  elif curl -fsS -m3 http://127.0.0.1:7000/v2/health 2>/dev/null | grep -q '"health"'; then ROLE=history
+  else ROLE=api; fi
+fi
+say "node: $NODE · role $ROLE"
 say "nodeos: $API · chain ${CHAIN_ID:0:16}… ($NETWORK) · head $HEAD · producer $PRODUCER · snapshots $SNAPDIR · validator unit $MG_UNIT"
 
 mkdir -p "$ETC" && chmod 750 "$ETC"
@@ -115,6 +125,8 @@ rpc_url = "http://127.0.0.1:9650/ext/bc/NOT-CONFIGURED/rpc"
 url = "${URL%/}/api/report"
 producer = "$PRODUCER"
 network = "$NETWORK"
+node = "$NODE"
+role = "$ROLE"
 token_file = "$ETC/beacon.token"
 interval_secs = $INTERVAL
 TOML

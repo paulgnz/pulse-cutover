@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#070a16">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>Cutover Mission Control</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
@@ -96,7 +97,9 @@ section{margin-top:26px}
 .sec-h{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:0 2px 12px}
 .sec-h h2{margin:0;font:700 20px var(--display);letter-spacing:-.2px}
 .sec-h span{color:var(--muted);font-size:12.5px}
-.track{padding:22px;overflow-x:auto}
+.track{padding:22px;overflow-x:auto;scrollbar-width:thin;scrollbar-color:rgba(139,92,246,.35) transparent}
+.track::-webkit-scrollbar{height:6px}.track::-webkit-scrollbar-track{background:transparent}.track::-webkit-scrollbar-thumb{background:rgba(139,92,246,.35);border-radius:6px}
+@media (min-width:1101px){.track{overflow-x:hidden}.stages{min-width:0}}
 .stages{position:relative;display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:12px;min-width:820px}
 .stages::before{content:"";position:absolute;left:18px;right:18px;top:17px;height:2px;background:rgba(255,255,255,.08)}
 .flow{position:absolute;left:18px;top:17px;height:2px;background:linear-gradient(90deg,var(--cut),var(--pvm));box-shadow:0 0 16px rgba(139,92,246,.7);transition:width 1s cubic-bezier(.2,.8,.2,1)}
@@ -132,7 +135,7 @@ section{margin-top:26px}
 .badge.FROZEN,.badge.SNAPSHOTTED{color:var(--warn);border-color:rgba(251,191,36,.35)}
 .checks{display:flex;gap:3px;margin-top:12px;height:6px}
 .checks i{flex:1;border-radius:3px;background:rgba(255,255,255,.07)}
-.checks i.ok{background:linear-gradient(90deg,#10b981,var(--ok))}.checks i.bad{background:var(--bad)}
+.checks i.ok{background:linear-gradient(90deg,#10b981,var(--ok))}.checks i.bad{background:var(--bad)}.checks i.todo{background:transparent;box-shadow:inset 0 0 0 1px rgba(251,191,36,.6)}
 .pc .foot{display:flex;justify-content:space-between;gap:8px;margin-top:9px;font-size:11.5px;color:var(--muted)}
 .pc .foot .st{display:flex;align-items:center;gap:6px}
 .pc.producing{box-shadow:0 0 0 1px rgba(245,165,36,.55),0 0 34px -6px rgba(245,165,36,.55)}
@@ -180,7 +183,7 @@ footer a{color:var(--muted)}
 .chipbtn{border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--muted);border-radius:99px;padding:7px 13px;font:600 12px var(--sans);cursor:pointer}
 .chipbtn[aria-pressed=true]{color:var(--ink);border-color:rgba(139,92,246,.5);background:rgba(139,92,246,.16)}
 .inf-tools input{flex:1;min-width:180px;background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:99px;color:var(--ink);padding:8px 14px;font:13px var(--sans)}
-.inf-table{padding:6px 0;overflow-x:auto}
+.inf-table{padding:6px 0;overflow-x:auto;scrollbar-width:thin;scrollbar-color:rgba(139,92,246,.35) transparent}
 .inf-table table{min-width:1080px}
 .inf-table table{width:100%;border-collapse:collapse;font-size:12.5px}
 .inf-table th{text-align:left;font:600 10.5px var(--sans);letter-spacing:1.2px;text-transform:uppercase;color:var(--muted);padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
@@ -231,7 +234,7 @@ footer a{color:var(--muted)}
 .nodecard .grid2 div span{display:block;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:1px}
 .chk{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px dashed var(--line);font-size:12.5px}
 .chk:last-child{border:0}.chk i{font-style:normal;font-weight:700;width:16px;flex:none}
-.chk .ok{color:var(--ok)}.chk .no{color:var(--bad)}
+.chk .ok{color:var(--ok)}.chk .no{color:var(--bad)}.chk .todo{color:var(--warn)}
 .chk b{font-weight:600;min-width:150px}
 .chk span{color:var(--muted);overflow-wrap:anywhere}
 .tl{list-style:none;margin:0;padding:0}.tl li{display:flex;gap:10px;padding:5px 0;font-size:12.5px}.tl time{color:var(--dim);font-family:var(--mono);min-width:92px}
@@ -529,6 +532,37 @@ function avatar(p) {
   const img = p.org?.logo ? `<img src="${esc(p.org.logo)}" alt="" loading="lazy" onerror="this.remove()">` : '';
   return `<span class="av" title="${esc(p.org?.name || p.name)}">${esc(initials(p.org?.name || p.name))}${img}</span>`;
 }
+
+/* check catalog: health (must be green) vs setup (to-do before a cutover) */
+const CHECKS = {
+  source_api: ['health', 'nodeos API reachable'], chain_id: ['health', 'on the expected chain'],
+  producer_api: ['health', 'producer API reachable locally'], freeze_height: ['health', 'cut height configured'],
+  freeze_lead_blocks: ['health', 'write-freeze lead set'], staged_snapshot_absent: ['health', 'no stale snapshot staged'],
+  disk_free: ['health', 'enough free disk'],
+  hook_on_freeze: ['setup', 'Write-freeze hook', 'closes writes at your public API just before the cut'],
+  hook_post_ignite: ['setup', 'Post-ignite hook', 'gives the new chain its first blocks and checks state'],
+  hook_on_live: ['setup', 'Go-live hook', 'switches your public API to PulseVM'],
+  hook_on_abort: ['setup', 'Rollback hook', 'reopens writes on the old chain if anything fails'],
+  validator_running: ['setup', 'Metal validator', 'metalgo installed and running next to nodeos'],
+};
+const kind = (c) => (CHECKS[c.name] || ['health'])[0];
+const label = (c) => (CHECKS[c.name] || [0, c.name])[1];
+function splitChecks(checks) {
+  const health = checks.filter((c) => kind(c) === 'health'), setup = checks.filter((c) => kind(c) === 'setup');
+  return { health, setup, sick: health.filter((c) => !c.ok), todo: setup.filter((c) => !c.ok) };
+}
+function statusOf(p) {
+  const bs = p.beacons || (p.report ? [{ node: 'node', report: p.report, silent: p.silent }] : []);
+  if (!bs.length) return { text: p.scheduled ? 'no beacon yet' : 'standby · no beacon', dot: '' };
+  const n = bs.length, nodes = n > 1 ? `${n} nodes · ` : '';
+  const silent = bs.filter((b) => b.silent).length;
+  if (silent) return { text: `${nodes}${silent} beacon${silent > 1 ? 's' : ''} silent`, dot: 'bad' };
+  const sick = bs.reduce((a, b) => a + splitChecks(b.report.checks || []).sick.length, 0);
+  if (sick) return { text: `${nodes}${sick} health issue${sick > 1 ? 's' : ''}`, dot: 'bad' };
+  const todo = bs.reduce((a, b) => a + splitChecks(b.report.checks || []).todo.length, 0);
+  if (todo) return { text: `${nodes}${todo} setup step${todo > 1 ? 's' : ''} left`, dot: 'warn' };
+  return { text: `${nodes}ready for cutover`, dot: 'ok' };
+}
 function render() {
   if (!data) return;
   const nets = data.networks;
@@ -603,10 +637,9 @@ function render() {
   $('prods').innerHTML = list.map((p) => {
     const r = p.report, checks = r?.checks || [], st = r?.ceremony?.state;
     const producing = c.head_producer === p.name;
-    const status = !r ? (p.scheduled ? 'no beacon yet' : 'standby · no beacon') : p.silent ? 'beacon silent' : r.ready ? 'ready' : 'needs attention';
-    const dot = !r ? '' : p.silent ? 'bad' : r.ready ? 'ok' : 'warn';
-    const bars = checks.length ? checks.map((x) => `<i class="${x.ok ? 'ok' : 'bad'}" title="${esc(x.name)}: ${esc(x.detail)}"></i>`).join('') : '<i></i><i></i><i></i><i></i><i></i><i></i>';
-    const failing = checks.filter((x) => !x.ok);
+    const so = statusOf(p), status = so.text, dot = so.dot;
+    const bars = checks.length ? checks.map((x) => `<i class="${x.ok ? 'ok' : kind(x) === 'setup' ? 'todo' : 'bad'}" title="${esc(label(x))}: ${esc(x.detail)}"></i>`).join('') : '<i></i><i></i><i></i><i></i><i></i><i></i>';
+    const failing = splitChecks(checks).sick;
     const logo = p.org?.logo ? `<img src="${esc(p.org.logo)}" alt="" loading="lazy" onerror="this.remove()">` : '';
     return `<article class="glass pc ${producing ? 'producing' : ''}" tabindex="0" data-name="${esc(p.name)}" aria-label="${esc(p.org?.name || p.name)}, ${esc(status)}">
       <div class="row"><div class="logo"><span>${esc(initials(p.org?.name || p.name))}</span>${logo}</div>
@@ -614,7 +647,7 @@ function render() {
         ${st ? `<span class="badge state ${esc(st)}">${esc(st)}</span>` : p.rank ? `<span class="badge ${p.scheduled ? 'sched' : ''}">#${p.rank}</span>` : p.scheduled ? '<span class="badge sched">producer</span>' : ''}</div>
       <div class="checks" aria-hidden="true">${bars}</div>
       <div class="foot"><span class="st"><span class="sd ${dot}"></span>${esc(status)}${producing ? ' · <b style="color:var(--cut)">producing</b>' : ''}</span><span class="mono">${r ? 'v' + esc(r.agent_version) : p.scheduled ? 'scheduled' : 'standby'}</span></div>
-      ${failing.length ? `<div class="fail">✗ ${esc(failing[0].name)}: ${esc(failing[0].detail)}</div>` : ''}
+      ${failing.length ? `<div class="fail">✗ ${esc(label(failing[0]))}: ${esc(failing[0].detail)}</div>` : ''}
       ${r?.coord?.event_id && co?.event?.event_id === r.coord.event_id ? (r.coord.accepted ? `<div class="fail" style="color:var(--ok)">✓ accepted event ${esc(r.coord.event_id)} · H ${fmt(r.coord.h)}${r.coord.armed ? ' · armed' : ''}</div>` : `<div class="fail">✗ rejected event: ${esc(r.coord.reason)}</div>`) : ''}
     </article>`;
   }).join('');
@@ -729,7 +762,7 @@ function renderDrawer() {
   const nodes = (infraData[active]?.nodes || []).filter((n) => n.producer === p.name);
   const logo = o.logo ? `<img src="${esc(o.logo)}" alt="" onerror="this.remove()">` : '';
   const dot = (ok, warn) => `<span class="sd ${ok ? (warn ? 'warn' : 'ok') : 'bad'}"></span>`;
-  const status = !r ? (p.scheduled ? 'in the schedule · no beacon' : 'standby · no beacon') : p.silent ? 'beacon silent' : r.ready ? 'ready' : 'needs attention';
+  const status = statusOf(p).text;
   const co = net.coordination;
   dr.innerHTML = `
     <div class="dr-head"><div class="logo"><span>${esc(initials(o.name || p.name))}</span>${logo}</div>
@@ -742,7 +775,7 @@ function renderDrawer() {
         <div class="fact"><b style="color:${c.head_producer === p.name ? 'var(--cut)' : 'inherit'}">${c.head_producer === p.name ? 'now' : '—'}</b><span>producing</span></div>
         <div class="fact"><b>${nodes.length || '—'}</b><span>nodes in bp.json</span></div>
         <div class="fact"><b>${nodes.filter((n) => n.api?.ok).length}/${nodes.filter((n) => n.url).length}</b><span>APIs answering</span></div>
-        <div class="fact"><b style="color:${!r ? 'var(--muted)' : p.silent ? 'var(--bad)' : r.ready ? 'var(--ok)' : 'var(--warn)'}">${!r ? 'no beacon' : p.silent ? 'silent' : r.ready ? 'ready' : 'attention'}</b><span>cutover readiness</span></div>
+        <div class="fact"><b style="color:${{ok: 'var(--ok)', warn: 'var(--warn)', bad: 'var(--bad)'}[statusOf(p).dot] || 'var(--muted)'}">${!r ? 'no beacon' : p.silent ? 'silent' : splitChecks(r.checks).sick.length ? 'issue' : splitChecks(r.checks).todo.length ? splitChecks(r.checks).todo.length + ' to set up' : 'ready'}</b><span>cutover readiness</span></div>
       </div>
 
       ${co ? `<div class="dr-sec"><h4>Coordinated event</h4><div class="chk"><i class="${r?.coord?.accepted ? 'ok' : 'no'}">${r?.coord?.accepted ? '✓' : '·'}</i><b>${esc(co.event.event_id)}</b><span>${r?.coord?.event_id === co.event.event_id ? (r.coord.accepted ? `accepted · H ${fmt(r.coord.h)}${r.coord.armed ? ' · armed' : ''}` : 'rejected: ' + esc(r.coord.reason)) : 'not acknowledged yet'}</span></div></div>` : ''}
@@ -759,9 +792,14 @@ function renderDrawer() {
         : `<div class="ev-empty">${net.id === 'rehearsal' ? 'Rehearsal nodes are known from their beacons, not bp.json.' : 'No bp.json nodes surveyed yet (the survey runs every 10 minutes), or this producer publishes no bp.json.'}</div>`}
       </div>
 
-      <div class="dr-sec"><h4>Readiness checks ${r ? `· agent v${esc(r.agent_version)} · ${Math.round((p.age_ms || 0) / 1000)}s ago` : ''}</h4>
-      ${r ? r.checks.map((x) => `<div class="chk"><i class="${x.ok ? 'ok' : 'no'}">${x.ok ? '✓' : '✗'}</i><b>${esc(x.name)}</b><span>${esc(x.detail)}</span></div>`).join('')
-        : `<div class="ev-empty">This producer hasn't connected a beacon. Running <b>pulse-cutover beacon</b> reports readiness here: source API, producer API, chain_id, H, hooks, validator, disk.</div>`}</div>
+      ${(p.beacons && p.beacons.length ? p.beacons : []).map((b) => { const k = splitChecks(b.report.checks || []); return `<div class="dr-sec"><h4>${esc(b.node)} · ${esc(b.role || 'node')} · agent v${esc(b.report.agent_version)} · ${b.silent ? '<span style="color:var(--bad)">silent</span>' : Math.round(b.age_ms / 1000) + 's ago'}</h4>
+        <div class="chk" style="border:0;padding-bottom:2px"><i></i><b style="color:var(--muted);font-size:11px;letter-spacing:1px;text-transform:uppercase">Cutover setup · ${k.setup.length - k.todo.length} of ${k.setup.length} done</b></div>
+        ${k.setup.map((x) => `<div class="chk"><i class="${x.ok ? 'ok' : 'todo'}">${x.ok ? '✓' : '○'}</i><b>${esc(label(x))}</b><span>${x.ok ? esc(x.detail) : esc((CHECKS[x.name] || [])[2] || x.detail)}</span></div>`).join('')}
+        <div class="chk" style="border:0;padding-bottom:2px"><i></i><b style="color:var(--muted);font-size:11px;letter-spacing:1px;text-transform:uppercase">Node health · ${k.health.length - k.sick.length} of ${k.health.length} OK</b></div>
+        ${k.health.map((x) => `<div class="chk"><i class="${x.ok ? 'ok' : 'no'}">${x.ok ? '✓' : '✗'}</i><b>${esc(label(x))}</b><span>${esc(x.detail)}</span></div>`).join('')}</div>`; }).join('')}
+      ${(() => { const withUrl = nodes.filter((n) => n.url); const covered = (p.beacons || []).length;
+        return !covered ? `<div class="dr-sec"><h4>Beacons</h4><div class="ev-empty">None of this producer's nodes report yet. One command connects each node: <b>docs/OPERATOR-QUICKSTART.md</b>.</div></div>`
+          : withUrl.length > covered ? `<div class="dr-sec"><div class="fail" style="color:var(--warn)">○ ${covered} of ${withUrl.length} public nodes have a beacon: every node that serves users needs one before a cutover.</div></div>` : ''; })()}
 
       ${r?.ceremony?.transitions?.length ? `<div class="dr-sec"><h4>Ceremony</h4><ul class="tl">${r.ceremony.transitions.map((t) => `<li><time>${esc(String(t.ts).slice(11, 23))}</time><b>${esc(t.state)}</b></li>`).join('')}</ul>${r.ceremony.last_error ? `<div class="fail" style="margin-top:6px">✗ ${esc(r.ceremony.last_error)}</div>` : ''}</div>` : ''}
       ${r?.ceremony?.evidence && Object.keys(r.ceremony.evidence).length ? `<div class="dr-sec"><h4>Evidence</h4><dl class="evk">${Object.entries(r.ceremony.evidence).map(([k, v]) => `<dt>${esc(k.replace(/_/g, ' '))}</dt><dd>${esc(typeof v === 'string' ? v : JSON.stringify(v))}</dd>`).join('')}</dl></div>` : ''}

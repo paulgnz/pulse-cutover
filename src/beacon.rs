@@ -129,6 +129,12 @@ pub fn journal_summary(path: &Path) -> Value {
            "evidence": Value::Object(ev), "last_error": last_error})
 }
 
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname").ok().map(|h| h.trim().to_string()).filter(|h| !h.is_empty())
+        .or_else(|| std::process::Command::new("hostname").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()))
+        .unwrap_or_else(|| "node".into())
+}
+
 pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     let a = agent();
     let mut checks = vec![];
@@ -208,6 +214,10 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         "schema": REPORT_SCHEMA,
         "producer": producer,
         "network": network,
+        "node": cfg.beacon.as_ref().and_then(|b| b.node.clone()).unwrap_or_else(hostname),
+        "role": cfg.beacon.as_ref().and_then(|b| b.role.clone()).unwrap_or_else(|| {
+            if cfg.ceremony.mode == crate::config::Mode::Producer { "producer".into() } else { "api".into() }
+        }),
         "agent_version": env!("CARGO_PKG_VERSION"),
         "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "mode": format!("{:?}", cfg.ceremony.mode).to_lowercase(),
