@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # beacon-install.sh — connect this producer's box to Cutover Mission Control (read-only readiness beacon).
 #
-#   curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh \
-#     | sudo bash -s -- --network testnet --producer <your-account>
+#   curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh | sudo bash
+#
+# Network (mainnet/testnet) is detected from the node's chain_id and the producer account from
+# `producer-name` in nodeos' config.ini; pass --network / --producer to override.
 #
 # What it does (and does NOT do):
 #   + downloads the static pulse-cutover binary from the GitHub release and verifies its sha256
@@ -32,8 +34,6 @@ if [ "$UNINSTALL" = 1 ]; then
   systemctl disable --now pulse-beacon 2>/dev/null || true; rm -f /etc/systemd/system/pulse-beacon.service
   systemctl daemon-reload; say "beacon removed (kept /etc/pulse-cutover for your records)"; exit 0
 fi
-[ -n "$NETWORK" ] && [ -n "$PRODUCER" ] || { echo "need --network and --producer" >&2; exit 2; }
-[[ "$PRODUCER" =~ ^[a-z1-5.]{1,12}$ ]] || { echo "--producer must be an Antelope account name" >&2; exit 2; }
 
 ARCH=$(uname -m); case "$ARCH" in x86_64) T=x86_64-unknown-linux-musl;; aarch64|arm64) T=aarch64-unknown-linux-musl;; *) echo "unsupported arch $ARCH"; exit 1;; esac
 BIN=/usr/local/bin/pulse-cutover; REL="https://github.com/paulgnz/pulse-cutover/releases/download/$VERSION"
@@ -63,7 +63,19 @@ if [ -z "$SNAPDIR" ]; then
 fi
 MG_UNIT=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -m1 -iE '^(metalgo|avalanchego)[^ ]*\.service$' | sed 's/\.service$//' || true)
 [ -n "$MG_UNIT" ] || MG_UNIT=metalgo
-say "nodeos: $API · chain ${CHAIN_ID:0:16}… · head $HEAD · snapshots $SNAPDIR · validator unit $MG_UNIT"
+if [ -z "$NETWORK" ]; then case "$CHAIN_ID" in
+  384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0) NETWORK=mainnet;;
+  71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd) NETWORK=testnet;;
+  *) echo "unknown chain ${CHAIN_ID:0:16}…: pass --network <id>" >&2; exit 2;; esac; fi
+if [ -z "$PRODUCER" ]; then
+  CFG=${CFG:-$(jqget '.nodeos.config_dir')}
+  for f in "$CFG/config.ini" $(ps -o args= -C nodeos 2>/dev/null | grep -o -- '--config-dir[= ][^ ]*' | awk '{print $NF}' | sed 's/.*=//; s|$|/config.ini|'); do
+    [ -f "$f" ] && PRODUCER=$(sed -n 's/^\s*producer-name\s*=\s*\([a-z1-5.]\{1,12\}\).*/\1/p' "$f" | head -1) && [ -n "$PRODUCER" ] && break
+  done
+  [ -n "$PRODUCER" ] || { echo "could not find producer-name in nodeos config: pass --producer <your-account>" >&2; exit 2; }
+fi
+[[ "$PRODUCER" =~ ^[a-z1-5.]{1,12}$ ]] || { echo "--producer must be an Antelope account name" >&2; exit 2; }
+say "nodeos: $API · chain ${CHAIN_ID:0:16}… ($NETWORK) · head $HEAD · producer $PRODUCER · snapshots $SNAPDIR · validator unit $MG_UNIT"
 
 mkdir -p "$ETC" && chmod 750 "$ETC"
 if [ ! -s "$ETC/beacon.token" ]; then (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ETC/beacon.token"); fi
@@ -127,7 +139,9 @@ UNIT
 systemctl daemon-reload; systemctl enable --now pulse-beacon >/dev/null 2>&1; systemctl restart pulse-beacon
 say "beacon running: $(systemctl is-active pulse-beacon)"
 echo
-echo "  Send this to the mission-control operator to authorize your beacon:"
-echo "    network=$NETWORK producer=$PRODUCER token_sha256=$HASH"
-echo "  Dashboard: ${URL%/}/?net=$NETWORK&p=$PRODUCER"
-echo "  Remove any time: sudo bash beacon-install.sh --uninstall"
+echo "  ✓ Done. Last step: send this ONE line to the mission-control operator (it is only a hash):"
+echo
+echo "      network=$NETWORK producer=$PRODUCER token_sha256=$HASH"
+echo
+echo "  Then watch your node here: ${URL%/}/?net=$NETWORK&p=$PRODUCER"
+echo "  To remove it later:  curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh | sudo bash -s -- --uninstall"

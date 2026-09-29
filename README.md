@@ -16,6 +16,12 @@ in a journal you can hand to anyone. Nothing a user can see changes until the
 new chain is verified and serving; aborting at any earlier point leaves your
 existing node exactly as it was.
 
+> **Block producer? Connect your node in 2 minutes → [docs/OPERATOR-QUICKSTART.md](docs/OPERATOR-QUICKSTART.md)**
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh | sudo bash
+> ```
+> Read-only, safe on a producing node; it detects your network and account and prints one line to send us.
+
 **New here? → [docs/PROCESS.md](docs/PROCESS.md)**: the whole cutover, step by step, with diagrams: who does what, the timeline around the cut, every gate, what apps see, and how rollback works.
 
 **How do we know the cut is atomic? → [ATOMICITY.md](ATOMICITY.md)**: five properties, each with a gate or a tool and the recorded proof.
@@ -101,8 +107,8 @@ production). Try it with `--dry-run` first; it changes nothing:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh -o beacon-install.sh
-sudo bash beacon-install.sh --network testnet --producer <your-account> --dry-run
-sudo bash beacon-install.sh --network testnet --producer <your-account>
+sudo bash beacon-install.sh --dry-run   # shows what it detected; changes nothing
+sudo bash beacon-install.sh             # detects network + producer from your node
 ```
 
 It ends by printing `token_sha256=…`: send that line (only a hash; the token never leaves your box) to
