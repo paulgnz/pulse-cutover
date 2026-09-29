@@ -102,6 +102,8 @@ struct MockOps {
     fleet_polls: Cell<u32>,
     /// Override for GET /api/status (roster fleet-gate tests).
     status_doc: RefCell<Option<serde_json::Value>>,
+    /// Stale reports age like the real relay's: `age_ms` values >= 60 000 grow 2 s per poll.
+    age_stale_per_poll: Cell<bool>,
     // --- fault injection ---
     /// The ignited target presents a DIFFERENT block id at the cut (wrong lineage).
     target_fork: Cell<bool>,
@@ -155,6 +157,7 @@ impl MockOps {
             fleet_agree_after: Cell::new(0),
             fleet_polls: Cell::new(0),
             status_doc: RefCell::new(None),
+            age_stale_per_poll: Cell::new(false),
             target_fork: Cell::new(false),
             target_stall_after: Cell::new(u64::MAX),
             source_calls: Cell::new(0),
@@ -375,7 +378,25 @@ impl ChainOps for MockOps {
         if url.ends_with("/api/status") {
             let polls = self.fleet_polls.get() + 1;
             self.fleet_polls.set(polls);
-            if let Some(doc) = self.status_doc.borrow().clone() {
+            if let Some(mut doc) = self.status_doc.borrow().clone() {
+                if self.age_stale_per_poll.get() {
+                    fn bump(v: &mut serde_json::Value, polls: u64) {
+                        match v {
+                            serde_json::Value::Object(m) => {
+                                for (k, x) in m.iter_mut() {
+                                    if k == "age_ms" && x.as_u64().map(|a| a >= 60_000).unwrap_or(false) {
+                                        *x = serde_json::json!(x.as_u64().unwrap() + polls * 2000);
+                                    } else {
+                                        bump(x, polls);
+                                    }
+                                }
+                            }
+                            serde_json::Value::Array(a) => a.iter_mut().for_each(|x| bump(x, polls)),
+                            _ => {}
+                        }
+                    }
+                    bump(&mut doc, polls as u64);
+                }
                 return Ok(Some(doc));
             }
             let ours = pulse_cutover::beacon::journal_summary(&self.dir.join("journal.jsonl"))["evidence"].clone();
@@ -3007,4 +3028,147 @@ fn r5b_operator_rollback_records_its_intent_before_any_step() {
     let intent = text.find("rollback_requested").expect("intent recorded");
     let first_step = text.find("rollback_step").expect("a step recorded");
     assert!(intent < first_step, "intent must precede every step");
+}
+
+
+#[test]
+fn r6_steady_stale_report_is_journaled_once_and_non_roster_producers_are_not_named() {
+    // Fable final N-1: the exclusion reason embedded the relay's changing age_ms, so a steadily
+    // stale report wrote a fleet_gate line on EVERY 2 s poll, and non-roster producers were named.
+    let probe = tempfile::tempdir().unwrap();
+    let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
+    let ours = pulse_cutover::beacon::journal_summary(&probe.path().join("journal.jsonl"))["evidence"].clone();
+    let d = tempfile::tempdir().unwrap();
+    let cfg = roster_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    ops.age_stale_per_poll.set(true);
+    let rep = |id: &str| serde_json::json!({"instance_id": id, "checks": [], "coord": {"event_id": "e1"},
+        "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}});
+    *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aa")}]},
+        {"name": "bp2", "beacons": [{"age_ms": 100000, "report": rep("bb")}]},
+        {"name": "outsider", "beacons": [{"age_ms": 100000, "report": rep("zz")}]}]}]}));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted, "quorum 2 never reached");
+    assert!(ops.fleet_polls.get() >= 50, "fixture: many polls ({})", ops.fleet_polls.get());
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let lines = text.lines().filter(|l| l.contains("\"fleet_gate\"")).count();
+    assert_eq!(lines, 1, "a constant situation is journaled once, not per poll");
+    assert!(!text.contains("outsider"), "non-roster producers are not named");
+    assert!(text.contains("stale report (older than 60 s)"), "{text}");
+}
+
+#[test]
+fn r6_forced_rollback_fences_on_every_attempt() {
+    // Fable final N-2 (P7e): after a forced attempt whose fence succeeded and whose resume failed, the
+    // re-run skipped the fence and resumed on the strength of the earlier "target stopped" proof.
+    let dir = tempfile::tempdir().unwrap();
+    let base = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.target_fork.set(true);
+    assert!(run_machine_result(&base, &ops).unwrap_err().starts_with("HALTED"));
+    set_target_line(dir.path(), "stop_cmd = \"stop-target\"");
+    let cfg = Config::load(&dir.path().join("ceremony.toml")).unwrap();
+    let ops = MockOps::new(dir.path(), 200);
+    ops.resume_fails.set(true);
+    let out = rollback_with(&cfg, &ops, true).unwrap();
+    assert!(!out.failed.is_empty(), "fixture: the resume failed: {out:?}");
+    assert!(ops.events.borrow().iter().any(|e| e == "hook:stop-target"));
+    let ops2 = MockOps::new(dir.path(), 200);
+    let out = rollback_with(&cfg, &ops2, true).unwrap();
+    assert!(out.failed.is_empty(), "{out:?}");
+    let ev = ops2.events.borrow().clone();
+    let fence = ev.iter().position(|e| e == "hook:stop-target").expect("fence re-run in THIS attempt");
+    let resume = ev.iter().position(|e| e == "resume").expect("resume");
+    assert!(fence < resume, "fence proven in this attempt before the resume: {ev:?}");
+}
+
+#[test]
+fn r6_status_shows_a_pending_rollback_and_cancel_intent_works_only_before_any_step() {
+    // Fable final N-3: a recorded intent was invisible in `status`/the beacon and could not be withdrawn.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_journal(dir.path());
+    {
+        let (mut j, rec) = Journal::open(&cfg.journal_path).unwrap();
+        j.evidence(rec.state.unwrap(), serde_json::json!({"rollback_requested": true, "force_after_ignite": false})).unwrap();
+    }
+    let toml = dir.path().join("ceremony.toml");
+    let st = String::from_utf8_lossy(&run_bin(&["status"], &toml).stdout).to_string();
+    assert!(st.contains("rollback_pending: yes") && st.contains("rollback: pending"), "{st}");
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["rollback_pending"], serde_json::json!(true));
+    // Without --i-understand: refused, nothing changes.
+    let out = run_bin(&["rollback", "--cancel-intent"], &toml);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(Journal::replay(&cfg.journal_path).unwrap().rollback_pending);
+    // No step completed yet: cancellation is journaled and clears it.
+    let out = run_bin(&["rollback", "--cancel-intent", "--i-understand"], &toml);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!Journal::replay(&cfg.journal_path).unwrap().rollback_pending);
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("rollback_intent_cancelled"));
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["rollback_pending"], serde_json::json!(false));
+    // Once a step has completed, the rollback can only be finished, not cancelled.
+    {
+        let (mut j, rec) = Journal::open(&cfg.journal_path).unwrap();
+        let s = rec.state.unwrap();
+        j.evidence(s, serde_json::json!({"rollback_requested": true})).unwrap();
+        j.evidence(s, serde_json::json!({"rollback_step": "resume", "ok": true})).unwrap();
+    }
+    let out = run_bin(&["rollback", "--cancel-intent", "--i-understand"], &toml);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be cancelled"));
+    assert!(Journal::replay(&cfg.journal_path).unwrap().rollback_pending);
+}
+
+#[test]
+fn r6_run_on_an_aborted_journal_with_an_unfinished_rollback_says_so_and_exits_4() {
+    // Fable final N-4: `run` said "it stopped safely and rolled back" for an ABORTED whose rollback
+    // never finished (writes still closed).
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_journal(dir.path());
+    let ops = MockOps::new(dir.path(), 200);
+    ops.resume_fails.set(true);
+    assert!(!rollback_with(&cfg, &ops, false).unwrap().failed.is_empty(), "fixture: incomplete rollback");
+    let out = run_bin(&["run"], &dir.path().join("ceremony.toml"));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(4), "{err}");
+    assert!(err.contains("rollback INCOMPLETE") && !err.contains("stopped safely and rolled back"), "{err}");
+}
+
+#[test]
+fn r6_pre_rc8_aborted_reads_as_unknown_not_incomplete() {
+    // Fable final N-8: every rc.7-written ABORTED (no step records) read as an incomplete rollback.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("journal.jsonl");
+    {
+        let (mut j, _) = Journal::open(&p).unwrap();
+        j.transition(State::Armed, serde_json::json!({})).unwrap();
+        j.transition(State::Aborted, serde_json::json!({"reason": "rc.7 style", "rollback_complete": true})).unwrap();
+    }
+    assert_eq!(pulse_cutover::beacon::journal_summary(&p)["rollback_complete"], serde_json::Value::Null);
+    let d2 = tempfile::tempdir().unwrap();
+    let p2 = d2.path().join("journal.jsonl");
+    {
+        let (mut j, _) = Journal::open(&p2).unwrap();
+        j.transition(State::Armed, serde_json::json!({})).unwrap();
+        j.transition(State::Aborted, serde_json::json!({"reason": "rc.8", "reverts_ok": true})).unwrap();
+    }
+    assert_eq!(pulse_cutover::beacon::journal_summary(&p2)["rollback_complete"], serde_json::json!(false));
+}
+
+#[cfg(unix)]
+#[test]
+fn r6_legacy_record_of_an_execd_script_hook_is_recognised() {
+    // Fable final N-6: an rc.7 record (no start time) of a script hook, which `sh -c` execs in place
+    // so the leader shows `<interpreter> <script>`, was refused as "pid reused?" and left running.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("myhook.sh");
+    std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (pid, exited) = spawn_group(&script.display().to_string());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let pg = dir.path().join("journal.jsonl.hook.pgid");
+    std::fs::write(&pg, format!("{pid}\n{}\n", script.display())).unwrap();
+    let res = pulse_cutover::ops::kill_recorded_hook_group(&pg, std::time::Duration::from_secs(2));
+    assert!(res.as_ref().map(|r| r.as_deref().unwrap_or("").contains("killed")).unwrap_or(false), "{res:?}");
+    assert!(wait_exited(&exited, pid));
 }
