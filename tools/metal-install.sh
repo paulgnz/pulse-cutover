@@ -88,9 +88,22 @@ port_diag() {
     CAUSE="nftables (this server's firewall) drops inbound by default and has no rule for 9651"
     FIX="add 'tcp dport 9651 accept' to the input chain in /etc/nftables.conf, then: sudo systemctl reload nftables"; return 0
   fi
-  CAUSE="nothing on this server blocks 9651, so the block is in front of it: your hosting provider's firewall"
-  FIX="in your provider's control panel, allow inbound TCP 9651 from anywhere (0.0.0.0/0) to this server"
-  FIX2="where: Vultr = Firewall group · Hetzner = Firewalls · AWS = Security group · OVH = Network firewall · DigitalOcean = Networking > Firewalls"
+  # Name the provider only when the cloud's own metadata service says who it is (link-local, never leaves the box).
+  md() { curl -fsS -m2 "$@" 2>/dev/null || true; }
+  PROV=""; WHERE=""
+  if md http://169.254.169.254/hetzner/v1/metadata/instance-id | grep -q '[0-9]'; then PROV="Hetzner"; WHERE="Hetzner Console > Firewalls (or the server's Firewalls tab)"
+  elif md http://169.254.169.254/v1.json | grep -q '"instanceid"'; then PROV="Vultr"; WHERE="Vultr > Network > Firewall (the firewall group attached to this instance)"
+  elif md http://169.254.169.254/metadata/v1/id | grep -q '[0-9]'; then PROV="DigitalOcean"; WHERE="DigitalOcean > Networking > Firewalls"
+  elif TOK=$(md -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" http://169.254.169.254/latest/api/token) && [ -n "$TOK" ]; then PROV="AWS"; WHERE="EC2 > this instance > Security > Security groups (inbound rules)"
+  elif md -H "Metadata-Flavor: Google" http://169.254.169.254/computeMetadata/v1/instance/id | grep -q '[0-9]'; then PROV="Google Cloud"; WHERE="VPC network > Firewall"
+  fi
+  if [ -n "$PROV" ]; then
+    CAUSE="nothing on this server blocks 9651, so the block is in front of it: the $PROV firewall"
+    FIX="allow inbound TCP 9651 from anywhere (0.0.0.0/0) to this server in $WHERE"
+  else
+    CAUSE="nothing on this server blocks 9651, so the block is in front of it: your hosting provider's firewall or network"
+    FIX="ask your hosting provider (or use their control panel) to allow inbound TCP 9651 from anywhere to this server"
+  fi
 }
 
 # --open-port: add the local rule for whichever firewall is active (never touches the provider's).
