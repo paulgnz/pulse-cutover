@@ -21,7 +21,7 @@
 #          [--snapshots-dir <dir>] [--interval 10] [--dry-run] [--uninstall]
 set -euo pipefail
 NETWORK=""; PRODUCER=""; NODE=""; ROLE=""; CFG_PRODUCER=""; URL="https://control-rehearsal.protonnz.com"; VERSION="v0.5.0-rc.4"
-API=""; PAPI=""; SNAPDIR=""; INTERVAL=10; DRY=0; UNINSTALL=0
+UPGRADE=0; API=""; PAPI=""; SNAPDIR=""; INTERVAL=10; DRY=0; UNINSTALL=0
 while [ $# -gt 0 ]; do case "$1" in
   --network) NETWORK=$2; shift 2;; --producer) PRODUCER=$2; shift 2;; --node) NODE=$2; shift 2;; --role) ROLE=$2; shift 2;; --url) URL=$2; shift 2;;
   --version) VERSION=$2; shift 2;; --api) API=$2; shift 2;; --producer-api) PAPI=$2; shift 2;;
@@ -41,7 +41,7 @@ if [ -f "$OLD" ]; then
   oldv() { sed -n "/^\[beacon\]/,/^\[/s/^$1 *= *\"\([^\"]*\)\".*/\1/p" "$OLD" | head -1 || true; }
   [ -n "$PRODUCER" ] || PRODUCER=$(oldv producer); [ -n "$NETWORK" ] || NETWORK=$(oldv network)
   [ -n "$NODE" ] || NODE=$(oldv node); [ -n "$ROLE" ] || ROLE=$(oldv role)
-  [ -n "$PRODUCER" ] && say "existing beacon found: upgrading in place (producer $PRODUCER, node ${NODE:-?}, same token)"
+  [ -n "$PRODUCER" ] && UPGRADE=1 && say "existing beacon found: upgrading in place (producer $PRODUCER, node ${NODE:-?}, same token)"
 fi
 ARCH=$(uname -m); case "$ARCH" in x86_64) T=x86_64-unknown-linux-musl;; aarch64|arm64) T=aarch64-unknown-linux-musl;; *) echo "unsupported arch $ARCH"; exit 1;; esac
 BIN=/usr/local/bin/pulse-cutover; REL="https://github.com/paulgnz/pulse-cutover/releases/download/$VERSION"
@@ -163,6 +163,11 @@ UNIT
 systemctl daemon-reload; systemctl enable --now pulse-beacon >/dev/null 2>&1; systemctl restart pulse-beacon
 say "beacon running: $(systemctl is-active pulse-beacon)"
 echo
+if [ "$UPGRADE" = 1 ] && [ "$(tr -d '\n' < "$ETC/beacon.token" | sha256sum | cut -d' ' -f1)" = "$HASH" ]; then
+  echo "  ✓ Upgraded to $VERSION. Same token, so there is nothing to send: your page updates within 10 seconds."
+  echo "      ${URL%/}/?net=$NETWORK&p=$PRODUCER&node=$NODE"
+  exit 0
+fi
 echo "  ✓ Done. Last step: send this ONE line to the mission-control operator (it is only a hash):"
 echo
 echo "      network=$NETWORK producer=$PRODUCER token_sha256=$HASH"
