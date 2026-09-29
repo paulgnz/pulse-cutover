@@ -27,7 +27,7 @@
 #          [--producer-api <url>] [--snapshots-dir <dir>] [--interval 10] [--force] [--dry-run] [--uninstall]
 set -euo pipefail
 
-VERSION_DEFAULT="v0.5.0-rc.5"
+VERSION_DEFAULT="v0.5.0-rc.6"
 URL_DEFAULT="https://control-rehearsal.protonnz.com"
 ETC=/etc/pulse-cutover; VAR=/var/lib/pulse-cutover; STATE=/var/lib/pulse-beacon; BIN=/usr/local/bin/pulse-cutover
 UNIT=/etc/systemd/system/pulse-beacon.service; SVC_USER=pulse-beacon
