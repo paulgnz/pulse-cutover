@@ -1931,11 +1931,12 @@ dependencies = [
 
 [[package]]
 name = "pulse-cutover"
-version = "0.5.0-rc.9"
+version = "0.5.0-rc.10"
 dependencies = [
  "chrono",
  "ed25519-dalek",
  "hex",
+ "libc",
  "pulsevm_chaindb",
  "pulsevm_snapshot",
  "pulsevm_snapshot_import",

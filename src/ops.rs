@@ -114,9 +114,24 @@ fn capture(mut r: impl std::io::Read) -> Vec<u8> {
     head
 }
 
+/// Send `sig` to every process in process group `pgid`, via the kernel directly.
+///
+/// Never shell out to `kill -SIG -<pgid>`: procps `kill` parses `-<pgid>` as more options, which on
+/// Ubuntu 24.04 became kill(-<first digit>) (SIGTERM to every process on the box) and on 22.04
+/// kill(0) (the agent killed itself). Found by the Linux fault-injection run, 2026-09-30.
+/// pgid 0 and 1 are refused: kill(0, …) is our own group and kill(-1, …) is every process.
+#[cfg(unix)]
+pub(crate) fn signal_group(pgid: u32, sig: i32) -> bool {
+    if pgid <= 1 || pgid > i32::MAX as u32 {
+        return false;
+    }
+    // SAFETY: plain syscall; a negative pid addresses exactly one process group.
+    unsafe { libc::kill(-(pgid as i32), sig) == 0 }
+}
+
 #[cfg(unix)]
 fn kill_group(pid: u32) {
-    let _ = std::process::Command::new("kill").arg("-KILL").arg(format!("-{pid}")).status();
+    let _ = signal_group(pid, libc::SIGKILL);
 }
 #[cfg(not(unix))]
 fn kill_group(_pid: u32) {}
@@ -124,7 +139,7 @@ fn kill_group(_pid: u32) {}
 /// Process ids currently in process group `pgid` (empty if none / cannot tell).
 #[cfg(unix)]
 fn group_members(pgid: u32) -> Vec<u32> {
-    let out = match std::process::Command::new("ps").args(["-A", "-o", "pid=,pgid="]).output() {
+    let out = match std::process::Command::new("ps").args(["-A", "-o", "pid=,pgid=,stat="]).output() {
         Ok(o) => o,
         Err(_) => return vec![],
     };
@@ -134,7 +149,9 @@ fn group_members(pgid: u32) -> Vec<u32> {
             let mut it = l.split_whitespace();
             let pid: u32 = it.next()?.parse().ok()?;
             let g: u32 = it.next()?.parse().ok()?;
-            (g == pgid).then_some(pid)
+            // A zombie is already dead (only its exit status is left): it is not a survivor.
+            let zombie = it.next().is_some_and(|st| st.starts_with('Z'));
+            (g == pgid && !zombie).then_some(pid)
         })
         .collect()
 }
@@ -224,7 +241,7 @@ pub fn kill_recorded_hook_group(pgid_file: &Path, grace: Duration) -> Result<Opt
             }
         }
     }
-    let _ = std::process::Command::new("kill").arg("-TERM").arg(format!("-{pgid}")).status();
+    let _ = signal_group(pgid, libc::SIGTERM);
     let start = std::time::Instant::now();
     while start.elapsed() < grace && !group_members(pgid).is_empty() {
         std::thread::sleep(Duration::from_millis(100));
@@ -622,5 +639,44 @@ impl ChainOps for HttpOps {
 
     fn sleep_ms(&self, ms: u64) {
         std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod group_kill_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+
+    /// Regression (Linux fault injection, 2026-09-30): killing a hook's process group must reach
+    /// exactly that group, on every platform, and never this process or anything else.
+    #[test]
+    fn signal_group_kills_exactly_the_hook_group_and_nothing_else() {
+        let mut bystander = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let mut hook = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 & sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = hook.id();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(group_members(pgid).len() >= 2, "fixture: the hook and its background child share the group");
+        assert!(signal_group(pgid, libc::SIGTERM));
+        let status = hook.wait().unwrap();
+        assert!(!status.success(), "the hook leader was killed");
+        let t = std::time::Instant::now();
+        while !group_members(pgid).is_empty() && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(group_members(pgid).is_empty(), "the background child in the group is gone too");
+        assert!(bystander.try_wait().unwrap().is_none(), "a process outside the group was NOT signalled");
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+    }
+
+    #[test]
+    fn signal_group_refuses_pgid_0_and_1() {
+        // kill(0, sig) would hit our own group; kill(-1, sig) every process we may signal.
+        assert!(!signal_group(0, 0));
+        assert!(!signal_group(1, 0));
     }
 }
