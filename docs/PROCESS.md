@@ -9,7 +9,7 @@ what is implemented and rehearsed today is marked where it differs, and the full
 status is in [ATOMICITY.md](../ATOMICITY.md).
 
 > [!IMPORTANT]
-> **Implemented vs intended (v0.5.0-rc.8).** Rehearsed: same cut on every producer, zero transactions
+> **Implemented vs intended (v0.5.0-rc.9).** Rehearsed: same cut on every producer, zero transactions
 > after H, a symmetric abort. Implemented since, not yet rehearsed: exact H in every mode (no fallback
 > to a later cut), a block-id-at-H lineage check on the target, a local point of no return at
 > ignition start (after it, any failure HALTS; the source is never resumed). Sampled only: state

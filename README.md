@@ -332,7 +332,12 @@ Each step is journaled as it completes, so re-running after a failure or crash r
 `--force-after-ignite` (coordinator's fleet-wide order only) first stops this box's target with
 `target.stop_cmd` (default `systemctl stop <metalgo_unit> && ! systemctl is-active --quiet <metalgo_unit>`;
 set it if your target runs elsewhere or under another supervisor; it runs under `hooks.timeout_secs`, so a
-unit with a longer stop timeout counts as a failed fence) and refuses to resume the source if that fails. In a multi-producer
+unit with a longer stop timeout counts as a failed fence) and refuses to resume the source if that fails; the
+fence runs on every forced attempt, never reused from an earlier one. A rollback records its intent first:
+if it dies before finishing, `run` refuses to carry on (`status` shows `rollback_pending: yes`; `unhalt` does
+not clear it) until `rollback` is re-run, or, only while no rollback step has completed,
+`rollback --cancel-intent --i-understand` withdraws it (journaled). `run` on an ABORTED journal whose rollback
+the journal does not prove finished exits 4 ("rollback INCOMPLETE"). In a multi-producer
 event a local abort is not yet coordinated with the rest of the fleet. An aborted rehearsal is a
 *useful* rehearsal: go to Step 5.
 
@@ -1168,7 +1173,7 @@ what testers get out of it.
 
 ## Status & caveats
 
-- Operator tooling v0.5.0-rc.8 (beacon, installers, mission control) — rehearsal-grade; the beacon installer
+- Operator tooling v0.5.0-rc.9 (beacon, installers, mission control) — rehearsal-grade; the beacon installer
   pins the latest *released* tag.
   The recorded ceremonies are real but ran the fork plugin (`v0.0.0-arena-mempoolfix.1`
   lineage, metalgo 1.13.5, plugin protocol 43), not upstream PulseVM v1.0.0 (protocol

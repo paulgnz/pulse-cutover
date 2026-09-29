@@ -203,7 +203,15 @@ Mutating (see SAFETY RAILS before running):
   `--force-after-ignite` only on the coordinator's fleet-wide order: it first stops THIS box's target
   (`target.stop_cmd`, default `systemctl stop <metalgo_unit> && ! systemctl is-active --quiet
   <metalgo_unit>`; runs under `hooks.timeout_secs`) and refuses to resume the source if that fails (a
-  local fence only).
+  local fence only). The fence runs on EVERY forced attempt (a proof from an earlier attempt is never
+  reused: the target may have been restarted since).
+- A rollback journals its intent (`rollback_requested`) before any step. If it dies before ABORTED,
+  `run` refuses to continue and `status` shows `rollback_pending: yes` / `rollback: pending` (the beacon
+  reports it; mission control flags it). Finish it by re-running `rollback`. `unhalt` does NOT clear it.
+  Only while no rollback step has completed, `pulse-cutover rollback --config c.toml --cancel-intent
+  --i-understand` withdraws it (journaled with who ran it); after a step ran it refuses (exit 3).
+- `run` on an ABORTED journal: exit 1 "stopped safely and rolled back" ONLY when the journal proves the
+  rollback finished (`rollback_done`); otherwise exit 4 "rollback INCOMPLETE": run `rollback`.
 - A resumed `run` first stops a hook (or upstream pipeline step) that the previous agent left running,
   and refuses to resume if it cannot. Hooks and pipeline steps record their process group (and its
   start time) in `<journal>.hook.pgid` while they run.
