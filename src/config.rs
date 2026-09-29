@@ -42,6 +42,9 @@ pub struct Config {
     /// ceremony never depends on it.
     #[serde(default)]
     pub beacon: Option<Beacon>,
+    /// Coordinated arming (`pulse-cutover await`) and the pre-ignite fleet gate.
+    #[serde(default)]
+    pub coordination: Option<Coordination>,
     /// Append-only JSONL journal — the ceremony's evidence log and the
     /// resume-after-crash source of truth.
     pub journal_path: PathBuf,
@@ -67,6 +70,40 @@ pub struct Beacon {
     pub token_file: Option<PathBuf>,
     #[serde(default = "default_beacon_interval")]
     pub interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Coordination {
+    /// Mission control base URL (relays signed coordinator messages; trusts nothing itself).
+    pub url: String,
+    /// Network id, as in mission control's networks.json.
+    pub network: String,
+    /// ed25519 public keys (hex) whose signatures this node accepts. Empty = trust nobody.
+    #[serde(default)]
+    pub coordinator_keys: Vec<String>,
+    /// false (default): a signed ARM also needs the local file `confirm-<event_id>` next to the journal.
+    #[serde(default)]
+    pub auto_arm: bool,
+    /// Reject events whose H is fewer than this many blocks ahead of head.
+    #[serde(default = "default_min_lead")]
+    pub min_lead_blocks: u64,
+    /// Before igniting, wait until this many producers (including this one) report VERIFIED with
+    /// the same snapshot hash and fingerprints on mission control. 0 = no fleet gate.
+    #[serde(default)]
+    pub fleet_quorum: usize,
+    #[serde(default = "default_fleet_timeout")]
+    pub fleet_timeout_secs: u64,
+    /// Set by `await` in the derived config: the event this ceremony belongs to (enables signed aborts).
+    #[serde(default)]
+    pub event_id: Option<String>,
+}
+
+fn default_min_lead() -> u64 {
+    120
+}
+fn default_fleet_timeout() -> u64 {
+    300
 }
 
 fn default_beacon_interval() -> u64 {

@@ -4,6 +4,7 @@
 
 pub mod beacon;
 pub mod config;
+pub mod coord;
 pub mod doctor;
 pub mod journal;
 pub mod looper;

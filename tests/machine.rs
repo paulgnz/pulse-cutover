@@ -92,6 +92,14 @@ struct MockOps {
     scheduled_h: Cell<u64>,
     /// Source head at the moment the write-freeze hook ran.
     freeze_head: Cell<u64>,
+    // --- coordination world ---
+    /// GET <url>/api/coord/<net> answer (signed messages), if any.
+    coord_doc: RefCell<Option<serde_json::Value>>,
+    /// /api/status: producers agreeing with our evidence = `fleet_agree` once
+    /// `fleet_agree_after` status polls have happened (1 before that: just us).
+    fleet_agree: Cell<usize>,
+    fleet_agree_after: Cell<u32>,
+    fleet_polls: Cell<u32>,
 }
 
 impl MockOps {
@@ -121,6 +129,10 @@ impl MockOps {
             schedule_ok: Cell::new(false),
             scheduled_h: Cell::new(0),
             freeze_head: Cell::new(0),
+            coord_doc: RefCell::new(None),
+            fleet_agree: Cell::new(0),
+            fleet_agree_after: Cell::new(0),
+            fleet_polls: Cell::new(0),
         }
     }
 
@@ -299,6 +311,18 @@ impl ChainOps for MockOps {
     }
 
     fn get_json(&self, url: &str) -> Result<Option<serde_json::Value>, String> {
+        if url.contains("/api/coord/") {
+            return Ok(self.coord_doc.borrow().clone());
+        }
+        if url.ends_with("/api/status") {
+            let polls = self.fleet_polls.get() + 1;
+            self.fleet_polls.set(polls);
+            let ours = pulse_cutover::beacon::journal_summary(&self.dir.join("journal.jsonl"))["evidence"].clone();
+            let n = if polls >= self.fleet_agree_after.get() { self.fleet_agree.get() } else { 1 };
+            let producers: Vec<_> = (0..n).map(|i| serde_json::json!({"name": format!("bp{i}"),
+                "report": {"ceremony": {"state": "VERIFIED", "evidence": ours.clone()}}})).collect();
+            return Ok(Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": producers}]})));
+        }
         // Local hyperion-rs /v2/health (the .95-observed shape).
         if url.contains("hyperion-local") {
             if !self.hyperion_started.get() {
@@ -1371,4 +1395,78 @@ fn upstream_backend_requires_upstream_section() {
     std::fs::write(&path, toml_text).unwrap();
     let err = Config::load(&path).unwrap_err();
     assert!(err.contains("[upstream]"));
+}
+
+// ---- coordinated arming ---------------------------------------------------------------------------
+
+fn coord_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[42u8; 32])
+}
+
+fn signed(payload: serde_json::Value) -> serde_json::Value {
+    use ed25519_dalek::Signer;
+    let sk = coord_key();
+    let p = payload.to_string();
+    serde_json::json!({"payload": p, "sig": hex::encode(sk.sign(p.as_bytes()).to_bytes()),
+        "key": hex::encode(sk.verifying_key().to_bytes())})
+}
+
+fn coord_config(dir: &std::path::Path, freeze_height: u64, quorum: usize, timeout: u64) -> Config {
+    let base = test_config(dir, freeze_height);
+    let _ = base;
+    let text = std::fs::read_to_string(dir.join("ceremony.toml")).unwrap();
+    let text = format!("{text}\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nfleet_quorum = {quorum}\nfleet_timeout_secs = {timeout}\n",
+        hex::encode(coord_key().verifying_key().to_bytes()));
+    let path = dir.join("ceremony-coord.toml");
+    std::fs::write(&path, text).unwrap();
+    Config::load(&path).unwrap()
+}
+
+#[test]
+fn signed_coordinator_abort_while_armed_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = coord_config(dir.path(), 120, 0, 60);
+    let ops = MockOps::new(dir.path(), 50);
+    *ops.coord_doc.borrow_mut() = Some(serde_json::json!({
+        "abort": signed(serde_json::json!({"type": "abort", "network": "rehearsal", "event_id": "e1"}))}));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("coordinator aborted the event (signed) before the freeze"));
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "freeze-writes"), "nothing was frozen");
+}
+
+#[test]
+fn abort_for_another_event_or_unsigned_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = coord_config(dir.path(), 120, 0, 60);
+    let ops = MockOps::new(dir.path(), 110);
+    let mut forged = signed(serde_json::json!({"type": "abort", "network": "rehearsal", "event_id": "e1"}));
+    forged["sig"] = serde_json::json!("00".repeat(64));
+    *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"abort": forged}));
+    assert_eq!(run_machine(&cfg, &ops), State::Live, "a forged abort must not stop the ceremony");
+}
+
+#[test]
+fn fleet_gate_holds_ignite_until_quorum_agrees() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = coord_config(dir.path(), 120, 3, 60);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.fleet_agree.set(3);
+    ops.fleet_agree_after.set(4);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""fleet_gate":{"agreeing":3,"quorum":3}"#), "gate journaled the agreeing count");
+    assert!(ops.fleet_polls.get() >= 4, "ignite waited for the fleet");
+}
+
+#[test]
+fn fleet_gate_times_out_and_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = coord_config(dir.path(), 120, 3, 5);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.fleet_agree.set(1);
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("fleet did not reach verified agreement"));
+    assert!(ops.resumes.get() >= 1, "source producer resumed");
 }

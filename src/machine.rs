@@ -51,6 +51,8 @@ pub struct Machine<'a, O: ChainOps> {
     /// producer mode: did schedule_snapshot(H) succeed at ARM? (If not, the
     /// FROZEN step falls back to an immediate create_snapshot.)
     scheduled: bool,
+    /// Last time the coordinator's abort signal was polled (rate limit).
+    last_coord_check_ms: u64,
 }
 
 /// Hydration predicate over a hyperion-rs /v2/health document. Two ways in:
@@ -125,6 +127,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             hyperion_flip_ran: flip_ran,
             source_stopped: false,
             scheduled: false,
+            last_coord_check_ms: 0,
         }
     }
 
@@ -325,6 +328,72 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Ok(())
     }
 
+    /// Coordinated ceremonies: has the coordinator published a SIGNED abort for this event?
+    /// Rate-limited to one poll every 3 s; unreachable mission control = no abort (the
+    /// ceremony's own gates still apply). Never consulted after IGNITED.
+    fn coordinator_aborted(&mut self, force: bool) -> bool {
+        let Some(co) = self.cfg.coordination.as_ref() else { return false };
+        let Some(id) = co.event_id.as_deref() else { return false };
+        let now = self.ops.now_ms();
+        if !force && now.saturating_sub(self.last_coord_check_ms) < 3000 {
+            return false;
+        }
+        self.last_coord_check_ms = now;
+        let url = format!("{}/api/coord/{}", co.url.trim_end_matches('/'), co.network);
+        match self.ops.get_json(&url) {
+            Ok(Some(doc)) => crate::coord::aborted(&doc, &co.coordinator_keys, &co.network, id),
+            _ => false,
+        }
+    }
+
+    /// Pre-ignite fleet gate: wait until `fleet_quorum` producers (this one included) report
+    /// VERIFIED-or-later with the same snapshot sha256 and fingerprint digest as ours.
+    /// Returns Ok(false) after aborting (signed abort or timeout).
+    fn fleet_gate(&mut self) -> Result<bool, String> {
+        let Some(co) = self.cfg.coordination.clone() else { return Ok(true) };
+        if co.fleet_quorum == 0 && co.event_id.is_none() {
+            return Ok(true);
+        }
+        let ours = crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"].clone();
+        let deadline = self.ops.now_ms() + co.fleet_timeout_secs * 1000;
+        let status_url = format!("{}/api/status", co.url.trim_end_matches('/'));
+        let mut last_seen = 0usize;
+        loop {
+            if self.coordinator_aborted(true) {
+                self.abort("coordinator aborted the event (signed) before ignition", json!({"event_id": co.event_id}))?;
+                return Ok(false);
+            }
+            if co.fleet_quorum == 0 {
+                return Ok(true);
+            }
+            let agreeing = match self.ops.get_json(&status_url) {
+                Ok(Some(st)) => st["networks"].as_array().and_then(|nets| nets.iter().find(|n| n["id"].as_str() == Some(co.network.as_str())))
+                    .and_then(|n| n["producers"].as_array())
+                    .map(|ps| ps.iter().filter(|p| {
+                        let c = &p["report"]["ceremony"];
+                        matches!(c["state"].as_str(), Some("VERIFIED" | "IGNITED" | "FLIPPED" | "LIVE"))
+                            && c["evidence"]["snapshot_sha256"] == ours["snapshot_sha256"]
+                            && c["evidence"]["fingerprints_digest"] == ours["fingerprints_digest"]
+                    }).count())
+                    .unwrap_or(0),
+                _ => 0,
+            };
+            if agreeing != last_seen {
+                self.journal.evidence(State::Verified, json!({"fleet_gate": {"agreeing": agreeing, "quorum": co.fleet_quorum}}))?;
+                last_seen = agreeing;
+            }
+            if agreeing >= co.fleet_quorum {
+                return Ok(true);
+            }
+            if self.ops.now_ms() > deadline {
+                self.abort("fleet did not reach verified agreement before fleet_timeout",
+                    json!({"agreeing": agreeing, "quorum": co.fleet_quorum, "fleet_timeout_secs": co.fleet_timeout_secs}))?;
+                return Ok(false);
+            }
+            self.ops.sleep_ms(2000);
+        }
+    }
+
     fn abort(&mut self, reason: &str, detail: serde_json::Value) -> Result<(), String> {
         self.journal.error(self.state, reason, detail)?;
         let mut rollback = json!({"reason": reason, "auto_rollback": self.cfg.target.auto_rollback});
@@ -427,6 +496,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let info = self.ops.source_info()?;
             if info.head_block_num >= freeze_at {
                 break info;
+            }
+            if self.coordinator_aborted(false) {
+                self.abort("coordinator aborted the event (signed) before the freeze", json!({"head": info.head_block_num}))?;
+                return Ok(());
             }
             let now = self.ops.now_ms();
             if now.saturating_sub(last_heartbeat) >= 30_000 {
@@ -605,6 +678,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let info = self.ops.source_info()?;
             if info.last_irreversible_block_num >= h {
                 break;
+            }
+            if self.coordinator_aborted(false) {
+                self.abort("coordinator aborted the event (signed) while waiting for H to finalize",
+                    json!({"h": h, "lib": info.last_irreversible_block_num}))?;
+                return Ok(None);
             }
             let now = self.ops.now_ms();
             if now > deadline {
@@ -1080,6 +1158,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 json!({"remaining": upstream::ignite_pending_reasons()}),
             )?;
             return Ok(());
+        }
+        if !self.fleet_gate()? {
+            return Ok(()); // aborted inside, with evidence
         }
         let started = self.ops.now_ms();
         let output = match self.ops.ignite() {

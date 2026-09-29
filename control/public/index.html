@@ -166,6 +166,46 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:40px 0 60px}
 footer a{color:var(--muted)}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
 
+
+/* infrastructure */
+.inf-sum{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:14px}
+.inf-sum .glass{padding:14px 16px}
+.inf-sum .v{font:700 22px var(--mono)}
+.inf-sum .l{color:var(--muted);font-size:12px}
+.mix{display:flex;height:6px;border-radius:4px;overflow:hidden;margin-top:9px;background:rgba(255,255,255,.06)}
+.mix i{display:block;height:100%}
+.mixl{display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:7px;font-size:11px;color:var(--muted)}
+.mixl b{font-weight:600;color:var(--ink)}
+.inf-tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.chipbtn{border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--muted);border-radius:99px;padding:7px 13px;font:600 12px var(--sans);cursor:pointer}
+.chipbtn[aria-pressed=true]{color:var(--ink);border-color:rgba(139,92,246,.5);background:rgba(139,92,246,.16)}
+.inf-tools input{flex:1;min-width:180px;background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:99px;color:var(--ink);padding:8px 14px;font:13px var(--sans)}
+.inf-table{padding:6px 0;overflow-x:auto}
+.inf-table table{min-width:1080px}
+.inf-table table{width:100%;border-collapse:collapse;font-size:12.5px}
+.inf-table th{text-align:left;font:600 10.5px var(--sans);letter-spacing:1.2px;text-transform:uppercase;color:var(--muted);padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+.inf-table td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
+.inf-table tr:last-child td{border:0}
+.inf-table tr:hover td{background:rgba(255,255,255,.02)}
+.who2{display:flex;align-items:center;gap:9px;min-width:0}
+.who2 .logo{width:26px;height:26px;border-radius:8px;font-size:10px}
+.who2 b{font-weight:600;white-space:nowrap}
+.tp{display:inline-block;font:600 10px var(--sans);letter-spacing:.5px;padding:2px 7px;border-radius:99px;margin:1px 3px 1px 0;border:1px solid var(--line);color:var(--muted);text-transform:uppercase}
+.tp.producer{color:var(--cut);border-color:rgba(245,165,36,.35)}.tp.query{color:var(--sky);border-color:rgba(96,165,250,.35)}.tp.seed{color:var(--ok);border-color:rgba(52,211,153,.35)}
+.url{font-family:var(--mono);font-size:11.5px;color:#c7cbe0;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+.st2{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;font-family:var(--mono);font-size:11.5px}
+.inf-foot{color:var(--dim);font-size:11.5px;padding:10px 12px}
+@media (max-width:1100px){.inf-sum{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media (max-width:760px){
+  .inf-table table{min-width:0}
+  .inf-sum{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .inf-table table,.inf-table tbody,.inf-table tr,.inf-table td{display:block;width:100%}
+  .inf-table thead{display:none}
+  .inf-table tr{padding:10px 12px;border-bottom:1px solid var(--line)}
+  .inf-table td{border:0;padding:3px 0;display:flex;justify-content:space-between;gap:10px}
+  .inf-table td::before{content:attr(data-l);color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px}
+  .inf-table td:first-child::before{content:none}.url{max-width:210px}
+}
 @media (max-width:1100px){.hero{grid-template-columns:minmax(0,1fr)}.globe-card{min-height:440px}.duo{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:640px){
   .tile{padding-bottom:56px;min-height:128px}
@@ -231,6 +271,13 @@ footer a{color:var(--muted)}
     <div class="more" id="more"></div>
   </section>
 
+
+  <section aria-labelledby="t-infra" id="infra-sec">
+    <div class="sec-h"><h2 id="t-infra">Infrastructure</h2><span id="infra-sub">every node every producer publishes in bp.json · probed read-only</span></div>
+    <div class="inf-sum" id="inf-sum"></div>
+    <div class="inf-tools" id="inf-tools"></div>
+    <div class="glass inf-table"><table><thead><tr><th>Producer</th><th>Node</th><th>Endpoint</th><th>API</th><th>Version</th><th>Lag</th><th>Edge</th><th>Hyperion</th><th>Atomic</th><th>P2P</th></tr></thead><tbody id="inf-rows"></tbody></table><div class="inf-foot" id="inf-foot"></div></div>
+  </section>
   <section class="duo">
     <div>
       <div class="sec-h"><h2>Atomicity evidence</h2><span>one colour per value · one unbroken band = every producer agrees</span></div>
@@ -483,7 +530,8 @@ function render() {
     <dt>beacons reporting</dt><dd>${fmt(s.reporting)}</dd><dt>chain</dt><dd>${c.ok === false ? '<span style="color:var(--bad)">unreachable</span>' : c.chain_id_ok === false ? '<span style="color:var(--bad)">unexpected chain_id</span>' : '<span style="color:var(--ok)">reachable</span>'}</dd>`;
 
   // cutover ring
-  const H = net.event?.h || prods.map((p) => p.report?.ceremony?.evidence?.h).find(Boolean);
+  const co = net.coordination;
+  const H = co?.event?.h || net.event?.h || prods.map((p) => p.report?.ceremony?.evidence?.h).find(Boolean);
   const stateCounts = s.states || {}, live = stateCounts.LIVE || 0;
   if (H) {
     const toH = c.head ? H - c.head : null;
@@ -492,7 +540,8 @@ function render() {
       live ? `${live}/${s.reporting}` : toH > 0 ? fmt(toH) : 'H', live ? 'LIVE' : toH > 0 ? 'BLOCKS TO H' : 'CUT', live ? ['#34d399', '#10b981'] : ['#f5a524', '#8b5cf6']);
     const eta = toH > 0 ? toH * 0.5 : 0;
     $('h-kv').innerHTML = `<dt>cut height H</dt><dd>${fmt(H)}</dd><dt>${toH > 0 ? 'time to H' : 'status'}</dt><dd>${toH > 0 ? `${Math.floor(eta / 60)}m ${Math.round(eta % 60)}s` : started ? 'ceremony in progress' : 'at H'}</dd>
-      <dt>write freeze</dt><dd>at H − ${esc(prods.find((p) => p.report)?.report?.checks?.find((x) => x.name === 'freeze_lead_blocks')?.detail?.match(/\d+/)?.[0] || '24')}</dd><dt>stages</dt><dd>${Object.entries(stateCounts).map(([k, v]) => `${v} ${k}`).join(' · ') || '—'}</dd>`;
+      ${co ? `<dt>signed event</dt><dd>${esc(co.event.event_id)} · <b style="color:${co.aborted ? 'var(--bad)' : co.armed ? 'var(--ok)' : 'var(--warn)'}">${co.aborted ? 'ABORTED' : co.armed ? 'ARMED' : 'published'}</b></dd><dt>accepted by</dt><dd>${co.accepted.length} / ${s.reporting || denom} producers${co.rejected.length ? ` · <span style="color:var(--bad)">${co.rejected.length} rejected</span>` : ''}</dd>` : ''}
+      <dt>write freeze</dt><dd>at H − ${esc(co?.event?.freeze_lead_blocks ?? prods.find((p) => p.report)?.report?.checks?.find((x) => x.name === 'freeze_lead_blocks')?.detail?.match(/\d+/)?.[0] ?? '24')}</dd><dt>stages</dt><dd>${Object.entries(stateCounts).map(([k, v]) => `${v} ${k}`).join(' · ') || '—'}</dd>`;
   } else {
     ring($('h-ring'), 0, '—', 'NO CUT', ['#f5a524', '#8b5cf6']);
     $('h-kv').innerHTML = `<dt>status</dt><dd>no cutover scheduled</dd><dt>readiness</dt><dd>${s.ready} of ${denom} producers</dd><dt>when scheduled</dt><dd>H appears here</dd>`;
@@ -526,6 +575,7 @@ function render() {
       <div class="checks" aria-hidden="true">${bars}</div>
       <div class="foot"><span class="st"><span class="sd ${dot}"></span>${esc(status)}${producing ? ' · <b style="color:var(--cut)">producing</b>' : ''}</span><span class="mono">${r ? 'v' + esc(r.agent_version) : p.scheduled ? 'scheduled' : 'standby'}</span></div>
       ${failing.length ? `<div class="fail">✗ ${esc(failing[0].name)}: ${esc(failing[0].detail)}</div>` : ''}
+      ${r?.coord?.event_id && co?.event?.event_id === r.coord.event_id ? (r.coord.accepted ? `<div class="fail" style="color:var(--ok)">✓ accepted event ${esc(r.coord.event_id)} · H ${fmt(r.coord.h)}${r.coord.armed ? ' · armed' : ''}</div>` : `<div class="fail">✗ rejected event: ${esc(r.coord.reason)}</div>`) : ''}
     </article>`;
   }).join('');
   $('prods').querySelectorAll('.pc').forEach((el) => { const go = () => flyTo(el.dataset.name); el.onclick = go; el.onkeydown = (e) => { if (e.key === 'Enter') go(); }; });
@@ -550,7 +600,77 @@ function render() {
       : `<li><time>—</time>Quiet. Events appear as producer beacons report readiness changes and ceremony steps.</li>`;
   }
   $('announce').textContent = `${net.name} ${net.label}: ${s.ready} of ${denom} producers ready.`;
+  if (typeof renderInfra === 'function' && render._lastNet !== active) { render._lastNet = active; renderInfra(); }
 }
+
+
+/* ---------------- infrastructure ---------------- */
+let infraData = {}, infraFilter = 'all', infraQuery = '';
+const FILTERS = [['all', 'All nodes'], ['api', 'API'], ['producer', 'Producer'], ['p2p', 'P2P peers'], ['hyperion', 'Hyperion'], ['atomic', 'AtomicAssets'], ['problems', 'Problems']];
+const MIXC = ['#8b5cf6', '#34d399', '#60a5fa', '#f5a524', '#fb7185', '#a3e635', '#f472b6', '#94a3b8'];
+function mix(counts) {
+  const tot = counts.reduce((a, [, n]) => a + n, 0) || 1;
+  return `<div class="mix">${counts.map(([, n], i) => `<i style="width:${100 * n / tot}%;background:${MIXC[i % MIXC.length]}"></i>`).join('')}</div>
+    <div class="mixl">${counts.slice(0, 4).map(([k, n], i) => `<span><i class="sd" style="background:${MIXC[i % MIXC.length]};display:inline-block;width:7px;height:7px;margin-right:4px"></i><b>${esc(k)}</b> ${n}</span>`).join('')}</div>`;
+}
+const tally = (arr) => Object.entries(arr.reduce((m, k) => (m[k] = (m[k] || 0) + 1, m), {})).sort((a, b) => b[1] - a[1]);
+const problem = (n) => (n.url && !n.api?.ok) || (n.api?.lag > 30) || (n.api && n.api.chain_ok === false) || (n.p2p && n.p2p_probe && !n.p2p_probe.ok) || (n.hyperion && (!n.hyperion.ok || n.hyperion.lag > 120)) || (n.atomic && !n.atomic.ok) || n.missing_bp_json;
+function renderInfra() {
+  const d = infraData[active];
+  const sec = $('infra-sec');
+  if (net?.id === 'rehearsal' || !d) { sec.style.display = net?.id === 'rehearsal' ? 'none' : ''; if (!d && net?.id !== 'rehearsal') { $('inf-rows').innerHTML = '<tr><td colspan="10" style="color:var(--muted)">Surveying every producer\u2019s nodes… (first pass takes about a minute)</td></tr>'; $('inf-sum').innerHTML = ''; } return; }
+  sec.style.display = '';
+  const nodes = d.nodes || [];
+  const api = nodes.filter((n) => n.url), up = api.filter((n) => n.api?.ok);
+  const p2p = nodes.filter((n) => n.p2p), p2pUp = p2p.filter((n) => n.p2p_probe?.ok);
+  const hy = nodes.filter((n) => n.hyperion?.ok), at = nodes.filter((n) => n.atomic?.ok);
+  $('inf-sum').innerHTML = `
+    <div class="glass"><div class="label">API endpoints</div><div class="v">${up.length}<span style="color:var(--muted);font-size:14px"> / ${api.length}</span></div><div class="l">answering now</div></div>
+    <div class="glass"><div class="label">nodeos versions</div>${mix(tally(up.map((n) => (n.api.version || '?').split('-')[0])))}</div>
+    <div class="glass"><div class="label">Edges</div>${mix(tally(up.map((n) => n.api.edge)))}</div>
+    <div class="glass"><div class="label">Hyperion</div><div class="v">${new Set(hy.map((n) => n.producer)).size}</div>${mix(tally(hy.map((n) => n.hyperion.version || '?')))}</div>
+    <div class="glass"><div class="label">AtomicAssets API</div><div class="v">${new Set(at.map((n) => n.producer)).size}</div><div class="l">producers serving it</div></div>
+    <div class="glass"><div class="label">P2P peers</div><div class="v">${p2pUp.length}<span style="color:var(--muted);font-size:14px"> / ${p2p.length}</span></div><div class="l">accepting connections</div></div>`;
+  $('inf-tools').innerHTML = FILTERS.map(([k, l]) => `<button class="chipbtn" aria-pressed="${infraFilter === k}" data-f="${k}">${l}</button>`).join('') + `<input id="inf-q" placeholder="search producer or URL" value="${esc(infraQuery)}" aria-label="Search nodes">`;
+  $('inf-tools').querySelectorAll('.chipbtn').forEach((b) => b.onclick = () => { infraFilter = b.dataset.f; renderInfra(); });
+  const q = $('inf-q'); q.oninput = () => { infraQuery = q.value; renderRows(); };
+  renderRows();
+  function renderRows() {
+    const ql = infraQuery.toLowerCase();
+    const rows = nodes.filter((n) => {
+      if (ql && !(`${n.producer} ${n.org?.name || ''} ${n.url || ''} ${n.p2p || ''}`.toLowerCase().includes(ql))) return false;
+      switch (infraFilter) {
+        case 'api': return !!n.url; case 'producer': return n.types?.includes('producer'); case 'p2p': return !!n.p2p;
+        case 'hyperion': return !!n.hyperion; case 'atomic': return !!n.atomic; case 'problems': return problem(n); default: return true;
+      }
+    });
+    const dot = (ok, warn) => `<span class="sd ${ok ? (warn ? 'warn' : 'ok') : 'bad'}"></span>`;
+    $('inf-rows').innerHTML = rows.slice(0, 400).map((n) => {
+      const logo = n.org?.logo ? `<img src="${esc(n.org.logo)}" alt="" loading="lazy" onerror="this.remove()">` : '';
+      if (n.missing_bp_json) return `<tr><td><div class="who2"><div class="logo"><span>${esc(initials(n.producer))}</span>${logo}</div><b>${esc(n.org?.name || n.producer)}</b></div></td><td colspan="9" data-l="bp.json" style="color:var(--bad)">no bp.json published: nodes unknown</td></tr>`;
+      const a = n.api, h = n.hyperion, at = n.atomic, pp = n.p2p_probe;
+      return `<tr>
+        <td><div class="who2"><div class="logo"><span>${esc(initials(n.org?.name || n.producer))}</span>${logo}</div><div><b>${esc(n.org?.name || n.producer)}</b><div style="color:var(--muted);font-size:11px">${flag(n.org?.country)} ${esc(n.producer)}${n.rank ? ' · #' + n.rank : ''}</div></div></div></td>
+        <td data-l="node">${(n.types.length ? n.types : ['node']).map((t) => `<span class="tp ${esc(t)}">${esc(t)}</span>`).join('')}</td>
+        <td data-l="endpoint">${n.url ? `<a class="url" href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${esc(n.url.replace(/^https?:\/\//, ''))}</a>` : n.p2p ? `<span class="url" title="p2p">${esc(n.p2p)}</span>` : '<span style="color:var(--dim)">—</span>'}</td>
+        <td data-l="api">${a ? `<span class="st2">${dot(a.ok && a.chain_ok !== false)}${a.ok ? (a.chain_ok === false ? 'wrong chain' : a.ms + ' ms') : esc(a.error || 'down')}</span>` : '<span style="color:var(--dim)">—</span>'}</td>
+        <td data-l="version" class="mono">${a?.version ? esc(a.version.split('-')[0]) : '—'}</td>
+        <td data-l="lag" class="mono">${a?.lag != null ? `<span style="color:${a.lag > 30 ? 'var(--warn)' : 'inherit'}">${fmt(a.lag)}</span>` : '—'}</td>
+        <td data-l="edge">${a?.edge ? esc(a.edge) : '—'}</td>
+        <td data-l="hyperion">${h ? `<span class="st2">${dot(h.ok, h.lag > 120)}${h.ok ? esc(h.version || '?') + (h.lag != null ? ' · lag ' + fmt(h.lag) : '') : 'down'}</span>` : '—'}</td>
+        <td data-l="atomic">${at ? `<span class="st2">${dot(at.ok && at.chain_ok !== false)}${at.ok ? esc(at.version || 'up') : 'down'}</span>` : '—'}</td>
+        <td data-l="p2p">${n.p2p ? `<span class="st2" title="${esc(n.p2p)}">${dot(pp?.ok)}${pp?.ok ? pp.ms + ' ms' : esc(pp?.error || '…')}</span>` : '—'}</td></tr>`;
+    }).join('') || '<tr><td colspan="10" style="color:var(--muted)">No nodes match.</td></tr>';
+    $('inf-foot').textContent = `${rows.length} of ${nodes.length} nodes · surveyed ${Math.round((Date.now() - d.ts) / 60000)} min ago · re-surveyed every 10 min`;
+  }
+}
+async function pollInfra() {
+  for (const id of ['mainnet', 'testnet']) {
+    try { const d = await (await fetch('/api/infra/' + id, { cache: 'no-store' })).json(); if (!d.pending) infraData[id] = d; } catch {}
+  }
+  renderInfra();
+}
+pollInfra(); setInterval(pollInfra, 30000);
 
 let lastHead = {};
 async function poll() {

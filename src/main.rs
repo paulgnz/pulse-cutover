@@ -37,6 +37,7 @@ read-only, safe anywhere (including production):
   scan-contracts  list contracts that reference host functions PulseVM stubs (advisory)
   report          build a sanitized tar.gz to share (keys/tokens auto-redacted)
   beacon          report readiness + ceremony evidence to mission control
+  await           arm from a signed coordinator event (same H on every producer)
   verify          hash + dual-import fingerprint a snapshot (heavy but touches nothing)
 
 mutating (normally driven by install.sh / cutover.sh):
@@ -73,6 +74,20 @@ Read-only on the box; runs beside the ceremony, never inside it.
 EXAMPLES
   pulse-cutover beacon --config /etc/pulse-cutover/ceremony.toml
   pulse-cutover beacon --config ceremony.toml --once     # print one report";
+
+const HELP_AWAIT: &str = "\
+pulse-cutover await --config ceremony.toml
+
+Coordinated arming. Waits for the coordinator's SIGNED event (network, chain_id, H,
+freeze lead, cpu scale) relayed by mission control ([coordination] url/network),
+verifies it against [coordination] coordinator_keys and this node's own config and
+head, then waits for a signed ARM. With auto_arm = false (default) the operator must
+also `touch <journal dir>/confirm-<event_id>`. It then runs the ceremony at exactly
+that H. A signed ABORT is honoured before arming and, during the ceremony, up to
+VERIFIED (never after IGNITED).
+
+EXAMPLES
+  pulse-cutover await --config /etc/pulse-cutover/ceremony.toml";
 
 const HELP_LOOP: &str = "\
 pulse-cutover loop --config ceremony.toml --runs N
@@ -168,6 +183,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "scan-contracts" => Some(HELP_SCAN),
         "report" => Some(HELP_REPORT),
         "beacon" => Some(HELP_BEACON),
+        "await" => Some(HELP_AWAIT),
         _ => None,
     }
 }
@@ -209,6 +225,7 @@ fn main() {
         "scan-contracts" => cmd_scan(&args),
         "report" => cmd_report(&args),
         "beacon" => cmd_beacon(&args),
+        "await" => cmd_await(&args),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -345,6 +362,13 @@ fn cmd_beacon(args: &[String]) -> Result<(), String> {
     let path = arg(args, "--config").ok_or("--config <ceremony.toml> is required")?;
     let cfg = Config::load(&PathBuf::from(path))?;
     pulse_cutover::beacon::run(&cfg, flag(args, "--once"))
+}
+
+fn cmd_await(args: &[String]) -> Result<(), String> {
+    let path = PathBuf::from(arg(args, "--config").ok_or("--config <ceremony.toml> is required")?);
+    let cfg = Config::load(&path)?;
+    let code = pulse_cutover::coord::run_await(&cfg, &path)?;
+    std::process::exit(code);
 }
 
 fn cmd_status(args: &[String]) -> Result<(), String> {

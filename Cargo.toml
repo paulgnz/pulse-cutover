@@ -26,6 +26,7 @@ wasmparser = "0.245"
 pulsevm_snapshot = { git = "https://github.com/paulgnz/pulsevm", rev = "8a81171e5c549a433d9929829a319457c95f74dd" }
 pulsevm_snapshot_import = { git = "https://github.com/paulgnz/pulsevm", rev = "8a81171e5c549a433d9929829a319457c95f74dd" }
 pulsevm_chaindb = { git = "https://github.com/paulgnz/pulsevm", rev = "8a81171e5c549a433d9929829a319457c95f74dd" }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -9,7 +9,8 @@
 // - Serves GET /api/status (JSON) and the dashboard (GET /).
 // No dependencies (Node >= 18). Nothing here can change a chain or a node: it only reads and displays.
 import http from 'node:http';
-import { createHash } from 'node:crypto';
+import net from 'node:net';
+import { createHash, createPublicKey, verify as edVerify } from 'node:crypto';
 import { readFileSync, existsSync, watchFile } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -134,6 +135,110 @@ async function logo(net, owner) {
   } catch { return null; }
 }
 
+// ---- infrastructure survey: every node of every active producer (bp.json nodes) ------------------------
+// Read-only public probes, bounded concurrency, every INFRA_EVERY_MS: API get_info (version, head, latency, edge),
+// Hyperion /v2/health, AtomicAssets /health, and a TCP connect to each advertised p2p endpoint.
+const INFRA_EVERY_MS = +(process.env.INFRA_EVERY_MS || 10 * 60e3);
+const n_id = (cid) => cfg.networks.find((x) => x.chain_id === cid)?.id;
+const infra = {}; // network id → { ts, running, nodes: [...] }
+const edgeOf = (h) => {
+  const sv = (h.get('server') || '').toLowerCase(), via = (h.get('via') || '').toLowerCase();
+  if (h.get('cf-ray') || sv.includes('cloudflare')) return 'cloudflare';
+  for (const k of ['openresty', 'nginx', 'haproxy', 'caddy', 'apache', 'envoy', 'traefik']) if (sv.includes(k) || via.includes(k)) return k;
+  return sv.startsWith('nodeos') ? 'direct / hidden' : sv ? sv.slice(0, 20) : 'hidden';
+};
+async function timed(fn) { const t = Date.now(); try { const r = await fn(); return { ok: true, ms: Date.now() - t, ...r }; } catch (e) { return { ok: false, ms: Date.now() - t, error: String(e.message || e).slice(0, 80) }; } }
+function tcp(hostport) {
+  return new Promise((res) => {
+    const m = String(hostport).trim().match(/^\[?([^\]]+?)\]?:(\d+)$/); if (!m) return res({ ok: false, error: 'bad endpoint' });
+    const t = Date.now(); const s = net.connect({ host: m[1], port: +m[2], timeout: 4000 });
+    s.once('connect', () => { s.destroy(); res({ ok: true, ms: Date.now() - t }); });
+    s.once('timeout', () => { s.destroy(); res({ ok: false, error: 'timeout' }); });
+    s.once('error', (e) => res({ ok: false, error: e.code || 'error' }));
+  });
+}
+async function probeApi(url, chainId, head) {
+  return timed(async () => {
+    const r = await fetch(`${url}/v1/chain/get_info`, { method: 'POST', body: '{}', signal: AbortSignal.timeout(6000) });
+    const b = await r.json();
+    return { edge: edgeOf(r.headers), version: b.server_version_string || null, head: b.head_block_num, lag: chain[n_id(chainId)]?.head && b.head_block_num ? Math.max(0, chain[n_id(chainId)].head - b.head_block_num) : null,
+      chain_ok: !chainId || b.chain_id === chainId };
+  });
+}
+async function probeHyperion(url, head) {
+  return timed(async () => {
+    const h = await (await fetch(`${url}/v2/health`, { signal: AbortSignal.timeout(6000) })).json();
+    if (!Array.isArray(h.health) || !h.version) throw new Error('not a Hyperion health document');
+    const idx = (h.health || []).map((x) => x.service_data?.last_indexed_block).filter((v) => v > 0).sort((x, y) => y - x)[0];
+    return { version: h.version || null, indexed: idx || null, lag: head && idx ? Math.max(0, head - idx) : null,
+      services: (h.health || []).map((x) => ({ s: x.service, ok: x.status === 'OK' })) };
+  });
+}
+async function probeAtomic(url) {
+  return timed(async () => {
+    const h = await (await fetch(`${url}/health`, { signal: AbortSignal.timeout(6000) })).json();
+    return { version: h.data?.version || null, chain_ok: h.data?.chain?.status === 'OK', head: h.data?.chain?.head_block || null };
+  });
+}
+async function pool(items, n, fn) { let i = 0; await Promise.all(Array.from({ length: n }, async () => { while (i < items.length) { const k = i++; await fn(items[k]); } })); }
+async function surveyInfra(n) {
+  const reg = registry[n.id]?.producers; const c = chain[n.id];
+  if (!reg || !c?.head || infra[n.id]?.running) return;
+  const run = (infra[n.id] ||= { nodes: [] }); run.running = true;
+  const nodes = [];
+  try {
+  await pool(Object.values(reg), 4, async (p) => { try {
+    const base = safeUrl(p.url); if (!base) return;
+    let bp; try { bp = await bpJson(base, n.chain_id); } catch { nodes.push({ producer: p.owner, rank: p.rank, missing_bp_json: true }); return; }
+    for (const nd of (bp.nodes || []).slice(0, 12)) {
+      const types = [].concat(nd.node_type || []).map(String);
+      const features = [].concat(nd.features || []).map(String);
+      const url = safeUrl(nd.ssl_endpoint || nd.api_endpoint || '');
+      const e = { producer: p.owner, rank: p.rank, types, features, url, p2p: nd.p2p_endpoint || null,
+        location: nd.location?.name || nd.location?.country || null };
+      const jobs = [];
+      if (url) {
+        jobs.push(probeApi(url, n.chain_id, c.head).then((r) => (e.api = r)));
+        if (features.includes('hyperion-v2') || types.includes('query')) jobs.push(probeHyperion(url, c.head).then((r) => { if (r.ok || features.includes('hyperion-v2')) e.hyperion = r; }));
+        if (features.some((f) => /atomic/i.test(f))) jobs.push(probeAtomic(url).then((r) => (e.atomic = r)));
+      }
+      if (e.p2p) jobs.push(tcp(e.p2p).then((r) => (e.p2p_probe = r)));
+      await Promise.all(jobs);
+      nodes.push(e);
+    }
+  } catch (err) { console.error(`infra ${n.id} ${p.owner}:`, err?.stack || err); nodes.push({ producer: p.owner, rank: p.rank, survey_error: String(err?.message || err).slice(0, 120) }); } });
+  nodes.sort((a, b) => (a.rank || 999) - (b.rank || 999));
+  infra[n.id] = { ts: Date.now(), running: false, head: c.head, nodes };
+  console.log(`infra ${n.id}: ${nodes.length} nodes surveyed`);
+  } catch (err) { console.error(`infra ${n.id} failed:`, err?.stack || err); }
+  finally { if (infra[n.id]) infra[n.id].running = false; }
+}
+setInterval(() => cfg.networks.forEach((n) => { if (!n.static_producers) surveyInfra(n).catch(() => {}); }), INFRA_EVERY_MS);
+setTimeout(() => cfg.networks.forEach((n) => { if (!n.static_producers) surveyInfra(n).catch((e) => console.error('infra', e)); }), +(process.env.INFRA_FIRST_MS || 45000));
+
+// ---- coordination: relay of SIGNED coordinator messages (event / arm / abort) ------------------------
+// The server checks signatures against the network's configured coordinator keys so it can't be spammed,
+// but agents verify again with keys from their OWN config: this relay cannot forge anything.
+const coord = {}; // network id → { event, arm, abort }  (each: { payload, sig, key })
+function verifySigned(msg, keys) {
+  try {
+    if (!keys?.map((k) => k.toLowerCase()).includes(String(msg.key).toLowerCase())) return null;
+    const pub = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(msg.key, 'hex')]), format: 'der', type: 'spki' });
+    if (!edVerify(null, Buffer.from(msg.payload), pub, Buffer.from(msg.sig, 'hex'))) return null;
+    return JSON.parse(msg.payload);
+  } catch { return null; }
+}
+function coordView(n) {
+  const c = coord[n.id] || {};
+  const ev = c.event ? JSON.parse(c.event.payload) : null;
+  if (!ev) return null;
+  const reps = Object.entries(nodes[n.id] || {});
+  return { event: ev, armed: !!c.arm, aborted: !!c.abort,
+    arm_at: c.arm ? JSON.parse(c.arm.payload).issued_at_ms : null,
+    accepted: reps.filter(([, r]) => r.report?.coord?.event_id === ev.event_id && r.report?.coord?.accepted).map(([p]) => p),
+    rejected: reps.filter(([, r]) => r.report?.coord?.event_id === ev.event_id && r.report?.coord?.accepted === false).map(([p, r]) => ({ producer: p, reason: r.report.coord.reason })) };
+}
+
 // ---- agreement (atomicity A1/A3 across producers) ------------------------------------------------
 const EVIDENCE_KEYS = [
   ['h', 'declared H'], ['cut_block_id', 'cut block id'], ['snapshot_sha256', 'snapshot sha256'],
@@ -181,7 +286,7 @@ function status() {
         summary: { producers: producers.length, active: producers.filter((p) => p.active).length, scheduled: (c.schedule || []).length, reporting: live.length,
           ready: live.filter((p) => p.report?.ready).length,
           states: live.reduce((m, p) => { const s = p.report?.ceremony?.state || 'IDLE'; m[s] = (m[s] || 0) + 1; return m; }, {}) },
-        producers, agreement: agreement(n.id), events: (events[n.id] || []).slice(0, 40) };
+        producers, agreement: agreement(n.id), coordination: coordView(n), events: (events[n.id] || []).slice(0, 40) };
     }).sort((a, b) => a.priority - b.priority),
   };
 }
@@ -198,6 +303,12 @@ http.createServer(async (req, res) => {
     return send(res, 200, readFileSync(join(HERE, 'public', 'index.html'), 'utf8'), 'text/html; charset=utf-8');
   if (req.method === 'GET' && url.pathname === '/api/status') return send(res, 200, status());
   if (req.method === 'GET' && url.pathname === '/healthz') return send(res, 200, { ok: true });
+  const im = url.pathname.match(/^\/api\/infra\/([a-z0-9-]+)$/);
+  if (im && req.method === 'GET') {
+    const x = infra[im[1]]; const reg = registry[im[1]]?.producers || {};
+    if (!x) return send(res, 200, { pending: true });
+    return send(res, 200, { ts: x.ts, head: x.head, nodes: x.nodes.map((nd) => ({ ...nd, org: reg[nd.producer]?.org ? { name: reg[nd.producer].org.name, country: reg[nd.producer].org.country, logo: reg[nd.producer].org.logo ? `/api/logo/${im[1]}/${nd.producer}` : null } : null })) });
+  }
   if (req.method === 'GET' && url.pathname.startsWith('/api/logo/')) {
     const [, , , net, owner] = url.pathname.split('/').map(decodeURIComponent);
     const l = await logo(net, owner);
@@ -205,6 +316,25 @@ http.createServer(async (req, res) => {
     res.writeHead(200, { 'content-type': l.type, 'cache-control': 'public, max-age=21600', 'x-content-type-options': 'nosniff',
       'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox" });
     return res.end(l.buf);
+  }
+  const cm = url.pathname.match(/^\/api\/coord\/([a-z0-9-]+)$/);
+  if (cm && req.method === 'GET') return send(res, 200, coord[cm[1]] || {});
+  if (cm && req.method === 'POST') {
+    const n = cfg.networks.find((x) => x.id === cm[1]); if (!n) return send(res, 404, { error: 'unknown network' });
+    let raw = ''; for await (const chunk of req) { raw += chunk; if (raw.length > 16384) return send(res, 413, { error: 'too large' }); }
+    let msg; try { msg = JSON.parse(raw); } catch { return send(res, 400, { error: 'bad json' }); }
+    const p = verifySigned(msg, n.coordinators);
+    if (!p || p.network !== n.id || !['event', 'arm', 'abort'].includes(p.type)) return send(res, 403, { error: 'not a valid signed coordinator message for this network' });
+    const c = (coord[n.id] ||= {});
+    if (p.type === 'event') {
+      if (n.chain_id && p.chain_id !== n.chain_id) return send(res, 409, { error: 'event chain_id does not match this network' });
+      coord[n.id] = { event: msg }; pushEvent(n.id, 'coordinator', `published event ${p.event_id}: cut at H = ${p.h}`);
+    } else {
+      const ev = c.event && JSON.parse(c.event.payload);
+      if (!ev || ev.event_id !== p.event_id) return send(res, 409, { error: 'no such event' });
+      c[p.type] = msg; pushEvent(n.id, 'coordinator', p.type === 'arm' ? `ARMED event ${p.event_id}` : `ABORTED event ${p.event_id}`);
+    }
+    return send(res, 200, { ok: true, type: p.type, event_id: p.event_id });
   }
   if (req.method === 'POST' && url.pathname === '/api/report') {
     const auth = req.headers.authorization || '';

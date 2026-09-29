@@ -12,7 +12,8 @@
         "https://api.protonnz.com",
         "https://proton.protonuk.io"
       ],
-      "event": null
+      "event": null,
+      "coordinators": []
     },
     {
       "id": "testnet",
@@ -25,7 +26,8 @@
         "https://tn1.protonnz.com",
         "https://test.proton.eosusa.io"
       ],
-      "event": null
+      "event": null,
+      "coordinators": []
     },
     {
       "id": "rehearsal",
@@ -75,7 +77,10 @@
           "lat": 50.11,
           "lon": 8.68
         }
-      }
+      },
+      "coordinators": [
+        "998a3a52e3bc1ab6826bd1736fe4914c8d4dc4a42332b9ba27eb8208460b510f"
+      ]
     }
   ]
 }

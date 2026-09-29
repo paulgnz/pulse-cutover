@@ -74,7 +74,7 @@ fn unit_active(unit: &str) -> bool {
 }
 
 /// Condense the journal into what mission control compares across producers.
-fn journal_summary(path: &Path) -> Value {
+pub fn journal_summary(path: &Path) -> Value {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut state = Value::Null;
     let mut last_ts = Value::Null;
@@ -215,6 +215,7 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         "checks": checks,
         "source": {"head": head, "lib": lib, "chain_id": chain_id},
         "ceremony": journal,
+        "coord": crate::coord::read_state(cfg),
     })
 }
 
