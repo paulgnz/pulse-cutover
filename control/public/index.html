@@ -310,7 +310,7 @@ footer a{color:var(--muted)}
 .big3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:12px}
 .big3 div{border-radius:12px;background:rgba(255,255,255,.03);border:1px solid var(--line);padding:10px 12px;font:700 18px var(--mono)}
 .big3 div span{display:block;font:500 10.5px var(--sans);color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}
-.spark{width:100%;height:64px;display:block}
+.pspark{width:100%;height:64px;display:block;overflow:hidden}
 .chainrow{display:flex;gap:8px;flex-wrap:wrap}
 pre.raw{margin:0;max-height:360px;overflow:auto;font:12px/1.5 var(--mono);color:var(--muted);background:rgba(0,0,0,.25);border-radius:12px;padding:12px}
 .openfull{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--muted);text-decoration:none;border:1px solid var(--line);border-radius:999px;padding:3px 10px;cursor:pointer;background:none}
@@ -984,7 +984,7 @@ const copyBtn = (v) => `<button class="cp" data-copy="${esc(v)}">copy</button>`;
 function sparkLine(vals, color) {
   const v = vals.filter((x) => x != null); if (v.length < 2) return '<div style="color:var(--dim);font-size:12px">collecting… (history builds while this page is open on the server)</div>';
   const mn = Math.min(...v), mx = Math.max(...v), W = 400, H = 64, pts = vals.map((x, i) => x == null ? null : [i / (vals.length - 1) * W, H - 6 - (mx === mn ? 0.5 : (x - mn) / (mx - mn)) * (H - 12)]).filter(Boolean);
-  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><polyline fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke" points="${pts.map((p) => p.join(',')).join(' ')}"/></svg><div style="display:flex;justify-content:space-between;color:var(--dim);font:11px var(--mono)"><span>min ${fmt(mn)}</span><span>now ${fmt(v.at(-1))}</span><span>max ${fmt(mx)}</span></div>`;
+  return `<svg class="pspark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><polyline fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke" points="${pts.map((p) => p.join(',')).join(' ')}"/></svg><div style="display:flex;justify-content:space-between;color:var(--dim);font:11px var(--mono)"><span>min ${fmt(mn)}</span><span>now ${fmt(v.at(-1))}</span><span>max ${fmt(mx)}</span></div>`;
 }
 async function renderPage() {
   const pg = $('page');

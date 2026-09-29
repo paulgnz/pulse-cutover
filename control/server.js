@@ -409,7 +409,7 @@ http.createServer(async (req, res) => {
     const prev = byNode[nodeName]?.report;
     // Short in-memory history (about 2 h at a 10 s interval) for the per-server page's charts.
     const hist = (byNode[nodeName]?.hist || []).slice(-719);
-    const lagNow = chain[r.network]?.head && r.source?.head ? chain[r.network].head - r.source.head : null;
+    const lagNow = chain[r.network]?.head && r.source?.head ? Math.max(0, chain[r.network].head - r.source.head) : null;
     hist.push({ t: Date.now(), head: r.source?.head ?? null, lag: lagNow, peers: r.metal?.peers ?? null, ok: (r.checks || []).filter((c) => c.ok).length, n: (r.checks || []).length });
     byNode[nodeName] = { report: r, received: Date.now(), token: tokenHash, hist };
     const who = Object.keys(byNode).length > 1 || r.node ? `${r.producer} · ${nodeName}` : r.producer;
