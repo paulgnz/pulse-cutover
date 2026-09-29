@@ -204,6 +204,9 @@ fn hook_ready(cmd: &str) -> (bool, String) {
 }
 
 fn free_gb(dir: &Path) -> Option<f64> {
+    // The snapshots dir may not exist yet (nodeos creates it on the first snapshot): measure the
+    // filesystem it will live on, i.e. the nearest existing ancestor.
+    let dir = dir.ancestors().find(|p| p.exists()).unwrap_or(dir);
     let out = std::process::Command::new("df").arg("-Pk").arg(dir).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let line = text.lines().nth(1)?;

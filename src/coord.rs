@@ -259,6 +259,15 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
+    /// The agent and mission control must compute the same `event_hash` for the same signed
+    /// payload. The vector is shared with control/test (control/test/fixtures/event-hash-vector.json).
+    #[test]
+    fn event_hash_matches_the_shared_control_vector() {
+        let v: Value = serde_json::from_str(include_str!("../control/test/fixtures/event-hash-vector.json")).unwrap();
+        let msg = serde_json::json!({ "payload": v["payload"].as_str().unwrap() });
+        assert_eq!(payload_hash(&msg).as_deref(), v["event_hash"].as_str());
+    }
+
     fn signed(sk: &SigningKey, payload: &Value) -> Value {
         let p = payload.to_string();
         json!({"payload": p, "sig": hex::encode(sk.sign(p.as_bytes()).to_bytes()), "key": hex::encode(sk.verifying_key().to_bytes())})
