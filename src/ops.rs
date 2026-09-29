@@ -48,8 +48,19 @@ pub trait ChainOps {
     /// REST gateway). Ok(None) while unreachable/mid-reload — the flip
     /// health check treats that as a transient, bounded by its timeout.
     fn public_info(&self, public_url: &str) -> Result<Option<ChainInfo>, String>;
+    /// The target chain's block id at `height` (lineage check at the cut). Ok(None) when the
+    /// target cannot show that block (not implemented / pruned / still booting).
+    fn target_block_id(&self, _height: u64) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     fn ignite(&self) -> Result<String, String>;
+    /// Hooks and operator commands: killed after the configured hook timeout.
     fn run_hook(&self, cmd: &str) -> Result<String, String>;
+    /// Long-running pipeline steps (upstream export/import over a mainnet snapshot take far
+    /// longer than any hook timeout). Default: same as run_hook.
+    fn run_long(&self, cmd: &str) -> Result<String, String> {
+        self.run_hook(cmd)
+    }
     /// GET a JSON document (hyperion /v2/health, local or public).
     /// Ok(None) while unreachable / non-JSON — health gates treat that as a
     /// transient bounded by their own timeout.
@@ -58,8 +69,54 @@ pub trait ChainOps {
     fn sleep_ms(&self, ms: u64);
 }
 
+/// Run a shell command with a deadline. The command runs in its own process group so a
+/// timeout kills the whole tree (sh + whatever it started), and a timeout is a FAILURE.
+pub fn run_shell_timeout(cmd: &str, timeout: Duration) -> Result<String, String> {
+    use std::io::Read;
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(cmd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().map_err(|e| format!("spawn `{cmd}`: {e}"))?;
+    // Drain pipes on threads so a chatty command can't block on a full pipe.
+    let mut so = child.stdout.take().expect("piped");
+    let mut se = child.stderr.take().expect("piped");
+    let t_out = std::thread::spawn(move || { let mut b = Vec::new(); let _ = so.read_to_end(&mut b); b });
+    let t_err = std::thread::spawn(move || { let mut b = Vec::new(); let _ = se.read_to_end(&mut b); b });
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().map_err(|e| format!("wait `{cmd}`: {e}"))? {
+            Some(st) => break Some(st),
+            None if started.elapsed() >= timeout => break None,
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let Some(status) = status else {
+        #[cfg(unix)]
+        {
+            let _ = std::process::Command::new("kill").arg("-KILL").arg(format!("-{}", child.id())).status();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("`{cmd}` timed out after {}s and was killed", timeout.as_secs()));
+    };
+    let stdout = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).trim().to_string();
+    let stderr = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).trim().to_string();
+    if status.success() {
+        Ok(if stdout.is_empty() { stderr } else { stdout })
+    } else {
+        Err(format!("`{cmd}` exited {status}: {stderr} {stdout}"))
+    }
+}
+
 /// Run a shell command, returning trimmed stdout (or stderr if stdout is
-/// empty) on success. Shared by hooks, ignition, and the loop harness reset.
+/// empty) on success. No deadline: loop-harness resets and long pipeline steps.
 pub fn run_shell(cmd: &str) -> Result<String, String> {
     let out = std::process::Command::new("sh")
         .arg("-c")
@@ -81,6 +138,8 @@ pub struct HttpOps {
     pub target_rpc: String,
     pub ignite_cmd: String,
     pub snapshot_timeout: Duration,
+    /// Deadline for hooks / flip / stop / start / ignite commands.
+    pub hook_timeout: Duration,
     agent: ureq::Agent,
 }
 
@@ -98,10 +157,16 @@ impl HttpOps {
             target_rpc: target_rpc.to_string(),
             ignite_cmd: ignite_cmd.to_string(),
             snapshot_timeout: Duration::from_secs(snapshot_timeout_secs),
+            hook_timeout: Duration::from_secs(300),
             agent: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(15))
                 .build(),
         }
+    }
+
+    pub fn with_hook_timeout(mut self, secs: u64) -> Self {
+        self.hook_timeout = Duration::from_secs(secs.max(1));
+        self
     }
 
     fn post(&self, url: &str, body: Option<Value>, timeout: Option<Duration>) -> Result<Value, String> {
@@ -259,11 +324,28 @@ impl ChainOps for HttpOps {
         }
     }
 
+    fn target_block_id(&self, height: u64) -> Result<Option<String>, String> {
+        // PulseVM's getBlock takes block_num_or_id as a STRING.
+        let body = json!({"jsonrpc": "2.0", "method": "pulsevm.getBlock",
+                          "params": {"block_num_or_id": height.to_string()}, "id": 1});
+        match self.post(&self.target_rpc, Some(body), None) {
+            Ok(v) => {
+                let r = v.get("result").cloned().unwrap_or(v);
+                Ok(["id", "block_id"].iter().find_map(|k| r.get(*k).and_then(|x| x.as_str()).map(str::to_string)))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     fn ignite(&self) -> Result<String, String> {
         self.run_hook(&self.ignite_cmd)
     }
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
+        run_shell_timeout(cmd, self.hook_timeout)
+    }
+
+    fn run_long(&self, cmd: &str) -> Result<String, String> {
         run_shell(cmd)
     }
 

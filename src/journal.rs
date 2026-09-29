@@ -46,6 +46,9 @@ pub struct Journal {
     path: PathBuf,
     file: File,
     seq: u64,
+    /// Held for the Journal's lifetime: an exclusive lock on `<journal>.lock`, so two ceremony
+    /// processes can never drive the same journal (released when the Journal is dropped).
+    _lock: File,
 }
 
 /// Ceremony facts recovered from a journal on resume: everything a restarted
@@ -62,17 +65,54 @@ pub struct Recovered {
     pub sha256: Option<String>,
     pub frozen_ts_ms: Option<u64>,
     pub last_source_block_time: Option<String>,
+    /// schedule_snapshot(H) succeeded at ARM (evidence `snapshot_scheduled_at`): a resumed
+    /// FROZEN step must wait for THAT snapshot, never fall back to an immediate one.
+    pub scheduled: bool,
+    /// Side effects the machine journaled as STARTED (`{"side_effect": name}` evidence is
+    /// written before each external action). A resumed agent treats started as possibly
+    /// applied — e.g. a flip that began before a crash must be considered live.
+    pub side_effects: Vec<String>,
+    /// The journal showed IGNITED (or later) at some point: this node's target has been
+    /// started, so a local failure must seal instead of resuming the source.
+    pub reached_ignited: bool,
+    /// A trailing partial line (crash mid-write) was found and set aside on open.
+    pub torn_tail: bool,
 }
 
 impl Journal {
     pub fn open(path: &Path) -> Result<(Self, Recovered), String> {
-        let recovered = if path.exists() {
-            Self::replay(path)?
-        } else {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("create journal dir: {e}"))?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("create journal dir: {e}"))?;
             }
+        }
+        // Exclusive lock FIRST: nothing below (tail repair, appends) may race another agent.
+        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| format!("open journal lock {}: {e}", lock_path.display()))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "another pulse-cutover process holds {} — a ceremony is already running on \
+                     this journal. Refusing to start a second one.",
+                    lock_path.display()
+                ))
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("lock {}: {e}", lock_path.display()))
+            }
+        }
+        let torn = if path.exists() { Self::repair_torn_tail(path)? } else { false };
+        let recovered = if path.exists() {
+            let mut r = Self::replay(path)?;
+            r.torn_tail = torn;
+            r
+        } else {
             Recovered::default()
         };
         let seq = if path.exists() {
@@ -92,6 +132,7 @@ impl Journal {
                 path: path.to_path_buf(),
                 file,
                 seq,
+                _lock: lock,
             },
             recovered,
         ))
@@ -146,21 +187,95 @@ impl Journal {
         Ok(())
     }
 
-    /// Rebuild the machine-relevant facts from an existing journal.
+    /// A crash mid-write can leave a partial last line. Appending after it would glue the next
+    /// entry onto garbage and turn a harmless torn TAIL into a corrupt MIDDLE line. So: if the
+    /// last line does not parse, move it to `<journal>.torn-<ms>` (forensics) and truncate the
+    /// journal back to the last complete line. Returns whether a tail was set aside.
+    fn repair_torn_tail(path: &Path) -> Result<bool, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("read journal {}: {e}", path.display()))?;
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        // Start of the last non-empty line.
+        let trimmed_end = bytes.iter().rposition(|b| *b != b'\n' && *b != b'\r').map(|i| i + 1).unwrap_or(0);
+        if trimmed_end == 0 {
+            return Ok(false);
+        }
+        let start = bytes[..trimmed_end].iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+        let last = &bytes[start..trimmed_end];
+        let ends_with_newline = bytes.last() == Some(&b'\n');
+        if serde_json::from_slice::<Entry>(last).is_ok() {
+            if !ends_with_newline {
+                // Complete entry but missing its newline: add it so the next append starts clean.
+                let mut f = OpenOptions::new().append(true).open(path).map_err(|e| e.to_string())?;
+                f.write_all(b"\n").map_err(|e| e.to_string())?;
+                f.sync_data().map_err(|e| e.to_string())?;
+            }
+            return Ok(false);
+        }
+        let aside = PathBuf::from(format!(
+            "{}.torn-{}",
+            path.display(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+        ));
+        std::fs::write(&aside, last).map_err(|e| format!("save torn tail: {e}"))?;
+        let f = OpenOptions::new().write(true).open(path).map_err(|e| e.to_string())?;
+        f.set_len(start as u64).map_err(|e| format!("truncate torn tail: {e}"))?;
+        f.sync_data().map_err(|e| e.to_string())?;
+        eprintln!(
+            "journal: WARNING a partial last line (crash mid-write) was set aside to {} and \
+             the journal truncated to its last complete entry",
+            aside.display()
+        );
+        Ok(true)
+    }
+
+    /// Rebuild the machine-relevant facts from an existing journal. A partial LAST line (crash
+    /// mid-write) is ignored with a warning; an unparsable line anywhere else is corruption and
+    /// an error — the ceremony must not resume from a journal it cannot fully read.
     pub fn replay(path: &Path) -> Result<Recovered, String> {
         let file = File::open(path).map_err(|e| format!("open journal {}: {e}", path.display()))?;
         let mut out = Recovered::default();
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|e| e.to_string())?;
+        let lines: Vec<String> = BufReader::new(file)
+            .lines()
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        let last_nonempty = lines.iter().rposition(|l| !l.trim().is_empty());
+        for (i, line) in lines.iter().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: Entry =
-                serde_json::from_str(&line).map_err(|e| format!("corrupt journal line: {e}"))?;
+            let entry: Entry = match serde_json::from_str(line) {
+                Ok(e) => e,
+                Err(e) if Some(i) == last_nonempty => {
+                    eprintln!("journal: WARNING ignoring a partial last line (crash mid-write): {e}");
+                    out.torn_tail = true;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "corrupt journal line {} of {} (not the last line, so not a torn write): {e}",
+                        i + 1,
+                        path.display()
+                    ))
+                }
+            };
             if entry.kind == "transition" {
-                out.state = Some(entry.state.parse()?);
+                let st: State = entry.state.parse()?;
+                if matches!(st, State::Ignited | State::Flipped | State::Live) {
+                    out.reached_ignited = true;
+                }
+                out.state = Some(st);
                 if entry.state == State::Frozen.as_str() {
                     out.frozen_ts_ms = Some(entry.ts_ms);
+                }
+            }
+            if entry.data.get("snapshot_scheduled_at").and_then(|v| v.as_u64()).is_some() {
+                out.scheduled = true;
+            }
+            if let Some(se) = entry.data.get("side_effect").and_then(|v| v.as_str()) {
+                if !out.side_effects.iter().any(|x| x == se) {
+                    out.side_effects.push(se.to_string());
                 }
             }
             for (key, slot) in [
