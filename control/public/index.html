@@ -401,7 +401,7 @@ a.tilelink{color:inherit;text-decoration:none;display:block}
         <span><i style="background:#c7cbe0"></i>scheduled</span><span><i style="background:#5b6480"></i>standby</span>
         <span><i style="background:var(--cut)"></i>producing now</span>
       </div>
-      <div class="hint">drag to spin · tap a producer for details</div>
+      <div class="hint">drag to spin · tap a producer for details · block arcs are illustrative, not measured propagation</div>
       <div class="tip" id="tip"></div>
     </div>
 
@@ -738,7 +738,7 @@ function render() {
     const eta = toH > 0 ? toH * 0.5 : 0;
     $('h-kv').innerHTML = `<dt>cut height H</dt><dd>${fmt(H)}</dd><dt>${toH > 0 ? 'time to H' : 'status'}</dt><dd>${toH > 0 ? `${Math.floor(eta / 60)}m ${Math.round(eta % 60)}s` : started ? 'ceremony in progress' : 'at H'}</dd>
       ${co ? `<dt>signed event</dt><dd>${esc(co.event.event_id)} · <b style="color:${co.aborted ? 'var(--bad)' : co.armed ? 'var(--ok)' : 'var(--warn)'}">${co.aborted ? 'ABORTED' : co.armed ? 'ARMED' : 'published'}</b></dd><dt>accepted by</dt><dd>${co.accepted.length} / ${s.reporting || denom} producers${co.rejected.length ? ` · <span style="color:var(--bad)">${co.rejected.length} rejected</span>` : ''}</dd>` : ''}
-      <dt>write freeze</dt><dd>at H − ${esc(co?.event?.freeze_lead_blocks ?? prods.find((p) => p.report)?.report?.checks?.find((x) => x.name === 'freeze_lead_blocks')?.detail?.match(/\d+/)?.[0] ?? '24')}</dd><dt>stages</dt><dd>${Object.entries(stateCounts).map(([k, v]) => `${v} ${k}`).join(' · ') || '—'}</dd>`;
+      <dt>write freeze</dt><dd>at H − ${esc(co?.event?.freeze_lead_blocks ?? prods.find((p) => p.report)?.report?.checks?.find((x) => x.name === 'freeze_lead_blocks')?.detail?.match(/\d+/)?.[0] ?? '24')}</dd><dt>stages</dt><dd>${Object.entries(stateCounts).map(([k, v]) => `${+v || 0} ${esc(k)}`).join(' · ') || '—'}</dd>`;
   } else {
     ring($('h-ring'), 0, '—', 'NO CUT', ['#f5a524', '#8b5cf6']);
     $('h-kv').innerHTML = `<dt>status</dt><dd>no cutover scheduled</dd><dt>readiness</dt><dd>${s.ready} of ${denom} producers</dd><dt>when scheduled</dt><dd>H appears here</dd>`;
@@ -784,7 +784,7 @@ function render() {
   $('ev').innerHTML = !net.agreement.length ? `<div class="ev-empty">When producers run a ceremony, their beacons report its evidence here: <b>cut block</b>, <b>snapshot hash</b>, <b>table fingerprints</b>, <b>transactions after the cut</b>, <b>state digest</b> and the <b>new chain's anchor</b>. Each value becomes a colour; every producer must show the same colour for the cut to be atomic.</div>`
     : net.agreement.map((a) => {
       const chips = withEv.map((p) => { const v = p.report.ceremony.evidence[a.key]; return v == null ? '' : `<i style="background:${color(JSON.stringify(v))}" data-p="${esc(p.name)}" title="${esc(p.name)}: ${esc(JSON.stringify(v))}"></i>`; }).join('');
-      return `<div class="ev-row"><div class="k">${esc(a.label)}</div><div class="ribbon">${chips}</div><div class="verdict ${a.agree ? 'ok' : 'bad'}">${a.agree ? `✓ ${a.reporting}/${a.reporting}` : '✗ MISMATCH'}</div></div>`;
+      return `<div class="ev-row"><div class="k">${esc(a.label)}</div><div class="ribbon">${chips}</div><div class="verdict ${a.agree ? 'ok' : 'bad'}" title="${esc([a.missing?.length ? 'missing: ' + a.missing.join(', ') : '', a.stale?.length ? 'stale (excluded): ' + a.stale.join(', ') : ''].filter(Boolean).join(' · '))}">${a.agree ? `✓ ${+a.reporting}/${+(a.roster || a.reporting)}` : a.bad_value ? '✗ NON-ZERO' : a.values.length > 1 ? '✗ MISMATCH' : `○ ${+a.reporting}/${+(a.roster || a.reporting)} · ${+(a.missing?.length || 0)} missing`}</div></div>`;
     }).join('');
 
   // feed
@@ -943,8 +943,10 @@ const ROLE_NAME = { producer: 'Block producer node', history: 'History / Hyperio
    /<net>/<producer>/endpoint/<host>      one public endpoint                                */
 let openName = null, pageSel = null, pageData = null, pageFetchT = 0, pageSig = '';
 const enc = encodeURIComponent;
-const pathFor = (net, prod, sel) => '/' + [net, prod, ...(sel?.node ? [sel.node] : sel?.ep ? ['endpoint', hostOf(sel.ep)] : [])].filter(Boolean).map(enc).join('/');
-const hostOf = (u) => { try { return new URL(u).host; } catch { return String(u || ''); } };
+// Endpoint pages are keyed by a canonical id: host plus path (no scheme, no trailing slash).
+const epId = (u) => { if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(String(u || ''))) return String(u || ''); try { const x = new URL(u); return (x.host + x.pathname).replace(/\/+$/, '').toLowerCase(); } catch { return String(u || ''); } };
+const hostOf = epId;
+const pathFor = (net, prod, sel) => '/' + [net, prod, ...(sel?.node ? [sel.node] : sel?.ep ? ['endpoint', epId(sel.ep)] : [])].filter(Boolean).map(enc).join('/');
 function readRoute() {
   const q = new URLSearchParams(location.search);
   if (q.get('net') || q.get('p')) {   // old ?net=&p=&node=&ep=&view= links → real paths
@@ -952,7 +954,9 @@ function readRoute() {
     const sel = !bad(q.get('node')) ? { node: q.get('node') } : !bad(q.get('ep')) ? { ep: q.get('ep') } : null;
     history.replaceState(null, '', pathFor(q.get('net') || active, q.get('p'), sel));
   }
-  const seg = location.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+  let seg;
+  try { seg = location.pathname.split('/').filter(Boolean).map(decodeURIComponent); }
+  catch { history.replaceState(null, '', '/' + (active || '')); seg = active ? [active] : []; }   // malformed link → overview
   if (seg[0]) active = seg[0];
   openName = seg[1] || null;
   pageSel = !openName ? null : seg[2] === 'endpoint' && seg[3] ? { ep: seg[3] } : seg[2] ? { node: seg[2] } : { producer: true };
@@ -1046,9 +1050,18 @@ async function renderPage() {
       <div class="pg-grid">${matrix}
         <div class="card2 span"><h3>${ic('globe')}Public endpoints<span class="cnt">bp.json · probed every 10 min</span></h3><div class="tiles2">${epTiles || '<div class="ev-empty">No bp.json endpoints surveyed.</div>'}</div></div></div>`;
   } else if (pageSel.node) {
-    if (Date.now() - pageFetchT > 9000) { pageFetchT = Date.now(); fetch(`/api/node/${encodeURIComponent(net.id)}/${encodeURIComponent(p.name)}/${encodeURIComponent(pageSel.node)}`, { cache: 'no-store' }).then((r) => r.ok ? r.json() : null).then((d) => { pageData = d; renderPage(); }).catch(() => {}); }
-    const d = pageData, rp = d?.report;
-    if (!rp) body = `<div class="card2">${d === null && pageFetchT ? 'Loading…' : 'This server is not reporting.'}</div>`;
+    // Responses are bound to the route that asked for them: a slow reply for a page the user already left is dropped.
+    const routeKey = `${net.id}/${p.name}/${pageSel.node}`;
+    if (pageData?.key !== routeKey) pageData = null;
+    if (Date.now() - pageFetchT > 9000 || !pageData) {
+      pageFetchT = Date.now();
+      fetch(`/api/node/${encodeURIComponent(net.id)}/${encodeURIComponent(p.name)}/${encodeURIComponent(pageSel.node)}`, { cache: 'no-store' })
+        .then(async (r) => ({ key: routeKey, status: r.status, data: r.ok ? await r.json() : null }))
+        .then((x) => { if (x.key !== `${net?.id}/${openName}/${pageSel?.node}`) return; pageData = x; renderPage(); })
+        .catch(() => {});
+    }
+    const d = pageData?.data, rp = d?.report;
+    if (!rp) body = `<div class="card2" style="margin-top:14px">${!pageData ? 'Loading…' : pageData.status === 404 ? `No server called <b>${esc(pageSel.node)}</b> is reporting for ${esc(p.org?.name || p.name)}. <a data-nav href="${pathFor(net.id, p.name)}">See all of its servers</a>` : 'Could not load this server right now; retrying.'}</div>`;
     else {
       const k = splitChecks(rp.checks || []), done = k.setup.length - k.todo.length;
       const st = d.silent ? ['bad', 'silent'] : k.sick.length ? ['bad', `${k.sick.length} issue${k.sick.length > 1 ? 's' : ''}`] : k.todo.length ? ['warn', `${k.todo.length} to set up`] : ['ok', 'ready'];
@@ -1082,8 +1095,10 @@ async function renderPage() {
       </div>`;
     }
   } else {
-    const n = (infraData[active]?.nodes || []).find((x) => x.url === pageSel.ep);
-    if (!n) body = `<div class="card2">Endpoint not found in the latest survey.</div>`;
+    const same = (infraData[active]?.nodes || []).filter((x) => x.producer === p.name && x.url && epId(x.url) === pageSel.ep);
+    // one URL can be listed several times in bp.json (e.g. as both 'full' and 'query'): show it once with all its roles
+    const n = same.length ? { ...same[0], types: [...new Set(same.flatMap((x) => x.types || []))], features: [...new Set(same.flatMap((x) => x.features || []))] } : null;
+    if (!n) body = `<div class="card2" style="margin-top:14px">${infraData[active] ? `<b>${esc(pageSel.ep)}</b> is not in ${esc(p.org?.name || p.name)}'s bp.json as of the latest survey. <a data-nav href="${pathFor(net.id, p.name)}">See its endpoints</a>` : 'Loading the endpoint survey…'}</div>`;
     else {
       const a = n.api, hy = n.hyperion, up = a?.ok && a.chain_ok !== false;
       body = `
