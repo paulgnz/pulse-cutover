@@ -1,0 +1,98 @@
+{
+  "agent_version": "0.5.0-rc.5",
+  "ceremony": {
+    "evidence": {
+      "burnoff_transactions": 0,
+      "chain_id": "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd",
+      "cut_block_id": "000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "cut_height": 1000,
+      "fingerprints_digest": "f134b00244e8db1ccd8e7dcec470044aed049148b83f25f148a8e5a94bab928f",
+      "h": 1000,
+      "lineage_at_cut": "verified",
+      "snapshot_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "target_head_id": "000003e9cccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "last_error_class": "HALTED: hook <path> exited 1: curl <url> failed",
+    "seq": 4,
+    "since": "2026-09-29T16:32:38.000Z",
+    "state": "IGNITED",
+    "transitions": [
+      {
+        "state": "ARMED",
+        "ts": "2026-09-29T16:32:38.000Z"
+      },
+      {
+        "state": "SNAPSHOTTED",
+        "ts": "2026-09-29T16:32:38.000Z"
+      },
+      {
+        "state": "VERIFIED",
+        "ts": "2026-09-29T16:32:38.000Z"
+      },
+      {
+        "state": "IGNITED",
+        "ts": "2026-09-29T16:32:38.000Z"
+      }
+    ]
+  },
+  "checks": [
+    {
+      "detail": "head 408407885 lib 408407555",
+      "name": "source_api",
+      "ok": true
+    },
+    {
+      "detail": "71ee83bcf52142d6…",
+      "name": "chain_id",
+      "ok": true
+    },
+    {
+      "detail": "reachable locally",
+      "name": "producer_api",
+      "ok": true
+    },
+    {
+      "detail": "not configured (needed for a multi-producer ceremony)",
+      "name": "hook_on_freeze",
+      "ok": false
+    },
+    {
+      "detail": "not configured (needed for a multi-producer ceremony)",
+      "name": "hook_post_ignite",
+      "ok": false
+    },
+    {
+      "detail": "staged by the ceremony (expected)",
+      "name": "staged_snapshot_absent",
+      "ok": true
+    },
+    {
+      "detail": "not running (unknown)",
+      "name": "validator_running",
+      "ok": false
+    },
+    {
+      "detail": "23 GB free",
+      "name": "disk_free",
+      "ok": true
+    }
+  ],
+  "coord": null,
+  "instance_id": "5f9db56e0d435c5dd80a7862a89bd177",
+  "interval_secs": 10,
+  "metal": null,
+  "mode": "producer",
+  "network": "testnet",
+  "node": "producer",
+  "producer": "protonnz",
+  "profile": "readiness",
+  "ready": false,
+  "role": "producer",
+  "schema": "pulse-cutover-beacon-v1",
+  "source": {
+    "chain_id": "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd",
+    "head": 408407885,
+    "lib": 408407555
+  },
+  "ts": "2026-09-29T16:32:38.729Z"
+}

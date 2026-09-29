@@ -3,6 +3,8 @@
 // validation + public projection, and redaction of free-text fields before they reach the public dashboard.
 import net from 'node:net';
 import dns from 'node:dns/promises';
+import http from 'node:http';
+import https from 'node:https';
 
 // ---- address classification ---------------------------------------------------------------------------
 const V4_BLOCKED = [
@@ -70,47 +72,100 @@ export function limiter(max) {
   const next = () => { if (active >= max || !q.length) return; active++; const [fn, ok, ko] = q.shift(); fn().then(ok, ko).finally(() => { active--; next(); }); };
   return (fn) => new Promise((ok, ko) => { q.push([fn, ok, ko]); next(); });
 }
-/** Read at most maxBytes of a Response body; aborts (throws 'too large') past the cap. */
-export async function readCapped(r, maxBytes) {
-  const len = +(r.headers.get('content-length') || 0);
-  if (len > maxBytes) { try { await r.body?.cancel(); } catch {} throw new Error('too large'); }
-  if (!r.body) return Buffer.alloc(0);
-  const reader = r.body.getReader(); const parts = []; let n = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    n += value.length;
-    if (n > maxBytes) { try { await reader.cancel(); } catch {} throw new Error('too large'); }
-    parts.push(value);
-  }
-  return Buffer.concat(parts.map((p) => Buffer.from(p)));
-}
+export const UA = 'pulse-cutover-mission-control/1.0 (+https://control-rehearsal.protonnz.com)';
+
 /**
- * fetch() for producer-supplied URLs: http(s) only, every hop's host must resolve to public addresses,
- * redirects followed manually (max 3) and re-validated. Residual risk: DNS can change between our lookup and
- * fetch's own connect (rebinding); acceptable for a read-only dashboard, noted in control/README.md.
+ * One HTTP(S) exchange with the connection PINNED to `ip` (already validated as public): the socket's DNS
+ * lookup is replaced so it can only ever reach that address, while TLS SNI and the Host header keep the real
+ * hostname. This closes the DNS-rebinding gap between "we checked the name" and "fetch connected somewhere".
+ * Resolves { status, headers (Headers), body (Buffer, ≤ maxBytes) }.
  */
-export async function safeFetch(url, opts = {}, { maxRedirects = 3, lookup } = {}) {
-  let u = new URL(url);
+function requestPinned(u, ip, { method = 'GET', headers = {}, body = null, timeoutMs = 6000, maxBytes = 1024 * 1024, onConnect } = {}) {
+  return new Promise((resolve, reject) => {
+    const mod = u.protocol === 'https:' ? https : http;
+    const host = u.hostname.replace(/^\[|\]$/g, '');
+    const fam = net.isIP(ip);
+    const pinned = (hostname, opts, cb) => {
+      if (typeof opts === 'function') { cb = opts; opts = {}; }
+      onConnect?.(ip);
+      if (opts && opts.all) cb(null, [{ address: ip, family: fam }]); else cb(null, ip, fam);
+    };
+    let done = false;
+    const finish = (fn, v) => { if (done) return; done = true; clearTimeout(timer); fn(v); };
+    const buf = body == null ? null : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
+    const req = mod.request({
+      protocol: u.protocol, hostname: host, port: u.port || undefined, path: (u.pathname || '/') + (u.search || ''), method,
+      headers: { 'user-agent': UA, ...headers, ...(buf ? { 'content-length': buf.length } : {}) },
+      lookup: pinned, servername: net.isIP(host) ? undefined : host, agent: false,
+    }, (res) => {
+      const hdrs = new Headers();
+      for (const [k, v] of Object.entries(res.headers)) if (v != null) hdrs.set(k, Array.isArray(v) ? v.join(', ') : String(v));
+      const len = +(res.headers['content-length'] || 0);
+      if (len > maxBytes) { res.destroy(); return finish(reject, new Error('too large')); }
+      const parts = []; let n = 0;
+      res.on('data', (c) => { n += c.length; if (n > maxBytes) { res.destroy(); finish(reject, new Error('too large')); } else parts.push(c); });
+      res.on('end', () => finish(resolve, { status: res.statusCode, headers: hdrs, body: Buffer.concat(parts) }));
+      res.on('error', (e) => finish(reject, e));
+    });
+    const timer = setTimeout(() => { req.destroy(); finish(reject, Object.assign(new Error('timeout'), { name: 'TimeoutError' })); }, timeoutMs);
+    req.on('error', (e) => finish(reject, e));
+    if (buf) req.write(buf);
+    req.end();
+  });
+}
+
+/**
+ * Request a producer-supplied URL: http(s) only, no credentials, every hop's hostname resolved and validated as
+ * public, the connection pinned to that validated address, redirects followed manually (max 3) and re-validated.
+ * `lookup` (tests) replaces dns.lookup for validation; `onConnect(ip)` (tests) observes the address actually dialled.
+ */
+export async function safeRequest(url, { method = 'GET', headers = {}, body = null, timeoutMs = 6000, maxBytes = 1024 * 1024, maxRedirects = 3, lookup, onConnect } = {}) {
+  let u = new URL(url), m = method, b = body;
+  const deadline = Date.now() + timeoutMs;
   for (let hop = 0; ; hop++) {
     if (!/^https?:$/.test(u.protocol)) throw new Error('blocked scheme');
     if (u.username || u.password) throw new Error('blocked credentials in URL');
-    await resolvePublic(u.hostname, lookup);
-    const r = await fetch(u.href, { ...opts, redirect: 'manual' });
-    if (r.status >= 300 && r.status < 400 && r.headers.get('location')) {
-      try { await r.body?.cancel(); } catch {}
+    const ip = await resolvePublic(u.hostname, lookup);
+    const left = deadline - Date.now(); if (left <= 0) throw Object.assign(new Error('timeout'), { name: 'TimeoutError' });
+    const r = await requestPinned(u, ip, { method: m, headers, body: b, timeoutMs: left, maxBytes, onConnect });
+    const loc = r.headers.get('location');
+    if (r.status >= 300 && r.status < 400 && loc) {
       if (hop >= maxRedirects) throw new Error('too many redirects');
-      u = new URL(r.headers.get('location'), u);
-      if (opts.method && opts.method !== 'GET' && r.status !== 307 && r.status !== 308) opts = { ...opts, method: 'GET', body: undefined };
+      u = new URL(loc, u);
+      if (m !== 'GET' && r.status !== 307 && r.status !== 308) { m = 'GET'; b = null; }
       continue;
     }
     return r;
   }
 }
 export async function safeJson(url, opts = {}, maxBytes = 1024 * 1024) {
-  const r = await safeFetch(url, opts);
-  if (!r.ok) { try { await r.body?.cancel(); } catch {} throw new Error(`HTTP ${r.status}`); }
-  return { json: JSON.parse((await readCapped(r, maxBytes)).toString('utf8')), headers: r.headers, status: r.status };
+  const r = await safeRequest(url, { ...opts, maxBytes });
+  if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status}`);
+  return { json: JSON.parse(r.body.toString('utf8')), headers: r.headers, status: r.status };
+}
+
+// ---- endpoint identity ------------------------------------------------------------------------------------
+/**
+ * Canonical endpoint id: scheme://host[:port]/path — scheme and host lower-cased, IPv6 bracketed, default port
+ * dropped, path case PRESERVED, trailing slashes trimmed. http vs https and /A vs /a are different endpoints.
+ */
+export function endpointId(u) {
+  try {
+    const x = new URL(String(u));
+    if (!/^https?:$/.test(x.protocol)) return null;
+    const path = x.pathname.replace(/\/+$/, '');
+    return `${x.protocol}//${x.host.toLowerCase()}${path}`;
+  } catch { return null; }
+}
+const b64u = (s) => Buffer.from(s, 'utf8').toString('base64url');
+const unb64u = (s) => { try { return Buffer.from(s, 'base64url').toString('utf8'); } catch { return null; } };
+/** Route segment for an endpoint page (URL-safe base64 of the canonical id). */
+export const endpointRef = (u) => { const id = endpointId(u); return id ? b64u(id) : null; };
+/** Inverse of endpointRef; null unless it decodes to a canonical http(s) endpoint id. */
+export function endpointFromRef(ref) {
+  if (!/^[A-Za-z0-9_-]{4,600}$/.test(String(ref || ''))) return null;
+  const id = unb64u(ref);
+  return id && endpointId(id) === id ? id : null;
 }
 
 // ---- safe decoding / routing ---------------------------------------------------------------------------
@@ -119,7 +174,8 @@ export const RE = {
   net: /^[a-z0-9-]{1,32}$/,
   producer: /^[a-z1-5.]{1,12}$/,
   label: /^[\p{L}\p{N} ._()@+-]{1,64}$/u,
-  endpoint: /^[A-Za-z0-9.-]{1,253}(:\d{1,5})?(\/[A-Za-z0-9._~\/-]{0,200})?$/,
+  endpoint: /^[A-Za-z0-9.-]{1,253}(:\d{1,5})?(\/[A-Za-z0-9._~\/-]{0,200})?$/,   // legacy host[/path] links
+  sid: /^[0-9a-f]{16}$/,
 };
 const RESERVED = new Set(['__proto__', 'constructor', 'prototype']);
 export const reservedKey = (k) => RESERVED.has(String(k));
@@ -134,7 +190,7 @@ export function isAppRoute(pathname, networks) {
   if (!RE.producer.test(seg[1])) return false;
   if (seg.length === 2) return true;
   if (seg.length === 3) return RE.label.test(seg[2]);
-  if (seg.length === 4) return seg[2] === 'endpoint' && RE.endpoint.test(seg[3]);
+  if (seg.length === 4) return seg[2] === 'endpoint' && (endpointFromRef(seg[3]) !== null || RE.endpoint.test(seg[3]));
   return false;
 }
 
@@ -155,10 +211,11 @@ export function redact(s, max = 120) {
 }
 
 // ---- beacon report schema + public projection -----------------------------------------------------------
-export const STATES = ['ARMED', 'FROZEN', 'SNAPSHOTTED', 'VERIFIED', 'IGNITED', 'FLIPPED', 'LIVE', 'ABORTED'];
+export const STATES = ['ARMED', 'FROZEN', 'SNAPSHOTTED', 'VERIFIED', 'IGNITED', 'FLIPPED', 'LIVE', 'ABORTED', 'HALTED'];
+export const PROFILES = ['readiness', 'ceremony'];
 export const ROLES = ['producer', 'history', 'api', 'seed', 'query'];
 export const EVIDENCE_ALLOW = ['h', 'chain_id', 'freeze_at', 'cut_height', 'cut_block_id', 'burnoff_transactions', 'snapshot_sha256',
-  'fingerprints_digest', 'target_head_id', 'write_gap_ms', 'state_diff_identical', 'state_digest', 'state_diff_b_head'];
+  'fingerprints_digest', 'target_head_id', 'write_gap_ms', 'state_diff_identical', 'state_digest', 'state_diff_b_head', 'lineage_at_cut'];
 
 class Bad extends Error {}
 const bad = (path, what) => { throw new Bad(`${path}: ${what}`); };
@@ -192,6 +249,16 @@ const numOrStr = (v, path) => {
   bad(path, 'must be a short number or string');
 };
 
+/** lineage_at_cut: rc.5 sends a short verdict string ("verified" / "UNVERIFIED (…)"); later beacons may send
+ *  {h, source_block_id, target_block_id, match}. Both are accepted and normalised. */
+function lineage(v) {
+  if (typeof v === 'string') { if (!/^[\w :().=,-]{1,64}$/.test(v)) bad('ceremony.evidence.lineage_at_cut', 'invalid verdict string'); return v; }
+  if (!isObj(v)) bad('ceremony.evidence.lineage_at_cut', 'must be a string or an object');
+  const hex = (x, p) => x == null ? null : str(x, p, { max: 64, re: /^[0-9a-fA-F]{64}$/ }).toLowerCase();
+  return { h: int(v.h, 'ceremony.evidence.lineage_at_cut.h'), source_block_id: hex(v.source_block_id, 'ceremony.evidence.lineage_at_cut.source_block_id'),
+    target_block_id: hex(v.target_block_id, 'ceremony.evidence.lineage_at_cut.target_block_id'), match: bool(v.match, 'ceremony.evidence.lineage_at_cut.match') };
+}
+
 /**
  * Validate a beacon report. Throws Bad (message = path: problem) on any violation of the declared types;
  * returns ONLY the allow-listed public projection (unknown fields are dropped, free text is redacted).
@@ -204,10 +271,11 @@ export function projectReport(r) {
     network: str(r.network, 'network', { max: 32, re: RE.net }),
     node: str(r.node ?? 'node', 'node', { re: RE.label }),
     role: r.role == null ? null : (ROLES.includes(r.role) ? r.role : bad('role', `must be one of ${ROLES.join('|')}`)),
-    instance_id: str(r.instance_id, 'instance_id', { max: 64, nullable: true, re: /^[A-Za-z0-9-]{8,64}$/ }),
+    instance_id: r.instance_id == null ? null : str(r.instance_id, 'instance_id', { max: 32, re: /^[0-9a-fA-F]{32}$/ }).toLowerCase(),
+    profile: r.profile == null ? null : (PROFILES.includes(r.profile) ? r.profile : bad('profile', `must be one of ${PROFILES.join('|')}`)),
     agent_version: str(r.agent_version, 'agent_version', { max: 32, re: /^[0-9A-Za-z.+-]+$/ }),
     ts: tsStr(r.ts, 'ts', false),
-    interval_secs: int(r.interval_secs, 'interval_secs', { min: 1, max: 3600 }),
+    interval_secs: r.interval_secs === 0 ? null : int(r.interval_secs, 'interval_secs', { min: 1, max: 3600 }),
     mode: str(r.mode, 'mode', { max: 16, nullable: true, re: /^[a-z]+$/ }),
     ready: bool(r.ready, 'ready', { nullable: false }),
   };
@@ -235,6 +303,7 @@ export function projectReport(r) {
     for (const k of EVIDENCE_ALLOW) {
       const v = ev[k];
       if (v === undefined || v === null) continue;
+      if (k === 'lineage_at_cut') { evOut[k] = lineage(v); continue; }
       if (typeof v === 'number' && Number.isFinite(v)) evOut[k] = v;
       else if (typeof v === 'boolean') evOut[k] = v;
       else if (typeof v === 'string' && /^[\w:.-]{1,80}$/.test(v)) evOut[k] = v;
@@ -244,8 +313,12 @@ export function projectReport(r) {
       state: st(ce.state, 'ceremony.state'), since: tsStr(ce.since, 'ceremony.since'), seq: int(ce.seq, 'ceremony.seq'),
       transitions: tr.map((t, i) => { if (!isObj(t)) bad(`ceremony.transitions[${i}]`, 'must be an object'); return { state: st(t.state, `ceremony.transitions[${i}].state`), ts: tsStr(t.ts, `ceremony.transitions[${i}].ts`) }; }),
       evidence: evOut,
-      // Raw journal errors can carry commands, paths, URLs: publish only a redacted hint.
+      // rc.5+ beacons send a sanitized class; older ones sent the raw journal error. Either way only a
+      // re-redacted short hint is published (errors can carry commands, paths, URLs).
+      last_error_class: ce.last_error_class == null ? null
+        : (typeof ce.last_error_class === 'string' && ce.last_error_class.length <= 400 ? redact(ce.last_error_class, 120) : bad('ceremony.last_error_class', 'must be a string ≤ 400')),
       last_error: ce.last_error == null ? null : (typeof ce.last_error === 'string' ? `error (see local journal): ${redact(ce.last_error, 60)}` : bad('ceremony.last_error', 'must be a string')),
+      armed_ts_ms: int(ce.armed_ts_ms, 'ceremony.armed_ts_ms'),
     };
   }
   const co = r.coord ?? null;

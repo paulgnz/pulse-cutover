@@ -154,7 +154,9 @@ test('coordination: persisted, and a different event cannot replace an active on
   const postC = (m) => fetch(`${base}/api/coord/testnet`, { method: 'POST', body: JSON.stringify(m) });
   assert.equal((await postC(signed({ type: 'event', network: 'testnet', chain_id: CHAIN, event_id: 'ev1', h: 100 }))).status, 200);
   assert.equal((await postC(signed({ type: 'event', network: 'testnet', chain_id: CHAIN, event_id: 'ev2', h: 200 }))).status, 409);
-  assert.equal((await postC(signed({ type: 'arm', network: 'testnet', event_id: 'ev1' }))).status, 200);
+  assert.equal((await postC(signed({ type: 'arm', network: 'testnet', event_id: 'ev1' }))).status, 409);        // arm must bind the event hash
+  const evHash = createHash('sha256').update(JSON.parse(readFileSync(join(dir, 'coord', 'coord.json'), 'utf8')).testnet.event.payload).digest('hex');
+  assert.equal((await postC(signed({ type: 'arm', network: 'testnet', event_id: 'ev1', event_hash: evHash }))).status, 200);
   assert.equal((await postC({ payload: '{}', key: 'zz', sig: 'zz' })).status, 403);
   const f = join(dir, 'coord', 'coord.json');
   assert.ok(existsSync(f));
