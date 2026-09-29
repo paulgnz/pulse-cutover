@@ -46,9 +46,11 @@ curl -fsSL -o "$TMP/sha256sums.txt" "$REL/sha256sums.txt"
 B=$([ "$DRY" = 1 ] && echo "$TMP/pulse-cutover-$T" || echo "$BIN"); chmod +x "$B"
 
 say "surveying this box (read-only doctor)"
-mkdir -p /var/lib/pulse-cutover
-"$B" doctor --json > /var/lib/pulse-cutover/doctor.json 2>/dev/null || true
-jqget() { command -v jq >/dev/null && jq -r "$1 // empty" /var/lib/pulse-cutover/doctor.json 2>/dev/null || true; }
+VAR=/var/lib/pulse-cutover; ETC=/etc/pulse-cutover
+if [ "$DRY" = 1 ]; then VAR=$TMP/var; ETC=$TMP/etc; fi
+mkdir -p "$VAR"
+"$B" doctor --json > "$VAR/doctor.json" 2>/dev/null || true
+jqget() { command -v jq >/dev/null && jq -r "$1 // empty" "$VAR/doctor.json" 2>/dev/null || true; }
 [ -n "$API" ] || API=$(jqget '.nodeos.chain_api_url'); [ -n "$API" ] || API="http://127.0.0.1:8888"
 [ -n "$PAPI" ] || PAPI="$API"
 INFO=$(curl -fsS -m 5 -X POST "$API/v1/chain/get_info" -d '{}' || true)
@@ -61,11 +63,11 @@ if [ -z "$SNAPDIR" ]; then
 fi
 say "nodeos: $API · chain ${CHAIN_ID:0:16}… · head $HEAD · snapshots $SNAPDIR"
 
-mkdir -p /etc/pulse-cutover && chmod 750 /etc/pulse-cutover
-if [ ! -s /etc/pulse-cutover/beacon.token ]; then (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /etc/pulse-cutover/beacon.token); fi
-HASH=$(tr -d '\n' < /etc/pulse-cutover/beacon.token | sha256sum | cut -d' ' -f1)
+mkdir -p "$ETC" && chmod 750 "$ETC"
+if [ ! -s "$ETC/beacon.token" ]; then (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ETC/beacon.token"); fi
+HASH=$(tr -d '\n' < "$ETC/beacon.token" | sha256sum | cut -d' ' -f1)
 
-cat > /etc/pulse-cutover/beacon.toml <<TOML
+cat > "$ETC/beacon.toml" <<TOML
 # Readiness-only config for pulse-cutover beacon (written by beacon-install.sh).
 # No ceremony can run from this file: freeze height is unset (0) and no hooks or target chain exist yet.
 journal_path = "/var/lib/pulse-cutover/journal.jsonl"
@@ -98,13 +100,13 @@ network = "$NETWORK"
 token_file = "/etc/pulse-cutover/beacon.token"
 interval_secs = $INTERVAL
 TOML
-chmod 640 /etc/pulse-cutover/beacon.toml
+chmod 640 "$ETC/beacon.toml"
 
 say "first report (printed, not sent):"
-sed 's|^url = .*|url = ""|' /etc/pulse-cutover/beacon.toml > "$TMP/once.toml"
+sed 's|^url = .*|url = ""|' "$ETC/beacon.toml" > "$TMP/once.toml"
 "$B" beacon --config "$TMP/once.toml" --once | sed -n '/"checks"/,/\]/p' | grep -E '"name"|"ok"|"detail"' | paste - - - | sed 's/  */ /g' | head -20 || true
 
-if [ "$DRY" = 1 ]; then say "dry run: nothing installed"; exit 0; fi
+if [ "$DRY" = 1 ]; then say "dry run: nothing installed or written outside a temp dir (token hash would be $HASH)"; exit 0; fi
 cat > /etc/systemd/system/pulse-beacon.service <<UNIT
 [Unit]
 Description=pulse-cutover beacon (read-only readiness reporter → mission control)
