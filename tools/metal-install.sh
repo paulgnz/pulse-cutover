@@ -7,13 +7,14 @@
 #   + reads the network manifest from mission control (which Metal network, pinned metalgo version + sha256,
 #     and the PulseVM subnet/chain IDs once they exist) — nobody types IDs by hand
 #   + checks the box (RAM, disk, ports, glibc) and picks how to install:
-#       official binary (glibc >= 2.34) · official Docker image (if Docker is present) · build from source (--build)
+#       official binary (glibc >= 2.34) · native Ubuntu 20.04 build of the same tag (glibc 2.31-2.33)
+#       · official Docker image · build from source (--build)
 #   + runs metalgo as the `metalgo` systemd service, API on 127.0.0.1 only, staking port 9651 open
 #   + waits for your node identity and prints: NodeID, BLS public key, proof of possession
 #   + backs up your staking keys to a root-only archive and tells you to copy it off the box
 #   - never stakes, funds, registers or changes nodeos; never prints private keys
 #
-# Options: [--metal tahoe|mainnet] [--manifest-url URL] [--build] [--method binary|docker|build] [--dry-run] [--uninstall]
+# Options: [--metal tahoe|mainnet] [--manifest-url URL] [--build] [--method binary|compat|docker|build] [--dry-run] [--uninstall]
 # Re-running is safe: it keeps the node identity, re-applies the pinned version and prints the IDs again.
 set -euo pipefail
 METAL=""; MANIFEST_URL=""; METHOD=""; BUILD=0; DRY=0; UNINSTALL=0
@@ -52,11 +53,12 @@ if [ -n "$M" ]; then
   VERSION=$(jqm metalgo_version); NETID=$(printf '%s' "$M" | sed -n 's/.*"network_id":\([0-9]*\).*/\1/p' | head -1)
   SHA_AMD=$(jqm sha256_linux_amd64); SHA_ARM=$(jqm sha256_linux_arm64); IMAGE=$(jqm docker_image)
   SUBNET=$(jqm subnet_id); CHAIN=$(jqm blockchain_id)
+  COMPAT_URL=$(jqm compat_glibc231_url); COMPAT_SHA=$(jqm compat_glibc231_sha256)
   say "manifest: $MANIFEST_URL"
 else
   warn "mission control unreachable — using built-in pins"
   case "$METAL" in tahoe) VERSION=v1.14.2-tahoe; NETID=5;; mainnet) VERSION=v1.13.5; NETID=1;; esac
-  SHA_AMD=""; SHA_ARM=""; IMAGE="metalblockchain/metalgo:$VERSION"; SUBNET=""; CHAIN=""
+  SHA_AMD=""; SHA_ARM=""; IMAGE="metalblockchain/metalgo:$VERSION"; SUBNET=""; CHAIN=""; COMPAT_URL=""; COMPAT_SHA=""
 fi
 [ -n "$VERSION" ] && [ -n "$NETID" ] || die "manifest has no metalgo version/network id"
 say "XPR $XPR → Metal $METAL (network-id $NETID) · metalgo $VERSION"
@@ -74,6 +76,7 @@ systemctl is-active --quiet metalgo && say "metalgo already installed: upgrading
 
 if [ -n "$METHOD" ]; then :
 elif awk "BEGIN{exit !($GLIBC >= 2.34)}"; then METHOD=binary
+elif [ "$A" = amd64 ] && [ -n "$COMPAT_URL" ] && awk "BEGIN{exit !($GLIBC >= 2.31)}"; then METHOD=compat
 elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then METHOD=docker
 elif [ "$BUILD" = 1 ]; then METHOD=build
 else
@@ -98,13 +101,20 @@ case "$METHOD" in
     curl -fsSL -o "$TMP/mg.tgz" "$URL"
     if [ -n "$SHA" ]; then echo "$SHA  $TMP/mg.tgz" | sha256sum -c --quiet || die "checksum mismatch for $URL: refusing to install"; else warn "no pinned checksum in manifest"; fi
     tar xzf "$TMP/mg.tgz" -C "$TMP"; install -m 755 "$TMP"/metalgo-*/metalgo "$BIN";;
+  compat)
+    # Same metalgo source tag, compiled on Ubuntu 20.04 so it runs natively on glibc 2.31
+    # (reproduce with tools/build-metalgo-glibc231.sh). Checksum pinned in the manifest.
+    curl -fsSL -o "$TMP/mg.tgz" "$COMPAT_URL"
+    echo "$COMPAT_SHA  $TMP/mg.tgz" | sha256sum -c --quiet || die "checksum mismatch for $COMPAT_URL: refusing to install"
+    tar xzf "$TMP/mg.tgz" -C "$TMP"; install -m 755 "$TMP"/metalgo-*/metalgo "$BIN"
+    "$BIN" --version >/dev/null || die "the glibc 2.31 build does not run here";;
   build)
     say "building metalgo $VERSION from source (nice 19; nodeos keeps priority)…"
     export DEBIAN_FRONTEND=noninteractive; apt-get install -y -qq git build-essential >/dev/null
     GOV=$(curl -fsSL "https://raw.githubusercontent.com/MetalBlockchain/metalgo/$VERSION/go.mod" | sed -n "s/^go //p"); curl -fsSL -o "$TMP/go.tgz" "https://go.dev/dl/go$GOV.linux-$A.tar.gz"; rm -rf /usr/local/go-metal; mkdir -p /usr/local/go-metal
     tar xzf "$TMP/go.tgz" -C /usr/local/go-metal --strip-components=1
     git clone -q --depth 1 --branch "$VERSION" https://github.com/MetalBlockchain/metalgo "$TMP/src"
-    (cd "$TMP/src" && PATH=/usr/local/go-metal/bin:$PATH GOFLAGS=-buildvcs=false nice -n 19 ionice -c3 ./scripts/build.sh >"$TMP/build.log" 2>&1) || { tail -20 "$TMP/build.log"; die "build failed"; }
+    (cd "$TMP/src" && PATH=/usr/local/go-metal/bin:$PATH GOFLAGS=-buildvcs=false CGO_LDFLAGS=-ldl nice -n 19 ionice -c3 ./scripts/build.sh >"$TMP/build.log" 2>&1) || { tail -20 "$TMP/build.log"; die "build failed"; }
     install -m 755 "$TMP/src/build/metalgo" "$BIN";;
   docker) docker pull -q "$IMAGE" >/dev/null;;
 esac

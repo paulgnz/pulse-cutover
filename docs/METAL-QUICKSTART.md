@@ -56,10 +56,12 @@ The script never stakes, registers, funds or spends anything, and never touches 
 
 ## Ubuntu 20.04
 
-metalgo needs glibc 2.34+, which means **Ubuntu 22.04 or newer**. On 20.04 the script stops and says so.
-The recommended fix is to upgrade the server (20.04 is past standard support). Stopgaps: install Docker and
-re-run (it uses the official `metalblockchain/metalgo` image), or re-run with `--build` to compile metalgo on the
-box (best effort).
+Supported natively, without Docker. Metal's official binaries need glibc 2.34 (Ubuntu 22.04+), so on 20.04 the
+installer uses the same metalgo source tag compiled on Ubuntu 20.04
+([release](https://github.com/paulgnz/pulse-cutover/releases/tag/metalgo-glibc2.31-1), checksum pinned in the
+manifest, reproducible with `tools/build-metalgo-glibc231.sh`). It still runs as the normal `metalgo` service.
+You'll see `install method: compat`. Upgrading to 22.04/24.04 is still a good idea (20.04 is past standard support),
+and after an upgrade re-running the installer switches you to Metal's official binary.
 
 ## The network manifest
 
@@ -73,6 +75,7 @@ each XPR network maps to, plus the pinned metalgo version and checksums:
 |---|---|
 | `network`, `network_id`, `hrp` | Metal network (Tahoe = 5, mainnet = 1) and address prefix |
 | `metalgo_version`, `sha256_linux_{amd64,arm64}`, `docker_image` | what the installer installs and verifies |
+| `compat_glibc231_url`, `compat_glibc231_sha256` | the Ubuntu 20.04 build of the same version |
 | `rpcchainvm_protocol` | plugin protocol that metalgo speaks; the PulseVM plugin must match |
 | `subnet_id`, `blockchain_id`, `vm_id` | the PulseVM chain to track (`null` until it exists) |
 | `pulsevm_version`, `plugin_sha256` | the PulseVM plugin build to run |
@@ -85,7 +88,7 @@ makes your node track it.
 
 | You see | Do this |
 |---|---|
-| `glibc 2.31 … needs 2.34+` | Upgrade to Ubuntu 22.04/24.04 (see above) |
+| `glibc … needs 2.34+` | Only on ARM or very old systems: upgrade to Ubuntu 22.04/24.04 |
 | `port 9650 is already in use` | Another metalgo/avalanchego runs here. Stop it, or use that one |
 | `checksum mismatch` | Stop. Don't install. Tell the operator |
 | `metalgo did not answer` | `journalctl -u metalgo -n 50` and send it to the operator |

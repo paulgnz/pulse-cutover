@@ -30,7 +30,9 @@
         "plugin_sha256": null,
         "status": "No PulseVM chain for XPR mainnet yet: validators sync the Metal primary network and get their NodeID ready.",
         "rpcchainvm_protocol": 43,
-        "upgrades_note": "PulseVM v1.0.0 speaks plugin protocol 45 (metalgo 1.14.x). Metal mainnet's current release v1.13.5 speaks 43, so a PulseVM chain on Metal mainnet needs a mainnet 1.14.x metalgo release first. Granite is unscheduled on mainnet."
+        "upgrades_note": "PulseVM v1.0.0 speaks plugin protocol 45 (metalgo 1.14.x). Metal mainnet's current release v1.13.5 speaks 43, so a PulseVM chain on Metal mainnet needs a mainnet 1.14.x metalgo release first. Granite is unscheduled on mainnet.",
+        "compat_glibc231_url": "https://github.com/paulgnz/pulse-cutover/releases/download/metalgo-glibc2.31-1/metalgo-linux-amd64-v1.13.5-glibc2.31.tar.gz",
+        "compat_glibc231_sha256": "aa01f965af12c1d7cb05e1ad147b95a8fd01e0e52b3335620410bff81f6cd640"
       }
     },
     {
@@ -62,7 +64,9 @@
         "plugin_sha256": null,
         "status": "No PulseVM chain for XPR testnet yet: validators sync the Tahoe primary network and get their NodeID ready.",
         "rpcchainvm_protocol": 45,
-        "upgrades_note": "Granite activated on Tahoe 2026-09-21 10:00 UTC: nodes older than v1.14.2-tahoe fall off the network."
+        "upgrades_note": "Granite activated on Tahoe 2026-09-21 10:00 UTC: nodes older than v1.14.2-tahoe fall off the network.",
+        "compat_glibc231_url": "https://github.com/paulgnz/pulse-cutover/releases/download/metalgo-glibc2.31-1/metalgo-linux-amd64-v1.14.2-tahoe-glibc2.31.tar.gz",
+        "compat_glibc231_sha256": "59777f62ae12e79a90bbec7effe2a38db59992d98683f8add37e9f68b063fdb2"
       }
     },
     {
