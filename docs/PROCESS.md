@@ -1,5 +1,7 @@
 # The cutover process, step by step
 
+<p align="center"><img src="media/cutover-hero.svg" alt="One block, one cut, same chain" width="100%"></p>
+
 How a running Antelope chain moves onto PulseVM **in one atomic step**, with every
 block producer cutting the same block, the chain keeping its chain_id, and users
 keeping their keys, balances and URLs.

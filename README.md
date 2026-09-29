@@ -1,5 +1,7 @@
 # pulse-cutover
 
+<p align="center"><img src="docs/media/cutover-hero.svg" alt="One block, one cut, same chain: 5 block producers on 5 continents cut the same block H; a verified snapshot of exactly H is imported 1:1 into PulseVM, which continues at H+1 with the same chain_id. Results: 5/5 same block, 0 transactions after the cut, byte-identical state, exactly once, ~72 s write pause." width="100%"></p>
+
 [![How the cutover works — 106s explainer](https://pulsevm.dev/media/cutover-explainer.png)](https://pulsevm.dev/guide/migrate-antelope-chain)
 
 *106-second explainer + full methodology and recorded numbers: [pulsevm.dev/guide/migrate-antelope-chain](https://pulsevm.dev/guide/migrate-antelope-chain)*

@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" width="1200" height="560" role="img" aria-labelledby="t d">
+  <title id="t">pulse-cutover: moving a live Antelope chain onto PulseVM in one atomic step</title>
+  <desc id="d">Blocks on the old Leap chain lead to block H, the cut. A verified snapshot of exactly block H is imported into PulseVM, which continues at H+1 with the same chain_id. Five block producers on five continents cut the same block. Results: same block on 5 of 5 producers, zero transactions after the cut, byte-identical state, exactly-once across the boundary, about 72 seconds of paused writes.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/><stop offset="1" stop-color="#140c24"/>
+    </linearGradient>
+    <linearGradient id="cut" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#b45309"/>
+    </linearGradient>
+    <linearGradient id="pvm" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8b5cf6"/><stop offset="1" stop-color="#5b21b6"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#a78bfa"/>
+    </marker>
+    <style>
+      .f { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="560" rx="18" fill="url(#bg)"/>
+  <!-- subtle grid -->
+  <g stroke="#ffffff" stroke-opacity="0.035">
+    <path d="M0 80H1200M0 160H1200M0 240H1200M0 320H1200M0 400H1200M0 480H1200"/>
+    <path d="M100 0V560M200 0V560M300 0V560M400 0V560M500 0V560M600 0V560M700 0V560M800 0V560M900 0V560M1000 0V560M1100 0V560"/>
+  </g>
+
+  <!-- title -->
+  <text x="48" y="62" class="f" font-size="30" font-weight="700" fill="#f9fafb">One block. One cut. Same chain.</text>
+  <text x="48" y="92" class="f" font-size="16" fill="#9ca3af">A live Antelope chain moves onto PulseVM atomically: same chain_id, same accounts and keys, same URLs.</text>
+
+  <!-- lane labels -->
+  <text x="48" y="150" class="f" font-size="13" font-weight="600" letter-spacing="1.5" fill="#9ca3af">OLD ENGINE · LEAP NODEOS</text>
+  <text x="700" y="150" class="f" font-size="13" font-weight="600" letter-spacing="1.5" fill="#c4b5fd">NEW ENGINE · PULSEVM ON METAL</text>
+
+  <!-- old chain blocks -->
+  <g class="mono" font-size="13" text-anchor="middle">
+    <rect x="48"  y="170" width="92" height="62" rx="10" fill="#1f2937" stroke="#374151"/>
+    <text x="94" y="207" fill="#9ca3af">H−3</text>
+    <rect x="158" y="170" width="92" height="62" rx="10" fill="#1f2937" stroke="#374151"/>
+    <text x="204" y="207" fill="#9ca3af">H−2</text>
+    <rect x="268" y="170" width="92" height="62" rx="10" fill="#1f2937" stroke="#374151"/>
+    <text x="314" y="207" fill="#9ca3af">H−1</text>
+    <path d="M140 201H158M250 201H268M360 201H378" stroke="#4b5563" stroke-width="2"/>
+  </g>
+  <!-- block H (old) -->
+  <g filter="url(#glow)">
+    <rect x="378" y="160" width="128" height="82" rx="12" fill="url(#cut)"/>
+  </g>
+  <text x="442" y="196" class="f" font-size="22" font-weight="800" fill="#fff" text-anchor="middle">H</text>
+  <text x="442" y="222" class="f" font-size="12" fill="#fff7ed" text-anchor="middle">the cut</text>
+  <!-- empty blocks after H on old chain -->
+  <g opacity="0.55">
+    <rect x="524" y="178" width="46" height="46" rx="8" fill="none" stroke="#6b7280" stroke-dasharray="4 4"/>
+    <rect x="580" y="178" width="46" height="46" rx="8" fill="none" stroke="#6b7280" stroke-dasharray="4 4"/>
+  </g>
+  <text x="575" y="248" class="f" font-size="11" fill="#9ca3af" text-anchor="middle">empty, then paused</text>
+
+  <!-- beam -->
+  <path d="M442 244 C 442 318, 760 318, 760 250" fill="none" stroke="url(#beam)" stroke-width="4" marker-end="url(#arrow)"/>
+  <rect x="468" y="288" width="270" height="44" rx="22" fill="#111827" stroke="#374151"/>
+  <text x="603" y="309" class="f" font-size="13" fill="#e5e7eb" text-anchor="middle">snapshot of exactly H · verified twice</text>
+  <text x="603" y="325" class="f" font-size="12" fill="#9ca3af" text-anchor="middle">imported 1:1, byte-identical</text>
+
+  <!-- new chain -->
+  <g filter="url(#glow)">
+    <rect x="700" y="160" width="128" height="82" rx="12" fill="url(#cut)"/>
+  </g>
+  <text x="764" y="196" class="f" font-size="22" font-weight="800" fill="#fff" text-anchor="middle">H</text>
+  <text x="764" y="222" class="f" font-size="12" fill="#fff7ed" text-anchor="middle">same block id</text>
+  <g class="mono" font-size="13" text-anchor="middle">
+    <path d="M828 201H848M940 201H960M1052 201H1072" stroke="#7c3aed" stroke-width="2"/>
+    <rect x="848" y="170" width="92" height="62" rx="10" fill="url(#pvm)"/>
+    <text x="894" y="207" fill="#fff">H+1</text>
+    <rect x="960" y="170" width="92" height="62" rx="10" fill="url(#pvm)" opacity="0.85"/>
+    <text x="1006" y="207" fill="#fff">H+2</text>
+    <rect x="1072" y="170" width="80" height="62" rx="10" fill="url(#pvm)" opacity="0.6"/>
+    <text x="1112" y="207" fill="#fff">…</text>
+  </g>
+
+  <!-- producers row -->
+  <text x="48" y="382" class="f" font-size="13" font-weight="600" letter-spacing="1.5" fill="#9ca3af">5 BLOCK PRODUCERS · 5 CONTINENTS · SAME BLOCK</text>
+  <g class="f" font-size="14" font-weight="600">
+    <rect x="48" y="396" width="208" height="44" rx="22" fill="#0f172a" stroke="#065f46"/>
+    <circle cx="72" cy="418" r="7" fill="#10b981"/><text x="88" y="423" fill="#e5e7eb">Sydney</text>
+    <rect x="272" y="396" width="208" height="44" rx="22" fill="#0f172a" stroke="#065f46"/>
+    <circle cx="296" cy="418" r="7" fill="#10b981"/><text x="312" y="423" fill="#e5e7eb">Singapore</text>
+    <rect x="496" y="396" width="208" height="44" rx="22" fill="#0f172a" stroke="#065f46"/>
+    <circle cx="520" cy="418" r="7" fill="#10b981"/><text x="536" y="423" fill="#e5e7eb">Los Angeles</text>
+    <rect x="720" y="396" width="208" height="44" rx="22" fill="#0f172a" stroke="#065f46"/>
+    <circle cx="744" cy="418" r="7" fill="#10b981"/><text x="760" y="423" fill="#e5e7eb">New Jersey</text>
+    <rect x="944" y="396" width="208" height="44" rx="22" fill="#0f172a" stroke="#065f46"/>
+    <circle cx="968" cy="418" r="7" fill="#10b981"/><text x="984" y="423" fill="#e5e7eb">Frankfurt</text>
+  </g>
+
+  <!-- stats strip -->
+  <g class="f">
+    <rect x="48" y="464" width="1104" height="68" rx="14" fill="#0b1224" stroke="#1f2937"/>
+    <text x="158" y="494" font-size="22" font-weight="800" fill="#34d399" text-anchor="middle">5 / 5</text>
+    <text x="158" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">cut the same block</text>
+    <path d="M268 478V518" stroke="#1f2937"/>
+    <text x="378" y="494" font-size="22" font-weight="800" fill="#34d399" text-anchor="middle">0</text>
+    <text x="378" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">transactions after the cut</text>
+    <path d="M488 478V518" stroke="#1f2937"/>
+    <text x="598" y="494" font-size="22" font-weight="800" fill="#34d399" text-anchor="middle">byte-identical</text>
+    <text x="598" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">state before and after</text>
+    <path d="M708 478V518" stroke="#1f2937"/>
+    <text x="818" y="494" font-size="22" font-weight="800" fill="#34d399" text-anchor="middle">exactly once</text>
+    <text x="818" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">no replays, no losses</text>
+    <path d="M928 478V518" stroke="#1f2937"/>
+    <text x="1040" y="494" font-size="22" font-weight="800" fill="#fbbf24" text-anchor="middle">~72 s</text>
+    <text x="1040" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">write pause · reads never stop</text>
+  </g>
+</svg>
