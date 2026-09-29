@@ -2,9 +2,11 @@
 
 **For block producers. Takes about 2 minutes. Safe on a live producing node.**
 
-This installs a small **read-only** reporter (the *beacon*) that tells
+This installs a small reporter (the *beacon*) that tells
 [Cutover Mission Control](https://control-rehearsal.protonnz.com) whether your node is ready for a future
-PulseVM cutover. It **does not** touch nodeos, its config, your keys or block production, and it opens no ports.
+PulseVM cutover. The running beacon only reads local state; it **does not** touch nodeos, its config, your keys or
+block production, and it opens no ports. (Installing it writes the binary, a config, a token and a systemd
+service; see below.)
 
 ---
 
@@ -35,8 +37,10 @@ The last thing it prints looks like this:
       network=testnet producer=youraccount token_sha256=3f9c…e21a
 ```
 
-Send that line to the operator (Telegram or email). It is only a **hash**: your secret token never leaves
-your server.
+Send that line to the operator (Telegram or email). It is only a **hash** of your token. The token itself stays
+on your server except that the beacon sends it, over HTTPS, with each report: that is how mission control knows
+the report is yours. Re-running the installer later (to upgrade) keeps the same token, so there is nothing to send
+again unless you change the producer or network.
 
 ## 3. Watch your node
 
@@ -44,7 +48,8 @@ Once you're approved, your node appears on the dashboard with its readiness chec
 `https://control-rehearsal.protonnz.com/testnet/youraccount`
 
 A few red items are expected today (for example "validator not running" until the Metal node is set up).
-That list **is** your to-do list for the cutover.
+That list is a **preparation** checklist. A fully green list does not authorize a cutover: release, validator
+admission, funding and routing are checked separately.
 
 ## 4. Set up your Metal node
 
@@ -76,14 +81,21 @@ curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/be
 
 - `/usr/local/bin/pulse-cutover`: the prebuilt binary from the
   [GitHub release](https://github.com/paulgnz/pulse-cutover/releases), checked against its sha256.
-- `/etc/pulse-cutover/beacon.toml`: a read-only config. No ceremony can run from it (no cut height, no hooks,
-  no target chain).
-- `/etc/pulse-cutover/beacon.token`: a random token made on your server, readable only by root.
-- `pulse-beacon.service`: a systemd service with a read-only filesystem, reporting every 10 seconds.
+- `/etc/pulse-cutover/beacon.toml`: a readiness config for reporting only. **Never run `pulse-cutover run` with it.**
+  Newer releases mark it `profile = "readiness"` so the ceremony refuses it; older releases can't, and the
+  installer warns you.
+- `/etc/pulse-cutover/beacon.token`: a random token made on your server (root and the beacon's service user only).
+- `pulse-beacon.service`: a systemd service, running as the unprivileged `pulse-beacon` user when it can read
+  what it needs (otherwise root limited to read-only file access), with a read-only filesystem.
+
+Everything is downloaded, checksum-verified and test-run before the box changes; if the new beacon does not start,
+the previous binary and config are restored. The report URL must be HTTPS.
 
 What the beacon reads: your nodeos `get_info`, whether the producer API answers locally, whether a Metal
 validator service is running, and free disk. What it sends (the dashboard is public, so it is kept minimal):
 pass/fail for each check with a short verdict (e.g. "83 GB free", "running"), head/LIB, your account, a node
-label you choose (default: its role), and the pulse-cutover version. **Never** sent: keys, tokens, IP addresses,
-hostnames, file paths, config contents or unit names.
+label you choose (default: its role; use `--node` to tell several servers of the same role apart), your Metal
+node's public identity (NodeID, BLS public key, version, peers), and the pulse-cutover version. Not sent: private
+keys, IP addresses, hostnames or config contents. If a ceremony step fails, its error message is included and may
+mention a command or path from your hooks.
 </details>

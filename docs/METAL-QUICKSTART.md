@@ -7,8 +7,15 @@ PulseVM validator. That can be the same box as your producer nodeos if it has ro
 curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/metal-install.sh | sudo bash
 ```
 
-It works out mainnet or testnet from your nodeos, then installs the metalgo version that
-[the network manifest](#the-network-manifest) pins, verifies its sha256 and starts it as the `metalgo` service.
+It works out mainnet or testnet from your nodeos and installs the metalgo version that
+[the network manifest](#the-network-manifest) pins. **Everything is downloaded and verified before anything on
+the box changes** (sha256, the binary's reported version and plugin protocol). Then it swaps the binary in, starts
+the `metalgo` service and checks the running node's version, network and identity. If an upgrade fails at any
+point, the previous binary and config are put back and the previous node is started again.
+
+The result is a **prepared Metal node**. Being admitted as a validator (registered, funded) and being ready for a
+cutover are separate steps with their own checks.
+
 Then it prints:
 
 ```
@@ -21,14 +28,16 @@ Then it prints:
   ── BACK UP YOUR KEYS NOW (PRIVATE: never share, never commit) ──
   …/staking/staker.key + staker.crt   → your NodeID
   …/staking/signer.key                → your BLS key
-  All three are in:  /root/metalgo-identity-NodeID-….tar.gz
+  All three are in:  /root/metalgo-identity-NodeID-…-<timestamp>.tar.gz   (PRIVATE KEYS)
 ```
 
 Then a numbered **NEXT STEPS** list tells you exactly what to do:
 1. whether port 9651 is reachable from the internet (mission control dials back to your server's IP on 9651
    only, via `/api/reach`) and how to fix it if not;
-2. the exact `scp` command to copy your key archive off the server. If you ran it with `sudo`, a copy is put in
-   your home directory so you can `scp` it as yourself;
+2. the exact `scp` command to copy your key archive off the server. The archive is verified against the live
+   key files, and every run makes a new timestamped one (never overwritten). If you ran it with `sudo`, a second
+   copy is put in your home directory, readable only by you, so you can `scp` it as yourself. **Both copies
+   contain private keys**: delete the home-directory copy once it is stored safely;
 3. how to check sync;
 4. **one line to send to the operator** (`metal network=… producer=… node_id=… bls=… pop=…`, public values only);
 5. what you'll need later to register.
@@ -62,8 +71,11 @@ Everything is also saved in `/etc/metalgo/identity.txt`, and machine-readable fo
    | nothing local: your provider's firewall | allow inbound TCP 9651 in the provider's panel (Vultr firewall group, Hetzner Firewalls, AWS security group, …) |
    | metalgo not listening / localhost only | restart metalgo / remove the listen override |
 
-   Re-check any time without changing anything: `… | sudo bash -s -- --check`. Add `--open-port` to have it
-   add the rule to this server's own firewall for you (it can't change your provider's).
+   These are **likely** causes: the test dials the address mission control sees your request come from, and the
+   local firewall inspection is a heuristic (NAT, IPv6 and multi-homed hosts can differ).
+   Re-check any time without changing anything: `… | sudo bash -s -- --check` (it queries the running node's live
+   identity). The installer never opens a firewall port on its own: add `--open-port` to have it add the rule to
+   this server's own firewall (ufw, firewalld or iptables; it can't change your provider's).
    The HTTP API (9650) stays on 127.0.0.1.
 3. **Stay on the pinned version.** Tahoe activated Granite on 2026-09-21. Nodes older than `v1.14.2-tahoe`
    fall off the network. To upgrade, re-run the same command: it keeps your keys.
@@ -117,4 +129,14 @@ makes your node track it.
 | `metalgo did not answer` | `journalctl -u metalgo -n 50` and send it to the operator |
 | Advertised address is wrong | Re-run as `… \| sudo METAL_PUBLIC_IP=<your IPv4> bash` |
 
-Remove the service (keeps your keys and data): `… | sudo bash -s -- --uninstall`
+Remove the service (keeps your keys and data): `… | sudo bash -s -- --uninstall`. It only removes a service this
+script installed.
+
+**Already running metalgo some other way?** The installer refuses to touch a `metalgo` service it did not install.
+`--adopt` takes it over, but only when it uses the standard `/var/lib/metalgo` data dir; a custom layout is refused
+rather than risk the node identity.
+
+**Mission control unreachable?** The installer stops: it does not install without the published manifest. On
+testnet only, `--allow-unpinned` falls back to the checksum pins built into the script. The Docker method needs a
+digest-pinned image in the manifest, and `--build` checks out the exact pinned commit and verifies the Go
+toolchain's checksum.
