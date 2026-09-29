@@ -2,6 +2,7 @@
 //! The binary in `main.rs` is a thin CLI over these modules; tests drive the
 //! machine with a mock `ChainOps`.
 
+pub mod beacon;
 pub mod config;
 pub mod doctor;
 pub mod journal;

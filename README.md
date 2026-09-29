@@ -20,6 +20,8 @@ existing node exactly as it was.
 
 **How do we know the cut is atomic? → [ATOMICITY.md](ATOMICITY.md)**: five properties, each with a gate or a tool and the recorded proof.
 
+**Watch it live → [Cutover Mission Control](control/README.md)**: readiness of every producer on mainnet, testnet and the rehearsal network, the ceremony as it happens, and cross-producer agreement on the evidence (live at [control-rehearsal.protonnz.com](https://control-rehearsal.protonnz.com)).
+
 **Want to help test? → [TESTING.md](TESTING.md)** — rehearsals never touch
 production, take about 40 minutes, and give you operational familiarity before
 any real event (plus credit for every setup you help us support).

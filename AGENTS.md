@@ -136,6 +136,7 @@ Always, LIVE or ABORTED:
 | `tools/state-diff.mjs` | byte-exact state comparison of two `/v1/chain` endpoints (atomicity A3) |
 | `tools/replay-canary.mjs` | exactly-once test across a same-chain_id cutover (atomicity A4) |
 | `docs/PROCESS.md` | the process, step by step, with diagrams |
+| `src/beacon.rs` + `control/` | `pulse-cutover beacon` (readiness + evidence reporter) and Cutover Mission Control (multi-network status board) |
 
 ## Command surface + contracts
 
@@ -148,6 +149,8 @@ Read-only (always safe, any box, including production):
   the journal, prints current state + pinned evidence. Exit 0.
 - `pulse-cutover scan-contracts <snapshot.bin> [--json]` — advisory scan.
   Exit 0 even with at-risk rows.
+- `pulse-cutover beacon --config c.toml [--once]` — read-only readiness checks + journal evidence, posted to
+  mission control (`[beacon]` section). `--once` with an empty url prints the report. Safe to run any time.
 - `pulse-cutover report [--out f.tar.gz] [--paranoid]` — reads configs/logs,
   writes ONE tar.gz (sanitized). No service changes.
 - `pulse-cutover verify --snapshot f.bin [--cpu-scale N]` — CPU/RAM heavy

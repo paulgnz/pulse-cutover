@@ -37,12 +37,40 @@ pub struct Config {
     pub r#loop: Option<LoopCfg>,
     #[serde(default)]
     pub hooks: Hooks,
+    /// Mission control reporting (`pulse-cutover beacon`): readiness checks and
+    /// ceremony evidence posted to a central status board. Optional; the
+    /// ceremony never depends on it.
+    #[serde(default)]
+    pub beacon: Option<Beacon>,
     /// Append-only JSONL journal — the ceremony's evidence log and the
     /// resume-after-crash source of truth.
     pub journal_path: PathBuf,
     /// Poll interval against the source chain while waiting for H.
     #[serde(default = "default_poll_ms")]
     pub poll_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Beacon {
+    /// Mission control report endpoint, e.g. `https://control.example/api/report`.
+    /// Empty + `--once` prints the report instead of sending it.
+    #[serde(default)]
+    pub url: String,
+    /// This producer's account name as it appears in the producer schedule.
+    pub producer: String,
+    /// Network id as mission control knows it: "mainnet", "testnet", "rehearsal"…
+    pub network: String,
+    /// File holding this producer's bearer token (one line, mode 600). Never
+    /// put the token itself in the config.
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
+    #[serde(default = "default_beacon_interval")]
+    pub interval_secs: u64,
+}
+
+fn default_beacon_interval() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Deserialize)]

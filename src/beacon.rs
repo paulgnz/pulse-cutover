@@ -1,0 +1,251 @@
+//! `pulse-cutover beacon`: readiness + ceremony status reporter for mission control.
+//!
+//! Runs next to (never inside) the ceremony: every `interval_secs` it checks the
+//! box's readiness, summarizes the journal into comparable evidence (cut id,
+//! snapshot sha256, fingerprint digest, state-diff digest) and POSTs one JSON
+//! report to the `[beacon] url` with a bearer token. Fire-and-forget: if mission
+//! control is down the beacon logs and retries; the ceremony never waits on it.
+//! Read-only on the box: it calls nodeos' chain API, reads files, and asks
+//! systemd whether a unit is active. It never changes anything.
+
+use std::path::Path;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+use crate::config::Config;
+
+pub const REPORT_SCHEMA: &str = "pulse-cutover-beacon-v1";
+
+fn check(name: &str, ok: bool, detail: impl Into<String>) -> Value {
+    json!({"name": name, "ok": ok, "detail": detail.into()})
+}
+
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(Duration::from_secs(3)).build()
+}
+
+fn post_json(a: &ureq::Agent, url: &str, body: Value) -> Result<Value, String> {
+    a.post(url)
+        .send_json(body)
+        .map_err(|e| e.to_string())?
+        .into_json::<Value>()
+        .map_err(|e| e.to_string())
+}
+
+/// First word of a hook command is the program; a hook is ready when it exists
+/// and is executable (the run-5 rehearsal stalled on a hook without +x).
+fn hook_ready(cmd: &str) -> (bool, String) {
+    let prog = cmd.split_whitespace().next().unwrap_or("");
+    if !prog.starts_with('/') {
+        return (true, format!("{prog} (on PATH; not checked)"));
+    }
+    match std::fs::metadata(prog) {
+        Ok(m) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if m.permissions().mode() & 0o111 == 0 {
+                    return (false, format!("{prog} is not executable (chmod +x)"));
+                }
+            }
+            let _ = m;
+            (true, prog.to_string())
+        }
+        Err(_) => (false, format!("{prog} does not exist")),
+    }
+}
+
+fn free_gb(dir: &Path) -> Option<f64> {
+    let out = std::process::Command::new("df").arg("-Pk").arg(dir).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().nth(1)?;
+    let avail_kb: f64 = line.split_whitespace().nth(3)?.parse().ok()?;
+    Some(avail_kb / 1024.0 / 1024.0)
+}
+
+fn unit_active(unit: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", unit])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Condense the journal into what mission control compares across producers.
+fn journal_summary(path: &Path) -> Value {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut state = Value::Null;
+    let mut last_ts = Value::Null;
+    let mut seq = 0u64;
+    let mut transitions = vec![];
+    let mut ev = serde_json::Map::new();
+    let mut last_error = Value::Null;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        seq = v["seq"].as_u64().unwrap_or(seq);
+        let d = &v["data"];
+        match v["kind"].as_str() {
+            Some("transition") => {
+                state = v["state"].clone();
+                last_ts = v["ts"].clone();
+                transitions.push(json!({"state": v["state"], "ts": v["ts"]}));
+                match v["state"].as_str() {
+                    Some("ARMED") => {
+                        ev.insert("h".into(), d["resolved_h"].clone());
+                        ev.insert("chain_id".into(), d["chain_id"].clone());
+                    }
+                    Some("FROZEN") => {
+                        ev.insert("freeze_at".into(), d["freeze_at"].clone());
+                    }
+                    Some("SNAPSHOTTED") => {
+                        ev.insert("cut_height".into(), d["cut_height"].clone());
+                        ev.insert("cut_block_id".into(), d["cut_block_id"].clone());
+                        ev.insert("burnoff_transactions".into(), d["burnoff_transactions"].clone());
+                    }
+                    Some("VERIFIED") => {
+                        ev.insert("snapshot_sha256".into(), d["sha256"].clone());
+                        if d["fingerprints"].is_object() {
+                            let canon = serde_json::to_string(&d["fingerprints"]).unwrap_or_default();
+                            let dig = hex::encode(Sha256::digest(canon.as_bytes()));
+                            ev.insert("fingerprints_digest".into(), json!(&dig[..16]));
+                        }
+                    }
+                    Some("IGNITED") => {
+                        ev.insert("target_head_id".into(), d["target_head_id"].clone());
+                    }
+                    Some("LIVE") => {
+                        ev.insert("write_gap_ms".into(), d["write_gap_ms_wallclock"].clone());
+                    }
+                    _ => {}
+                }
+            }
+            Some("error") => last_error = d["message"].clone(),
+            _ => {}
+        }
+    }
+    json!({"state": state, "since": last_ts, "seq": seq, "transitions": transitions,
+           "evidence": Value::Object(ev), "last_error": last_error})
+}
+
+pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
+    let a = agent();
+    let mut checks = vec![];
+    let journal = journal_summary(&cfg.journal_path);
+    let state = journal["state"].as_str().unwrap_or("").to_string();
+    let past_ignite = matches!(state.as_str(), "IGNITED" | "FLIPPED" | "LIVE");
+
+    // Source chain.
+    let info = post_json(&a, &format!("{}/v1/chain/get_info", cfg.source.rpc_url.trim_end_matches('/')), json!({}));
+    let (head, lib, chain_id) = match &info {
+        Ok(v) => (v["head_block_num"].as_u64(), v["last_irreversible_block_num"].as_u64(), v["chain_id"].as_str().map(String::from)),
+        Err(_) => (None, None, None),
+    };
+    checks.push(check("source_api", info.is_ok(), match &info { Ok(_) => format!("head {} lib {}", head.unwrap_or(0), lib.unwrap_or(0)), Err(e) => e.clone() }));
+    if let Some(want) = &cfg.ceremony.chain_id {
+        let ok = chain_id.as_deref() == Some(want.as_str());
+        checks.push(check("chain_id", ok, if ok { format!("{}…", &want[..16.min(want.len())]) } else { format!("node reports {:?}, config expects {}…", chain_id, &want[..16.min(want.len())]) }));
+    }
+    if cfg.ceremony.mode == crate::config::Mode::Producer {
+        let p = post_json(&a, &format!("{}/v1/producer/paused", cfg.source.producer_api_url.trim_end_matches('/')), json!({}));
+        checks.push(check("producer_api", p.is_ok(), match &p { Ok(v) => format!("paused={v}"), Err(e) => e.clone() }));
+    }
+
+    // Declared H.
+    let h = cfg.ceremony.freeze_height;
+    if h > 0 {
+        let ok = past_ignite || state == "LIVE" || head.map(|x| x < h || !state.is_empty()).unwrap_or(false);
+        checks.push(check("freeze_height", ok, format!("H = {h}{}", head.map(|x| if x < h { format!(", {} blocks away", h - x) } else { String::new() }).unwrap_or_default())));
+    } else {
+        checks.push(check("freeze_height", cfg.ceremony.freeze_margin.is_some(), "H derived at ARM from LIB + freeze_margin"));
+    }
+    if cfg.ceremony.freeze_strategy == crate::config::FreezeStrategy::ScheduleAtH {
+        checks.push(check("freeze_lead_blocks", cfg.ceremony.freeze_lead_blocks > 0, format!("writes close {} blocks before H", cfg.ceremony.freeze_lead_blocks)));
+    }
+
+    // Hooks.
+    let hooks = [("on_freeze", &cfg.hooks.on_freeze), ("post_ignite", &cfg.hooks.post_ignite), ("on_live", &cfg.hooks.on_live), ("on_abort", &cfg.hooks.on_abort)];
+    for (name, h) in hooks {
+        if let Some(cmd) = h {
+            let (ok, d) = hook_ready(cmd);
+            checks.push(check(&format!("hook_{name}"), ok, d));
+        } else if cfg.ceremony.mode == crate::config::Mode::Producer && matches!(name, "on_freeze" | "post_ignite") {
+            checks.push(check(&format!("hook_{name}"), false, "not configured (needed for a multi-producer ceremony)"));
+        }
+    }
+
+    // Target side.
+    let staged = &cfg.snapshot.staged_path;
+    let staged_ok = past_ignite || !staged.exists();
+    checks.push(check("staged_snapshot_absent", staged_ok, if staged_ok { "not pre-staged".to_string() } else { format!("{} already exists (would boot the target from a stale cut)", staged.display()) }));
+    let unit = &cfg.target.metalgo_unit;
+    let active = unit_active(unit);
+    checks.push(check("validator_running", active, format!("{unit} {}", if active { "active" } else { "not active" })));
+    if let Some(dir) = cfg.snapshot.dir.as_ref().or(staged.parent().map(|p| p.to_path_buf()).as_ref()) {
+        let gb = free_gb(dir);
+        checks.push(check("disk_free", gb.map(|g| g >= 5.0).unwrap_or(false), gb.map(|g| format!("{g:.1} GB free in {}", dir.display())).unwrap_or_else(|| "unknown".into())));
+    }
+
+    // State diff (A3), if the post_ignite hook produced one next to the journal.
+    let mut journal = journal;
+    if let Some(dir) = cfg.journal_path.parent() {
+        if let Ok(t) = std::fs::read_to_string(dir.join("state-diff.json")) {
+            if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                journal["evidence"]["state_diff_identical"] = v["identical"].clone();
+                journal["evidence"]["state_digest"] = json!(v["b"]["digest"].as_str().map(|d| &d[..16.min(d.len())]));
+                journal["evidence"]["state_diff_b_head"] = v["b"]["head_block_num"].clone();
+            }
+        }
+    }
+
+    let ready = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(false));
+    json!({
+        "schema": REPORT_SCHEMA,
+        "producer": producer,
+        "network": network,
+        "agent_version": env!("CARGO_PKG_VERSION"),
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "mode": format!("{:?}", cfg.ceremony.mode).to_lowercase(),
+        "ready": ready,
+        "checks": checks,
+        "source": {"head": head, "lib": lib, "chain_id": chain_id},
+        "ceremony": journal,
+    })
+}
+
+/// Loop forever (or once), posting reports. Never exits on a delivery failure.
+pub fn run(cfg: &Config, once: bool) -> Result<(), String> {
+    let b = cfg.beacon.as_ref().ok_or("config has no [beacon] section")?;
+    let token = match &b.token_file {
+        Some(p) => std::fs::read_to_string(p).map_err(|e| format!("token_file {}: {e}", p.display()))?.trim().to_string(),
+        None => String::new(),
+    };
+    let a = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
+    loop {
+        let report = build_report(cfg, &b.producer, &b.network);
+        if once && b.url.is_empty() {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+            return Ok(());
+        }
+        let mut req = a.post(&b.url);
+        if !token.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {token}"));
+        }
+        match req.send_json(report.clone()) {
+            Ok(_) => {
+                if once {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                eprintln!("beacon: delivery failed ({e}); will retry");
+                if once {
+                    return Err(format!("delivery failed: {e}"));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(b.interval_secs.max(1)));
+    }
+}

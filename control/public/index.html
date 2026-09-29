@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#070a16">
+<title>Cutover Mission Control</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#070a16; --ink:#eef1f8; --muted:#8a93a8; --dim:#4f5871; --line:rgba(255,255,255,.07); --glass:rgba(17,23,43,.55);
+  --cut:#f5a524; --cut2:#ff7a1a; --pvm:#8b5cf6; --pvm2:#6d5dfc; --ok:#34d399; --warn:#fbbf24; --bad:#fb7185; --sky:#60a5fa;
+  --r:22px; --display:"Space Grotesk",Inter,system-ui,sans-serif; --sans:Inter,system-ui,-apple-system,"Segoe UI",sans-serif; --mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans);-webkit-font-smoothing:antialiased;overflow-x:hidden}
+body::before{content:"";position:fixed;inset:-20%;z-index:-2;background:
+  radial-gradient(40% 35% at 18% 12%,rgba(109,93,252,.28),transparent 70%),
+  radial-gradient(35% 30% at 85% 8%,rgba(245,165,36,.16),transparent 70%),
+  radial-gradient(45% 40% at 70% 90%,rgba(52,211,153,.10),transparent 70%);
+  filter:blur(20px);animation:aurora 26s ease-in-out infinite alternate}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.35;
+  background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);
+  background-size:48px 48px;mask-image:radial-gradient(ellipse at 50% 0%,#000 30%,transparent 75%)}
+@keyframes aurora{0%{transform:translate3d(0,0,0) rotate(0)}100%{transform:translate3d(-4%,3%,0) rotate(8deg)}}
+a{color:inherit}
+.mono{font-family:var(--mono)}
+.wrap{max-width:1480px;margin:0 auto;padding:0 clamp(14px,3vw,32px)}
+
+/* header */
+header{position:sticky;top:0;z-index:20;backdrop-filter:saturate(140%) blur(14px);background:linear-gradient(180deg,rgba(7,10,22,.86),rgba(7,10,22,.55));border-bottom:1px solid var(--line)}
+.bar{display:flex;align-items:center;gap:16px;min-height:66px}
+.mark{width:34px;height:34px;border-radius:10px;position:relative;flex:none;background:conic-gradient(from 210deg,var(--cut),var(--cut2),var(--pvm),var(--pvm2),var(--cut));box-shadow:0 0 24px rgba(245,165,36,.35)}
+.mark::after{content:"";position:absolute;inset:7px;border-radius:6px;background:var(--bg)}
+.mark i{position:absolute;left:50%;top:6px;bottom:6px;width:2px;margin-left:-1px;background:linear-gradient(var(--cut),var(--pvm));z-index:1;border-radius:2px}
+.brand b{display:block;font:700 16px/1.1 var(--display);letter-spacing:.2px}
+.brand span{color:var(--muted);font-size:12px}
+.clock{margin-left:auto;text-align:right;font-size:12px;color:var(--muted);white-space:nowrap}
+.clock b{display:block;font:600 14px var(--mono);color:var(--ink)}
+.live{display:inline-flex;align-items:center;gap:6px}
+.live i{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(52,211,153,.6);animation:ping 1.8s infinite}
+@keyframes ping{70%{box-shadow:0 0 0 9px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
+
+/* network switcher */
+.switch{position:relative;display:flex;gap:4px;padding:4px;border-radius:999px;background:rgba(255,255,255,.04);border:1px solid var(--line);overflow-x:auto;scrollbar-width:none;margin:18px 0 0}
+.switch::-webkit-scrollbar{display:none}
+.switch button{position:relative;z-index:1;flex:none;border:0;background:none;color:var(--muted);font:600 13px var(--sans);padding:9px 16px;border-radius:999px;cursor:pointer;display:flex;align-items:center;gap:8px;transition:color .25s}
+.switch button[aria-selected=true]{color:var(--ink)}
+.switch button:focus-visible{outline:2px solid var(--pvm);outline-offset:2px}
+.switch .pill{position:absolute;z-index:0;top:4px;bottom:4px;border-radius:999px;background:linear-gradient(135deg,rgba(245,165,36,.18),rgba(139,92,246,.28));box-shadow:inset 0 0 0 1px rgba(255,255,255,.09);transition:left .45s cubic-bezier(.2,.8,.2,1),width .45s cubic-bezier(.2,.8,.2,1)}
+.sd{width:8px;height:8px;border-radius:50%;background:var(--dim)}
+.sd.ok{background:var(--ok)}.sd.warn{background:var(--warn)}.sd.bad{background:var(--bad)}
+.count{font:600 11px var(--mono);color:var(--muted);padding:2px 7px;border-radius:99px;background:rgba(255,255,255,.05)}
+
+/* glass */
+.glass{position:relative;background:var(--glass);border-radius:var(--r);backdrop-filter:blur(14px);border:1px solid transparent;
+  background-clip:padding-box;box-shadow:0 30px 60px -30px rgba(0,0,0,.6)}
+.glass::before{content:"";position:absolute;inset:-1px;border-radius:inherit;padding:1px;pointer-events:none;
+  background:linear-gradient(135deg,rgba(255,255,255,.16),rgba(255,255,255,.02) 40%,rgba(139,92,246,.18));
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude}
+.label{font:600 11px var(--sans);letter-spacing:1.6px;text-transform:uppercase;color:var(--muted)}
+
+/* hero */
+.hero{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);gap:20px;margin-top:20px}
+.globe-card{min-height:600px;overflow:hidden}
+#globe{position:absolute;inset:0;width:100%;height:100%;cursor:grab;touch-action:none}
+#globe:active{cursor:grabbing}
+.globe-over{position:absolute;left:0;top:0;right:0;padding:22px 24px 60px;pointer-events:none;display:flex;justify-content:space-between;gap:12px;background:linear-gradient(180deg,rgba(12,17,36,.92) 30%,rgba(12,17,36,0));z-index:1}
+.globe-over h1{margin:6px 0 0;font:700 clamp(26px,3.4vw,40px)/1.02 var(--display);letter-spacing:-.5px}
+.globe-over h1 em{font-style:normal;background:linear-gradient(90deg,var(--cut),var(--pvm));-webkit-background-clip:text;background-clip:text;color:transparent}
+.globe-over p{margin:8px 0 0;color:var(--muted);max-width:380px;font-size:13px}
+.legend{position:absolute;left:24px;right:24px;bottom:18px;display:flex;flex-wrap:wrap;gap:8px 14px;font-size:12px;color:var(--muted);pointer-events:none}
+.legend span{display:flex;align-items:center;gap:6px}
+.legend i{width:9px;height:9px;border-radius:50%}
+.tip{position:absolute;pointer-events:none;padding:8px 11px;border-radius:12px;background:rgba(7,10,22,.9);border:1px solid var(--line);font-size:12px;transform:translate(-50%,-120%);white-space:nowrap;opacity:0;transition:opacity .15s}
+.tip b{display:block;font-size:13px}
+.hint{position:absolute;right:22px;top:24px;font-size:11px;color:var(--dim);pointer-events:none;z-index:2;text-align:right}
+
+.inst{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-content:start}
+.tile{padding:18px 20px 64px;min-height:150px;overflow:hidden}
+.tile.wide{padding-bottom:18px}
+.tile.wide{grid-column:span 2}
+.big{font:700 clamp(28px,3.2vw,40px)/1 var(--mono);letter-spacing:-1px;margin-top:10px;font-variant-numeric:tabular-nums}
+.sub{color:var(--muted);font-size:12.5px;margin-top:6px}
+.spark{position:absolute;right:0;left:0;bottom:0;height:46px;opacity:.9}
+.ring-wrap{display:flex;align-items:center;gap:18px;margin-top:6px}
+.ring{width:108px;height:108px;flex:none}
+.ring text{font:700 22px var(--mono);fill:var(--ink)}
+.ring .small{font:500 10px var(--sans);fill:var(--muted);letter-spacing:1px}
+.kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 14px;font-size:12.5px}
+.kv dt{color:var(--muted)}.kv dd{margin:0;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* track */
+section{margin-top:26px}
+.sec-h{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:0 2px 12px}
+.sec-h h2{margin:0;font:700 20px var(--display);letter-spacing:-.2px}
+.sec-h span{color:var(--muted);font-size:12.5px}
+.track{padding:22px;overflow-x:auto}
+.stages{position:relative;display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:12px;min-width:820px}
+.stages::before{content:"";position:absolute;left:18px;right:18px;top:17px;height:2px;background:rgba(255,255,255,.08)}
+.flow{position:absolute;left:18px;top:17px;height:2px;background:linear-gradient(90deg,var(--cut),var(--pvm));box-shadow:0 0 16px rgba(139,92,246,.7);transition:width 1s cubic-bezier(.2,.8,.2,1)}
+.flow::after{content:"";position:absolute;right:-4px;top:-3px;width:8px;height:8px;border-radius:50%;background:#fff;box-shadow:0 0 14px 4px rgba(167,139,250,.9)}
+.stage{position:relative;z-index:1}
+.node{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;background:#0d1330;border:1px solid rgba(255,255,255,.12);font:700 12px var(--mono);color:var(--muted);transition:all .5s}
+.stage.reached .node{color:#fff;border-color:transparent;background:linear-gradient(135deg,var(--cut),var(--pvm));box-shadow:0 0 18px rgba(139,92,246,.55)}
+.stage.current .node{animation:beat 1.6s infinite}
+@keyframes beat{50%{box-shadow:0 0 0 8px rgba(139,92,246,.12),0 0 26px rgba(139,92,246,.8)}}
+.stage h3{margin:12px 0 2px;font:700 12px var(--sans);letter-spacing:1.3px}
+.stage p{margin:0;color:var(--muted);font-size:12px;min-height:34px}
+.stack{display:flex;margin-top:10px;min-height:28px}
+.av{width:28px;height:28px;border-radius:50%;border:2px solid #0b1022;margin-left:-8px;background:#1a2244 center/cover no-repeat;display:grid;place-items:center;font:700 10px var(--sans);color:#c7cbe0;flex:none}
+.av:first-child{margin-left:0}
+.av{position:relative;overflow:hidden}.av img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.stage.abort .node{background:#3b0d18;color:var(--bad);border-color:rgba(251,113,133,.5)}
+
+/* producers */
+.prods{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}
+.pc{padding:14px 14px 12px;cursor:pointer;transition:transform .25s,box-shadow .25s}
+.pc:hover{transform:translateY(-2px);box-shadow:0 20px 40px -20px rgba(139,92,246,.45)}
+.pc:focus-visible{outline:2px solid var(--pvm);outline-offset:2px}
+.pc .row{display:flex;align-items:center;gap:11px}
+.logo{width:40px;height:40px;border-radius:12px;flex:none;background:#141b38 center/cover no-repeat;display:grid;place-items:center;font:700 14px var(--display);color:#c9cdf0;position:relative;overflow:hidden}
+.logo img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#141b38}
+.pc .who{min-width:0;flex:1}
+.pc .who b{display:block;font:600 14px var(--sans);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pc .who span{display:block;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badge{font:600 10.5px var(--sans);letter-spacing:.6px;padding:3px 8px;border-radius:99px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.badge.sched{color:#c4b5fd;border-color:rgba(139,92,246,.35)}
+.badge.state{color:var(--sky);border-color:rgba(96,165,250,.35)}
+.badge.LIVE{color:var(--ok);border-color:rgba(52,211,153,.35)}.badge.ABORTED{color:var(--bad);border-color:rgba(251,113,133,.4)}
+.badge.FROZEN,.badge.SNAPSHOTTED{color:var(--warn);border-color:rgba(251,191,36,.35)}
+.checks{display:flex;gap:3px;margin-top:12px;height:6px}
+.checks i{flex:1;border-radius:3px;background:rgba(255,255,255,.07)}
+.checks i.ok{background:linear-gradient(90deg,#10b981,var(--ok))}.checks i.bad{background:var(--bad)}
+.pc .foot{display:flex;justify-content:space-between;gap:8px;margin-top:9px;font-size:11.5px;color:var(--muted)}
+.pc .foot .st{display:flex;align-items:center;gap:6px}
+.pc.producing{box-shadow:0 0 0 1px rgba(245,165,36,.55),0 0 34px -6px rgba(245,165,36,.55)}
+.pc.producing .logo::after{content:"";position:absolute;inset:0;border-radius:inherit;box-shadow:inset 0 0 0 2px var(--cut)}
+.pc .fail{margin-top:8px;font-size:11.5px;color:#fda4af;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.more{margin-top:12px;text-align:center}
+.more button{border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--ink);border-radius:99px;padding:9px 18px;font:600 13px var(--sans);cursor:pointer}
+
+/* evidence + feed */
+.duo{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:20px}
+.ev{padding:20px}
+.ev-row{display:grid;grid-template-columns:190px 1fr auto;gap:14px;align-items:center;padding:11px 0;border-bottom:1px dashed var(--line)}
+.ev-row:last-child{border:0}
+.ev-row .k{color:var(--muted);font-size:12.5px}
+.ribbon{display:flex;gap:3px;height:26px}
+.ribbon i{flex:1;border-radius:6px;position:relative;min-width:18px}
+.ribbon i::after{content:attr(data-p);position:absolute;inset:0;display:grid;place-items:center;font:600 9.5px var(--mono);color:rgba(0,0,0,.65)}
+.verdict{font:700 12px var(--mono);white-space:nowrap}
+.verdict.ok{color:var(--ok)}.verdict.bad{color:var(--bad)}
+.ev-empty{color:var(--muted);font-size:13px;line-height:1.6}
+.ev-empty b{color:var(--ink)}
+.feed{padding:20px;max-height:430px;overflow:auto}
+.feed ol{list-style:none;margin:0;padding:0;position:relative}
+.feed ol::before{content:"";position:absolute;left:5px;top:6px;bottom:6px;width:1px;background:var(--line)}
+.feed li{position:relative;padding:0 0 14px 22px;font-size:12.5px;animation:rise .5s ease}
+.feed li::before{content:"";position:absolute;left:0;top:5px;width:11px;height:11px;border-radius:50%;background:#1a2244;border:2px solid var(--pvm)}
+.feed li.good::before{border-color:var(--ok)}.feed li.bad::before{border-color:var(--bad)}
+.feed time{color:var(--dim);font:500 11px var(--mono);margin-right:6px}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+footer{color:var(--dim);font-size:12px;text-align:center;padding:40px 0 60px}
+footer a{color:var(--muted)}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+
+@media (max-width:1100px){.hero{grid-template-columns:minmax(0,1fr)}.globe-card{min-height:440px}.duo{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:640px){
+  .tile{padding-bottom:56px;min-height:128px}
+  .bar{min-height:58px}.brand span{display:none}
+  .globe-card{min-height:360px}.globe-over{left:16px;right:16px;top:16px}.globe-over p{display:none}
+  .legend{left:16px;bottom:14px;gap:10px}.hint{display:none}
+  .inst{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}.tile{padding:14px;min-height:112px}.tile.wide{grid-column:span 2}
+  .ring{width:88px;height:88px}
+  .ev-row{grid-template-columns:minmax(0,1fr);gap:8px}.prods{grid-template-columns:minmax(0,1fr)}
+  .kv{grid-template-columns:auto minmax(0,1fr)}.kv dd{white-space:normal;overflow-wrap:anywhere}
+  .ring-wrap{align-items:flex-start}.big{font-size:21px;letter-spacing:-.5px}
+  .globe-over h1{font-size:24px}.globe-over{padding-bottom:40px}
+  .sec-h{flex-direction:column;align-items:flex-start;gap:2px}
+  .legend{font-size:11px}
+}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<header><div class="wrap bar">
+  <div class="mark" aria-hidden="true"><i></i></div>
+  <div class="brand"><b>Cutover Mission Control</b><span>Readiness and ceremony status for moving Antelope chains onto PulseVM</span></div>
+  <div class="clock"><span class="live"><i></i>live</span><b id="clock">--:--:--</b></div>
+</div></header>
+
+<main class="wrap">
+  <nav class="switch" id="switch" role="tablist" aria-label="Network"><span class="pill" id="pill"></span></nav>
+
+  <div class="hero">
+    <div class="glass globe-card">
+      <canvas id="globe" aria-label="Globe showing producer locations and live block propagation"></canvas>
+      <div class="globe-over">
+        <div><div class="label" id="net-label">Network</div><h1 id="net-title">Loading…</h1><p id="net-desc"></p></div>
+      </div>
+      <div class="legend">
+        <span><i style="background:var(--ok)"></i>ready</span><span><i style="background:var(--warn)"></i>needs attention</span>
+        <span><i style="background:#c7cbe0"></i>scheduled</span><span><i style="background:#5b6480"></i>standby</span>
+        <span><i style="background:var(--cut)"></i>producing now</span>
+      </div>
+      <div class="hint">drag to spin · tap a producer to fly there</div>
+      <div class="tip" id="tip"></div>
+    </div>
+
+    <div class="inst">
+      <div class="glass tile"><div class="label">Head block</div><div class="big" id="head">—</div><div class="sub" id="head-sub">—</div><svg class="spark" id="spark" preserveAspectRatio="none" viewBox="0 0 100 40"></svg></div>
+      <div class="glass tile"><div class="label">Finality</div><div class="big" id="lib">—</div><div class="sub" id="lib-sub">last irreversible</div></div>
+      <div class="glass tile wide"><div class="label">Producer readiness</div>
+        <div class="ring-wrap"><svg class="ring" viewBox="0 0 120 120" id="ready-ring"></svg>
+          <dl class="kv" id="ready-kv"></dl></div></div>
+      <div class="glass tile wide"><div class="label">Cutover</div>
+        <div class="ring-wrap"><svg class="ring" viewBox="0 0 120 120" id="h-ring"></svg><dl class="kv" id="h-kv"></dl></div></div>
+    </div>
+  </div>
+
+  <section aria-labelledby="t-track">
+    <div class="sec-h"><h2 id="t-track">Ceremony</h2><span id="track-sub">Every producer runs the same six steps; nothing public changes before LIVE.</span></div>
+    <div class="glass track"><div class="stages" id="stages"><div class="flow" id="flow" style="width:0"></div></div></div>
+  </section>
+
+  <section aria-labelledby="t-prods">
+    <div class="sec-h"><h2 id="t-prods">Producers</h2><span id="prods-sub"></span></div>
+    <div class="prods" id="prods"></div>
+    <div class="more" id="more"></div>
+  </section>
+
+  <section class="duo">
+    <div>
+      <div class="sec-h"><h2>Atomicity evidence</h2><span>one colour per value · one unbroken band = every producer agrees</span></div>
+      <div class="glass ev" id="ev"></div>
+    </div>
+    <div>
+      <div class="sec-h"><h2>Mission log</h2><span id="feed-sub"></span></div>
+      <div class="glass feed"><ol id="feed"></ol></div>
+    </div>
+  </section>
+  <p class="sr" aria-live="polite" id="announce"></p>
+</main>
+<footer class="wrap">pulse-cutover mission control · read-only view of public chain data and opt-in producer beacons · <a href="https://github.com/paulgnz/pulse-cutover">github.com/paulgnz/pulse-cutover</a></footer>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = (n) => n == null || isNaN(n) ? '—' : Math.round(n).toLocaleString('en-US');
+const flag = (cc) => /^[A-Za-z]{2}$/.test(cc || '') ? String.fromCodePoint(...[...cc.toUpperCase()].map((c) => 127397 + c.charCodeAt(0))) : '';
+const initials = (s) => (s || '?').replace(/[^A-Za-z0-9 ]/g, '').split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join('').toUpperCase() || '?';
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const STAGES = [['ARMED','watching the head approach H'],['FROZEN','writes closed at H − lead'],['SNAPSHOTTED','cut pinned at exactly H'],['VERIFIED','two imports agree'],['IGNITED','new chain serves block H'],['LIVE','producing · URLs flipped']];
+let active = null; try { active = new URLSearchParams(location.search).get('net') || localStorage.getItem('mc-net'); } catch {}
+let data = null, net = null, showAll = false;
+const hist = {}; // net → [{t, head}]
+
+/* ---------------- globe ---------------- */
+const G = { canvas: $('globe'), ctx: $('globe').getContext('2d'), rot: [-10, 28], vel: 0.035, land: [], nodes: [], arcs: [], hover: null, target: null, dpr: Math.min(devicePixelRatio || 1, 2), ready: false };
+let geo = null;
+(async () => {
+  try {
+    const [d3, topo, atlas] = await Promise.all([
+      import('https://cdn.jsdelivr.net/npm/d3-geo@3/+esm'),
+      import('https://cdn.jsdelivr.net/npm/topojson-client@3/+esm'),
+      fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json').then((r) => r.json()),
+    ]);
+    geo = d3;
+    const land = topo.feature(atlas, atlas.objects.land);
+    const step = innerWidth < 640 ? 3 : 2.2, pts = [];
+    for (let lat = -58; lat <= 80; lat += step) {
+      const k = Math.cos(lat * Math.PI / 180), s = step / Math.max(k, 0.25);
+      for (let lon = -180; lon < 180; lon += s) pts.push([lon, lat]);
+    }
+    for (let i = 0; i < pts.length; i += 800) {
+      for (const p of pts.slice(i, i + 800)) if (d3.geoContains(land, p)) G.land.push(p);
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  } catch { /* offline CDN: globe draws without land */ }
+  G.ready = true;
+})();
+
+function project(lon, lat) {
+  const λ = (lon + G.rot[0]) * Math.PI / 180, φ = lat * Math.PI / 180, φ0 = G.rot[1] * Math.PI / 180;
+  const cosφ = Math.cos(φ);
+  const x = cosφ * Math.sin(λ);
+  const y = Math.cos(φ0) * Math.sin(φ) - Math.sin(φ0) * cosφ * Math.cos(λ);
+  const z = Math.sin(φ0) * Math.sin(φ) + Math.cos(φ0) * cosφ * Math.cos(λ);
+  return [x, -y, z];
+}
+function greatCircle(a, b, t) {
+  const r = Math.PI / 180, [l1, p1] = [a[0] * r, a[1] * r], [l2, p2] = [b[0] * r, b[1] * r];
+  const d = 2 * Math.asin(Math.sqrt(Math.sin((p2 - p1) / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin((l2 - l1) / 2) ** 2)) || 1e-9;
+  const A = Math.sin((1 - t) * d) / Math.sin(d), B = Math.sin(t * d) / Math.sin(d);
+  const x = A * Math.cos(p1) * Math.cos(l1) + B * Math.cos(p2) * Math.cos(l2);
+  const y = A * Math.cos(p1) * Math.sin(l1) + B * Math.cos(p2) * Math.sin(l2);
+  const z = A * Math.sin(p1) + B * Math.sin(p2);
+  return [Math.atan2(y, x) / r, Math.atan2(z, Math.hypot(x, y)) / r, d];
+}
+function resize() {
+  const r = G.canvas.getBoundingClientRect();
+  G.canvas.width = r.width * G.dpr; G.canvas.height = r.height * G.dpr;
+}
+addEventListener('resize', resize); resize();
+
+function nodeColor(p) {
+  if (p.producing) return '#f5a524';
+  if (p.reporting && p.silent) return '#fb7185';
+  if (p.reporting && p.ready) return '#34d399';
+  if (p.reporting) return '#fbbf24';
+  return p.scheduled ? '#c7cbe0' : '#5b6480';
+}
+function draw(ts) {
+  const c = G.ctx, W = G.canvas.width, H = G.canvas.height;
+  const mobile = W / G.dpr < 640;
+  const R = Math.min(W * 0.44, H * 0.34) * (mobile ? 1.05 : 1), cx = W * (mobile ? 0.5 : 0.58), cy = H * (mobile ? 0.63 : 0.585);
+  c.clearRect(0, 0, W, H);
+  // atmosphere
+  let g = c.createRadialGradient(cx, cy, R * 0.9, cx, cy, R * 1.35);
+  g.addColorStop(0, 'rgba(109,93,252,.28)'); g.addColorStop(1, 'rgba(109,93,252,0)');
+  c.fillStyle = g; c.beginPath(); c.arc(cx, cy, R * 1.35, 0, 7); c.fill();
+  g = c.createRadialGradient(cx - R * .35, cy - R * .4, R * .1, cx, cy, R);
+  g.addColorStop(0, '#162048'); g.addColorStop(1, '#090d20');
+  c.fillStyle = g; c.beginPath(); c.arc(cx, cy, R, 0, 7); c.fill();
+  c.strokeStyle = 'rgba(167,139,250,.35)'; c.lineWidth = 1 * G.dpr; c.stroke();
+  // graticule
+  c.strokeStyle = 'rgba(255,255,255,.05)'; c.lineWidth = G.dpr;
+  for (let lon = -180; lon < 180; lon += 30) { c.beginPath(); let pen = false; for (let lat = -90; lat <= 90; lat += 4) { const [x, y, z] = project(lon, lat); if (z > 0) { pen ? c.lineTo(cx + x * R, cy + y * R) : c.moveTo(cx + x * R, cy + y * R); pen = true; } else pen = false; } c.stroke(); }
+  for (let lat = -60; lat <= 60; lat += 30) { c.beginPath(); let pen = false; for (let lon = -180; lon <= 180; lon += 4) { const [x, y, z] = project(lon, lat); if (z > 0) { pen ? c.lineTo(cx + x * R, cy + y * R) : c.moveTo(cx + x * R, cy + y * R); pen = true; } else pen = false; } c.stroke(); }
+  // land dots
+  const ds = (mobile ? 1.1 : 1.35) * G.dpr;
+  for (const [lon, lat] of G.land) {
+    const [x, y, z] = project(lon, lat); if (z <= 0) continue;
+    c.fillStyle = `rgba(160,170,220,${0.12 + z * 0.42})`;
+    c.fillRect(cx + x * R - ds / 2, cy + y * R - ds / 2, ds, ds);
+  }
+  // arcs (block propagation)
+  const now = performance.now();
+  G.arcs = G.arcs.filter((a) => now - a.t0 < a.dur + 600);
+  for (const a of G.arcs) {
+    const t = Math.min(1, (now - a.t0) / a.dur), fade = 1 - Math.max(0, (now - a.t0 - a.dur) / 600);
+    const seg = 28, tail = 0.35;
+    c.lineWidth = 1.8 * G.dpr; c.lineCap = 'round';
+    for (let i = 0; i < seg; i++) {
+      const u0 = Math.max(0, t - tail + (tail * i) / seg), u1 = Math.max(0, t - tail + (tail * (i + 1)) / seg);
+      if (u1 <= 0) continue;
+      const p0 = greatCircle(a.from, a.to, u0), p1 = greatCircle(a.from, a.to, u1);
+      const lift = (u) => 1 + 0.18 * Math.sin(Math.PI * u) * Math.min(1, p0[2] / 1.2);
+      const [x0, y0, z0] = project(p0[0], p0[1]), [x1, y1, z1] = project(p1[0], p1[1]);
+      if (z0 <= -0.05 || z1 <= -0.05) continue;
+      const al = (i / seg) * fade;
+      c.strokeStyle = `rgba(${Math.round(245 - 106 * u1)},${Math.round(165 - 73 * u1)},${Math.round(36 + 210 * u1)},${al})`;
+      c.beginPath(); c.moveTo(cx + x0 * R * lift(u0), cy + y0 * R * lift(u0)); c.lineTo(cx + x1 * R * lift(u1), cy + y1 * R * lift(u1)); c.stroke();
+    }
+    if (t >= 1 && fade > 0) { const [x, y, z] = project(a.to[0], a.to[1]); if (z > 0) { c.strokeStyle = `rgba(167,139,250,${fade * .8})`; c.lineWidth = 1.5 * G.dpr; c.beginPath(); c.arc(cx + x * R, cy + y * R, (6 + (1 - fade) * 14) * G.dpr, 0, 7); c.stroke(); } }
+  }
+  // producer nodes
+  G.screen = [];
+  const pulse = (Math.sin(now / 380) + 1) / 2;
+  for (const p of G.nodes) {
+    const [x, y, z] = project(p.lon, p.lat); if (z <= 0) continue;
+    const sx = cx + x * R, sy = cy + y * R, col = nodeColor(p), s = (p.scheduled ? 4.2 : 3) * G.dpr * (0.7 + z * 0.3);
+    if (p.producing || (p.reporting && p.ready)) {
+      c.fillStyle = col + (p.producing ? '55' : '30'); c.beginPath(); c.arc(sx, sy, s * (p.producing ? 3.2 + pulse * 2 : 2.4), 0, 7); c.fill();
+    }
+    c.fillStyle = col; c.beginPath(); c.arc(sx, sy, s, 0, 7); c.fill();
+    if (G.hover === p.name || G.focus === p.name) { c.strokeStyle = '#fff'; c.lineWidth = 1.5 * G.dpr; c.beginPath(); c.arc(sx, sy, s + 4 * G.dpr, 0, 7); c.stroke(); }
+    G.screen.push({ p, x: sx / G.dpr, y: sy / G.dpr });
+  }
+  // rotation
+  if (G.target) {
+    const d = ((G.target[0] - G.rot[0] + 540) % 360) - 180, e = G.target[1] - G.rot[1];
+    G.rot[0] += d * 0.08; G.rot[1] += e * 0.08;
+    if (Math.abs(d) < .2 && Math.abs(e) < .2) G.target = null;
+  } else if (!G.drag && !REDUCED) G.rot[0] += G.vel;
+  if (!document.hidden) requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) requestAnimationFrame(draw); });
+// interaction
+G.canvas.addEventListener('pointerdown', (e) => { G.drag = { x: e.clientX, y: e.clientY, r: [...G.rot] }; G.target = null; G.canvas.setPointerCapture(e.pointerId); });
+G.canvas.addEventListener('pointermove', (e) => {
+  if (G.drag) { G.rot[0] = G.drag.r[0] + (e.clientX - G.drag.x) * 0.35; G.rot[1] = Math.max(-70, Math.min(70, G.drag.r[1] - (e.clientY - G.drag.y) * 0.35)); return; }
+  const r = G.canvas.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+  const hit = (G.screen || []).find((s) => Math.hypot(s.x - mx, s.y - my) < 10);
+  const tip = $('tip');
+  G.hover = hit?.p.name || null;
+  if (hit) { tip.style.left = hit.x + 'px'; tip.style.top = hit.y + 'px'; tip.style.opacity = 1;
+    tip.innerHTML = `<b>${esc(hit.p.label)}</b>${esc([hit.p.city, hit.p.country].filter(Boolean).join(' · '))}${hit.p.state ? ' · ' + esc(hit.p.state) : ''}`; }
+  else tip.style.opacity = 0;
+});
+G.canvas.addEventListener('pointerup', () => { G.drag = null; });
+G.canvas.addEventListener('pointerleave', () => { G.drag = null; $('tip').style.opacity = 0; G.hover = null; });
+function flyTo(name) {
+  const n = G.nodes.find((x) => x.name === name); if (!n) return;
+  G.target = [-n.lon, Math.max(-60, Math.min(60, n.lat - 8))]; G.focus = name;
+  setTimeout(() => { if (G.focus === name) G.focus = null; }, 4000);
+}
+function fireBlock(fromName) {
+  if (REDUCED) return;
+  const from = G.nodes.find((n) => n.name === fromName); if (!from) return;
+  const targets = G.nodes.filter((n) => n !== from && n.scheduled).sort(() => 0.5 - Math.random()).slice(0, innerWidth < 640 ? 5 : 9);
+  const t0 = performance.now();
+  targets.forEach((n, i) => G.arcs.push({ from: [from.lon, from.lat], to: [n.lon, n.lat], t0: t0 + i * 70, dur: 900 + Math.random() * 500 }));
+}
+
+/* ---------------- instruments ---------------- */
+function ring(svg, frac, big, small, color) {
+  const r = 50, C = 2 * Math.PI * r, f = Math.max(0, Math.min(1, frac || 0));
+  svg.innerHTML = `<defs><linearGradient id="g-${svg.id}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${color[0]}"/><stop offset="1" stop-color="${color[1]}"/></linearGradient></defs>
+    <circle cx="60" cy="60" r="${r}" fill="none" stroke="rgba(255,255,255,.07)" stroke-width="9"/>
+    <circle cx="60" cy="60" r="${r}" fill="none" stroke="url(#g-${svg.id})" stroke-width="9" stroke-linecap="round" stroke-dasharray="${C * f} ${C}" opacity="${f > 0 ? 1 : 0}" transform="rotate(-90 60 60)" style="transition:stroke-dasharray 1s cubic-bezier(.2,.8,.2,1)"/>
+    <text x="60" y="62" text-anchor="middle">${esc(big)}</text><text x="60" y="80" text-anchor="middle" class="small">${esc(small)}</text>`;
+}
+const shown = { head: 0, lib: 0 };
+function tweenNumbers() {
+  const c = net?.chain; if (c?.head) {
+    for (const k of ['head', 'lib']) {
+      const target = c[k]; if (!target) continue;
+      if (!shown[k] || Math.abs(target - shown[k]) > 5000) shown[k] = target;
+      shown[k] += (target - shown[k]) * 0.12; $(k).textContent = fmt(shown[k]);
+    }
+  }
+  requestAnimationFrame(tweenNumbers);
+}
+requestAnimationFrame(tweenNumbers);
+function spark(points) {
+  const svg = $('spark'); if (points.length < 3) { svg.innerHTML = ''; return; }
+  const rates = []; for (let i = 1; i < points.length; i++) { const dt = (points[i].t - points[i - 1].t) / 1000; if (dt > 0) rates.push((points[i].head - points[i - 1].head) / dt); }
+  const max = Math.max(...rates, 2.2), n = rates.length;
+  const pts = rates.map((r, i) => `${(i / (n - 1)) * 100},${38 - (r / max) * 32}`).join(' ');
+  svg.innerHTML = `<defs><linearGradient id="sg" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="rgba(139,92,246,.45)"/><stop offset="1" stop-color="rgba(139,92,246,0)"/></linearGradient></defs>
+    <polygon points="0,40 ${pts} 100,40" fill="url(#sg)"/><polyline points="${pts}" fill="none" stroke="#a78bfa" stroke-width="1.2" vector-effect="non-scaling-stroke"/>`;
+  return rates.slice(-5).reduce((a, b) => a + b, 0) / Math.min(5, rates.length);
+}
+
+/* ---------------- render ---------------- */
+function color(v) { let h = 0; for (const ch of String(v)) h = (h * 31 + ch.charCodeAt(0)) >>> 0; return `hsl(${h % 360} 72% 62%)`; }
+function avatar(p) {
+  const img = p.org?.logo ? `<img src="${esc(p.org.logo)}" alt="" loading="lazy" onerror="this.remove()">` : '';
+  return `<span class="av" title="${esc(p.org?.name || p.name)}">${esc(initials(p.org?.name || p.name))}${img}</span>`;
+}
+function render() {
+  if (!data) return;
+  const nets = data.networks;
+  if (!active || !nets.some((n) => n.id === active)) active = nets[0].id;
+  net = nets.find((n) => n.id === active);
+  // switcher
+  const sw = $('switch');
+  const btns = nets.map((n) => {
+    const s = n.summary, cls = n.chain?.ok === false || s.states?.ABORTED ? 'bad' : s.reporting ? (s.ready === s.reporting ? 'ok' : 'warn') : '';
+    return `<button role="tab" aria-selected="${n.id === active}" data-id="${esc(n.id)}"><span class="sd ${cls}"></span>${esc(n.name)} · ${esc(n.label)}<span class="count">${s.ready}/${s.active || s.producers}</span></button>`;
+  }).join('');
+  if (sw.dataset.sig !== btns) { sw.innerHTML = '<span class="pill" id="pill"></span>' + btns; sw.dataset.sig = btns;
+    sw.querySelectorAll('button').forEach((b) => b.onclick = () => { active = b.dataset.id; try { localStorage.setItem('mc-net', active); } catch {} G.arcs = []; showAll = false; lastHead = {}; render(); }); }
+  const on = sw.querySelector('button[aria-selected=true]'), pill = sw.querySelector('.pill');
+  if (on && pill) { pill.style.left = on.offsetLeft + 'px'; pill.style.width = on.offsetWidth + 'px'; }
+
+  const c = net.chain || {}, s = net.summary;
+  $('net-label').textContent = `${net.label}${c.chain_id ? ' · chain ' + c.chain_id.slice(0, 8) : ''}`;
+  $('net-title').innerHTML = net.id === 'mainnet' ? `${esc(net.name)} <em>Mainnet</em>` : net.id === 'testnet' ? `${esc(net.name)} <em>Testnet</em>` : `<em>${esc(net.name)}</em>`;
+  $('net-desc').textContent = net.description;
+
+  // globe nodes
+  const prods = net.producers;
+  G.nodes = prods.filter((p) => isFinite(p.org?.lat) && isFinite(p.org?.lon) && !(p.org.lat === 0 && p.org.lon === 0)).map((p) => ({
+    name: p.name, label: p.org?.name || p.name, lat: +p.org.lat, lon: +p.org.lon, city: p.org.city, country: p.org.country,
+    scheduled: p.scheduled, reporting: p.reporting, ready: p.report?.ready, silent: p.silent, state: p.report?.ceremony?.state,
+    producing: c.head_producer === p.name }));
+
+  // head + rate
+  const h = (hist[net.id] ||= []); if (c.head && (!h.length || h[h.length - 1].head !== c.head)) h.push({ t: Date.now(), head: c.head }); if (h.length > 40) h.shift();
+  const rate = spark(h);
+  $('head-sub').innerHTML = `by <b>${esc(prods.find((p) => p.name === c.head_producer)?.org?.name || c.head_producer || '—')}</b>${rate ? ` · ${rate.toFixed(1)} blocks/s` : ''}`;
+  $('lib-sub').textContent = c.head && c.lib ? `last irreversible · ${fmt(c.head - c.lib)} blocks behind head` : 'last irreversible';
+
+  // readiness ring
+  const denom = s.active || s.producers || 1;
+  ring($('ready-ring'), s.ready / denom, `${s.ready}/${denom}`, 'READY', ['#10b981', '#34d399']);
+  $('ready-kv').innerHTML = `<dt>active producers</dt><dd>${fmt(s.active || s.producers)}</dd><dt>in schedule</dt><dd>${fmt(s.scheduled)}</dd>
+    <dt>beacons reporting</dt><dd>${fmt(s.reporting)}</dd><dt>chain</dt><dd>${c.ok === false ? '<span style="color:var(--bad)">unreachable</span>' : c.chain_id_ok === false ? '<span style="color:var(--bad)">unexpected chain_id</span>' : '<span style="color:var(--ok)">reachable</span>'}</dd>`;
+
+  // cutover ring
+  const H = net.event?.h || prods.map((p) => p.report?.ceremony?.evidence?.h).find(Boolean);
+  const stateCounts = s.states || {}, live = stateCounts.LIVE || 0;
+  if (H) {
+    const toH = c.head ? H - c.head : null;
+    const started = prods.some((p) => p.report?.ceremony?.state && p.report.ceremony.state !== 'ARMED');
+    ring($('h-ring'), live ? live / (s.reporting || 1) : toH != null ? Math.max(0.02, 1 - toH / 3600) : 0,
+      live ? `${live}/${s.reporting}` : toH > 0 ? fmt(toH) : 'H', live ? 'LIVE' : toH > 0 ? 'BLOCKS TO H' : 'CUT', live ? ['#34d399', '#10b981'] : ['#f5a524', '#8b5cf6']);
+    const eta = toH > 0 ? toH * 0.5 : 0;
+    $('h-kv').innerHTML = `<dt>cut height H</dt><dd>${fmt(H)}</dd><dt>${toH > 0 ? 'time to H' : 'status'}</dt><dd>${toH > 0 ? `${Math.floor(eta / 60)}m ${Math.round(eta % 60)}s` : started ? 'ceremony in progress' : 'at H'}</dd>
+      <dt>write freeze</dt><dd>at H − ${esc(prods.find((p) => p.report)?.report?.checks?.find((x) => x.name === 'freeze_lead_blocks')?.detail?.match(/\d+/)?.[0] || '24')}</dd><dt>stages</dt><dd>${Object.entries(stateCounts).map(([k, v]) => `${v} ${k}`).join(' · ') || '—'}</dd>`;
+  } else {
+    ring($('h-ring'), 0, '—', 'NO CUT', ['#f5a524', '#8b5cf6']);
+    $('h-kv').innerHTML = `<dt>status</dt><dd>no cutover scheduled</dd><dt>readiness</dt><dd>${s.ready} of ${denom} producers</dd><dt>when scheduled</dt><dd>H appears here</dd>`;
+  }
+
+  // ceremony track
+  const reachedIdx = Math.max(-1, ...prods.map((p) => STAGES.findIndex(([k]) => k === p.report?.ceremony?.state)));
+  const aborted = prods.filter((p) => p.report?.ceremony?.state === 'ABORTED');
+  $('stages').innerHTML = `<div class="flow" id="flow"></div>` + STAGES.map(([k, d], i) => {
+    const here = prods.filter((p) => p.report?.ceremony?.state === k);
+    return `<div class="stage ${i <= reachedIdx ? 'reached' : ''} ${here.length ? 'current' : ''}"><div class="node">${i + 1}</div><h3>${k}</h3><p>${d}</p><div class="stack">${here.slice(0, 8).map(avatar).join('')}${here.length > 8 ? `<span class="av">+${here.length - 8}</span>` : ''}</div></div>`;
+  }).join('') + (aborted.length ? `` : '');
+  requestAnimationFrame(() => { const f = $('flow'); const nodes = $('stages').querySelectorAll('.stage'); if (f && nodes.length) { const last = reachedIdx >= 0 ? nodes[reachedIdx] : null; f.style.width = last ? (last.offsetLeft + 18 - 18) + 'px' : '0px'; } });
+  $('track-sub').textContent = aborted.length ? `${aborted.length} producer(s) ABORTED and resumed the old chain` : s.reporting ? `${s.reporting} producer beacon${s.reporting > 1 ? 's' : ''} reporting` : 'Every producer runs the same six steps; nothing public changes before LIVE.';
+
+  // producers
+  const list = showAll ? prods : prods.filter((p) => p.scheduled || p.reporting);
+  $('prods-sub').textContent = `${s.active || prods.length} active · ${s.scheduled} in schedule · ${s.reporting} with beacons`;
+  $('prods').innerHTML = list.map((p) => {
+    const r = p.report, checks = r?.checks || [], st = r?.ceremony?.state;
+    const producing = c.head_producer === p.name;
+    const status = !r ? (p.scheduled ? 'no beacon yet' : 'standby · no beacon') : p.silent ? 'beacon silent' : r.ready ? 'ready' : 'needs attention';
+    const dot = !r ? '' : p.silent ? 'bad' : r.ready ? 'ok' : 'warn';
+    const bars = checks.length ? checks.map((x) => `<i class="${x.ok ? 'ok' : 'bad'}" title="${esc(x.name)}: ${esc(x.detail)}"></i>`).join('') : '<i></i><i></i><i></i><i></i><i></i><i></i>';
+    const failing = checks.filter((x) => !x.ok);
+    const logo = p.org?.logo ? `<img src="${esc(p.org.logo)}" alt="" loading="lazy" onerror="this.remove()">` : '';
+    return `<article class="glass pc ${producing ? 'producing' : ''}" tabindex="0" data-name="${esc(p.name)}" aria-label="${esc(p.org?.name || p.name)}, ${esc(status)}">
+      <div class="row"><div class="logo"><span>${esc(initials(p.org?.name || p.name))}</span>${logo}</div>
+        <div class="who"><b>${esc(p.org?.name || p.name)}</b><span>${flag(p.org?.country)} ${esc(p.name)}${p.org?.city ? ' · ' + esc(p.org.city) : ''}</span></div>
+        ${st ? `<span class="badge state ${esc(st)}">${esc(st)}</span>` : p.rank ? `<span class="badge ${p.scheduled ? 'sched' : ''}">#${p.rank}</span>` : p.scheduled ? '<span class="badge sched">producer</span>' : ''}</div>
+      <div class="checks" aria-hidden="true">${bars}</div>
+      <div class="foot"><span class="st"><span class="sd ${dot}"></span>${esc(status)}${producing ? ' · <b style="color:var(--cut)">producing</b>' : ''}</span><span class="mono">${r ? 'v' + esc(r.agent_version) : p.scheduled ? 'scheduled' : 'standby'}</span></div>
+      ${failing.length ? `<div class="fail">✗ ${esc(failing[0].name)}: ${esc(failing[0].detail)}</div>` : ''}
+    </article>`;
+  }).join('');
+  $('prods').querySelectorAll('.pc').forEach((el) => { const go = () => flyTo(el.dataset.name); el.onclick = go; el.onkeydown = (e) => { if (e.key === 'Enter') go(); }; });
+  const hidden = prods.length - list.length;
+  $('more').innerHTML = hidden > 0 || showAll ? `<button id="more-btn">${showAll ? 'Show scheduled only' : `Show all ${prods.length} active producers (+${hidden} standby)`}</button>` : '';
+  const mb = $('more-btn'); if (mb) mb.onclick = () => { showAll = !showAll; render(); };
+
+  // evidence
+  const withEv = prods.filter((p) => p.report?.ceremony?.evidence && Object.keys(p.report.ceremony.evidence).length);
+  $('ev').innerHTML = !net.agreement.length ? `<div class="ev-empty">When producers run a ceremony, their beacons report its evidence here: <b>cut block</b>, <b>snapshot hash</b>, <b>table fingerprints</b>, <b>transactions after the cut</b>, <b>state digest</b> and the <b>new chain's anchor</b>. Each value becomes a colour; every producer must show the same colour for the cut to be atomic.</div>`
+    : net.agreement.map((a) => {
+      const chips = withEv.map((p) => { const v = p.report.ceremony.evidence[a.key]; return v == null ? '' : `<i style="background:${color(JSON.stringify(v))}" data-p="${esc(p.name)}" title="${esc(p.name)}: ${esc(JSON.stringify(v))}"></i>`; }).join('');
+      return `<div class="ev-row"><div class="k">${esc(a.label)}</div><div class="ribbon">${chips}</div><div class="verdict ${a.agree ? 'ok' : 'bad'}">${a.agree ? `✓ ${a.reporting}/${a.reporting}` : '✗ MISMATCH'}</div></div>`;
+    }).join('');
+
+  // feed
+  $('feed-sub').textContent = net.events.length ? `${net.events.length} recent events` : '';
+  const fsig = JSON.stringify(net.events.slice(0, 1));
+  if ($('feed').dataset.sig !== fsig + active) {
+    $('feed').dataset.sig = fsig + active;
+    $('feed').innerHTML = net.events.length ? net.events.map((e) => `<li class="${/READY|LIVE/.test(e.text) ? 'good' : /ABORT|not ready|silent/.test(e.text) ? 'bad' : ''}"><time>${esc(e.ts.slice(11, 19))}</time><b>${esc(e.producer)}</b> ${esc(e.text)}</li>`).join('')
+      : `<li><time>—</time>Quiet. Events appear as producer beacons report readiness changes and ceremony steps.</li>`;
+  }
+  $('announce').textContent = `${net.name} ${net.label}: ${s.ready} of ${denom} producers ready.`;
+}
+
+let lastHead = {};
+async function poll() {
+  try {
+    data = await (await fetch('/api/status', { cache: 'no-store' })).json();
+    const n = data.networks.find((x) => x.id === (active || data.networks[0].id));
+    if (n?.chain?.head && lastHead[n.id] && n.chain.head > lastHead[n.id]) fireBlock(n.chain.head_producer);
+    if (n?.chain?.head) lastHead[n.id] = n.chain.head;
+    render();
+    $('clock').textContent = new Date(data.generated_at).toISOString().slice(11, 19) + ' UTC';
+  } catch { $('clock').textContent = 'reconnecting'; }
+}
+poll(); setInterval(poll, 2000);
+</script>
+</body>
+</html>

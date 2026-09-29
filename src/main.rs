@@ -36,6 +36,7 @@ read-only, safe anywhere (including production):
   status          how far the ceremony got, from the journal
   scan-contracts  list contracts that reference host functions PulseVM stubs (advisory)
   report          build a sanitized tar.gz to share (keys/tokens auto-redacted)
+  beacon          report readiness + ceremony evidence to mission control
   verify          hash + dual-import fingerprint a snapshot (heavy but touches nothing)
 
 mutating (normally driven by install.sh / cutover.sh):
@@ -57,6 +58,21 @@ If the process dies, re-run the same command — it resumes from the journal.
 EXAMPLES
   pulse-cutover run --config /etc/pulse-cutover/ceremony.toml
   ./cutover.sh --manifest ceremony.json     # the friendly wrapper";
+
+const HELP_BEACON: &str = "\
+pulse-cutover beacon --config ceremony.toml [--once]
+
+Reports this node's readiness and ceremony evidence to mission control (the
+[beacon] section: url, producer, network, token_file, interval_secs). Every
+interval it checks the source API, producer API, chain_id, H, freeze lead,
+hooks (exist + executable), staged snapshot absent, validator running and
+disk, then summarizes the journal (state, cut id, snapshot sha256,
+fingerprint digest, state-diff digest) and POSTs one JSON report.
+Read-only on the box; runs beside the ceremony, never inside it.
+
+EXAMPLES
+  pulse-cutover beacon --config /etc/pulse-cutover/ceremony.toml
+  pulse-cutover beacon --config ceremony.toml --once     # print one report";
 
 const HELP_LOOP: &str = "\
 pulse-cutover loop --config ceremony.toml --runs N
@@ -151,6 +167,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "doctor" => Some(HELP_DOCTOR),
         "scan-contracts" => Some(HELP_SCAN),
         "report" => Some(HELP_REPORT),
+        "beacon" => Some(HELP_BEACON),
         _ => None,
     }
 }
@@ -191,6 +208,7 @@ fn main() {
         "doctor" => cmd_doctor(&args),
         "scan-contracts" => cmd_scan(&args),
         "report" => cmd_report(&args),
+        "beacon" => cmd_beacon(&args),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -321,6 +339,12 @@ fn cmd_loop(args: &[String]) -> Result<(), String> {
         cfg.source.snapshot_timeout_secs,
     );
     pulse_cutover::looper::run_loop(&cfg, &ops, runs)
+}
+
+fn cmd_beacon(args: &[String]) -> Result<(), String> {
+    let path = arg(args, "--config").ok_or("--config <ceremony.toml> is required")?;
+    let cfg = Config::load(&PathBuf::from(path))?;
+    pulse_cutover::beacon::run(&cfg, flag(args, "--once"))
 }
 
 fn cmd_status(args: &[String]) -> Result<(), String> {
