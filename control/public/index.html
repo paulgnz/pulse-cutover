@@ -206,6 +206,38 @@ footer a{color:var(--muted)}
   .inf-table td::before{content:attr(data-l);color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px}
   .inf-table td:first-child::before{content:none}.url{max-width:210px}
 }
+
+/* producer drawer */
+.scrim{position:fixed;inset:0;background:rgba(3,5,12,.55);backdrop-filter:blur(3px);opacity:0;pointer-events:none;transition:opacity .3s;z-index:40}
+.scrim.on{opacity:1;pointer-events:auto}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(560px,100vw);z-index:41;transform:translateX(104%);transition:transform .45s cubic-bezier(.2,.8,.2,1);
+  background:linear-gradient(180deg,#0e1430,#0a0f22);border-left:1px solid var(--line);box-shadow:-30px 0 80px -20px rgba(0,0,0,.7);overflow-y:auto;overscroll-behavior:contain}
+.drawer.on{transform:none}
+.dr-head{position:sticky;top:0;z-index:1;padding:22px 22px 16px;background:linear-gradient(180deg,#0e1430 70%,rgba(14,20,48,0));display:flex;gap:14px;align-items:center}
+.dr-head .logo{width:58px;height:58px;border-radius:16px;font-size:18px}
+.dr-head h3{margin:0;font:700 22px/1.1 var(--display)}
+.dr-head .sub2{color:var(--muted);font-size:12.5px;margin-top:4px}
+.dr-x{margin-left:auto;align-self:flex-start;border:1px solid var(--line);background:rgba(255,255,255,.04);color:var(--ink);width:36px;height:36px;border-radius:12px;font-size:18px;cursor:pointer}
+.dr-body{padding:4px 22px 40px}
+.dr-sec{margin-top:20px}
+.dr-sec h4{margin:0 0 10px;font:600 11px var(--sans);letter-spacing:1.6px;text-transform:uppercase;color:var(--muted)}
+.facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.fact{padding:12px;border-radius:14px;background:rgba(255,255,255,.03);border:1px solid var(--line)}
+.fact b{display:block;font:700 16px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fact span{color:var(--muted);font-size:11.5px}
+.nodecard{padding:12px 14px;border-radius:14px;background:rgba(255,255,255,.025);border:1px solid var(--line);margin-bottom:9px}
+.nodecard .r1{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.nodecard .grid2{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px 12px;margin-top:9px;font-size:12px}
+.nodecard .grid2 div span{display:block;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:1px}
+.chk{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px dashed var(--line);font-size:12.5px}
+.chk:last-child{border:0}.chk i{font-style:normal;font-weight:700;width:16px;flex:none}
+.chk .ok{color:var(--ok)}.chk .no{color:var(--bad)}
+.chk b{font-weight:600;min-width:150px}
+.chk span{color:var(--muted);overflow-wrap:anywhere}
+.tl{list-style:none;margin:0;padding:0}.tl li{display:flex;gap:10px;padding:5px 0;font-size:12.5px}.tl time{color:var(--dim);font-family:var(--mono);min-width:92px}
+.evk{display:grid;grid-template-columns:150px minmax(0,1fr);gap:6px 12px;font-size:12px}.evk dt{color:var(--muted)}.evk dd{margin:0;font-family:var(--mono);overflow-wrap:anywhere}
+.clickable{cursor:pointer}
+@media (max-width:640px){.drawer{width:100vw;border-left:0}.facts{grid-template-columns:repeat(2,minmax(0,1fr))}.nodecard .grid2{grid-template-columns:repeat(2,minmax(0,1fr))}.chk{flex-wrap:wrap}.chk b{min-width:0}}
 @media (max-width:1100px){.hero{grid-template-columns:minmax(0,1fr)}.globe-card{min-height:440px}.duo{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:640px){
   .tile{padding-bottom:56px;min-height:128px}
@@ -245,7 +277,7 @@ footer a{color:var(--muted)}
         <span><i style="background:#c7cbe0"></i>scheduled</span><span><i style="background:#5b6480"></i>standby</span>
         <span><i style="background:var(--cut)"></i>producing now</span>
       </div>
-      <div class="hint">drag to spin · tap a producer to fly there</div>
+      <div class="hint">drag to spin · tap a producer for details</div>
       <div class="tip" id="tip"></div>
     </div>
 
@@ -290,6 +322,8 @@ footer a{color:var(--muted)}
   </section>
   <p class="sr" aria-live="polite" id="announce"></p>
 </main>
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="dr-title" aria-hidden="true"></aside>
 <footer class="wrap">pulse-cutover mission control · read-only view of public chain data and opt-in producer beacons · <a href="https://github.com/paulgnz/pulse-cutover">github.com/paulgnz/pulse-cutover</a></footer>
 
 <script type="module">
@@ -438,7 +472,13 @@ G.canvas.addEventListener('pointermove', (e) => {
     tip.innerHTML = `<b>${esc(hit.p.label)}</b>${esc([hit.p.city, hit.p.country].filter(Boolean).join(' · '))}${hit.p.state ? ' · ' + esc(hit.p.state) : ''}`; }
   else tip.style.opacity = 0;
 });
-G.canvas.addEventListener('pointerup', () => { G.drag = null; });
+G.canvas.addEventListener('pointerup', (e) => {
+  const moved = G.drag && Math.hypot(e.clientX - G.drag.x, e.clientY - G.drag.y) > 5; G.drag = null;
+  if (moved) return;
+  const r = G.canvas.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+  const hit = (G.screen || []).find((s) => Math.hypot(s.x - mx, s.y - my) < 12);
+  if (hit) openProducer(hit.p.name);
+});
 G.canvas.addEventListener('pointerleave', () => { G.drag = null; $('tip').style.opacity = 0; G.hover = null; });
 function flyTo(name) {
   const n = G.nodes.find((x) => x.name === name); if (!n) return;
@@ -578,7 +618,8 @@ function render() {
       ${r?.coord?.event_id && co?.event?.event_id === r.coord.event_id ? (r.coord.accepted ? `<div class="fail" style="color:var(--ok)">✓ accepted event ${esc(r.coord.event_id)} · H ${fmt(r.coord.h)}${r.coord.armed ? ' · armed' : ''}</div>` : `<div class="fail">✗ rejected event: ${esc(r.coord.reason)}</div>`) : ''}
     </article>`;
   }).join('');
-  $('prods').querySelectorAll('.pc').forEach((el) => { const go = () => flyTo(el.dataset.name); el.onclick = go; el.onkeydown = (e) => { if (e.key === 'Enter') go(); }; });
+  $('prods').querySelectorAll('.pc').forEach((el) => { const go = () => openProducer(el.dataset.name); el.onclick = go; el.onkeydown = (e) => { if (e.key === 'Enter') go(); }; });
+  if (openName) renderDrawer();
   const hidden = prods.length - list.length;
   $('more').innerHTML = hidden > 0 || showAll ? `<button id="more-btn">${showAll ? 'Show scheduled only' : `Show all ${prods.length} active producers (+${hidden} standby)`}</button>` : '';
   const mb = $('more-btn'); if (mb) mb.onclick = () => { showAll = !showAll; render(); };
@@ -649,7 +690,7 @@ function renderInfra() {
       const logo = n.org?.logo ? `<img src="${esc(n.org.logo)}" alt="" loading="lazy" onerror="this.remove()">` : '';
       if (n.missing_bp_json) return `<tr><td><div class="who2"><div class="logo"><span>${esc(initials(n.producer))}</span>${logo}</div><b>${esc(n.org?.name || n.producer)}</b></div></td><td colspan="9" data-l="bp.json" style="color:var(--bad)">no bp.json published: nodes unknown</td></tr>`;
       const a = n.api, h = n.hyperion, at = n.atomic, pp = n.p2p_probe;
-      return `<tr>
+      return `<tr class="clickable" data-p="${esc(n.producer)}">
         <td><div class="who2"><div class="logo"><span>${esc(initials(n.org?.name || n.producer))}</span>${logo}</div><div><b>${esc(n.org?.name || n.producer)}</b><div style="color:var(--muted);font-size:11px">${flag(n.org?.country)} ${esc(n.producer)}${n.rank ? ' · #' + n.rank : ''}</div></div></div></td>
         <td data-l="node">${(n.types.length ? n.types : ['node']).map((t) => `<span class="tp ${esc(t)}">${esc(t)}</span>`).join('')}</td>
         <td data-l="endpoint">${n.url ? `<a class="url" href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${esc(n.url.replace(/^https?:\/\//, ''))}</a>` : n.p2p ? `<span class="url" title="p2p">${esc(n.p2p)}</span>` : '<span style="color:var(--dim)">—</span>'}</td>
@@ -661,6 +702,7 @@ function renderInfra() {
         <td data-l="atomic">${at ? `<span class="st2">${dot(at.ok && at.chain_ok !== false)}${at.ok ? esc(at.version || 'up') : 'down'}</span>` : '—'}</td>
         <td data-l="p2p">${n.p2p ? `<span class="st2" title="${esc(n.p2p)}">${dot(pp?.ok)}${pp?.ok ? pp.ms + ' ms' : esc(pp?.error || '…')}</span>` : '—'}</td></tr>`;
     }).join('') || '<tr><td colspan="10" style="color:var(--muted)">No nodes match.</td></tr>';
+    $('inf-rows').querySelectorAll('tr[data-p]').forEach((tr) => tr.onclick = (e) => { if (e.target.closest('a')) return; openProducer(tr.dataset.p); });
     $('inf-foot').textContent = `${rows.length} of ${nodes.length} nodes · surveyed ${Math.round((Date.now() - d.ts) / 60000)} min ago · re-surveyed every 10 min`;
   }
 }
@@ -671,6 +713,62 @@ async function pollInfra() {
   renderInfra();
 }
 pollInfra(); setInterval(pollInfra, 30000);
+
+
+/* ---------------- producer detail drawer ---------------- */
+let openName = null; try { openName = new URLSearchParams(location.search).get('p'); } catch {}
+function openProducer(name) { openName = name; flyTo(name); renderDrawer(); try { const u = new URL(location); u.searchParams.set('p', name); u.searchParams.set('net', active); history.replaceState(null, '', u); } catch {} }
+function closeProducer() { openName = null; renderDrawer(); try { const u = new URL(location); u.searchParams.delete('p'); history.replaceState(null, '', u); } catch {} }
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && openName) closeProducer(); });
+$('scrim').onclick = closeProducer;
+function renderDrawer() {
+  const dr = $('drawer'), sc = $('scrim');
+  const p = openName && net?.producers.find((x) => x.name === openName);
+  if (!p) { dr.classList.remove('on'); sc.classList.remove('on'); dr.setAttribute('aria-hidden', 'true'); return; }
+  const r = p.report, c = net.chain || {}, o = p.org || {};
+  const nodes = (infraData[active]?.nodes || []).filter((n) => n.producer === p.name);
+  const logo = o.logo ? `<img src="${esc(o.logo)}" alt="" onerror="this.remove()">` : '';
+  const dot = (ok, warn) => `<span class="sd ${ok ? (warn ? 'warn' : 'ok') : 'bad'}"></span>`;
+  const status = !r ? (p.scheduled ? 'in the schedule · no beacon' : 'standby · no beacon') : p.silent ? 'beacon silent' : r.ready ? 'ready' : 'needs attention';
+  const co = net.coordination;
+  dr.innerHTML = `
+    <div class="dr-head"><div class="logo"><span>${esc(initials(o.name || p.name))}</span>${logo}</div>
+      <div style="min-width:0"><h3 id="dr-title">${esc(o.name || p.name)}</h3><div class="sub2">${flag(o.country)} ${esc(p.name)}${o.city ? ' · ' + esc(o.city) : ''}${o.website ? ` · <a href="${esc(o.website)}" target="_blank" rel="noopener noreferrer">website</a>` : ''}</div></div>
+      <button class="dr-x" id="dr-x" aria-label="Close">×</button></div>
+    <div class="dr-body">
+      <div class="facts">
+        <div class="fact"><b>${p.rank ? '#' + p.rank : '—'}</b><span>vote rank</span></div>
+        <div class="fact"><b>${p.scheduled ? 'yes' : 'no'}</b><span>in active schedule</span></div>
+        <div class="fact"><b style="color:${c.head_producer === p.name ? 'var(--cut)' : 'inherit'}">${c.head_producer === p.name ? 'now' : '—'}</b><span>producing</span></div>
+        <div class="fact"><b>${nodes.length || '—'}</b><span>nodes in bp.json</span></div>
+        <div class="fact"><b>${nodes.filter((n) => n.api?.ok).length}/${nodes.filter((n) => n.url).length}</b><span>APIs answering</span></div>
+        <div class="fact"><b style="color:${!r ? 'var(--muted)' : p.silent ? 'var(--bad)' : r.ready ? 'var(--ok)' : 'var(--warn)'}">${!r ? 'no beacon' : p.silent ? 'silent' : r.ready ? 'ready' : 'attention'}</b><span>cutover readiness</span></div>
+      </div>
+
+      ${co ? `<div class="dr-sec"><h4>Coordinated event</h4><div class="chk"><i class="${r?.coord?.accepted ? 'ok' : 'no'}">${r?.coord?.accepted ? '✓' : '·'}</i><b>${esc(co.event.event_id)}</b><span>${r?.coord?.event_id === co.event.event_id ? (r.coord.accepted ? `accepted · H ${fmt(r.coord.h)}${r.coord.armed ? ' · armed' : ''}` : 'rejected: ' + esc(r.coord.reason)) : 'not acknowledged yet'}</span></div></div>` : ''}
+
+      <div class="dr-sec"><h4>Nodes (${nodes.length})</h4>
+      ${nodes.length ? nodes.map((n) => `<div class="nodecard"><div class="r1"><div>${(n.types.length ? n.types : ['node']).map((t) => `<span class="tp ${esc(t)}">${esc(t)}</span>`).join('')}</div>${n.api ? `<span class="st2">${dot(n.api.ok && n.api.chain_ok !== false)}${n.api.ok ? n.api.ms + ' ms' : 'down'}</span>` : ''}</div>
+        ${n.url ? `<a class="url" style="max-width:100%;margin-top:6px" href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${esc(n.url)}</a>` : ''}
+        <div class="grid2">
+          <div><span>version</span>${esc(n.api?.version?.split('-')[0] || '—')}</div><div><span>head lag</span>${n.api?.lag != null ? fmt(n.api.lag) : '—'}</div><div><span>edge</span>${esc(n.api?.edge || '—')}</div>
+          <div><span>hyperion</span>${n.hyperion ? (n.hyperion.ok ? esc(n.hyperion.version) + (n.hyperion.lag != null ? ' · lag ' + fmt(n.hyperion.lag) : '') : 'down') : '—'}</div>
+          <div><span>atomicassets</span>${n.atomic ? (n.atomic.ok ? esc(n.atomic.version || 'up') : 'down') : '—'}</div>
+          <div><span>p2p</span>${n.p2p ? `${dot(n.p2p_probe?.ok)} ${esc(n.p2p)}` : '—'}</div>
+        </div>${n.features?.length ? `<div style="margin-top:8px">${n.features.map((f) => `<span class="tp">${esc(f)}</span>`).join('')}</div>` : ''}</div>`).join('')
+        : `<div class="ev-empty">${net.id === 'rehearsal' ? 'Rehearsal nodes are known from their beacons, not bp.json.' : 'No bp.json nodes surveyed yet (the survey runs every 10 minutes), or this producer publishes no bp.json.'}</div>`}
+      </div>
+
+      <div class="dr-sec"><h4>Readiness checks ${r ? `· agent v${esc(r.agent_version)} · ${Math.round((p.age_ms || 0) / 1000)}s ago` : ''}</h4>
+      ${r ? r.checks.map((x) => `<div class="chk"><i class="${x.ok ? 'ok' : 'no'}">${x.ok ? '✓' : '✗'}</i><b>${esc(x.name)}</b><span>${esc(x.detail)}</span></div>`).join('')
+        : `<div class="ev-empty">This producer hasn't connected a beacon. Running <b>pulse-cutover beacon</b> reports readiness here: source API, producer API, chain_id, H, hooks, validator, disk.</div>`}</div>
+
+      ${r?.ceremony?.transitions?.length ? `<div class="dr-sec"><h4>Ceremony</h4><ul class="tl">${r.ceremony.transitions.map((t) => `<li><time>${esc(String(t.ts).slice(11, 23))}</time><b>${esc(t.state)}</b></li>`).join('')}</ul>${r.ceremony.last_error ? `<div class="fail" style="margin-top:6px">✗ ${esc(r.ceremony.last_error)}</div>` : ''}</div>` : ''}
+      ${r?.ceremony?.evidence && Object.keys(r.ceremony.evidence).length ? `<div class="dr-sec"><h4>Evidence</h4><dl class="evk">${Object.entries(r.ceremony.evidence).map(([k, v]) => `<dt>${esc(k.replace(/_/g, ' '))}</dt><dd>${esc(typeof v === 'string' ? v : JSON.stringify(v))}</dd>`).join('')}</dl></div>` : ''}
+    </div>`;
+  $('dr-x').onclick = closeProducer;
+  dr.classList.add('on'); sc.classList.add('on'); dr.setAttribute('aria-hidden', 'false');
+}
 
 let lastHead = {};
 async function poll() {
