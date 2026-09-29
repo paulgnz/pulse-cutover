@@ -59,6 +59,10 @@ HEAD=$(printf '%s' "$INFO" | sed -n 's/.*"head_block_num":\([0-9]*\).*/\1/p')
 [ -n "$CHAIN_ID" ] || { echo "could not reach nodeos chain API at $API (use --api)"; exit 1; }
 if [ -z "$SNAPDIR" ]; then
   CFG=$(jqget '.nodeos.config_dir'); [ -n "$CFG" ] && SNAPDIR=$(sed -n 's/^\s*snapshots-dir\s*=\s*//p' "$CFG/config.ini" 2>/dev/null | tail -1)
+  if [ -z "$SNAPDIR" ]; then   # nodeos default: <data-dir>/snapshots
+    DD=$(ps -o args= -C nodeos 2>/dev/null | grep -o -- '--data-dir[= ][^ ]*' | head -1 | awk '{print $NF}' | sed 's/.*=//')
+    [ -n "$DD" ] && [ -d "$DD" ] && SNAPDIR="$DD/snapshots"
+  fi
   [ -n "$SNAPDIR" ] || SNAPDIR=/var/lib/pulse-cutover/snapshots
 fi
 MG_UNIT=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -m1 -iE '^(metalgo|avalanchego)[^ ]*\.service$' | sed 's/\.service$//' || true)
@@ -111,7 +115,7 @@ rpc_url = "http://127.0.0.1:9650/ext/bc/NOT-CONFIGURED/rpc"
 url = "${URL%/}/api/report"
 producer = "$PRODUCER"
 network = "$NETWORK"
-token_file = "/etc/pulse-cutover/beacon.token"
+token_file = "$ETC/beacon.token"
 interval_secs = $INTERVAL
 TOML
 chmod 640 "$ETC/beacon.toml"
