@@ -72,7 +72,7 @@ flowchart LR
 
 | What stays the same for users | How it is proven |
 |---|---|
-| **chain_id** — signatures, wallets and keys keep working | target must report the source chain_id and a height ≥ H before anything flips (block-id-at-H lineage is not yet checked) |
+| **chain_id** — signatures, wallets and keys keep working | target must report the source chain_id, a height ≥ H and the same block id at H before anything flips (rc.6) |
 | **Accounts, permissions, contracts and table rows** | snapshot imported twice by the same importer; 19–21 table fingerprints must match. `state-diff` compares a discovered sample against the old chain; a whole-state commitment is still open |
 | **The URL** | producer mode: the edge swaps its backend at `on_live`. API mode: the flip happens before the FLIPPED/LIVE transitions |
 | **Nothing is lost at the boundary** | burn-off audit: zero transactions allowed after the cut, or this producer's ceremony aborts and resumes its old chain (not fleet-wide) |
@@ -619,10 +619,12 @@ stateDiagram-v2
     ABORTED --> [*]: source producer resumed
 ```
 
-`ABORTED` is reachable from every state before `LIVE`, and for this agent
-rollback is resuming its source producer. That is only safe while no other
-producer has started the target: there is no fleet-wide "target authorized"
-state yet, so the point of no return is not enforced (ATOMICITY Known limits #1).
+`ABORTED` is reachable only **before ignition starts**; for this agent rollback is resuming its
+source producer. From the moment ignition starts (journaled first), any failure goes to a durable
+`HALTED` instead: nothing is rolled back and the source is never resumed (`unhalt --i-understand` to
+clear). That is the local point of no return. There is no fleet-wide "target authorized" state yet,
+so one BP aborting before its ignition cannot know whether another has ignited (ATOMICITY Known
+limits #1; design in `docs/DESIGN-authority-boundary.md`).
 
 Per-mode ceremony:
 
@@ -643,11 +645,11 @@ hyperion  ARMED → FROZEN → SNAPSHOTTED → VERIFIED → IGNITED* → FLIPPED
   code path a PulseVM node boots with (`pulsevm_snapshot_import`); compared
   against pre-published goldens (multi-BP) or captured with provenance (rehearsal).
 - **IGNITED** — verified snapshot staged into the pre-staged PulseVM chain config,
-  metalgo (re)started; target must report the **source chain_id and a height ≥ H**
-  (matching the block id at H is not yet checked).
-- **LIVE** — local target head advances past the cut. In bp mode the `on_live` hook
-  flips the edge now; in api mode the flip already happened at FLIPPED. LIVE is a
-  local head-progress check, not sustained all-validator health or inclusion.
+  metalgo (re)started; target must report the **source chain_id, a height ≥ H and the cut's block
+  id at H**. Ignition start is journaled before the restart; any failure after it HALTS.
+- **LIVE** — local target head keeps advancing for `live_sustain_secs` (default 60) with no gap over
+  `live_max_gap_secs` (20); in bp mode `on_live` flips the edge first and must succeed, in api mode the
+  flip already happened at FLIPPED. It is still a local check, not all-validator health or inclusion.
 
 Every transition is an fsynced JSONL journal line with timestamps and evidence
 (hashes, block ids, fingerprints, durations). A restarted agent resumes from the
@@ -1145,7 +1147,7 @@ what testers get out of it.
 
 ## Status & caveats
 
-- Operator tooling v0.5.0-rc.4 (beacon, installers, mission control) — rehearsal-grade.
+- Operator tooling v0.5.0-rc.6 (beacon, installers, mission control) — rehearsal-grade.
   The recorded ceremonies are real but ran the fork plugin (`v0.0.0-arena-mempoolfix.1`
   lineage, metalgo 1.13.5, plugin protocol 43), not upstream PulseVM v1.0.0 (protocol
   45, needs metalgo 1.14.x); no *mainnet* event has run. See the status box at the top.

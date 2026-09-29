@@ -104,12 +104,12 @@ is safe. Open items, most severe first:
 
 | # | Limit | Why it matters |
 |---|---|---|
-| 1 | **No fleet-wide authority boundary.** A producer's local abort still resumes the old chain, even if other producers have already ignited. | A partial abort can split the network. Needs source fencing and a durable "target authorized" state that forbids unilateral resume. |
-| 2 | **API mode does not enforce exact H**, and a restarted run can fall back to a later snapshot. | An API provider could serve a different cut than the producers. |
-| 3 | **Coordination is single-key and in-memory.** One coordinator signature arms; the relay loses state on restart; agreement can pass while producers are missing. | Needs a signed immutable manifest, threshold authorization, a durable event log, and a complete roster before arming. |
+| 1 | **No fleet-wide authority boundary.** Since rc.6 a producer never resumes the old chain after its *own* ignition started (it HALTS), but a producer aborting *before* its ignition cannot know whether others have ignited. | A partial abort can split the network. Needs source fencing and a durable "target authorized" state that forbids unilateral resume. |
+| 2 | **Exact H is implemented but not rehearsed.** Since rc.5/rc.6 every mode schedules the snapshot at H, refuses any other height, restores that on restart and checks the target's block id at H; none of this has run on real boxes or upstream v1.0.0 yet. | Until rehearsed, treat it as untested code. |
+| 3 | **Coordination is single-key with unsigned fleet evidence.** One coordinator signature arms; the relay is now durable (fails with 503 rather than accept what it can't persist) and events can bind a roster and quorum, but producer reports are not signed and validator weight is not modelled. | Needs a signed immutable manifest, threshold authorization, a durable event log, and a complete roster before arming. |
 | 4 | **Shared producer identity.** The fork plugin requires every validator to run the same producer name and key. | Unacceptable for mainnet custody; needs per-validator authoring identity. |
 | 5 | **State evidence is narrower than "every account"**: `state-diff` covers the accounts and tables it discovers; fingerprints are 64-bit; both imports use the same importer. | Needs a complete, cryptographic whole-state commitment checked by an independent implementation. |
-| 6 | **Crash recovery** (locks, side-effect reconciliation, hook timeouts) is not certified. | A crash mid-ceremony must never produce a later-H snapshot or an accidental resume. |
+| 6 | **Crash recovery is implemented, not certified.** Exclusive journal lock, torn-tail repair, staged-artifact and ignition-start records, durable HALTED and process-group hook timeouts exist (rc.6) and have unit tests; no fault-injection run on real boxes yet. | A crash mid-ceremony must never produce a later-H snapshot or an accidental resume. |
 | 7 | **Validator registration and METAL funding** are not automated or certified. | Every producer needs an accepted, funded validator before H can be scheduled. |
 | 8 | **The ~50 s post-LIVE stall** is unexplained. | Clients see timeouts right after the cut. |
 

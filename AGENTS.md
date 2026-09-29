@@ -181,8 +181,11 @@ Mutating (see SAFETY RAILS before running):
   target chain, FLIP public traffic (api modes) and run the manifest's
   source stop command. Exit 0 = LIVE; non-zero = did not reach LIVE
   (journal has the evidence).
-- `./cutover.sh abort` — stops a running agent + reverts any staged flip /
-  resumes the source producer. Safe; use it on a stuck or ^C'd run.
+- `./cutover.sh abort` — stops a running agent and, only when `status` proves ignition has NOT
+  started, reverts any staged flip / resumes the source producer. If ignition started, the state is
+  unknown or the journal is corrupt, it refuses (exit 3): read the journal and escalate; do not force.
+- `pulse-cutover unhalt --config c.toml --i-understand` — clears a durable HALTED (journaled with
+  who ran it). Only after a human has decided; never as a retry.
 - `pulse-cutover loop --config c.toml --runs N` — repeated ceremonies with a
   reset between runs. Rehearsal boxes only.
 
@@ -290,10 +293,16 @@ stateDiagram-v2
 
 - Nothing user-visible changes before FLIPPED (bp mode: before LIVE hooks).
   Abort earlier = zero public impact, source chain untouched/authoritative.
-- ABORTED means: the run stopped safely, rollback ran (flip reverted /
-  producer resumed per mode + `auto_rollback`), and the journal's last
-  `error` line has the reason. It is a normal, designed outcome — not a
-  crash. Do not retry blindly; read the reason.
+- ABORTED means: the run stopped **before ignition started**, rollback ran (flip
+  reverted / producer resumed per mode + `auto_rollback`), and the journal's last
+  `error` line has the reason. It is a normal, designed outcome — not a crash.
+  Do not retry blindly; read the reason.
+- HALTED means: something failed **after ignition started**. Nothing was rolled
+  back and the source was NOT resumed (the target may be running). `run` refuses
+  a HALTED journal. Escalate to the coordinator; never `unhalt` to retry.
+- Hooks run in their own process group and are killed at `hooks.timeout_secs`;
+  a hook that leaves background work attached to its output is killed ~5 s after
+  it exits. Detach long-running work: `setsid cmd >log 2>&1 &`.
 - All states are resumable via journal replay except the two terminals.
 
 ## SAFETY RAILS (hard rules for agents)

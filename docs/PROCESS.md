@@ -9,11 +9,14 @@ what is implemented and rehearsed today is marked where it differs, and the full
 status is in [ATOMICITY.md](../ATOMICITY.md).
 
 > [!IMPORTANT]
-> **Implemented vs intended (2026-09-29).** Rehearsed: same cut on every producer, zero transactions
-> after H, a symmetric abort. Sampled only: state equality and exactly-once. Not implemented: a
-> fleet-wide authority boundary (all-or-nothing), exact H in API mode and on restart, block-id-at-H
-> lineage check on the target, per-validator producer keys, validator registration/funding. The
-> rehearsal ran a fork plugin on a private network, not upstream PulseVM v1.0.0 on Tahoe.
+> **Implemented vs intended (v0.5.0-rc.6).** Rehearsed: same cut on every producer, zero transactions
+> after H, a symmetric abort. Implemented since, not yet rehearsed: exact H in every mode (no fallback
+> to a later cut), a block-id-at-H lineage check on the target, a local point of no return at
+> ignition start (after it, any failure HALTS; the source is never resumed). Sampled only: state
+> equality and exactly-once. Not implemented: a fleet-wide authority boundary (all-or-nothing;
+> designed in `docs/DESIGN-authority-boundary.md`), per-validator producer keys, validator
+> registration/funding. The rehearsal ran a fork plugin on a private network, not upstream PulseVM
+> v1.0.0 on Tahoe.
 
 > [!NOTE]
 > Numbers on this page come from the recorded 5-producer rehearsal (Sydney · Singapore ·
@@ -212,7 +215,7 @@ stateDiagram-v2
 |---|---|
 | **Action** | Stages the verified snapshot where the PulseVM chain expects it and restarts the validator. The chain imports it and presents the source chain_id. |
 | **Users see** | Still 503 on writes. |
-| **Gate** | Target chain_id == source chain_id, and target head ≥ H. *Intended but not yet enforced: the target's block id at H equals the cut's block id (it is recorded in the journal, not compared).* |
+| **Gate** | Target chain_id == source chain_id, target head ≥ H, and the target's block id at H equals the cut's block id (rc.6; via `pulsevm.getBlock(H)` — not yet verified against upstream v1.0.0). Ignition start is journaled first: from then on any failure halts, it never resumes the source. |
 | **Then** | The `post_ignite` hook sends a few transactions: PulseVM builds blocks on demand, so an idle new chain would never pass H. |
 
 ### ⑥ LIVE: the new chain is producing, URLs flip
@@ -248,7 +251,7 @@ sequenceDiagram
     BP->>N: pause · audit H+1… (0 transactions)
     BP->>BP: verify: 2 imports, fingerprints
     BP->>P: ignite from the snapshot
-    P-->>BP: chain_id ✓, head ≥ H (block id at H: recorded, not yet compared)
+    P-->>BP: chain_id ✓, head ≥ H, block id at H ✓
     BP->>P: first transactions → block H+1
     BP->>E: flip backend, reopen writes
     BP-->>C: journals, hashes, fingerprints, state diff
@@ -328,8 +331,11 @@ flowchart LR
 > [!IMPORTANT]
 > For one producer, rollback is **resuming its paused producer** and reopening writes; rehearsal
 > run 1 exercised this on all five at once (a symmetric abort). It is safe only while no producer
-> has authorized or started the target. Once the target may be producing, a local timeout must not
-> independently resume the old chain. That boundary is not enforced by the tooling yet.
+> has authorized or started the target. Locally this is enforced from rc.6: once ignition has
+> started, every failure HALTS (durable; `pulse-cutover unhalt --i-understand` to clear) and nothing
+> resumes the old chain, and `cutover.sh abort` refuses. Fleet-wide, the boundary is still only a
+> design (`docs/DESIGN-authority-boundary.md`): one BP's local abort before ignition does not know
+> whether another BP has ignited.
 
 ---
 
