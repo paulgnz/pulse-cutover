@@ -1019,7 +1019,7 @@ async function renderPage() {
           <dl class="kv"><dt>NodeID</dt><dd>${esc(m.node_id)}${copyBtn(m.node_id)}</dd>
             <dt>BLS public key</dt><dd title="${esc(m.bls_public_key)}">${esc(String(m.bls_public_key || '').slice(0, 22))}…${copyBtn(m.bls_public_key)}</dd>
             <dt>version</dt><dd>${esc(m.version)}</dd><dt>plugin protocol</dt><dd>${esc(m.rpcchainvm)}</dd>
-            <dt>network id</dt><dd>${esc(m.network_id)}${m.network_id === 5 ? ' (Tahoe)' : m.network_id === 1 ? ' (Metal mainnet)' : ''}</dd>
+            <dt>network id</dt><dd>${esc(m.network_id)}${+m.network_id === 5 ? " (Tahoe)" : +m.network_id === 1 ? " (Metal mainnet)" : +m.network_id === 88888 ? " (rehearsal)" : ""}</dd>
             <dt>X / C chains</dt><dd>${yn(m.bootstrapped?.X, 'synced', 'syncing')} / ${yn(m.bootstrapped?.C, 'synced', 'syncing')}</dd>
             <dt>health</dt><dd>${yn(m.healthy, 'healthy', 'unhealthy')}</dd></dl>
           <div style="color:var(--muted);font-size:11px;margin:10px 0 4px">peers, last ${h.length} reports</div>${sparkLine(h.map((x) => x.peers), 'var(--ok)')}`
