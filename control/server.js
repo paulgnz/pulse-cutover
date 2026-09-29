@@ -26,7 +26,8 @@ const HOST = process.env.HOST || '127.0.0.1';
 const NETWORKS_FILE = process.env.NETWORKS || join(HERE, 'networks.json');
 const TOKENS_FILE = process.env.TOKENS || '';
 const COORD_FILE = process.env.COORD_FILE || '/var/lib/pulse-control/coord.json';
-const REPLAY_FILE = process.env.REPLAY_FILE || join(dirname(COORD_FILE), 'replay.json');
+const REPLAY_FILE = process.env.REPLAY_FILE || join(dirname(COORD_FILE), 'replay.json'); // rc.6 format, migrated on start
+const STATE_FILE = process.env.STATE_FILE || join(dirname(COORD_FILE), 'servers.json');
 const OFFLINE = process.env.MC_OFFLINE === '1';
 const MAX_BODY = 256 * 1024;
 const TS_FUTURE_MS = 2 * 60e3, TS_PAST_MS = 5 * 60e3;
@@ -311,8 +312,9 @@ const sidOf = (key) => sha(`sid:${key}`).slice(0, 16);
 function servers(netId, producer) {
   const byKey = nodes[netId]?.[producer]; if (!byKey) return [];
   const list = Object.entries(byKey).map(([key, v]) => ({ key, sid: sidOf(key), ...v })).sort((a, b) => a.first_seen - b.first_seen || a.key.localeCompare(b.key));
-  const seen = dict();
-  for (const s of list) { const base = s.report.node; seen[base] = (seen[base] || 0) + 1; s.label = seen[base] > 1 ? `${base} (${seen[base]})` : base; }
+  // Display labels are unique per producer, even when beacons choose colliding names ("api", "api", "api (2)").
+  const taken = new Set();
+  for (const s of list) { const base = s.report.node; let cand = base, n = 2; while (taken.has(cand)) cand = `${base} (${n++})`; taken.add(cand); s.label = cand; }
   return list;
 }
 // Freshness is judged by the report's OWN timestamp (not when we received it), so a stale report replayed
@@ -351,9 +353,33 @@ function stages(s, now = Date.now()) {
 // answers 503 and changes nothing. A corrupt store stops startup (never "start empty" and forget an event).
 // `used` = every event id ever published → sha256 of its payload: ids are never reusable.
 let coord = dict(); // network id → { event, arm, abort, history: [{type, event_id, at}], used: {event_id: payloadSha} }
+const isSignedMsg = (m) => m && typeof m === 'object' && !Array.isArray(m) && typeof m.payload === 'string' && typeof m.key === 'string' && typeof m.sig === 'string';
+/** Validate one network's stored coordination entry; returns a normalized copy or throws. */
+function validCoordEntry(k, v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error(`${k}: not an object`);
+  const out = dict();
+  for (const f of ['event', 'arm', 'abort']) {
+    if (v[f] === undefined) continue;
+    if (!isSignedMsg(v[f])) throw new Error(`${k}.${f}: not a signed message`);
+    let pl; try { pl = JSON.parse(v[f].payload); } catch { throw new Error(`${k}.${f}: payload is not JSON`); }
+    if (!pl || typeof pl.event_id !== 'string') throw new Error(`${k}.${f}: payload has no event_id`);
+    out[f] = { payload: v[f].payload, key: v[f].key, sig: v[f].sig };
+  }
+  if ((out.arm || out.abort) && !out.event) throw new Error(`${k}: arm/abort without an event`);
+  if (v.history !== undefined && !Array.isArray(v.history)) throw new Error(`${k}.history: not an array`);
+  out.history = (v.history || []).map((h, i) => { if (!h || typeof h !== 'object' || typeof h.event_id !== 'string') throw new Error(`${k}.history[${i}]: invalid`); return h; });
+  if (v.used !== undefined && (!v.used || typeof v.used !== 'object' || Array.isArray(v.used))) throw new Error(`${k}.used: not an object`);
+  out.used = dict();
+  for (const [id, h] of Object.entries(v.used || {})) { if (typeof h !== 'string' || reservedKey(id)) throw new Error(`${k}.used.${id}: invalid`); out.used[id] = h; }
+  // rc.5 stores had no `used` map: every event they mention (active, aborted or only in history) is used, so an
+  // id can never be republished after the upgrade. The hash is the stored payload's when we have it.
+  if (out.event) { const id = JSON.parse(out.event.payload).event_id; if (!own(out.used, id)) out.used[id] = sha(out.event.payload); }
+  for (const h of out.history) if (h.type === 'event' && !own(out.used, h.event_id)) out.used[h.event_id] = h.event_hash || 'legacy:unknown-payload';
+  return out;
+}
 if (existsSync(COORD_FILE)) {
   try { const j = JSON.parse(readFileSync(COORD_FILE, 'utf8')); if (!j || typeof j !== 'object' || Array.isArray(j)) throw new Error('not an object');
-    const safe = clone(j); for (const [k, v] of Object.entries(safe)) if (RE.net.test(k)) coord[k] = v; }
+    for (const [k, v] of Object.entries(j)) { if (!RE.net.test(k)) throw new Error(`unknown key ${JSON.stringify(k).slice(0, 40)}`); coord[k] = validCoordEntry(k, v); } }
   catch (e) { console.error(`coord: ${COORD_FILE} is unreadable or corrupt (${e.message}). Refusing to start: fix or restore it (a backup, or delete it ONLY if no event is live).`); process.exit(3); }
 }
 function atomicWrite(file, obj) {
@@ -361,6 +387,9 @@ function atomicWrite(file, obj) {
   const tmp = `${file}.tmp-${process.pid}`;
   const fd = openSync(tmp, 'w'); try { writeSync(fd, JSON.stringify(obj, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(tmp, file);
+  // the rename itself is only durable once the directory entry is: fsync the directory too
+  const dfd = openSync(dirname(file), 'r');
+  try { fsyncSync(dfd); } catch (e) { if (!['EINVAL', 'ENOTSUP', 'EISDIR'].includes(e.code)) throw e; } finally { closeSync(dfd); }
 }
 /** Persist `next` as the whole coordination state; returns true only if it is durably on disk. */
 function commitCoord(next) {
@@ -368,15 +397,59 @@ function commitCoord(next) {
   catch (e) { console.error(`coord: persist failed (${e.message}); change NOT accepted`); return false; }
 }
 
-// Replay state (last accepted report timestamp per server key) survives restarts, so a captured report can't be
-// replayed just because mission control restarted. Written through, coalesced to at most once per second.
+// Server state = the replay watermark (last accepted report timestamp per server key) + every server entry
+// (latest report, first_seen, instance_id, conflict). It is written synchronously (tmp + fsync + rename + dir
+// fsync) BEFORE a report or an operator change is acknowledged, so a crash right after a 200 can neither replay a
+// report nor forget an identity conflict. Only the per-server chart history is memory-only.
+// A corrupt state file stops startup (same rule as the coordination store).
 const lastTs = dict();
-try { if (existsSync(REPLAY_FILE)) { const j = JSON.parse(readFileSync(REPLAY_FILE, 'utf8')); for (const [k, v] of Object.entries(j)) if (/^[0-9a-f]{64}(:[0-9a-f]{32})?$/.test(k) && Number.isFinite(v)) lastTs[k] = v; } }
-catch (e) { console.error(`replay: ${REPLAY_FILE} unreadable (${e.message}); starting with a fresh replay window (reports older than ${TS_PAST_MS / 60e3} min are still refused)`); }
-let replayDirty = false;
-function saveReplaySoon() {
-  if (replayDirty) return; replayDirty = true;
-  setTimeout(() => { replayDirty = false; try { atomicWrite(REPLAY_FILE, lastTs); } catch (e) { console.error(`replay: persist failed (${e.message})`); } }, 1000).unref();
+const KEY_RE = /^[0-9a-f]{64}(:[0-9a-f]{32})?$/;
+function loadServerState() {
+  if (existsSync(STATE_FILE)) {
+    let j; try { j = JSON.parse(readFileSync(STATE_FILE, 'utf8')); } catch (e) { throw new Error(`not JSON (${e.message})`); }
+    if (!j || typeof j !== 'object' || j.v !== 1 || typeof j.lastTs !== 'object' || typeof j.nodes !== 'object' || !j.lastTs || !j.nodes) throw new Error('bad shape');
+    for (const [k, v] of Object.entries(j.lastTs)) { if (!KEY_RE.test(k) || !Number.isFinite(v)) throw new Error(`lastTs.${k.slice(0, 20)}`); lastTs[k] = v; }
+    for (const [netId, prods] of Object.entries(j.nodes)) {
+      if (!RE.net.test(netId) || !prods || typeof prods !== 'object') throw new Error(`nodes.${netId}`);
+      for (const [prod, byKey] of Object.entries(prods)) {
+        if (!RE.producer.test(prod) || !byKey || typeof byKey !== 'object') throw new Error(`nodes.${netId}.${prod}`);
+        for (const [key, e] of Object.entries(byKey)) {
+          if (!KEY_RE.test(key) || !e || typeof e !== 'object' || !Number.isFinite(e.first_seen) || !Number.isFinite(e.received) || typeof e.conflict !== 'boolean'
+            || !(e.instance_id === null || /^[0-9a-f]{32}$/.test(e.instance_id))) throw new Error(`nodes.${netId}.${prod}.${key.slice(0, 12)}`);
+          let r; try { r = projectReport(e.report); } catch (x) { throw new Error(`nodes.${netId}.${prod}.${key.slice(0, 12)}.report: ${x.message}`); }
+          ((nodes[netId] ||= dict())[prod] ||= dict())[key] = { report: r, received: e.received, hist: [], first_seen: e.first_seen, instance_id: e.instance_id, conflict: e.conflict };
+        }
+      }
+    }
+    return;
+  }
+  // rc.6 kept only a replay watermark (written ~1 s after acknowledging): carry it over.
+  if (existsSync(REPLAY_FILE)) {
+    try { const j = JSON.parse(readFileSync(REPLAY_FILE, 'utf8')); for (const [k, v] of Object.entries(j)) if (KEY_RE.test(k) && Number.isFinite(v)) lastTs[k] = v; }
+    catch (e) { console.error(`replay: ${REPLAY_FILE} unreadable (${e.message}); starting with a fresh replay window (reports older than ${TS_PAST_MS / 60e3} min are still refused)`); }
+  }
+}
+try { loadServerState(); }
+catch (e) { console.error(`servers: ${STATE_FILE} is unreadable or corrupt (${e.message}). Refusing to start: fix or restore it (deleting it forgets replay protection and identity conflicts).`); process.exit(3); }
+/** The whole server state with `override` = [netId, producer, byKey] swapped in (not yet live), as a plain object. */
+function serverSnapshot(override, lastOverride) {
+  const out = { v: 1, lastTs: { ...lastTs, ...(lastOverride || {}) }, nodes: {} };
+  const put = (netId, prod, byKey) => { const o = ((out.nodes[netId] ||= {})[prod] = {});
+    for (const [k, e] of Object.entries(byKey)) o[k] = { report: e.report, received: e.received, first_seen: e.first_seen, instance_id: e.instance_id ?? null, conflict: !!e.conflict }; };
+  for (const [netId, prods] of Object.entries(nodes)) for (const [prod, byKey] of Object.entries(prods)) {
+    if (override && override[0] === netId && override[1] === prod) continue; put(netId, prod, byKey); }
+  if (override) put(override[0], override[1], override[2]);
+  return out;
+}
+/** Durably persist the state with the proposed change; true only if it is on disk. Nothing live changes here. */
+function commitServers(override, lastOverride) {
+  try { atomicWrite(STATE_FILE, serverSnapshot(override, lastOverride)); return true; }
+  catch (e) { console.error(`servers: persist failed (${e.message}); change NOT accepted`); return false; }
+}
+/** One token = one machine: every entry of a token is in conflict while the token has more than one entry. */
+function recomputeConflicts(byKey, tok) {
+  const mine = Object.keys(byKey).filter((k) => k.split(':')[0] === tok);
+  for (const k of mine) byKey[k] = { ...byKey[k], conflict: mine.length > 1 };
 }
 function verifySigned(msg, keys) {
   try {
@@ -421,16 +494,17 @@ function agreement(n) {
   const members = roster(n);
   const all = [...new Set([...members, ...Object.keys(nodes[n.id] || {})])];
   for (const [key, label] of EVIDENCE_KEYS) {
-    const vals = [], stale = [];
+    const vals = [], stale = [], conflicted = [];
     for (const p of all) {
       for (const s of servers(n.id, p).filter((x) => (x.report.role || 'producer') === 'producer')) {
         const v = s.report.ceremony?.evidence?.[key];
         if (v === undefined || v === null) continue;
         const who = servers(n.id, p).length > 1 ? `${p}/${s.label}` : p;
-        if (isSilent(s, now)) stale.push(who); else vals.push([who, p, v]);
+        // Evidence from a server whose identity is in conflict never counts toward agreement.
+        if (s.conflict) conflicted.push(who); else if (isSilent(s, now)) stale.push(who); else vals.push([who, p, v]);
       }
     }
-    if (!vals.length && !stale.length) continue;
+    if (!vals.length && !stale.length && !conflicted.length) continue;
     const groups = {};
     for (const [who, , v] of vals) (groups[JSON.stringify(v)] ||= []).push(who);
     const distinct = Object.keys(groups);
@@ -441,9 +515,9 @@ function agreement(n) {
     const missing = (members.length ? members : reporters).filter((p) => !have.has(p));
     const expectBad = key === 'burnoff_transactions' ? vals.some(([, , v]) => v !== 0) : false;
     // No roster = no agreement verdict: "everyone who happened to report agrees" is not agreement.
-    const agree = !members.length ? null : distinct.length === 1 && !missing.length && !stale.length && !expectBad;
+    const agree = !members.length ? null : distinct.length === 1 && !missing.length && !stale.length && !conflicted.length && !expectBad;
     rows.push({ key, label, agree, verdict: !members.length ? 'no roster' : agree ? 'agree' : 'disagree', reporting: vals.length, roster: members.length,
-      missing, stale, bad_value: expectBad, values: distinct.map((v) => ({ value: JSON.parse(v), producers: groups[v] })) });
+      missing, stale, conflicted, bad_value: expectBad, values: distinct.map((v) => ({ value: JSON.parse(v), producers: groups[v] })) });
   }
   return rows;
 }
@@ -465,7 +539,7 @@ function status() {
           .sort((x, y) => (x.role === 'producer' ? -1 : 0) - (y.role === 'producer' ? -1 : 0));
         for (const b of beacons) {
           serversAll++; if (b.conflict) serversConflict++;
-          if (!b.silent) { serversLive++; if (b.report.ready) serversReady++; const st = b.report.ceremony?.state || 'IDLE'; states[st] = (states[st] || 0) + 1; }
+          if (!b.silent) { serversLive++; if (b.report.ready && !b.conflict) serversReady++; const st = b.report.ceremony?.state || 'IDLE'; states[st] = (states[st] || 0) + 1; }
         }
         const r = beacons.length ? { report: beacons[0].report, received: now - beacons[0].age_ms } : null;
         const age = r ? now - r.received : null;
@@ -643,9 +717,11 @@ async function handle(req, res) {
     const byKey = nodes[netId]?.[prod]; const hit = byKey && Object.keys(byKey).find((k) => sidOf(k) === sid);
     if (!hit) return send(res, 404, { error: 'no such server' });
     const tok = hit.split(':')[0];
-    delete byKey[hit];
-    // clearing one side of a conflict un-flags the remaining entries of that token
-    for (const [k, v] of Object.entries(byKey)) if (k.split(':')[0] === tok) v.conflict = false;
+    // Remove ONLY the selected instance; the rest of that token stay in conflict while more than one remains.
+    const next = dict(); for (const [k, v] of Object.entries(byKey)) if (k !== hit) next[k] = v;
+    recomputeConflicts(next, tok);
+    if (!commitServers([netId, prod, next])) return send(res, 503, { error: 'could not persist; nothing changed' });
+    nodes[netId][prod] = next;
     pushEvent(netId, prod, `operator removed server ${sid}`);
     return send(res, 200, { ok: true, removed: sid });
   }
@@ -663,24 +739,27 @@ async function handle(req, res) {
     const ts = Date.parse(r.ts), now = Date.now();
     if (ts > now + TS_FUTURE_MS) return send(res, 400, { error: 'report timestamp is in the future (check the server clock)' });
     if (ts < now - TS_PAST_MS) return send(res, 400, { error: 'report is too old' });
-    const byKey = ((nodes[r.network] ||= dict())[r.producer] ||= dict());
+    const live = nodes[r.network]?.[r.producer] || dict();
     const key = r.instance_id ? `${tokenHash}:${r.instance_id}` : tokenHash;
     if (ts <= (lastTs[key] || 0)) return send(res, 409, { error: 'replayed or out-of-order report' });
+    // Work on a copy; nothing live changes until the new state is durably on disk.
+    const byKey = dict(); for (const [k, v] of Object.entries(live)) byKey[k] = v;
     // Pre-instance_id entry of the same token upgrades in place to the keyed entry (same machine, newer beacon).
     if (r.instance_id && !byKey[key] && byKey[tokenHash]) { byKey[key] = byKey[tokenHash]; delete byKey[tokenHash]; }
     const prevE = byKey[key];
-    // One token on two machines shows up as a second instance_id: keep BOTH entries, flag both as a conflict,
-    // until an operator removes one (POST /api/admin/clear-server) or re-enrolls with separate tokens.
-    const siblings = Object.keys(byKey).filter((k) => k !== key && k.split(':')[0] === tokenHash && k.includes(':'));
-    const conflict = siblings.length > 0;
-    if (conflict) for (const k of siblings) byKey[k].conflict = true;
     const prev = prevE?.report;
     // Short in-memory history (about 2 h at a 10 s interval) for the per-server page's charts.
     const hist = (prevE?.hist || []).slice(-719);
     const lagNow = chain[r.network]?.head && r.source?.head ? Math.max(0, chain[r.network].head - r.source.head) : null;
     hist.push({ t: ts, head: r.source?.head ?? null, lag: lagNow, peers: r.metal?.peers ?? null, ok: r.checks.filter((c) => c.ok).length, n: r.checks.length });
-    byKey[key] = { report: r, received: now, hist, first_seen: prevE?.first_seen || now, instance_id: r.instance_id || null, conflict: conflict || !!prevE?.conflict };
-    lastTs[key] = ts; saveReplaySoon();
+    byKey[key] = { report: r, received: now, hist, first_seen: prevE?.first_seen || now, instance_id: r.instance_id || null, conflict: false };
+    // One token on two machines shows up as a second instance_id: keep BOTH entries, flag every entry of the token
+    // as a conflict, until an operator removes one (POST /api/admin/clear-server) or re-enrolls with separate tokens.
+    recomputeConflicts(byKey, tokenHash);
+    const conflict = byKey[key].conflict;
+    if (!commitServers([r.network, r.producer, byKey], { [key]: ts })) return send(res, 503, { error: 'could not persist the report; not accepted, retry' });
+    (nodes[r.network] ||= dict())[r.producer] = byKey;
+    lastTs[key] = ts;
     const label = servers(r.network, r.producer).find((s) => s.key === key)?.label || r.node;
     const who = Object.keys(byKey).length > 1 || r.node ? `${r.producer} · ${label}` : r.producer;
     if (conflict && !prevE?.conflict) pushEvent(r.network, who, 'the same beacon token is reporting from two machines (second instance id): both kept and flagged');
