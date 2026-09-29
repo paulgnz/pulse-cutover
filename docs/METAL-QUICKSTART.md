@@ -37,7 +37,10 @@ Then a numbered **NEXT STEPS** list tells you exactly what to do:
 1. whether port 9651 is reachable from the internet (mission control dials back to your server's IP on 9651
    only, via `/api/reach`) and how to fix it if not;
 2. the exact `scp` command to copy your key archive off the server. The archive is verified against the live
-   key files, and every run makes a new timestamped one (never overwritten). If you ran it with `sudo`, a second
+   key files and restore-tested (the archived certificate must derive the NodeID the node runs as), and every
+   run makes a new timestamped one (never overwritten). At a terminal it then asks you to confirm you copied it
+   off the server (`--i-have-backed-up` skips the question for automation); the answer is recorded as `custody`
+   in `identity.json`, and `--check` reminds you while it is unconfirmed. If you ran it with `sudo`, a second
    copy is put in your home directory, readable only by you, so you can `scp` it as yourself. **Both copies
    contain private keys**: delete the home-directory copy once it is stored safely;
 3. how to check sync;
@@ -47,7 +50,8 @@ Then a numbered **NEXT STEPS** list tells you exactly what to do:
 Everything is also saved in `/etc/metalgo/identity.txt`, and machine-readable for scripts and agents in
 `/etc/metalgo/identity.json` (schema `metal-identity-v1`, public values only).
 
-> Want to look first? Add `-s -- --dry-run`. No nodeos on this box? Add `-s -- --metal tahoe` (testnet) or
+> Want to look first? Add `-s -- --dry-run`: it installs and changes nothing (it does fetch the manifest, to
+> validate it). No nodeos on this box? Add `-s -- --metal tahoe` (testnet) or
 > `-s -- --metal mainnet`.
 
 ## The three things you must not miss
@@ -61,7 +65,7 @@ Everything is also saved in `/etc/metalgo/identity.txt`, and machine-readable fo
 
    Chain data doesn't need backing up: it re-syncs. **Never run two nodes with the same keys at the same time.**
 2. **Open 9651/tcp to the internet.** Peers reach you there. The installer tests it from outside (mission
-   control dials back to your server's IP on 9651 only) and, if it's closed, tells you **which** firewall blocks it
+   control dials back to your server's IP on 9651 only) and, if it's closed, names the **likely** firewall layer
    and the exact fix:
 
    | Blocked by | Fix it prints |
@@ -140,5 +144,12 @@ rather than risk the node identity.
 
 **Mission control unreachable?** The installer stops: it does not install without the published manifest. On
 testnet only, `--allow-unpinned` falls back to the checksum pins built into the script. The Docker method needs a
-digest-pinned image in the manifest, and `--build` checks out the exact pinned commit and verifies the Go
-toolchain's checksum.
+digest-pinned image in the manifest, and `--build` needs the manifest to pin `metalgo_commit`: it checks out exactly
+that commit and verifies the Go toolchain's checksum (a tag alone is refused, since tags can move).
+
+**Upgrades are transactions.** Everything is downloaded and verified first. From the moment the old metalgo is
+stopped until the new one is verified (same NodeID **and** same BLS key, expected version and network), any
+failure puts the previous binary, config and unit back, starts the previous node and checks it answers with its
+old NodeID and BLS key. `--adopt` also refuses a node whose key files are configured anywhere other than
+`/var/lib/metalgo/staking/`, or that uses ephemeral or inline keys, since this script's config would change its
+identity.

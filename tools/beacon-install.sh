@@ -7,8 +7,10 @@
 # `producer-name` in nodeos' config.ini; pass --network / --producer to override.
 #
 # What the INSTALLER writes: the pulse-cutover binary (/usr/local/bin/pulse-cutover), a readiness config
-# (/etc/pulse-cutover/beacon.toml), a token (/etc/pulse-cutover/beacon.token), a doctor report
-# (/var/lib/pulse-cutover/doctor.json) and the `pulse-beacon` systemd service.
+# (/etc/pulse-cutover/beacon.toml), a token and an instance id (/etc/pulse-cutover/beacon.token, beacon.instance),
+# a doctor report (/var/lib/pulse-cutover/doctor.json), the beacon's own state dir (/var/lib/pulse-beacon) and the
+# `pulse-beacon` systemd service. The beacon can write ONLY its state dir: the ceremony directory
+# /var/lib/pulse-cutover (journal, lock, staged snapshot) stays root-owned and is read-only to the beacon.
 # What the running BEACON does: reads local state (nodeos get_info, Metal node info, service status, free disk)
 # and reports it to mission control every few seconds. It never touches nodeos, its config, keys or block
 # production, and opens no port.
@@ -27,7 +29,7 @@ set -euo pipefail
 
 VERSION_DEFAULT="v0.5.0-rc.5"
 URL_DEFAULT="https://control-rehearsal.protonnz.com"
-ETC=/etc/pulse-cutover; VAR=/var/lib/pulse-cutover; BIN=/usr/local/bin/pulse-cutover
+ETC=/etc/pulse-cutover; VAR=/var/lib/pulse-cutover; STATE=/var/lib/pulse-beacon; BIN=/usr/local/bin/pulse-cutover
 UNIT=/etc/systemd/system/pulse-beacon.service; SVC_USER=pulse-beacon
 MAINNET_CHAIN=384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0
 TESTNET_CHAIN=71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd
@@ -38,13 +40,25 @@ die() { printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---- pure helpers (unit-tested in tools/test/run.sh) --------------------------------------------------
 # The bearer token travels with every report, so the report URL must be HTTPS (plain http only to this host).
+# Parsed, not pattern-matched: `http://localhost.example.org` and `http://localhost:80@example.org` are remote.
 check_url() {
-  case "$1" in
-    https://*) return 0;;
-    http://127.0.0.1*|http://localhost*|http://\[::1\]*) return 0;;
-    *) die "mission-control URL must be https:// (the beacon token is sent with every report): got '$1'";;
-  esac
+  local why
+  why=$(python3 - "$1" <<'PY2'
+import sys, urllib.parse
+u = sys.argv[1]
+try: p = urllib.parse.urlsplit(u); host = p.hostname; p.port
+except Exception as e: print(f"not a valid URL ({e.__class__.__name__})"); sys.exit(1)
+if p.username is not None or p.password is not None or "@" in p.netloc: print("URL must not contain user info (user@host)"); sys.exit(1)
+if not host: print("URL has no host"); sys.exit(1)
+if p.scheme == "https": sys.exit(0)
+if p.scheme == "http" and host in ("localhost", "127.0.0.1", "::1"): sys.exit(0)
+print("must be https:// (plain http only to localhost / 127.0.0.1 / [::1])"); sys.exit(1)
+PY2
+  ) || die "mission-control URL rejected: $why (the beacon token is sent with every report): got '$1'"
 }
+# existing_ancestor PATH → PATH itself or its nearest existing parent (free space is measured there when the
+# snapshots dir does not exist yet).
+existing_ancestor() { local p=$1; while [ -n "$p" ] && [ "$p" != / ] && [ ! -e "$p" ]; do p=$(dirname "$p"); done; printf '%s' "${p:-/}"; }
 check_producer() { [[ "$1" =~ ^[a-z1-5.]{1,12}$ ]] || die "--producer must be an Antelope account name (got '$1')"; }
 mode_for_role() { [ "$1" = producer ] && echo producer || echo api; }
 # toml_read FILE → shell-quoted OLD_<section>_<key>=value lines for the simple `key = value` TOML this script
@@ -95,6 +109,40 @@ parse_args() {
   [ -z "$NODE" ] || [[ "$NODE" =~ ^[A-Za-z0-9._-]{1,48}$ ]] || die "--node must be 1-48 of A-Z a-z 0-9 . _ -"
 }
 
+# restore_previous: put back binary, config, token, instance id and unit as they were before this run.
+APPLYING=0; RESTORED=0; RETIRED=""; OLD_FOUND=0
+restore_previous() {
+  RESTORED=1; APPLYING=0
+  warn "the update did not complete: restoring the previous beacon"
+  systemctl stop pulse-beacon 2>/dev/null || true
+  local f
+  for f in "$BIN" "$ETC/beacon.toml" "$ETC/beacon.instance" "$UNIT"; do
+    if [ -f "$f.prev" ]; then mv -f "$f.prev" "$f"; else [ "$OLD_FOUND" = 1 ] || rm -f "$f"; fi
+    rm -f "$f.new"
+  done
+  # token: if this run retired the enrolled token, bring it back; if it replaced one, restore the old bytes
+  if [ -n "$RETIRED" ] && [ -f "$RETIRED" ]; then mv -f "$RETIRED" "$ETC/beacon.token"
+  elif [ -f "$ETC/beacon.token.prev" ]; then mv -f "$ETC/beacon.token.prev" "$ETC/beacon.token"; fi
+  systemctl daemon-reload 2>/dev/null || true
+  if [ "$OLD_FOUND" = 1 ] && [ -f "$UNIT" ]; then
+    systemctl restart pulse-beacon 2>/dev/null || true; sleep 2
+    RESTORE_MSG="rolled back to the previous beacon (service: $(systemctl is-active pulse-beacon 2>/dev/null); token hash $(token_hash "$ETC/beacon.token" | cut -c1-12)…, unchanged)"
+  else
+    systemctl disable --now pulse-beacon >/dev/null 2>&1 || true
+    RESTORE_MSG="install failed: nothing is running; the partial install was removed"
+  fi
+}
+on_exit() {
+  local rc=$?
+  if [ "$APPLYING" = 1 ] && [ "$RESTORED" = 0 ]; then
+    restore_previous
+    printf '\033[31m[x]\033[0m update failed (exit %s). %s. Send the lines above to the operator.\n' "$rc" "$RESTORE_MSG" >&2
+    rc=1
+  fi
+  [ -n "${TMP:-}" ] && rm -rf "$TMP"
+  exit $rc
+}
+
 uninstall() {
   systemctl disable --now pulse-beacon 2>/dev/null || true; rm -f "$UNIT"
   systemctl daemon-reload; say "beacon removed (kept $ETC for your records; the token there is still enrolled until the operator revokes it)"
@@ -107,7 +155,8 @@ main() {
   if [ "$UNINSTALL" = 1 ]; then uninstall; exit 0; fi
 
   # ---- re-run = upgrade: every existing value is kept unless a flag overrides it ------------------------
-  local OLD_FOUND=0 CHANGED_OWNER=0 HASH_BEFORE=""
+  OLD_FOUND=0; local CHANGED_OWNER=0 HASH_BEFORE=""
+  JOURNAL=""; STAGED=""; TARGET_RPC=""
   if [ -f "$ETC/beacon.toml" ]; then
     OLD_FOUND=1; eval "$(toml_read "$ETC/beacon.toml")"
     local old_prod=${OLD_beacon_producer:-} old_net=${OLD_beacon_network:-}
@@ -116,6 +165,7 @@ main() {
     [ -n "$INTERVAL" ] || INTERVAL=${OLD_beacon_interval_secs:-}
     [ -n "$API" ] || API=${OLD_source_rpc_url:-};         [ -n "$PAPI" ] || PAPI=${OLD_source_producer_api_url:-}
     [ -n "$SNAPDIR" ] || SNAPDIR=${OLD_snapshot_dir:-}
+    JOURNAL=${OLD_journal_path:-}; STAGED=${OLD_snapshot_staged_path:-}; TARGET_RPC=${OLD_target_rpc_url:-}
     if [ -z "$URL" ] && [ -n "${OLD_beacon_url:-}" ]; then URL=${OLD_beacon_url%/api/report}; fi
     if { [ -n "$old_prod" ] && [ "$PRODUCER" != "$old_prod" ]; } || { [ -n "$old_net" ] && [ "$NETWORK" != "$old_net" ]; }; then
       CHANGED_OWNER=1; warn "producer/network changed ($old_prod@$old_net → $PRODUCER@$NETWORK): a NEW token will be generated and must be enrolled"
@@ -124,13 +174,15 @@ main() {
   fi
   HASH_BEFORE=$(token_hash "$ETC/beacon.token")
   URL=${URL:-$URL_DEFAULT}; VERSION=${VERSION:-$VERSION_DEFAULT}; INTERVAL=${INTERVAL:-10}
+  JOURNAL=${JOURNAL:-$VAR/journal.jsonl}; STAGED=${STAGED:-$VAR/snapshot-cut.bin}
+  TARGET_RPC=${TARGET_RPC:-http://127.0.0.1:9650/ext/bc/NOT-CONFIGURED/rpc}
   check_url "$URL"
 
   # ---- download + verify + survey, all in a temp dir (nothing on the box changes yet) --------------------
   local ARCH T REL TMP B
   ARCH=$(uname -m); case "$ARCH" in x86_64) T=x86_64-unknown-linux-musl;; aarch64|arm64) T=aarch64-unknown-linux-musl;; *) die "unsupported arch $ARCH";; esac
   REL="https://github.com/paulgnz/pulse-cutover/releases/download/$VERSION"
-  TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+  TMP=$(mktemp -d); trap on_exit EXIT
   say "downloading pulse-cutover $VERSION ($T)"
   curl -fsSL -o "$TMP/pulse-cutover-$T" "$REL/pulse-cutover-$T" || die "download failed: $REL/pulse-cutover-$T"
   curl -fsSL -o "$TMP/sha256sums.txt" "$REL/sha256sums.txt" || die "download failed: $REL/sha256sums.txt"
@@ -195,7 +247,7 @@ main() {
     cat <<TOML
 # Readiness-only config for the pulse-cutover beacon (written by beacon-install.sh $VERSION).
 # It is for reporting only. Do not run a ceremony with it.
-journal_path = "$VAR/journal.jsonl"
+journal_path = "$JOURNAL"
 poll_ms = 1000
 
 [ceremony]
@@ -211,12 +263,12 @@ rpc_url = "$API"
 producer_api_url = "$PAPI"
 
 [snapshot]
-staged_path = "$VAR/snapshot-cut.bin"
+staged_path = "$STAGED"
 dir = "$SNAPDIR"
 
 [target]
 metalgo_unit = "$MG_UNIT"
-rpc_url = "http://127.0.0.1:9650/ext/bc/NOT-CONFIGURED/rpc"
+rpc_url = "$TARGET_RPC"
 
 [beacon]
 url = "${URL%/}/api/report"
@@ -230,7 +282,9 @@ TOML
   }
   # probe: does this binary understand `profile = "readiness"` (then no ceremony can run from the file)?
   local PROFILE=1
-  write_config 1 | sed 's|^url = .*|url = ""|; s|^token_file = .*|token_file = "/dev/null"|' > "$TMP/probe.toml"
+  mkdir -p "$TMP/probe-journal"
+  probe_cfg() { sed "s|^url = .*|url = \"\"|; s|^token_file = .*|token_file = \"/dev/null\"|; s|^journal_path = .*|journal_path = \"$TMP/probe-journal/journal.jsonl\"|"; }
+  write_config 1 | probe_cfg > "$TMP/probe.toml"
   if "$B" beacon --config "$TMP/probe.toml" --once > "$TMP/probe.out" 2>&1; then :
   elif grep -qi "profile" "$TMP/probe.out"; then
     PROFILE=0
@@ -241,7 +295,7 @@ TOML
   fi
   write_config "$PROFILE" > "$TMP/beacon.toml"
   # The exact file that will be installed must load and produce a report, or nothing is installed.
-  sed 's|^url = .*|url = ""|; s|^token_file = .*|token_file = "/dev/null"|' "$TMP/beacon.toml" > "$TMP/once.toml"
+  probe_cfg < "$TMP/beacon.toml" > "$TMP/once.toml"
   if ! "$B" beacon --config "$TMP/once.toml" --once > "$TMP/once.out" 2>"$TMP/once.err"; then
     [ "$FORCE" = 1 ] || die "the beacon cannot run with the generated config: $(tail -c 300 "$TMP/once.err") (nothing was changed; --force installs anyway)"
     warn "the beacon cannot run with the generated config; continuing because of --force"
@@ -255,28 +309,49 @@ for c in r.get("checks",[]): print("   ", "ok " if c.get("ok") else "-- ", c.get
 
   if [ "$DRY" = 1 ]; then say "dry run: nothing installed or written outside a temp dir"; exit 0; fi
 
-  # ---- apply: keep the previous binary/config/unit and restore them if the new beacon does not start -------
-  mkdir -p "$ETC" "$VAR"; chmod 750 "$ETC"
-  [ -f "$BIN" ] && cp -p "$BIN" "$BIN.prev"
-  [ -f "$ETC/beacon.toml" ] && cp -p "$ETC/beacon.toml" "$ETC/beacon.toml.prev"
-  [ -f "$UNIT" ] && cp -p "$UNIT" "$UNIT.prev"
+  # ---- apply: transactional. From the first change until the new beacon is confirmed running, ANY failure
+  # (install, chown, systemctl, restart, or the beacon not staying up) restores the previous binary, config,
+  # unit, token and instance id and restarts the previous beacon. ---------------------------------------------
+  mkdir -p "$ETC"; chmod 750 "$ETC"
+  local f
+  for f in "$BIN" "$ETC/beacon.toml" "$ETC/beacon.token" "$ETC/beacon.instance" "$UNIT"; do
+    rm -f "$f.prev"; [ -f "$f" ] && cp -p "$f" "$f.prev"
+  done
+  APPLYING=1
+  RETIRED=""
   if [ "$CHANGED_OWNER" = 1 ] || [ ! -s "$ETC/beacon.token" ]; then
-    [ -s "$ETC/beacon.token" ] && mv -f "$ETC/beacon.token" "$ETC/beacon.token.retired-$(date -u +%Y%m%dT%H%M%SZ)"
+    if [ -s "$ETC/beacon.token" ]; then RETIRED="$ETC/beacon.token.retired-$(date -u +%Y%m%dT%H%M%SZ)"; mv -f "$ETC/beacon.token" "$RETIRED"; fi
     (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ETC/beacon.token")
   fi
-  install -m 755 "$B" "$BIN.new" && mv -f "$BIN.new" "$BIN"
-  install -m 640 "$TMP/beacon.toml" "$ETC/beacon.toml.new" && mv -f "$ETC/beacon.toml.new" "$ETC/beacon.toml"
-  cp -f "$TMP/doctor.json" "$VAR/doctor.json" 2>/dev/null || true
+  install -m 755 "$B" "$BIN.new"; mv -f "$BIN.new" "$BIN"
+  install -m 640 "$TMP/beacon.toml" "$ETC/beacon.toml.new"; mv -f "$ETC/beacon.toml.new" "$ETC/beacon.toml"
+  mkdir -p "$VAR"; cp -f "$TMP/doctor.json" "$VAR/doctor.json" 2>/dev/null || true
 
-  # Run as an unprivileged user when that user can read everything the beacon needs (token, journal dir,
-  # snapshots dir for free-space). Otherwise root, but with only the capability to read/search files.
+  # Instance id: stable per server. rc.5 kept it next to the journal ($VAR); it now lives with the token, so the
+  # beacon never has to write into the ceremony directory. An existing id is carried over, never regenerated.
+  if [ ! -s "$ETC/beacon.instance" ]; then
+    if [ -s "$VAR/beacon.instance" ] && grep -qE '^[0-9a-f]{32}$' "$VAR/beacon.instance"; then cp "$VAR/beacon.instance" "$ETC/beacon.instance"
+    else head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ETC/beacon.instance"; echo >> "$ETC/beacon.instance"; fi
+  fi
+
+  # Observer isolation: the ceremony directory is root's (rc.5 handed it to the beacon user; take it back).
+  chown root:root "$VAR"; chmod 755 "$VAR"
+  [ -f "$VAR/beacon.instance" ] && chown root:root "$VAR/beacon.instance"
   local RUNAS=root
   id "$SVC_USER" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin "$SVC_USER"
-  chown root:"$SVC_USER" "$ETC" "$ETC/beacon.toml" "$ETC/beacon.token"; chmod 640 "$ETC/beacon.token" "$ETC/beacon.toml"; chmod 750 "$ETC"
-  chown "$SVC_USER":"$SVC_USER" "$VAR" 2>/dev/null || true
-  if runuser -u "$SVC_USER" -- test -r "$ETC/beacon.token" 2>/dev/null && runuser -u "$SVC_USER" -- df -P "$SNAPDIR" >/dev/null 2>&1; then RUNAS=$SVC_USER
-  else warn "the snapshots dir $SNAPDIR is not readable by an unprivileged user: running the beacon as root with read-only file access (CAP_DAC_READ_SEARCH only)"; chmod 600 "$ETC/beacon.token"; chown root:root "$ETC/beacon.token"; fi
-  cat > "$UNIT" <<UNIT
+  chown root:"$SVC_USER" "$ETC" "$ETC/beacon.toml" "$ETC/beacon.token" "$ETC/beacon.instance"
+  chmod 640 "$ETC/beacon.token" "$ETC/beacon.toml" "$ETC/beacon.instance"; chmod 750 "$ETC"
+  # Unprivileged when that user can read what the beacon reads: token, the ceremony journal (if one exists),
+  # and the snapshots dir (free-space check). Otherwise root, limited to reading files.
+  if runuser -u "$SVC_USER" -- test -r "$ETC/beacon.token" 2>/dev/null \
+     && runuser -u "$SVC_USER" -- test -x "$(dirname "$JOURNAL")" 2>/dev/null \
+     && { [ ! -e "$JOURNAL" ] || runuser -u "$SVC_USER" -- test -r "$JOURNAL" 2>/dev/null; } \
+     && runuser -u "$SVC_USER" -- df -P "$(existing_ancestor "$SNAPDIR")" >/dev/null 2>&1; then RUNAS=$SVC_USER
+  else
+    warn "the beacon user cannot read the ceremony journal or snapshots dir: running the beacon as root with read-only file access (CAP_DAC_READ_SEARCH only)"
+    chmod 600 "$ETC/beacon.token"; chown root:root "$ETC/beacon.token"
+  fi
+  cat > "$UNIT.new" <<UNIT
 [Unit]
 Description=pulse-cutover beacon (readiness reporter → mission control)
 After=network-online.target
@@ -290,25 +365,21 @@ ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
 PrivateDevices=yes
-ReadWritePaths=$VAR
+# The beacon may write only its own state dir; the ceremony dir ($VAR) and /etc stay read-only to it.
+StateDirectory=pulse-beacon
+ReadWritePaths=$STATE
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 [Install]
 WantedBy=multi-user.target
 UNIT
+  mv -f "$UNIT.new" "$UNIT"
+  ${FAULT_BEFORE_RESTART:-true}   # test hook: FAULT_BEFORE_RESTART=false forces a failure mid-apply
   systemctl daemon-reload; systemctl enable pulse-beacon >/dev/null 2>&1; systemctl restart pulse-beacon
   sleep 3
-  if ! systemctl is-active --quiet pulse-beacon; then
-    warn "the new beacon did not stay up: restoring the previous version"
-    journalctl -u pulse-beacon -n 15 --no-pager 2>/dev/null | sed 's/^/    /' || true
-    [ -f "$BIN.prev" ] && mv -f "$BIN.prev" "$BIN"
-    [ -f "$ETC/beacon.toml.prev" ] && mv -f "$ETC/beacon.toml.prev" "$ETC/beacon.toml"
-    [ -f "$UNIT.prev" ] && mv -f "$UNIT.prev" "$UNIT"
-    systemctl daemon-reload
-    if [ -f "$BIN" ] && [ "$OLD_FOUND" = 1 ]; then systemctl restart pulse-beacon 2>/dev/null || true
-      die "update failed and was rolled back (beacon: $(systemctl is-active pulse-beacon 2>/dev/null))"; fi
-    systemctl disable --now pulse-beacon >/dev/null 2>&1 || true
-    die "install failed: the beacon is stopped and disabled. Send the lines above to the operator."
-  fi
+  systemctl is-active --quiet pulse-beacon || { journalctl -u pulse-beacon -n 15 --no-pager 2>/dev/null | sed 's/^/    /' || true; false; }
+  APPLYING=0   # committed
+  rm -f "$BIN.prev" "$ETC/beacon.toml.prev" "$ETC/beacon.instance.prev" "$UNIT.prev"
+  [ -z "$RETIRED" ] && rm -f "$ETC/beacon.token.prev"
   say "beacon running as $RUNAS: $(systemctl is-active pulse-beacon)"
 
   local HASH; HASH=$(token_hash "$ETC/beacon.token")
