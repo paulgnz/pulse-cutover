@@ -1,15 +1,28 @@
 # Atomicity: what we claim, and how each claim is proven
 
 A cutover keeps the **same chain_id**, so a transaction signed for the old chain is also
-validly signed for the new one. That is what makes the switch instant for wallets,
-exchanges and bots, and it is also why the cut has to be **atomic**. Every transaction
-lands on exactly one side of the boundary, exactly once, and the state on both sides of
-the boundary is the same state.
+validly signed for the new one. That keeps the signing domain for wallets, exchanges and
+bots unchanged (validity still depends on TAPOS, expiry, permissions and deduplication), and
+it is also why the cut has to be **atomic**: every transaction should land on exactly one
+side of the boundary, exactly once, with the same state on both sides. That is the
+requirement; this document records how far the evidence goes towards it.
 
 This document breaks "atomic" into five properties, names the evidence for each, and
-records the rehearsal that produced that evidence. Every check is automated: it is either a
-ceremony gate (the ceremony aborts if it fails) or a tool in [`tools/`](tools/) whose
-output is kept as evidence.
+records the rehearsal that produced that evidence. Some checks are ceremony gates (the
+ceremony aborts if they fail); others are optional tools in [`tools/`](tools/) whose output
+is kept as evidence. Producing evidence automatically is not the same as a mandatory
+fleet-wide barrier, and run 5 needed a manual step.
+
+> [!IMPORTANT]
+> **Status at a glance (2026-09-29)**
+> - **Proven in rehearsal** (5 BPs, private Metal network, fork plugin): the same cut block, snapshot hash and table
+>   fingerprints on every BP (A1); zero transactions after H in every successful run (A2); a symmetric abort where all
+>   5 BPs resumed the old chain (run 1).
+> - **Demonstrated on a sample only**: state equality on 19 accounts / 5 contracts / 32 table scopes (A3); a replay
+>   canary of 10 held + 10 pre-cut transfers (A4).
+> - **Not done**: A5 (fleet-wide all-or-nothing) is not implemented; nothing has run on upstream PulseVM v1.0.0 /
+>   protocol 45 / Tahoe; validators shared one producer key. See [Known limits](#known-limits-independent-review-2026-09-29)
+>   and [Upstream stack re-qualification](#upstream-stack-re-qualification).
 
 ```mermaid
 flowchart LR
@@ -29,11 +42,11 @@ flowchart LR
 
 | # | Property | Why it matters | Evidence | Kind |
 |---|---|---|---|---|
-| **A1** | **Same cut on every producer**: every BP snapshots the same block H, byte-for-byte | Validators that import different states fork on the first block | `schedule_at_h` pins the snapshot to H's block id; each BP's journal records the file name `snapshot-<id of H>.bin`, its sha256 and 19–21 table fingerprints. All BPs must agree | gate + cross-BP comparison |
+| **A1** | **Same cut on every producer**: every BP snapshots the same block H, byte-for-byte | Validators that import different states fork on the first block | `schedule_at_h` pins the snapshot to H's block id; each BP's journal records the file name `snapshot-<id of H>.bin`, its sha256 and 19–21 table fingerprints. Scheduled producer runs produced identical H artifacts; the fallback snapshot path, restart recovery and API mode do not yet enforce exact H, and agreement is not checked against a complete roster | gate (producer mode) + cross-BP comparison |
 | **A2** | **Nothing lands after the cut**: zero transactions in H+1 … pause | Anything after H is on the old chain but not the new one, so it silently disappears | Writes close `freeze_lead_blocks` before H; the **burn-off audit** reads every block from H+1 to the pause and aborts on any transaction (fail-closed: an unreadable block also aborts) | gate |
-| **A3** | **Same state on both sides**: accounts, permissions, keys, contracts (code and ABI hash) and table rows on the new chain at H equal the old chain at H, *for the state the diff surveys* (seeded accounts, every contract found, every scope of every ABI table). Not yet a whole-state commitment: see Known limits | Proves the import neither lost nor altered anything | `tools/state-diff.mjs`: byte-exact diff of the paused old chain against the new chain **before its first new block**, run on every BP by the `post_ignite` hook. Plus dual import with identical fingerprints (VERIFIED gate) | tool on every BP |
-| **A4** | **Exactly once across the boundary**: a transaction executed before the cut does not execute again after it; one signed before but sent after executes once | Same chain_id makes pre-cut signatures valid on the new chain, so a replay would be a double spend | `tools/replay-canary.mjs`: pre-signs transfers with a long expiry, sends half to the old chain before the freeze, then after LIVE sends **all of them twice** to the new chain. Checks the receiver's balance delta equals the held half exactly. Plus app-level reconciliation (HFT and perps bots: 0 duplicates, every accepted transaction accounted for) | tool |
-| **A5** | **All or nothing**: either every producer moves to the new chain or the old chain carries on untouched | Half a network on each chain is a fork | Nothing user-visible changes before LIVE; any gate failure → `ABORTED` → the producer resumes the old chain (proven: run 1 aborted on all 5 BPs and all resumed). The public edge flips only `on_live` | gate + rehearsal |
+| **A3** | **Same state on both sides**: accounts, permissions, keys, contracts (code and ABI hash) and table rows on the new chain at H equal the old chain at H, *for the state the diff surveys* (seeded accounts, every contract found, every scope of every ABI table). Not yet a whole-state commitment: see Known limits | Shows equality of the successfully enumerated, normalized sample; comparator errors and pagination caps are not yet fail-closed | `tools/state-diff.mjs`: byte-exact diff of the paused old chain against the new chain **before its first new block**, run on every BP by the `post_ignite` hook. Plus dual import with identical fingerprints (VERIFIED gate) | tool on every BP |
+| **A4** | **Exactly once across the boundary**: a transaction executed before the cut does not execute again after it; one signed before but sent after executes once | Same chain_id makes pre-cut signatures valid on the new chain, so a replay would be a double spend | `tools/replay-canary.mjs`: pre-signs transfers with a long expiry, sends half to the old chain before the freeze, then after LIVE sends **all of them twice** to the new chain. Checks the receiver's balance delta equals the held half exactly. Plus app-level reconciliation (HFT and perps bots: 0 duplicate orders). A passing sample, not a general exactly-once result: some orders admitted after LIVE never executed (see note below), and the verdict rests on an aggregate balance delta | tool |
+| **A5** | **All or nothing**: either every producer moves to the new chain or the old chain carries on untouched | Half a network on each chain is a fork | **Not implemented as a fleet property.** Each producer aborts and resumes locally on a gate failure; run 1 showed a *symmetric* abort (all 5 resumed). There is no fleet-wide authority boundary, so a partial abort after some producers ignite is not prevented. The write freeze is user-visible, and in API mode the public flip can precede LIVE | local gate only; open |
 
 ## Evidence from the 5-BP rehearsal
 
@@ -42,7 +55,7 @@ validator and a public TLS API edge (nginx on three, HAProxy on two). Apps write
 the edges the whole time: a 0.5 s transfer bot, a perps DEX order bot, an oracle feeder
 and a keeper. Full timelines are in the [README](README.md#multi-producer-cutover-5-bps-5-continents).
 
-### Run 5: all five properties checked in one ceremony (2026-09-28, cut at H = 6220)
+### Run 5: A1–A4 exercised in one ceremony (2026-09-28, cut at H = 6220)
 
 | # | Result | Evidence (per BP, all 5 identical) |
 |---|---|---|
@@ -50,17 +63,19 @@ and a keeper. Full timelines are in the [README](README.md#multi-producer-cutove
 | **A2** nothing after the cut | ✅ **0 transactions** | burn-off audit: 62 blocks from H+1 to the pause, 0 transactions, on every BP, with four bots still hammering the API edges (writes closed at H−24) |
 | **A3** same state | ✅ **identical on the surveyed state, 5/5** | `state-diff`: old chain (paused at 6282) vs PulseVM at **exactly 6220**, before its first new block. 19 accounts (permissions, keys, privileged flag), 5 contracts (code hash + ABI hash), 32 table scopes (every row as raw bytes). State digest `c21764756abb1080…` on both sides, on every BP |
 | **A4** exactly once | ✅ **0 replays, 0 losses, 0 duplicates** | `replay-canary`: 10 transfers executed on the old chain before the cut were re-sent twice to PulseVM → **all 20 attempts rejected** (`duplicate tx`: the imported state carries the recent-transaction dedupe set). 10 transfers signed before the cut but held → **executed exactly once**, second sends rejected; receiver delta = exactly 10 transfers. Perps order bot: 483 cycles, **0 duplicate orders**, every order admitted before the cut is on the book |
-| **A5** all or nothing | ✅ | every BP stayed on the old chain until its own LIVE gate passed; run 1 of the same rehearsal aborted on all 5 BPs (transactions leaked past H) and all 5 resumed the old chain automatically |
+| **A5** all or nothing | ⚠️ **not proven** | every BP reached LIVE, so no asymmetric case occurred. Run 1 showed a symmetric abort (all 5 resumed); a partial abort is not prevented by the tooling (Known limits #1) |
 
 Timeline (bp1, UTC): ARMED 23:54:34 · FROZEN 23:56:47 · SNAPSHOTTED 23:57:32.6 · VERIFIED 23:57:32.6 ·
 IGNITED 23:57:45 · LIVE 00:05:59.5. All five BPs hit each transition within 1.5 s of each other.
 
 > [!NOTE]
-> The long gap between IGNITED and LIVE in run 5 is an operator error, not the protocol: the
-> `post_ignite` hook shipped without its execute bit, so no heartbeat reached the new chain. That
-> left every BP holding the new chain at exactly H for 8 minutes, which is when the A3 state
-> diff was taken; the heartbeat was then sent by hand. Writes stayed frozen (HTTP 503) the whole
-> time: 1,103 refused writes on the HFT bot, none lost. Runs 2–4 had a write gap of ~72 s.
+> The long gap between IGNITED and LIVE in run 5 has two causes: a packaging error (the `post_ignite`
+> hook shipped without its execute bit, so no heartbeat reached the new chain) and a ceremony gap (a
+> required hook failing did not stop the run). Every BP held the new chain at exactly H for 8 minutes,
+> which is when the A3 state diff was taken; the heartbeat was then sent by hand. Writes stayed frozen
+> (HTTP 503) the whole time: 1,103 refused writes on the HFT bot, none lost. Measured write gaps
+> (journal `write_gap_ms_wallclock`): run 2 ≈ 243 s (manual traffic), runs 3 and 4 ≈ 72 s and 71 s,
+> run 5 ≈ 553 s, run 6 101–114 s.
 
 > [!NOTE]
 > "Admitted" on PulseVM means accepted into the mempool, not executed. One perps order per run (runs 4 and 5)
@@ -76,10 +91,10 @@ bot ledgers) is archived with the rehearsal notes.
 | Run | Properties exercised | Outcome |
 |---|---|---|
 | 1 | A1, A2, **A5** | identical snapshot on all 5; 3 transactions leaked into H+1 → **every BP aborted and resumed the old chain** (the gate working as designed); led to `freeze_lead_blocks` |
-| 2 | A1, A2 | LIVE on all 5; identical fingerprints and anchor id; balances continuous |
-| 3 | A1, A2, apps | LIVE unattended through public edges; surfaced a mempool bug in the plugin build (fixed upstream, fork rebuilt) |
-| 4 | A1, A2, apps | LIVE with a perps DEX, oracle and keeper; 0 duplicate orders; 79/79 transfers landed |
-| 6 | **A1–A5, unattended, one public URL** | all 7 evidence values agreed 5/5 on mission control; `state-diff` ran automatically at H = 8539 on every BP: identical, digest `df0f4017e7ba97bc…`; replay canary exactly-once (0 pre-cut replays accepted, 10/10 held landed once) |
+| 2 | A1, A2 | LIVE on all 5 (LIVE waited on manual post-ignite traffic; gap ≈ 243 s); identical fingerprints and anchor id; balances continuous |
+| 3 | A1, A2, apps | LIVE unattended through public edges (gap ≈ 72 s); surfaced a mempool bug in the plugin build that dropped admitted transactions (fixed upstream, fork rebuilt) |
+| 4 | A1, A2, apps | LIVE with a perps DEX, oracle and keeper (gap ≈ 71 s); 0 duplicate orders; 79/79 transfers landed; ~50 s post-LIVE stall (unexplained) |
+| 6 | **A1–A4, unattended, one public URL** | gap 101–114 s, local LIVE spread ~13 s; all 7 evidence values agreed 5/5 on mission control; `state-diff` ran automatically at H = 8539 on every BP: identical on the sample, digest `df0f4017e7ba97bc…`; replay canary passed (0 pre-cut replays accepted, 10/10 held landed once). A5 not exercised |
 
 ## Known limits (independent review, 2026-09-29)
 
@@ -101,10 +116,27 @@ is safe. Open items, most severe first:
 These are tracked as the priority list for the next release. The rehearsal results above stand as evidence for what
 they measured, and nothing more.
 
+## Upstream stack re-qualification
+
+Every run above used the fork plugin (`v0.0.0-arena-mempoolfix.1` lineage) on metalgo 1.13.5 (plugin protocol 43) on a
+private Metal network, with one shared producer key. Before any result is relied on for a public cut, re-run it on the
+intended stack (upstream PulseVM v1.0.0, protocol 45, metalgo 1.14.x on Tahoe):
+
+- exact-H import, source block-id preservation, target lineage at H and full state coverage;
+- TAPOS, unexpired-transaction deduplication, expiry and replay behaviour;
+- distinct validator identities, authoring permissions and independent key custody;
+- loaded application reconciliation (per-transaction inclusion), dependent transactions and restart behaviour;
+- the post-LIVE stall, with consensus, peer, VM and inclusion traces;
+- every supported edge adapter and the legacy Hyperion / AtomicAssets fixture;
+- validator registration and funding on the actual deployment model (classic subnet or converted L1);
+- asymmetric failures: stale or missing participant, relay restart, source restart, early target start, partial LIVE,
+  failed hooks, torn journal, host reboot.
+
 ## Reproducing the proof
 
 ```sh
-# A3 — on any BP after IGNITED, before the first new block (the post_ignite hook does this):
+# A3 — on any BP after IGNITED, before the first new block. The post_ignite hook runs this locally; it cannot
+# guarantee peers have not started producing unless the hook takes part in an enforced fleet barrier.
 node tools/state-diff.mjs --a http://127.0.0.1:8888 --b http://127.0.0.1:8899 \
      --accounts <accounts to seed discovery> --out state-diff.json
 

@@ -2,9 +2,10 @@
 
 **For block producers. Takes about 2 minutes. Safe on a live producing node.**
 
-This installs a small **read-only** reporter (the *beacon*) that tells
-[Cutover Mission Control](https://control-rehearsal.protonnz.com) whether your node is ready for a future
-PulseVM cutover. It **does not** touch nodeos, its config, your keys or block production, and it opens no ports.
+This installs a small reporter (the *beacon*) that tells [Cutover Mission Control](https://control-rehearsal.protonnz.com)
+how far your server is with preparing for a future PulseVM cutover. The running beacon only observes. Installing
+it writes a binary, a config, a token and a systemd service; it **does not** touch nodeos, its config, your keys
+or block production, and it opens no ports.
 
 ---
 
@@ -16,8 +17,10 @@ Log in to the server that runs your **producer** nodeos, then run:
 curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh | sudo bash
 ```
 
-It works out everything itself: mainnet or testnet (from your chain), your producer account (from
-`producer-name` in your nodeos `config.ini`), and your nodeos API address.
+It works out what it can by itself: mainnet or testnet (from your chain), your producer account (from
+`producer-name` in your nodeos `config.ini`), and your nodeos API address. Discovery is best-effort for the
+common layouts, so check what it prints: the nodeos instance and API it picked, the producer API, the snapshot
+directory and the Metal service name.
 
 > Want to look before you install? Add `-s -- --dry-run` to the end. It shows what it found and your readiness
 > checklist, and changes nothing:
@@ -35,8 +38,9 @@ The last thing it prints looks like this:
       network=testnet producer=youraccount token_sha256=3f9c…e21a
 ```
 
-Send that line to the operator (Telegram or email). It is only a **hash**: your secret token never leaves
-your server.
+Send that line to the operator (Telegram or email). It is only a **hash** of your token, which is what mission
+control stores. The token itself stays in a root-only file on your server and is sent to mission control, over
+HTTPS, with every report: that is how mission control knows the report is yours.
 
 ## 3. Watch your node
 
@@ -44,7 +48,8 @@ Once you're approved, your node appears on the dashboard with its readiness chec
 `https://control-rehearsal.protonnz.com/testnet/youraccount`
 
 A few red items are expected today (for example "validator not running" until the Metal node is set up).
-That list **is** your to-do list for the cutover.
+That list is your **preparation** checklist. An all-green page is not authorization to cut: it does not yet
+cover release pinning, validator membership and funding, recovery, or every public route you operate.
 
 ## 4. Set up your Metal node
 
@@ -76,14 +81,19 @@ curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/be
 
 - `/usr/local/bin/pulse-cutover`: the prebuilt binary from the
   [GitHub release](https://github.com/paulgnz/pulse-cutover/releases), checked against its sha256.
-- `/etc/pulse-cutover/beacon.toml`: a read-only config. No ceremony can run from it (no cut height, no hooks,
-  no target chain).
+- `/etc/pulse-cutover/beacon.toml`: a **readiness-only profile**; from v0.5.0-rc.5 the ceremony commands
+  (`run`, `loop`, `await`) refuse it. Configs written by rc.4 and earlier lacked that guard: a mistaken
+  `pulse-cutover run` against them could start scheduling and freezing steps. Re-run the installer to upgrade.
 - `/etc/pulse-cutover/beacon.token`: a random token made on your server, readable only by root.
 - `pulse-beacon.service`: a systemd service with a read-only filesystem, reporting every 10 seconds.
 
 What the beacon reads: your nodeos `get_info`, whether the producer API answers locally, whether a Metal
-validator service is running, and free disk. What it sends (the dashboard is public, so it is kept minimal):
+validator service is running (and, from rc.4, the Metal node's public identity: NodeID, BLS public key,
+version, peers, sync state), and free disk. What it sends (the dashboard is public, so it is kept minimal):
 pass/fail for each check with a short verdict (e.g. "83 GB free", "running"), head/LIB, your account, a node
-label you choose (default: its role), and the pulse-cutover version. **Never** sent: keys, tokens, IP addresses,
-hostnames, file paths, config contents or unit names.
+label you choose (default: its role), the pulse-cutover version, the Metal node's public identity, and the
+ceremony/coordination state. Normal check details never include private keys, hostnames, file paths, config
+contents or unit names. Two caveats: the token is sent with every report (see step 2), and a ceremony error
+message in the journal is passed through as written, so a failing hook's output can appear on the dashboard.
+Mission control also sees the IP address your reports come from (it uses it only for the 9651 reachability check).
 </details>

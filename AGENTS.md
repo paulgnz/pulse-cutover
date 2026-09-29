@@ -4,7 +4,7 @@ Instructions for AI agents (Claude Code and similar) asked to rehearse, stage or
 cutover. Read this section in full before running any command.
 
 Human-oriented docs: **[docs/PROCESS.md](docs/PROCESS.md)** (the process, step by step, with diagrams),
-[ATOMICITY.md](ATOMICITY.md) (what "atomic" means and how it is proven),
+[ATOMICITY.md](ATOMICITY.md) (what "atomic" means, what the evidence shows so far, and what is still open),
 [README.md](README.md) (operator walkthrough and field notes), [TESTING.md](TESTING.md).
 
 ---
@@ -21,6 +21,8 @@ Human-oriented docs: **[docs/PROCESS.md](docs/PROCESS.md)** (the process, step b
 2. **Start read-only.** `pulse-cutover doctor --json` first, every time. Act on `verdicts.<mode>.status`.
 3. **Get explicit human confirmation** before: `install.sh`, `cutover.sh` / `pulse-cutover run` / `loop`,
    any flip/revert script, any `stop_cmd`/`start_cmd`, any restart of nodeos, metalgo, nginx or haproxy.
+   Never pass the beacon's readiness-only config (`/etc/pulse-cutover/beacon.toml`) to `run`, `loop` or `await`:
+   from v0.5.0-rc.5 they refuse it, but rc.4 and earlier did not.
 4. **Never change H or the target config yourself.** H, the target genesis, `import_cpu_scale` and pinned
    versions come from the coordinator and must be identical on every producer. A mismatch = stop and tell the human.
 5. **Never skip or reorder gates.** Never ignite before VERIFIED, never flip public traffic before LIVE, never
@@ -33,7 +35,8 @@ Human-oriented docs: **[docs/PROCESS.md](docs/PROCESS.md)** (the process, step b
 8. **Rehearsals stay in the sandbox.** Test bots, oracle feeders and keepers must point only at the rehearsal
    endpoints. Many scripts default to real public endpoints; always pass them explicitly, and use test keys only.
 9. **Hooks must be executable, fast and idempotent.** A hook that is missing its execute bit or blocks for minutes
-   stalls the ceremony (a real rehearsal failure; see [hooks](#hook-contract)).
+   stalls the ceremony (a real rehearsal failure; see [hooks](#hook-contract)). The agent does not yet stop on a
+   failing required hook and hooks have no deadline, so check them yourself (`test -x`, a dry run) before arming.
 10. **Evidence or it didn't happen.** Every run ends with the evidence bundle in [§ Evidence to hand back](#evidence-to-hand-back),
     whether it went LIVE or ABORTED.
 
@@ -85,7 +88,7 @@ snapshot, edit `ceremony.toml`, change the edge config, or send transactions of 
 | Hook | Fires | Must do | Rehearsal reference |
 |---|---|---|---|
 | `on_freeze` | head ≥ H − `freeze_lead_blocks` | close writes at the public edge (reads stay open), return in < 5 s | nginx flag file → 503; HAProxy `add map … frozen 1` |
-| `post_ignite` | after IGNITED | give the new chain its first transactions (it builds blocks on demand); optionally run `state-diff` first | background a few local transfers, return immediately |
+| `post_ignite` | after IGNITED | give the new chain its first transactions (it builds blocks on demand); optionally run `state-diff` first (it only shows this box's view; it cannot stop peers that have already started producing) | background a few local transfers, return immediately |
 | `on_live` | after LIVE | flip the edge backend to PulseVM and reopen writes | nginx upstream swap + reload; HAProxy `enable/disable server` (0 reloads) |
 | `on_abort` | on ABORTED | undo `on_freeze`/flip; the agent resumes the producer itself | restore backend, reopen writes |
 
@@ -99,8 +102,8 @@ Every hook: executable (`chmod +x`), idempotent (safe to run twice), exits 0 on 
 | A1 same cut | compare `cut_block_id`, VERIFIED `sha256` and `fingerprints` across all producers' journals | identical everywhere |
 | A2 nothing after the cut | SNAPSHOTTED `burnoff_transactions` | `0` |
 | A3 same state | `tools/state-diff.mjs` at IGNITED, before block H+1 | `identical: true`, same digest on every producer |
-| A4 exactly once | `tools/replay-canary.mjs prepare` → `pre` (before freeze) → `post` (after LIVE) | `exactly_once: true`, `pre_cut_replays_accepted: 0` |
-| A5 all or nothing | no public flip before LIVE; any abort resumed the old chain | journal order + `source_producer_resumed: true` on aborts |
+| A4 exactly once | `tools/replay-canary.mjs prepare` → `pre` (before freeze) → `post` (after LIVE) | **all** of: `pre_cut_replays_accepted: 0`, `held_first_send_accepted` = number held, `held_second_send_accepted: 0` (don't rely on `exactly_once` alone: it is derived from an aggregate balance delta). Report it as a sample, not a proof |
+| A5 all or nothing | **not provable with the current tooling** (no fleet-wide authority boundary). Report what was exercised: every producer's terminal state, and on aborts `source_producer_resumed: true` | say "symmetric outcome observed" or "not exercised", never "A5 proven" |
 
 Details and the recorded proof: [ATOMICITY.md](ATOMICITY.md).
 
@@ -129,7 +132,7 @@ Always, LIVE or ABORTED:
 | `src/report.rs` + `src/sanitize.rs` | sanitized feedback bundle (secret redaction) |
 | `src/looper.rs` | N-run rehearsal loop harness + metrics |
 | `src/config.rs` | `ceremony.toml` agent config (see `examples/*.toml`, fully commented) |
-| `install.sh` | stages a box for a ceremony (doctor-gated, idempotent, sha256-pinned artifacts) |
+| `install.sh` | stages a box for a ceremony (doctor-gated, sha256-pinned manifest artifacts; re-running before a ceremony converges; a refusal can leave a partial install) |
 | `cutover.sh` | day-of wrapper: validate → run agent → plain-language streaming; `status` / `abort` |
 | `federator/` | /v2 history federation router (pre-cut = legacy Hyperion, post-cut = local) |
 | `examples/` | commented manifests per mode + the reference loop deployment + the containerized haproxy test rig (`haproxy-test/`) |
@@ -149,8 +152,9 @@ Read-only (always safe, any box, including production):
   the journal, prints current state + pinned evidence. Exit 0.
 - `pulse-cutover scan-contracts <snapshot.bin> [--json]` — advisory scan.
   Exit 0 even with at-risk rows.
-- `pulse-cutover beacon --config c.toml [--once]` — read-only readiness checks + journal evidence, posted to
-  mission control (`[beacon]` section). `--once` with an empty url prints the report. Safe to run any time.
+- `pulse-cutover beacon --config c.toml [--once]` — observational readiness checks + journal evidence, posted to
+  mission control (`[beacon]` section) with the bearer token. `--once` with an empty url prints the report
+  without sending it; `--once` with a url **sends** one report. Changes nothing on the box.
 - `pulse-cutover report [--out f.tar.gz] [--paranoid]` — reads configs/logs,
   writes ONE tar.gz (sanitized). No service changes.
 - `pulse-cutover verify --snapshot f.bin [--cpu-scale N]` — CPU/RAM heavy
