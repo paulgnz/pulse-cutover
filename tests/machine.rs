@@ -109,6 +109,10 @@ struct MockOps {
     target_stall_after: Cell<u64>,
     /// Source info calls (a readiness refusal must make none).
     source_calls: Cell<u32>,
+    /// The ignite command fails (after possibly starting the target).
+    ignite_fails: Cell<bool>,
+    /// Extra mock-clock time each target_info poll takes (RPC latency).
+    target_latency_ms: Cell<u64>,
 }
 
 impl MockOps {
@@ -146,6 +150,8 @@ impl MockOps {
             target_fork: Cell::new(false),
             target_stall_after: Cell::new(u64::MAX),
             source_calls: Cell::new(0),
+            ignite_fails: Cell::new(false),
+            target_latency_ms: Cell::new(0),
         }
     }
 
@@ -251,6 +257,7 @@ impl ChainOps for MockOps {
     }
 
     fn target_info(&self) -> Result<Option<ChainInfo>, String> {
+        self.now.set(self.now.get() + self.target_latency_ms.get());
         if !self.ignited.get() {
             return Ok(None);
         }
@@ -295,6 +302,9 @@ impl ChainOps for MockOps {
 
     fn ignite(&self) -> Result<String, String> {
         self.ignited.set(true);
+        if self.ignite_fails.get() {
+            return Err("systemctl restart exited 1 (partial start)".into());
+        }
         Ok("mock metalgo restarted".into())
     }
 
@@ -346,7 +356,7 @@ impl ChainOps for MockOps {
             let ours = pulse_cutover::beacon::journal_summary(&self.dir.join("journal.jsonl"))["evidence"].clone();
             let n = if polls >= self.fleet_agree_after.get() { self.fleet_agree.get() } else { 1 };
             let producers: Vec<_> = (0..n).map(|i| serde_json::json!({"name": format!("bp{i}"),
-                "report": {"ceremony": {"state": "VERIFIED", "evidence": ours.clone()}}})).collect();
+                "report": {"coord": {"event_id": "e1"}, "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}}})).collect();
             return Ok(Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": producers}]})));
         }
         // Local hyperion-rs /v2/health (the .95-observed shape).
@@ -1564,6 +1574,12 @@ fn beacon_url_must_be_https_unless_local() {
     assert!(check_beacon_url("http://[::1]:8787/api/report").is_ok());
     assert!(check_beacon_url("http://mc.example/api/report").is_err());
     assert!(check_beacon_url("").is_ok(), "empty = print-only --once");
+    // Astra 2026-09-30 #5: authority tricks that hand-parsing accepted.
+    assert!(check_beacon_url("http://localhost:80@example.org/api/report").is_err(), "userinfo: real host is example.org");
+    assert!(check_beacon_url("http://localhost.example.org/api/report").is_err());
+    assert!(check_beacon_url("http://127.0.0.1.nip.io/api/report").is_err());
+    assert!(check_beacon_url("https://user:pw@mc.example/api/report").is_err(), "no userinfo on https either");
+    assert!(check_beacon_url("ftp://localhost/x").is_err());
 }
 
 #[test]
@@ -1678,16 +1694,63 @@ fn api_mode_without_simulate_cuts_exactly_h_via_scheduler() {
 }
 
 #[test]
-fn target_with_wrong_lineage_at_the_cut_aborts_before_ignited() {
+fn wrong_lineage_after_ignite_started_halts_without_resuming_source() {
+    // Astra 2026-09-30 #1: the lineage check runs AFTER the ignite command; the target may be
+    // running, so a mismatch must seal, never resume the source.
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(dir.path(), 120);
     let ops = MockOps::new(dir.path(), 110);
     ops.target_fork.set(true);
-    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.starts_with("HALTED"), "{err}");
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(text.contains("wrong lineage"));
+    assert!(text.contains(r#""side_effect":"ignite_started""#));
+    assert!(text.contains(r#""kind":"transition","state":"HALTED""#), "HALTED is a durable journaled state");
     assert!(!text.contains(r#""state":"IGNITED""#));
-    assert!(ops.resumes.get() >= 1, "pre-IGNITED abort still rolls the source back");
+    assert!(!text.contains(r#""state":"ABORTED""#));
+    assert_eq!(ops.resumes.get(), 0, "the source producer must NOT be resumed once ignition started");
+    assert!(ops.paused.get());
+}
+
+#[test]
+fn failing_ignite_command_halts_without_resuming_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.ignite_fails.set(true);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.starts_with("HALTED") && err.contains("ignition command failed"), "{err}");
+    assert_eq!(ops.resumes.get(), 0);
+    assert!(!ops.hooks.borrow().iter().any(|h| h.contains("abort")), "on_abort must not run");
+}
+
+#[test]
+fn halted_journal_is_durable_and_only_unhalt_clears_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.target_fork.set(true);
+    assert!(run_machine_result(&cfg, &ops).unwrap_err().starts_with("HALTED"));
+    // A restarted run refuses to continue OR roll back.
+    let ops2 = MockOps::new(dir.path(), 200);
+    let err = run_machine_result(&cfg, &ops2).unwrap_err();
+    assert!(err.contains("HALTED (journaled)"), "{err}");
+    assert_eq!(ops2.resumes.get(), 0);
+    assert_eq!(ops2.source_calls.get(), 0, "refused before touching anything");
+    // The operator clears it with the real binary (journaled), returning to the halted-from state.
+    let bin = env!("CARGO_BIN_EXE_pulse-cutover");
+    let cfgp = dir.path().join("ceremony.toml");
+    let out = std::process::Command::new(bin).args(["unhalt", "--config"]).arg(&cfgp).output().unwrap();
+    assert!(!out.status.success(), "unhalt without --i-understand is refused");
+    let out = std::process::Command::new(bin).args(["unhalt", "--config"]).arg(&cfgp).arg("--i-understand").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let rec = Journal::replay(&cfg.journal_path).unwrap();
+    assert_eq!(rec.state, Some(State::Verified));
+    assert!(rec.unhalted);
+    assert!(rec.reached_ignited, "ignition-started stays recorded after unhalt");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("unhalted_by"));
 }
 
 #[test]
@@ -1701,7 +1764,7 @@ fn happy_path_journals_verified_lineage_and_sustained_live() {
     let live: serde_json::Value = text.lines().map(|l| serde_json::from_str(l).unwrap())
         .find(|v: &serde_json::Value| v["state"] == "LIVE" && v["kind"] == "transition").unwrap();
     assert_eq!(live["data"]["sustained"]["sustain_secs"], 60);
-    assert!(text.contains(r#""side_effect":"ignite""#));
+    assert!(text.contains(r#""side_effect":"ignite_started""#));
 }
 
 #[test]
@@ -1718,6 +1781,50 @@ fn post_live_stall_halts_sealed_without_resuming_source() {
     assert!(!text.contains(r#""state":"LIVE""#));
     assert_eq!(ops.resumes.get(), 0, "sealed: the paused source producer was NOT resumed");
     assert!(ops.paused.get());
+}
+
+#[test]
+fn failing_on_live_hook_halts_and_never_journals_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::read_to_string({ test_config(dir.path(), 120); dir.path().join("ceremony.toml") }).unwrap();
+    let cfg = load_toml(dir.path(), "l.toml", &base.replace("on_live = \"flip-gateway\"", "on_live = \"fail-live\"")).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.starts_with("HALTED") && err.contains("on_live hook failed"), "{err}");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(!text.contains(r#""kind":"transition","state":"LIVE""#), "LIVE only after on_live succeeds");
+    assert_eq!(ops.resumes.get(), 0);
+}
+
+#[test]
+fn slow_target_polls_count_as_gaps_in_the_sustained_live_window() {
+    // Each target poll takes 25 s of wall clock (RPC latency) > live_max_gap_secs (20): even
+    // though every poll shows progress, the observed interval is a stall.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.target_latency_ms.set(25_000);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.starts_with("HALTED"), "{err}");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("live_stall"), "{text}");
+    assert!(!text.contains(r#""kind":"transition","state":"LIVE""#));
+}
+
+#[test]
+fn live_outage_metric_includes_sustain_window_and_on_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    assert_eq!(run_machine(&cfg, &MockOps::new(dir.path(), 110)), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let live: serde_json::Value = text.lines().map(|l| serde_json::from_str(l).unwrap())
+        .find(|v: &serde_json::Value| v["state"] == "LIVE" && v["kind"] == "transition").unwrap();
+    let gap = live["data"]["write_gap_ms_wallclock"].as_u64().unwrap();
+    let first = live["data"]["first_progress_gap_ms_wallclock"].as_u64().unwrap();
+    assert!(gap >= first + 60_000, "gap {gap} must include the 60 s sustain window (first progress {first})");
+    let on_live = text.lines().position(|l| l.contains("on_live_hook")).unwrap();
+    let live_line = text.lines().position(|l| l.contains(r#""kind":"transition","state":"LIVE""#)).unwrap();
+    assert!(on_live < live_line, "on_live ran before LIVE was journaled");
 }
 
 #[test]
@@ -1757,12 +1864,16 @@ fn failing_required_hooks_abort_before_ignition_and_halt_after() {
 #[test]
 fn second_process_on_the_same_journal_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("journal.jsonl");
-    let (_j, _) = Journal::open(&path).unwrap();
-    let err = Journal::open(&path).err().expect("second open must fail while the first is held");
-    assert!(err.contains("already running"), "{err}");
-    drop(_j);
-    assert!(Journal::open(&path).is_ok(), "lock released on drop");
+    let cfg = test_config(dir.path(), 120);
+    let (held, _) = Journal::open(&cfg.journal_path).unwrap();
+    // A genuinely separate process (the real binary) must be refused while this one holds it.
+    let bin = env!("CARGO_BIN_EXE_pulse-cutover");
+    let out = std::process::Command::new(bin).args(["run", "--config"]).arg(dir.path().join("ceremony.toml")).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("already running"), "{stderr}");
+    drop(held);
+    assert!(Journal::open(&cfg.journal_path).is_ok(), "lock released on drop");
 }
 
 #[test]
@@ -1786,6 +1897,64 @@ fn torn_last_line_is_set_aside_but_a_corrupt_middle_line_is_fatal() {
     std::fs::write(&bad, format!("{good}\nnot json at all\n{good}\n")).unwrap();
     let err = Journal::replay(&bad).unwrap_err();
     assert!(err.contains("corrupt journal line 2"), "{err}");
+
+    // A COMPLETE (newline-terminated) last line that does not parse is corruption, not a torn
+    // write: refuse instead of silently dropping what may be an authority-relevant record.
+    let done = dir.path().join("done.jsonl");
+    std::fs::write(&done, format!("{good}\n{{\"seq\":1,\"garbled\n")).unwrap();
+    let err = Journal::open(&done).err().expect("must refuse");
+    assert!(err.contains("corruption, not a torn"), "{err}");
+    assert!(Journal::replay(&done).is_err());
+}
+
+#[test]
+fn crash_after_ignite_started_before_ignited_resumes_into_halt() {
+    // Drive a real ceremony to completion, then cut the journal back to the moment right after
+    // `ignite_started` was journaled (the process "died" inside the ignite command).
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    assert_eq!(run_machine(&cfg, &MockOps::new(dir.path(), 110)), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let keep: Vec<&str> = text.lines().take_while(|l| !l.contains(r#""state":"IGNITED""#)).collect();
+    assert!(keep.last().unwrap().contains("ignite_started") || keep.iter().any(|l| l.contains("ignite_started")));
+    let cut = keep.iter().position(|l| l.contains("ignite_started")).unwrap();
+    std::fs::write(&cfg.journal_path, keep[..=cut].join("\n") + "\n").unwrap();
+    let rec = Journal::replay(&cfg.journal_path).unwrap();
+    assert_eq!(rec.state, Some(State::Verified));
+    assert!(rec.reached_ignited, "ignite_started alone marks the boundary");
+    // Recovery: a fresh agent on the same journal must seal, not re-ignite and not roll back.
+    let ops = MockOps::new(dir.path(), 200);
+    ops.paused.set(true);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.starts_with("HALTED") && err.contains("ignition may have started"), "{err}");
+    assert_eq!(ops.resumes.get(), 0);
+    assert!(!ops.ignited.get(), "did not re-run the ignite command on its own");
+}
+
+#[test]
+fn crash_mid_staging_resumes_and_accepts_its_own_staged_snapshot() {
+    // Astra 2026-09-30 #2: a crash after staging but before VERIFIED left the staged file; the
+    // resumed preflight used to call it stale and abort.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    assert_eq!(run_machine(&cfg, &MockOps::new(dir.path(), 110)), State::Live);
+    let rec_full = Journal::replay(&cfg.journal_path).unwrap();
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let staged = lines.iter().position(|l| l.contains("staged_artifact")).expect("staging identity journaled");
+    std::fs::write(&cfg.journal_path, lines[..=staged].join("\n") + "\n").unwrap();
+    assert!(cfg.snapshot.staged_path.exists());
+    let rec = Journal::replay(&cfg.journal_path).unwrap();
+    assert_eq!(rec.state, Some(State::Snapshotted));
+    assert!(rec.staged_sha256.is_some());
+    let ops = MockOps::new(dir.path(), rec_full.cut_height.unwrap() + 3);
+    ops.paused.set(true);
+    ops.target_head.set(rec_full.cut_height.unwrap());
+    let st = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("matches this ceremony's journaled staged_artifact"), "{text}");
+    assert!(!text.contains("stale snapshot from a previous ceremony"));
+    assert_eq!(st.unwrap(), State::Live);
 }
 
 #[test]
@@ -1800,6 +1969,21 @@ fn side_effects_started_before_a_crash_are_recovered() {
     let rec = Journal::replay(&path).unwrap();
     assert!(rec.reached_ignited);
     assert_eq!(rec.side_effects, vec!["flip_cmd".to_string()]);
+}
+
+#[test]
+fn hook_completion_is_bounded_when_a_descendant_holds_the_pipe() {
+    // Astra 2026-09-30 #4: the shell exits but a background child keeps stdout open.
+    let t0 = std::time::Instant::now();
+    let out = pulse_cutover::ops::run_shell_timeout("sleep 30 & echo hi", std::time::Duration::from_secs(20)).unwrap();
+    let took = t0.elapsed();
+    assert!(took < pulse_cutover::ops::PIPE_GRACE + std::time::Duration::from_secs(4), "took {took:?}");
+    assert!(out.starts_with("hi"), "{out}");
+    assert!(out.contains("were killed"), "{out}");
+    // Output is capped (head + tail kept).
+    let big = pulse_cutover::ops::run_shell_timeout("head -c 500000 /dev/zero | tr '\\0' a", std::time::Duration::from_secs(20)).unwrap();
+    assert!(big.len() < pulse_cutover::ops::OUTPUT_CAP + 200, "{}", big.len());
+    assert!(big.contains("bytes of output dropped"));
 }
 
 #[test]
@@ -1826,7 +2010,7 @@ fn roster_fleet_gate_counts_only_fresh_roster_members() {
     let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
     let ours = pulse_cutover::beacon::journal_summary(&probe.path().join("journal.jsonl"))["evidence"].clone();
     assert!(!ours["snapshot_sha256"].is_null());
-    let rep = |id: &str| serde_json::json!({"instance_id": id, "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}});
+    let rep = |id: &str| serde_json::json!({"instance_id": id, "coord": {"event_id": "e1"}, "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}});
     let run = |good: bool| -> (State, String) {
         let d = tempfile::tempdir().unwrap();
         let cfg = roster_config(d.path());
@@ -1846,4 +2030,82 @@ fn roster_fleet_gate_counts_only_fresh_roster_members() {
     assert!(text.contains("fleet did not reach verified agreement"));
     let (st, text) = run(true);
     assert_eq!(st, State::Live, "{text}");
+}
+
+
+#[test]
+fn roster_members_count_once_and_only_for_this_event() {
+    // Duplicate roster entries are rejected at load (one report must not count twice).
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::read_to_string({ roster_config(dir.path()); dir.path().join("roster.toml") }).unwrap();
+    let dup = base.clone() + "\n[[coordination.roster]]\nproducer = \"bp2\"\n";
+    let err = load_toml(dir.path(), "dup.toml", &dup).unwrap_err();
+    assert!(err.contains("more than once"), "{err}");
+
+    // Reports about a DIFFERENT event, or with no evidence at all, never agree.
+    let probe = tempfile::tempdir().unwrap();
+    let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
+    let ours = pulse_cutover::beacon::journal_summary(&probe.path().join("journal.jsonl"))["evidence"].clone();
+    let d = tempfile::tempdir().unwrap();
+    let cfg = roster_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": {"instance_id": "aa", "coord": {"event_id": "OTHER"},
+            "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}}}]},
+        {"name": "bp2", "beacons": [{"age_ms": 1000, "report": {"instance_id": "bb", "coord": {"event_id": "e1"},
+            "ceremony": {"state": "VERIFIED", "evidence": {}}}}]},
+    ]}]}));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted, "wrong event + empty evidence must not satisfy the gate");
+}
+
+#[test]
+fn event_quorum_is_never_inherited_and_release_pin_needs_a_plugin() {
+    use pulse_cutover::coord::{derived_config, validate_event};
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("c.toml");
+    std::fs::write(&src, "journal_path = \"/j\"\n[ceremony]\nfreeze_height = 0\n[snapshot]\nstaged_path = \"/s\"\n[coordination]\nurl = \"https://mc\"\nnetwork = \"testnet\"\nfleet_quorum = 1\n").unwrap();
+    let ev = serde_json::json!({"type": "event", "event_id": "e9", "h": 900, "roster": [{"producer": "bp1"}, {"producer": "bp2"}, {"producer": "bp3"}]});
+    let out = dir.path().join("d.toml");
+    derived_config(&src, &ev, &out).unwrap();
+    let d: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(d["coordination"]["fleet_quorum"].as_integer(), Some(3), "no event quorum = all roster members, not the local 1");
+
+    let cfg = test_config(dir.path(), 120);
+    let dup = serde_json::json!({"type": "event", "network": "rehearsal", "h": 100_000, "roster": [{"producer": "bp1"}, {"producer": "bp1"}]});
+    assert!(validate_event(&dup, &cfg, "rehearsal", Some(10), 10).unwrap_err().contains("more than once"));
+    let pinned = serde_json::json!({"type": "event", "network": "rehearsal", "h": 100_000, "release_sha256": "ab".repeat(32)});
+    assert!(validate_event(&pinned, &cfg, "rehearsal", Some(10), 10).unwrap_err().contains("plugin_path"));
+}
+
+#[test]
+fn beacon_preview_writes_nothing() {
+    // Astra 2026-09-30 #8: `beacon --once` with no url (installer dry-run) created the journal
+    // dir and beacon.instance.
+    let dir = tempfile::tempdir().unwrap();
+    let jdir = dir.path().join("not-created");
+    let text = format!(r#"
+journal_path = "{j}/journal.jsonl"
+[ceremony]
+profile = "readiness"
+[source]
+rpc_url = "http://127.0.0.1:9"
+producer_api_url = "http://127.0.0.1:9"
+[snapshot]
+staged_path = "{j}/staged.bin"
+[target]
+metalgo_unit = "metalgo-none"
+rpc_url = "http://127.0.0.1:9/ext/bc/X/rpc"
+[beacon]
+url = ""
+producer = "bp1"
+network = "testnet"
+"#, j = jdir.display());
+    let cfgp = dir.path().join("b.toml");
+    std::fs::write(&cfgp, text).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pulse-cutover"))
+        .args(["beacon", "--config"]).arg(&cfgp).arg("--once").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["instance_id"].as_str().map(str::len), Some(32));
+    assert!(!jdir.exists(), "a preview must not create the journal dir or beacon.instance");
 }
