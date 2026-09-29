@@ -358,8 +358,11 @@ http.createServer(async (req, res) => {
       return send(res, 403, { error: `token is bound to ${bind.producer}@${bind.network}` });
     const nodeName = String(r.node || 'node').slice(0, 64);
     const byNode = ((nodes[r.network] ||= {})[r.producer] ||= {});
+    const tokenHash = sha(auth.replace(/^Bearer\s+/i, ''));
+    // One token = one box: if this token reported under another name before, that was a rename, not a second node.
+    for (const [nd, v] of Object.entries(byNode)) if (nd !== nodeName && v.token === tokenHash) delete byNode[nd];
     const prev = byNode[nodeName]?.report;
-    byNode[nodeName] = { report: r, received: Date.now() };
+    byNode[nodeName] = { report: r, received: Date.now(), token: tokenHash };
     const who = Object.keys(byNode).length > 1 || r.node ? `${r.producer} · ${nodeName}` : r.producer;
     const was = prev?.ceremony?.state, is = r.ceremony?.state;
     if (!prev) pushEvent(r.network, who, `started reporting (${r.role || 'node'}, agent ${r.agent_version})`);
