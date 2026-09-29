@@ -765,7 +765,8 @@ function render() {
   const abortText = [[ak('resumed'), 'ABORTED before ignition, old chain resumed'], [ak('forced'), 'ABORTED after a forced rollback (target fenced on that box only)'],
     [ak('incomplete'), 'ABORTED with an INCOMPLETE rollback (old chain may not be producing)'], [ak('unknown'), 'ABORTED (older beacon: rollback result not reported)']]
     .filter(([n]) => n).map(([n, t]) => `${n} ${t}`).join(' · ');
-  $('track-sub').textContent = aborted.length ? abortText : s.reporting ? `${s.reporting} producer beacon${s.reporting > 1 ? 's' : ''} reporting` : 'Every producer runs the same six steps; nothing public changes before LIVE.';
+  const pending = prods.filter((p) => p.report?.ceremony?.rollback_pending === true).length;
+  $('track-sub').textContent = pending ? `${pending} producer${pending > 1 ? 's' : ''} with an UNFINISHED operator rollback (re-run \`pulse-cutover rollback\`)${aborted.length ? ' · ' + abortText : ''}` : aborted.length ? abortText : s.reporting ? `${s.reporting} producer beacon${s.reporting > 1 ? 's' : ''} reporting` : 'Every producer runs the same six steps; nothing public changes before LIVE.';
 
   // producers
   const list = showAll ? prods : prods.filter((p) => p.scheduled || p.reporting);

@@ -354,6 +354,8 @@ export function projectReport(r) {
       // rc.8+: the journal proves every rollback step completed (false = a step failed or the rollback
       // died part-way: the old chain may NOT be producing). null for older beacons.
       rollback_complete: bool(ce.rollback_complete, 'ceremony.rollback_complete'),
+      // rc.9+: an operator rollback recorded its intent and has not finished (`run` refuses there).
+      rollback_pending: bool(ce.rollback_pending, 'ceremony.rollback_pending'),
     };
   }
   const co = r.coord ?? null;
