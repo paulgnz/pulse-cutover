@@ -95,48 +95,37 @@ use is defined in the [Glossary](#glossary).
 
 ### Step 1 — get the tools
 
-Two git repos side by side (the cutover agent and the PulseVM import library
-it links against), then one build:
+**Just want your node on Cutover Mission Control?** One command installs the prebuilt,
+checksum-verified binary and a **read-only** readiness beacon (it never touches nodeos, its config or
+production). Try it with `--dry-run` first; it changes nothing:
 
 ```sh
-sudo apt-get install -y git curl build-essential jq
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env"
-git clone --branch feat/arena-snapshot-import https://github.com/paulgnz/pulsevm pulsevm-arena-import
-git clone https://github.com/paulgnz/pulse-cutover
-cd pulse-cutover
-cargo build --release
-sudo install target/release/pulse-cutover /usr/local/bin/
+curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh -o beacon-install.sh
+sudo bash beacon-install.sh --network testnet --producer <your-account> --dry-run
+sudo bash beacon-install.sh --network testnet --producer <your-account>
 ```
 
-You should see the build end with:
+It ends by printing `token_sha256=…`: send that line (only a hash; the token never leaves your box) to
+the mission-control operator to be listed. See [control/README.md](control/README.md).
 
-```
-    Finished `release` profile [optimized + debuginfo] target(s) in 7.15s
-```
-
-**Or skip the build entirely:** every tagged release ships **static musl
-binaries** (x86_64 + aarch64) that run on any supported Ubuntu regardless of
-glibc — a glibc-2.36-built binary once failed on a 20.04 box's glibc 2.31,
-hence static:
+**For a rehearsal or a ceremony,** install the binary itself. Every release ships **static musl binaries**
+(x86_64 + aarch64) that run on any supported Ubuntu regardless of glibc. **Don't build from source on a
+producing node**: compiling takes minutes of full CPU.
 
 ```sh
-curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/latest/download/pulse-cutover-x86_64-unknown-linux-musl
-curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/latest/download/sha256sums.txt
+V=v0.5.0-rc.1   # or: latest
+curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/download/$V/pulse-cutover-x86_64-unknown-linux-musl
+curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/download/$V/sha256sums.txt
 sha256sum -c sha256sums.txt --ignore-missing
 sudo install -m 0755 pulse-cutover-x86_64-unknown-linux-musl /usr/local/bin/pulse-cutover
+git clone https://github.com/paulgnz/pulse-cutover   # for install.sh / cutover.sh and the examples
 ```
 
-`install.sh` does the same automatically (release binary, sha256-verified,
-falling back to `cargo build`) whenever the ceremony manifest pins no agent
-artifact — a manifest-pinned binary still wins, fail-closed, in a real event.
+`install.sh` does the same automatically (release binary, sha256-verified) whenever the ceremony manifest
+pins no agent artifact; a manifest-pinned binary still wins, fail-closed, in a real event.
 
-(In an organized test event the coordinator ships a prebuilt, sha256-pinned
-binary in the ceremony bundle, and `install.sh` verifies and installs it for
-you — then this step is just the two `git clone` lines, for the scripts.)
-
-**If it didn't:** `failed to load manifest ... pulsevm-arena-import` means the
-two repos are not side by side — both `git clone` commands must run in the
-same parent directory.
+**Building from source** (developers, on a non-producing box): `cargo build --release --locked`. The PulseVM
+import crates are fetched from a pinned git revision automatically; no second checkout is needed.
 
 ### Step 2 — survey the box: `pulse-cutover doctor`
 
