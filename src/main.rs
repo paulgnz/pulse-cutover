@@ -82,12 +82,23 @@ holds the journal), replays it, and rolls this node back (resume the paused sour
 api mode: revert the flips, restart the source if the agent stopped it) ONLY when the journal
 positively shows ignition has not started.
 
-Refuses (exit 3, nothing changed) when:
-  - there is no journal (absence is not proof: pass --no-journal-i-know only on a box that
-    never ran a ceremony);
-  - ignition may have started (ignite_started journaled, IGNITED or later, HALTED):
-    --force-after-ignite performs it anyway, for a fleet-wide rollback the coordinator confirmed.
-Every rollback is journaled (ABORTED, `operator_rollback`, `force_after_ignite`).";
+Exit codes:
+  0  rolled back (every step succeeded), or already rolled back (a repeat does nothing again)
+  3  REFUSED, nothing changed: the config cannot be loaded; there is no journal (absence is not
+     proof: pass --no-journal-i-know only on a box that never ran a ceremony); the journal is
+     locked past --wait, corrupt or unreadable; or ignition may have started (ignite_started
+     journaled, IGNITED or later, HALTED) and --force-after-ignite was not given
+  4  INCOMPLETE: a rollback step failed (resume, flip revert, source restart, on_abort, unstage,
+     or the target fence of a forced rollback); the failed steps are printed. The source may NOT
+     be producing: check by hand.
+
+Before anything else it kills a hook left running by a killed agent. --force-after-ignite first
+FENCES this box's target (target.stop_cmd, default `systemctl stop <unit> && ! systemctl
+is-active --quiet <unit>`); if that fails the source is not resumed (exit 4). This is a local
+fence only: other producers' targets are not affected. A staged snapshot is moved aside
+(<staged>.rolled-back-<ms>). Every rollback is journaled (ABORTED, `operator_rollback`,
+`force_after_ignite`); with --no-journal-i-know the record goes to <journal>.rollback-<ms>.jsonl
+and the ceremony journal is not created.";
 
 const HELP_BEACON: &str = "\
 pulse-cutover beacon --config ceremony.toml [--once]
@@ -352,7 +363,8 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         &ignite_cmd,
         cfg.source.snapshot_timeout_secs,
     )
-    .with_hook_timeout(cfg.hooks.timeout_secs);
+    .with_hook_timeout(cfg.hooks.timeout_secs)
+    .with_pgid_file_for(&cfg.journal_path);
     let (journal, recovered) = Journal::open(&cfg.journal_path)?;
     if let Some(state) = recovered.state {
         eprintln!("resuming ceremony from journaled state {state}");
@@ -402,7 +414,8 @@ fn cmd_loop(args: &[String]) -> Result<(), String> {
         &ignite_cmd,
         cfg.source.snapshot_timeout_secs,
     )
-    .with_hook_timeout(cfg.hooks.timeout_secs);
+    .with_hook_timeout(cfg.hooks.timeout_secs)
+    .with_pgid_file_for(&cfg.journal_path);
     pulse_cutover::looper::run_loop(&cfg, &ops, runs)
 }
 
@@ -453,44 +466,85 @@ fn cmd_unhalt(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Exit codes: 0 = rolled back (or already rolled back); 3 = REFUSED, nothing changed;
+/// 4 = rollback attempted but INCOMPLETE (some step failed: the source may NOT be producing).
 fn cmd_rollback(args: &[String]) -> Result<(), String> {
-    let cfg = load_config(args)?;
-    cfg.ensure_ceremony_profile()?;
-    let force = flag(args, "--force-after-ignite");
-    let wait: u64 = arg(args, "--wait").map(|s| s.parse().map_err(|e| format!("bad --wait: {e}"))).transpose()?.unwrap_or(30);
     let refuse = |msg: String| -> ! {
         eprintln!("pulse-cutover rollback: REFUSED — {msg}");
         eprintln!("Nothing was changed: the source was NOT resumed and public routing was NOT reverted.");
         std::process::exit(3);
     };
-    if !cfg.journal_path.exists() && !flag(args, "--no-journal-i-know") {
-        refuse(format!(
-            "no journal at {}. A missing journal is not proof that ignition never started (wrong path, \
-             deleted, unreadable). If this box never ran a ceremony, re-run with --no-journal-i-know.",
-            cfg.journal_path.display()));
+    let incomplete = |failed: &[String]| -> ! {
+        eprintln!("pulse-cutover rollback: INCOMPLETE — {} step(s) failed:", failed.len());
+        for f in failed {
+            eprintln!("  - {f}");
+        }
+        eprintln!("The source may NOT be producing and routing may NOT be reverted: check by hand.");
+        std::process::exit(4);
+    };
+    // Every failure before any rollback action runs is a refusal (exit 3): nothing changed.
+    let cfg = load_config(args).unwrap_or_else(|e| refuse(format!("cannot load the config: {e}")));
+    cfg.ensure_ceremony_profile().unwrap_or_else(|e| refuse(e));
+    let force = flag(args, "--force-after-ignite");
+    let wait: u64 = match arg(args, "--wait").map(|s| s.parse::<u64>()) {
+        None => 30,
+        Some(Ok(w)) => w,
+        Some(Err(e)) => refuse(format!("bad --wait: {e}")),
+    };
+    // --no-journal-i-know on a box without a journal: do the reverts, but never create the
+    // ceremony journal (a terminal ABORTED there would make the next `run` a no-op). The record
+    // goes to a separate audit file instead.
+    let mut journal_path = cfg.journal_path.clone();
+    let mut audit_only = false;
+    if !cfg.journal_path.exists() {
+        if !flag(args, "--no-journal-i-know") {
+            refuse(format!(
+                "no journal at {}. A missing journal is not proof that ignition never started (wrong path, \
+                 deleted, unreadable). If this box never ran a ceremony, re-run with --no-journal-i-know.",
+                cfg.journal_path.display()));
+        }
+        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let mut p = cfg.journal_path.as_os_str().to_owned();
+        p.push(format!(".rollback-{ms}.jsonl"));
+        journal_path = std::path::PathBuf::from(p);
+        audit_only = true;
     }
     // Hold the journal's exclusive lock while deciding: a still-running agent must not race us.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
     let (journal, recovered) = loop {
-        match Journal::open(&cfg.journal_path) {
+        match Journal::open(&journal_path) {
             Ok(x) => break x,
             Err(e) if e.contains("holds") && std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
-            Err(e) => return Err(format!("cannot take the journal lock to decide safely: {e}")),
+            Err(e) => refuse(format!("cannot take and read the journal to decide safely: {e}")),
         }
     };
     let ignite_cmd = cfg.target.ignite_cmd.clone().unwrap_or_else(|| format!("systemctl restart {}", cfg.target.metalgo_unit));
     let ops = HttpOps::new(&cfg.source.rpc_url, &cfg.source.producer_api_url, &cfg.target.rpc_url, &ignite_cmd,
-        cfg.source.snapshot_timeout_secs).with_hook_timeout(cfg.hooks.timeout_secs);
+        cfg.source.snapshot_timeout_secs).with_hook_timeout(cfg.hooks.timeout_secs)
+        .with_pgid_file_for(&cfg.journal_path);
     let mut machine = Machine::new(&cfg, &ops, journal, recovered);
     match machine.operator_rollback(force) {
-        Ok(st) => {
-            println!("rolled back: journal now {st} (see {})", cfg.journal_path.display());
+        Ok(out) => {
+            for n in &out.notes {
+                println!("  {n}");
+            }
+            if !out.failed.is_empty() {
+                incomplete(&out.failed);
+            }
+            if out.already {
+                println!("already rolled back: journal {} (nothing done again)", cfg.journal_path.display());
+            } else if audit_only {
+                println!("rolled back (no ceremony journal existed; audit record: {})", journal_path.display());
+            } else {
+                println!("rolled back: journal now {} (see {})", out.state, cfg.journal_path.display());
+            }
             Ok(())
         }
         Err(e) if e.starts_with("refusing") => refuse(e),
-        Err(e) => Err(e),
+        // A failure after rollback actions may have started (e.g. the journal could not be written).
+        Err(e) => incomplete(&[e]),
     }
 }
 

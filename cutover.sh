@@ -3,8 +3,9 @@
 #
 #   ./cutover.sh --manifest ceremony.json    # validate + run to LIVE (exit 0) or ABORT (exit 1)
 #   ./cutover.sh status                      # current journaled state
-#   ./cutover.sh abort                       # stop the agent + roll back (refused unless the journal proves
-#                                            #   ignition has not started; see `pulse-cutover help rollback`)
+#   ./cutover.sh abort                       # stop the agent + roll back (exit 3 = refused, nothing changed,
+#                                            #   unless the journal proves ignition has not started; exit 4 =
+#                                            #   attempted but incomplete; see `pulse-cutover help rollback`)
 #   ./cutover.sh abort --force-after-ignite  # roll back after IGNITED (coordinator-confirmed only)
 #   ./cutover.sh abort --no-journal-i-know   # roll back a box that never ran a ceremony (no journal)
 #
@@ -27,23 +28,33 @@ case "$CMD" in
     echo "aborting: stopping the agent (the ratchet means nothing user-visible ran unless FLIPPED/LIVE printed)"
     pkill -f 'pulse-cutover run' || echo "  (no running agent)"
     # The decision is made by `pulse-cutover rollback`, which takes the journal's exclusive lock
-    # (so it cannot race an agent that is still shutting down), replays it, and rolls back ONLY when
-    # the journal positively shows ignition has not started. It refuses (exit 3) on a missing,
-    # corrupt or unreadable journal, and once ignition may have started: after that point resuming
-    # the source or reverting routing could create a second writable history, which is a human,
-    # fleet-wide decision (--force-after-ignite).
+    # (so it cannot race an agent that is still shutting down), kills a hook the stopped agent left
+    # running, replays the journal, and rolls back ONLY when it positively shows ignition has not
+    # started. Exit 3 = REFUSED, nothing changed (missing/corrupt/locked journal, unloadable config,
+    # or ignition may have started: resuming the source then could create a second writable
+    # history, a human fleet-wide decision: --force-after-ignite). Exit 4 = attempted but
+    # INCOMPLETE (a step failed; the source may NOT be producing).
     shift
     set +e
     pulse-cutover rollback --config "$CONFIG" --wait "${PULSE_CUTOVER_ABORT_WAIT:-30}" "$@"
     RC=$?
     set -e
-    if [ "$RC" = 3 ]; then
-      echo "  NOT rolled back. The agent is stopped; the source was NOT resumed and public routing was NOT reverted."
-      echo "  Only if the coordinator has confirmed a fleet-wide rollback, run:"
-      echo "    ./cutover.sh abort --force-after-ignite"
-    elif [ "$RC" = 0 ] && [ "$(tomlget mode)" = "api" ]; then
-      echo "  api mode: if you stopped the source yourself, restart it: $(tomlget start_cmd)"
-    fi
+    case "$RC" in
+      0)
+        if [ "$(tomlget mode)" = "api" ]; then
+          echo "  api mode: if you stopped the source yourself, restart it: $(tomlget start_cmd)"
+        fi;;
+      3)
+        echo "  REFUSED: NOT rolled back. The agent is stopped; the source was NOT resumed and public routing was NOT reverted."
+        echo "  Read the reason above. If it says ignition may have started, and ONLY if the coordinator has"
+        echo "  confirmed a fleet-wide rollback, run:"
+        echo "    ./cutover.sh abort --force-after-ignite";;
+      4)
+        echo "  rollback INCOMPLETE: the steps listed above failed; the source may NOT be producing and routing"
+        echo "  may NOT be reverted. Fix each failed step by hand (or re-run ./cutover.sh abort once fixed).";;
+      *)
+        echo "  rollback exited $RC (unexpected): assume NOTHING was rolled back and check by hand.";;
+    esac
     echo "journal: $(tomlget journal_path)"
     exit "$RC"
     ;;

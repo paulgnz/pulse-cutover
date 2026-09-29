@@ -87,6 +87,10 @@ pub struct Recovered {
     pub unhalted: bool,
     /// A trailing partial line (crash mid-write) was found and set aside on open.
     pub torn_tail: bool,
+    /// The journal ends in an ABORTED whose rollback actions all succeeded
+    /// (`rollback_complete: true` and no later `rollback_incomplete` evidence): a repeated
+    /// `rollback` is a no-op instead of a second resume.
+    pub aborted_rollback_complete: bool,
 }
 
 impl Journal {
@@ -330,17 +334,18 @@ impl Journal {
                     out.unhalted = false;
                     out.halted_from = entry.data.get("halted_from").and_then(|v| v.as_str()).and_then(|v| v.parse().ok());
                 }
+                out.aborted_rollback_complete = st == State::Aborted
+                    && entry.data.get("rollback_complete").and_then(|v| v.as_bool()) == Some(true);
                 out.state = Some(st);
                 if entry.state == State::Frozen.as_str() {
                     out.frozen_ts_ms = Some(entry.ts_ms);
                 }
             }
-            // A halt-intent record (rc.7: `halting: true`; rc.6 wrote an error whose detail was
-            // `sealed: true` BEFORE its HALTED transition) is HALTED even if the process died before
-            // anything else was written: the decision was made and must not be lost.
+            // rc.6 wrote a halt as an error whose detail was `sealed: true` BEFORE its HALTED
+            // transition: that error is HALTED even if the process died before the transition.
+            // (rc.7+ writes one HALTED transition carrying the reason.)
             if entry.kind == "error"
-                && (entry.data.get("halting").and_then(|v| v.as_bool()) == Some(true)
-                    || entry.data.get("detail").and_then(|d| d.get("sealed")).and_then(|v| v.as_bool()) == Some(true))
+                && entry.data.get("detail").and_then(|d| d.get("sealed")).and_then(|v| v.as_bool()) == Some(true)
             {
                 out.halted_from = entry.state.parse().ok().filter(|s: &State| *s != State::Halted).or(out.halted_from);
                 out.state = Some(State::Halted);
@@ -359,6 +364,9 @@ impl Journal {
                 if se == "ignite_started" || se == "ignite" {
                     out.reached_ignited = true;
                 }
+            }
+            if entry.data.get("rollback_incomplete").is_some() {
+                out.aborted_rollback_complete = false;
             }
             if entry.data.get("unhalted_by").is_some() {
                 out.unhalted = true;

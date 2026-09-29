@@ -275,9 +275,28 @@ struct Acc {
     ev: serde_json::Map<String, Value>,
     last_error: Option<String>,
     armed_ts_ms: Option<u64>,
+    /// Ignition may have started on this box (ignite_started journaled, or IGNITED or later).
+    ignition_started: bool,
+    /// The journal ends in an operator rollback forced after ignition (`--force-after-ignite`).
+    forced_rollback: bool,
 }
 
 static JOURNALS: Mutex<Option<HashMap<PathBuf, Acc>>> = Mutex::new(None);
+
+/// Preparation ("setup") checks: not health. Same split as the dashboard's CHECKS map
+/// (control/public/index.html); every other check is a HEALTH check.
+pub const SETUP_CHECKS: &[&str] = &[
+    "hook_on_freeze", "hook_post_ignite", "hook_on_live", "hook_on_abort",
+    "validator_running", "metal_synced", "metal_reachable",
+];
+
+/// A report with any failing HEALTH check (a failing setup check does not count).
+pub fn has_failing_health(report: &Value) -> bool {
+    report["checks"].as_array().map(|cs| cs.iter().any(|c| {
+        c["ok"].as_bool() == Some(false)
+            && !c["name"].as_str().map(|n| SETUP_CHECKS.contains(&n)).unwrap_or(false)
+    })).unwrap_or(false)
+}
 
 fn file_ident(m: &std::fs::Metadata) -> (u64, u64) {
     #[cfg(unix)]
@@ -302,9 +321,16 @@ fn apply_line(acc: &mut Acc, v: &Value) {
             ev.insert(k.into(), val.clone());
         }
     }
+    if matches!(d["side_effect"].as_str(), Some("ignite_started" | "ignite")) {
+        acc.ignition_started = true;
+    }
     match v["kind"].as_str() {
         Some("transition") => {
             acc.state = v["state"].clone();
+            if matches!(v["state"].as_str(), Some("IGNITED" | "FLIPPED" | "LIVE" | "HALTED")) {
+                acc.ignition_started = true;
+            }
+            acc.forced_rollback = v["state"].as_str() == Some("ABORTED") && d["force_after_ignite"].as_bool() == Some(true);
             acc.last_ts = v["ts"].clone();
             acc.transitions.push(json!({"state": v["state"], "ts": v["ts"]}));
             let ev = &mut acc.ev;
@@ -388,7 +414,9 @@ pub fn journal_summary(path: &Path) -> Value {
            "evidence": Value::Object(acc.ev),
            // Never the raw message: errors can carry commands, paths and hosts.
            "last_error_class": acc.last_error.as_deref().map(sanitize_short),
-           "armed_ts_ms": acc.armed_ts_ms})
+           "armed_ts_ms": acc.armed_ts_ms,
+           "ignition_started": acc.ignition_started,
+           "forced_rollback": acc.forced_rollback})
 }
 
 /// Coordination status for the report, with free-text fields sanitized.
@@ -406,7 +434,9 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     let journal = journal_summary(&cfg.journal_path);
     let state = journal["state"].as_str().unwrap_or("").to_string();
     // HALTED: ignition may have started (the target may be running), so judge like post-ignite.
-    let past_ignite = matches!(state.as_str(), "IGNITED" | "FLIPPED" | "LIVE" | "HALTED");
+    // So is an ABORTED that followed ignition (a forced rollback): never judged as pre-ceremony.
+    let past_ignite = matches!(state.as_str(), "IGNITED" | "FLIPPED" | "LIVE" | "HALTED")
+        || (state == "ABORTED" && journal["ignition_started"].as_bool() == Some(true));
     // From VERIFIED on, the staged snapshot is supposed to exist, and ignition restarts the
     // validator: judge those checks by phase, not by the pre-ceremony rule.
     let past_verify = past_ignite || state == "VERIFIED";

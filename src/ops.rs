@@ -4,6 +4,7 @@
 //! source side, pulsevm JSON-RPC on the target side, systemctl/shell for
 //! ignition and hooks.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{
@@ -56,6 +57,11 @@ pub trait ChainOps {
     fn ignite(&self) -> Result<String, String>;
     /// Hooks and operator commands: killed after the configured hook timeout.
     fn run_hook(&self, cmd: &str) -> Result<String, String>;
+    /// Kill a hook process group left running by an agent that died mid-hook (recorded while
+    /// hooks run). Ok(Some(desc)) = killed one; Ok(None) = nothing to do. Default: nothing.
+    fn kill_orphan_hooks(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     /// Long-running pipeline steps (upstream export/import over a mainnet snapshot take far
     /// longer than any hook timeout). Default: same as run_hook.
     fn run_long(&self, cmd: &str) -> Result<String, String> {
@@ -113,12 +119,116 @@ fn kill_group(pid: u32) {
 #[cfg(not(unix))]
 fn kill_group(_pid: u32) {}
 
+/// Process ids currently in process group `pgid` (empty if none / cannot tell).
+#[cfg(unix)]
+fn group_members(pgid: u32) -> Vec<u32> {
+    let out = match std::process::Command::new("ps").args(["-A", "-o", "pid=,pgid="]).output() {
+        Ok(o) => o,
+        Err(_) => return vec![],
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let pid: u32 = it.next()?.parse().ok()?;
+            let g: u32 = it.next()?.parse().ok()?;
+            (g == pgid).then_some(pid)
+        })
+        .collect()
+}
+
+/// Kill a hook process group recorded by `run_shell_timeout_tracked` (an agent that died
+/// mid-hook leaves it running): SIGTERM the group, wait up to `grace`, then SIGKILL. Returns
+/// Ok(None) when nothing was recorded or the group is already gone, Ok(Some(description)) when
+/// a group was killed, Err when it could not be killed. The record is removed afterwards.
+#[cfg(unix)]
+pub fn kill_recorded_hook_group(pgid_file: &Path, grace: Duration) -> Result<Option<String>, String> {
+    let text = match std::fs::read_to_string(pgid_file) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    let mut lines = text.lines();
+    let pgid: u32 = match lines.next().and_then(|l| l.trim().parse().ok()) {
+        Some(p) if p > 1 => p,
+        _ => {
+            let _ = std::fs::remove_file(pgid_file);
+            return Ok(None);
+        }
+    };
+    let cmd = lines.next().unwrap_or("").to_string();
+    if group_members(pgid).is_empty() {
+        let _ = std::fs::remove_file(pgid_file);
+        return Ok(None);
+    }
+    // Guard against a recycled pid: if the group leader still exists it must be our `sh -c`, or
+    // the recorded command itself (`sh -c` execs a simple command in place).
+    if let Ok(o) = std::process::Command::new("ps").args(["-o", "command=", "-p", &pgid.to_string()]).output() {
+        let leader = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_string();
+        let leader_prog = leader.split_whitespace().next().map(base).unwrap_or_default();
+        let cmd_prog = cmd.split_whitespace().next().map(base).unwrap_or_default();
+        let ours = leader.starts_with("sh -c") || (!cmd_prog.is_empty() && leader_prog == cmd_prog);
+        if !leader.is_empty() && !ours {
+            let _ = std::fs::remove_file(pgid_file);
+            return Err(format!(
+                "recorded hook process group {pgid} now belongs to `{leader}` (pid reused?): not killed"
+            ));
+        }
+    }
+    let _ = std::process::Command::new("kill").arg("-TERM").arg(format!("-{pgid}")).status();
+    let start = std::time::Instant::now();
+    while start.elapsed() < grace && !group_members(pgid).is_empty() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut how = "SIGTERM";
+    if !group_members(pgid).is_empty() {
+        kill_group(pgid);
+        how = "SIGKILL";
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = std::fs::remove_file(pgid_file);
+    if group_members(pgid).is_empty() {
+        Ok(Some(format!("killed orphaned hook process group {pgid} ({how}): `{cmd}`")))
+    } else {
+        Err(format!("orphaned hook process group {pgid} (`{cmd}`) survived SIGKILL"))
+    }
+}
+#[cfg(not(unix))]
+pub fn kill_recorded_hook_group(_pgid_file: &Path, _grace: Duration) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
 /// Run a shell command with a deadline. The command runs in its own process group so a
 /// timeout kills the whole tree (sh + whatever it started), and a timeout is a FAILURE.
 /// Completion is bounded too: after the shell exits, output pipes still held open by a
 /// descendant get `PIPE_GRACE`, then the group is killed. Output is capped (`OUTPUT_CAP`).
 /// Hooks that must leave work running should detach it (`setsid … >log 2>&1 &`).
+/// `<journal>.hook.pgid`: the process group of the hook currently running for this journal.
+pub fn hook_pgid_path(journal_path: &Path) -> PathBuf {
+    let mut s = journal_path.as_os_str().to_owned();
+    s.push(".hook.pgid");
+    PathBuf::from(s)
+}
+
 pub fn run_shell_timeout(cmd: &str, timeout: Duration) -> Result<String, String> {
+    run_shell_timeout_tracked(cmd, timeout, None)
+}
+
+/// Removes the recorded hook process-group file when the hook finishes (any path out).
+struct PgidRecord(Option<PathBuf>);
+impl Drop for PgidRecord {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// `run_shell_timeout`, additionally recording the hook's process-group id in `pgid_file` while
+/// it runs (removed on completion). If the agent is killed mid-hook (`cutover.sh abort`
+/// SIGTERMs it; hooks live in their own process group and survive), `rollback` reads this file
+/// and kills the orphaned group before it runs `on_abort` or any revert.
+pub fn run_shell_timeout_tracked(cmd: &str, timeout: Duration, pgid_file: Option<&Path>) -> Result<String, String> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc;
@@ -133,6 +243,10 @@ pub fn run_shell_timeout(cmd: &str, timeout: Duration) -> Result<String, String>
     command.process_group(0);
     let mut child = command.spawn().map_err(|e| format!("spawn `{cmd}`: {e}"))?;
     let pid = child.id();
+    let _record = PgidRecord(pgid_file.and_then(|p| {
+        // pgid (= the shell's pid: process_group(0)) and the command, for the operator.
+        std::fs::write(p, format!("{pid}\n{cmd}\n")).ok().map(|_| p.to_path_buf())
+    }));
     // Drain pipes on threads (a chatty command can't block on a full pipe); results arrive on a
     // channel so waiting for them can be bounded instead of an unconditional join.
     let so = child.stdout.take().expect("piped");
@@ -201,6 +315,8 @@ pub struct HttpOps {
     pub snapshot_timeout: Duration,
     /// Deadline for hooks / flip / stop / start / ignite commands.
     pub hook_timeout: Duration,
+    /// Where the running hook's process-group id is recorded (`<journal>.hook.pgid`).
+    pub pgid_file: Option<PathBuf>,
     agent: ureq::Agent,
 }
 
@@ -219,6 +335,7 @@ impl HttpOps {
             ignite_cmd: ignite_cmd.to_string(),
             snapshot_timeout: Duration::from_secs(snapshot_timeout_secs),
             hook_timeout: Duration::from_secs(300),
+            pgid_file: None,
             agent: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(15))
                 .build(),
@@ -227,6 +344,12 @@ impl HttpOps {
 
     pub fn with_hook_timeout(mut self, secs: u64) -> Self {
         self.hook_timeout = Duration::from_secs(secs.max(1));
+        self
+    }
+
+    /// Record running hooks' process groups in `<journal>.hook.pgid` (see `kill_orphan_hooks`).
+    pub fn with_pgid_file_for(mut self, journal_path: &Path) -> Self {
+        self.pgid_file = Some(hook_pgid_path(journal_path));
         self
     }
 
@@ -403,7 +526,14 @@ impl ChainOps for HttpOps {
     }
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
-        run_shell_timeout(cmd, self.hook_timeout)
+        run_shell_timeout_tracked(cmd, self.hook_timeout, self.pgid_file.as_deref())
+    }
+
+    fn kill_orphan_hooks(&self) -> Result<Option<String>, String> {
+        match &self.pgid_file {
+            Some(p) => kill_recorded_hook_group(p, Duration::from_secs(5)),
+            None => Ok(None),
+        }
     }
 
     fn run_long(&self, cmd: &str) -> Result<String, String> {

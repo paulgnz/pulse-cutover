@@ -62,6 +62,19 @@ pub struct Machine<'a, O: ChainOps> {
     staged_sha256: Option<String>,
     /// An operator cleared a previous HALT: continue forward instead of halting on resume.
     unhalted: bool,
+    /// The journal ends in an ABORTED whose rollback actions all succeeded.
+    aborted_rollback_complete: bool,
+}
+
+/// What `pulse-cutover rollback` did. `failed` lists every step that did not succeed; the
+/// command exits 4 ("rollback attempted, incomplete") unless it is empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RollbackOutcome {
+    pub state: State,
+    pub failed: Vec<String>,
+    pub notes: Vec<String>,
+    /// The journal already ended in a complete rollback: nothing was done again.
+    pub already: bool,
 }
 
 /// Hydration predicate over a hyperion-rs /v2/health document. Two ways in:
@@ -122,6 +135,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let reached_ignited = recovered.reached_ignited;
         let staged_sha256 = recovered.staged_sha256.clone();
         let unhalted = recovered.unhalted;
+        let aborted_rollback_complete = recovered.aborted_rollback_complete;
         Machine {
             cfg,
             ops,
@@ -148,6 +162,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             reached_ignited,
             staged_sha256,
             unhalted,
+            aborted_rollback_complete,
         }
     }
 
@@ -469,7 +484,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             };
             // Every report the gate may count: per-server beacons (with the relay's identity-conflict
             // flag and age), or the producer-level report of an older relay. A conflicted report (one
-            // token reporting from two machines) or a stale one never counts.
+            // token reporting from two machines), a stale one, or one with a failing HEALTH check
+            // (setup checks such as hooks are ignored: the dashboard's health/setup split) never counts.
             let max_age_ms = co.report_max_age_secs * 1000;
             let reports_of = |p: &serde_json::Value| -> Vec<serde_json::Value> {
                 let mut v: Vec<(serde_json::Value, Option<u64>, bool)> = p["beacons"].as_array().map(|bs| bs.iter()
@@ -479,7 +495,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     v.push((p["report"].clone(), p["age_ms"].as_u64(), p["conflict"].as_bool().unwrap_or(false)));
                 }
                 v.into_iter()
-                    .filter(|(_, age, conflict)| !conflict && age.map(|a| a <= max_age_ms).unwrap_or(false))
+                    .filter(|(r, age, conflict)| !conflict && age.map(|a| a <= max_age_ms).unwrap_or(false)
+                        && !crate::beacon::has_failing_health(r))
                     .map(|(r, _, _)| r)
                     .collect()
             };
@@ -547,10 +564,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// `pulse-cutover rollback` (what `cutover.sh abort` runs), holding the journal lock: undo
     /// this node's changes and resume the source, but ONLY while ignition has provably not started.
     /// After that point it refuses unless `force` (a coordinator-confirmed, fleet-wide rollback),
-    /// which is journaled as such. Always performs the rollback actions (not gated on
-    /// `target.auto_rollback`: the operator asked for them).
-    pub fn operator_rollback(&mut self, force: bool) -> Result<State, String> {
-        if self.past_point_of_no_return() && !force {
+    /// and even then only after FENCING this box's target (`target.stop_cmd`): a forced rollback
+    /// that cannot prove the target stopped does not resume the source. Always performs the
+    /// rollback actions (not gated on `target.auto_rollback`: the operator asked for them).
+    /// Err = refused/nothing changed (message starts with "refusing") or a journal I/O error.
+    pub fn operator_rollback(&mut self, force: bool) -> Result<RollbackOutcome, String> {
+        let past = self.past_point_of_no_return();
+        if self.state == State::Aborted && self.aborted_rollback_complete {
+            return Ok(RollbackOutcome { state: self.state, failed: vec![], already: true,
+                notes: vec!["already rolled back (the journal ends in a complete rollback): nothing done again".into()] });
+        }
+        if past && !force {
             return Err(format!(
                 "refusing to roll back: journal state {} and ignition may have started (the target may \
                  be running). Nothing was changed. A fleet-wide rollback confirmed by the coordinator \
@@ -558,15 +582,69 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.state
             ));
         }
-        if force && self.past_point_of_no_return() {
+        let mut notes = vec![];
+        // An agent killed mid-hook leaves its hook's process group running (hooks run in their
+        // own group). Stop it before anything below runs, or e.g. a still-running on_freeze could
+        // close writes again after on_abort reopened them.
+        match self.ops.kill_orphan_hooks() {
+            Ok(None) => {}
+            Ok(Some(desc)) => {
+                self.journal.evidence(self.state, json!({"orphan_hook_killed": desc}))?;
+                notes.push(desc);
+            }
+            Err(e) => {
+                self.journal.evidence(self.state, json!({"orphan_hook_kill_error": e, "rollback_blocked": true}))?;
+                return Ok(RollbackOutcome { state: self.state, notes, already: false,
+                    failed: vec![format!("an orphaned hook could not be stopped ({e}); nothing was rolled back")] });
+            }
+        }
+        if force && past {
+            // Local fence FIRST: resuming the source while this box's target still runs would
+            // create two writable histories under one chain_id, by our own hand.
+            let fence = self.cfg.target.fence_cmd();
+            self.journal.evidence(self.state, json!({"side_effect": "target_fence", "cmd": fence}))?;
+            match self.ops.run_hook(&fence) {
+                Ok(out) => {
+                    self.journal.evidence(self.state, json!({"target_fenced": true, "output": out}))?;
+                    notes.push("this box's target was stopped first (local fence only: other producers' targets are unaffected)".into());
+                }
+                Err(e) => {
+                    self.journal.evidence(self.state, json!({"target_fenced": false, "error": e,
+                        "forced_rollback_blocked": "the target on this box could not be proven stopped; the source was NOT resumed"}))?;
+                    return Ok(RollbackOutcome { state: self.state, notes, already: false,
+                        failed: vec![format!("target fence failed ({e}): the source was NOT resumed and routing was NOT reverted")] });
+                }
+            }
             // Operator decision: every configured flip revert runs (a flip may have half-applied).
             self.flip_ran = self.flip_ran || self.cfg.flip.is_some();
             self.hyperion_flip_ran = self.hyperion_flip_ran || self.cfg.hyperion.is_some();
         }
-        let detail = json!({"by": "operator_rollback", "force_after_ignite": force && self.past_point_of_no_return(),
-                            "state_before": self.state.as_str()});
-        self.rollback("operator rollback (pulse-cutover rollback)", detail, true)?;
-        Ok(self.state)
+        let detail = json!({"by": "operator_rollback", "force_after_ignite": force && past,
+                            "ignition_started": past, "state_before": self.state.as_str()});
+        let mut failed = self.rollback("operator rollback (pulse-cutover rollback)", detail, true)?;
+        // Unstage: a staged snapshot left behind makes the next preflight refuse and, worse, a
+        // metalgo restart for any reason would import this (now abandoned) cut.
+        let staged = self.cfg.snapshot.staged_path.clone();
+        if staged.exists() {
+            let mut to = staged.as_os_str().to_owned();
+            to.push(format!(".rolled-back-{}", self.ops.now_ms()));
+            let to = std::path::PathBuf::from(to);
+            match std::fs::rename(&staged, &to) {
+                Ok(()) => {
+                    self.journal.evidence(State::Aborted, json!({"unstaged": {"from": staged, "to": to}}))?;
+                    notes.push(format!("staged snapshot moved aside to {}", to.display()));
+                }
+                Err(e) => {
+                    let msg = format!("unstage {} failed: {e}", staged.display());
+                    self.journal.evidence(State::Aborted, json!({"unstage_error": msg}))?;
+                    failed.push(msg);
+                }
+            }
+        }
+        if !failed.is_empty() {
+            self.journal.evidence(State::Aborted, json!({"rollback_incomplete": failed}))?;
+        }
+        Ok(RollbackOutcome { state: self.state, failed, notes, already: false })
     }
 
     fn abort(&mut self, reason: &str, detail: serde_json::Value) -> Result<(), String> {
@@ -574,18 +652,36 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return self.halt(reason, detail);
         }
         let perform = self.cfg.target.auto_rollback;
-        self.rollback(reason, detail, perform)
+        let failed = self.rollback(reason, detail, perform)?;
+        if !failed.is_empty() {
+            eprintln!("ABORTED, but the rollback is INCOMPLETE: {}", failed.join("; "));
+            self.journal.evidence(State::Aborted, json!({"rollback_incomplete": failed}))?;
+        }
+        Ok(())
     }
 
-    fn rollback(&mut self, reason: &str, detail: serde_json::Value, perform: bool) -> Result<(), String> {
-        self.journal.error(self.state, reason, detail)?;
+    /// Journal the abort and (if `perform`) undo this node's changes. Returns the rollback steps
+    /// that FAILED (empty = everything that was attempted succeeded).
+    fn rollback(&mut self, reason: &str, detail: serde_json::Value, perform: bool) -> Result<Vec<String>, String> {
+        self.journal.error(self.state, reason, detail.clone())?;
+        let mut failed: Vec<String> = vec![];
         let mut rollback = json!({"reason": reason, "auto_rollback": self.cfg.target.auto_rollback, "rollback_performed": perform});
+        if let Some(obj) = detail.as_object() {
+            for k in ["by", "force_after_ignite", "ignition_started"] {
+                if let Some(v) = obj.get(k) {
+                    rollback[k] = v.clone();
+                }
+            }
+        }
         if perform {
             match self.cfg.ceremony.mode {
                 // Producer mode: un-pausing nodeos IS the entire rollback.
                 Mode::Producer => match self.ops.resume() {
                     Ok(()) => rollback["source_producer_resumed"] = json!(true),
-                    Err(e) => rollback["source_producer_resume_error"] = json!(e),
+                    Err(e) => {
+                        failed.push(format!("resume the source producer: {e}"));
+                        rollback["source_producer_resume_error"] = json!(e);
+                    }
                 },
                 // api mode: nodeos was never paused (it isn't ours to pause).
                 // Undo whatever user-visible steps already happened, in
@@ -596,9 +692,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         if let Some(cmd) = &self.cfg.source.start_cmd {
                             match self.ops.run_hook(cmd) {
                                 Ok(o) => rollback["source_restarted"] = json!(o),
-                                Err(e) => rollback["source_restart_error"] = json!(e),
+                                Err(e) => {
+                                    failed.push(format!("restart the source: {e}"));
+                                    rollback["source_restart_error"] = json!(e);
+                                }
                             }
                         } else {
+                            failed.push("the source was stopped and no source.start_cmd is configured: restart it by hand".into());
                             rollback["source_stopped_no_start_cmd"] = json!(true);
                         }
                     }
@@ -608,7 +708,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         {
                             match self.ops.run_hook(&cmd) {
                                 Ok(o) => rollback["hyperion_flip_reverted"] = json!(o),
-                                Err(e) => rollback["hyperion_flip_revert_error"] = json!(e),
+                                Err(e) => {
+                                    failed.push(format!("revert the /v2 flip: {e}"));
+                                    rollback["hyperion_flip_revert_error"] = json!(e);
+                                }
                             }
                         }
                     }
@@ -618,7 +721,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         {
                             match self.ops.run_hook(&cmd) {
                                 Ok(o) => rollback["flip_reverted"] = json!(o),
-                                Err(e) => rollback["flip_revert_error"] = json!(e),
+                                Err(e) => {
+                                    failed.push(format!("revert the public flip: {e}"));
+                                    rollback["flip_revert_error"] = json!(e);
+                                }
                             }
                         }
                     }
@@ -626,16 +732,20 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 }
             }
         }
+        rollback["rollback_complete"] = json!(perform && failed.is_empty());
         self.state = State::Aborted;
         self.journal.transition(State::Aborted, rollback)?;
         if let Some(hook) = &self.cfg.hooks.on_abort {
             let result = self.ops.run_hook(hook);
+            if let Err(e) = &result {
+                failed.push(format!("on_abort hook: {e}"));
+            }
             self.journal.evidence(
                 State::Aborted,
                 json!({"on_abort_hook": format!("{result:?}")}),
             )?;
         }
-        Ok(())
+        Ok(failed)
     }
 
     /// ARMED: watch head until H, then FREEZE WRITES (hook) — production

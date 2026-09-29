@@ -580,6 +580,25 @@ pub struct Target {
     /// `release_sha256`, `await` rejects the event unless this file hashes to it.
     #[serde(default)]
     pub plugin_path: Option<PathBuf>,
+    /// Local fence for a forced rollback after ignition (`rollback --force-after-ignite`): must
+    /// stop THIS box's target and succeed only if it is no longer running. It runs BEFORE the
+    /// source is resumed; if it fails the source is not resumed. Default:
+    /// `systemctl stop <metalgo_unit> && ! systemctl is-active --quiet <metalgo_unit>`.
+    /// A local fence only: other producers' targets are not affected.
+    #[serde(default)]
+    pub stop_cmd: Option<String>,
+}
+
+impl Target {
+    /// The command that fences this box's target (see `stop_cmd`).
+    pub fn fence_cmd(&self) -> String {
+        self.stop_cmd.clone().unwrap_or_else(|| {
+            format!(
+                "systemctl stop {u} && ! systemctl is-active --quiet {u}",
+                u = self.metalgo_unit
+            )
+        })
+    }
 }
 
 fn default_live_sustain() -> u64 {
