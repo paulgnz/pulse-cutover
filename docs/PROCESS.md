@@ -46,7 +46,7 @@ flowchart LR
     U -. "after" .-> NEW
 ```
 
-**One block, H, is the boundary.** Everything up to and including H is carried over byte-for-byte.
+**One block, H, is the boundary.** Everything up to and including H is carried over: every producer writes a byte-identical snapshot of H, it is imported, and the result is checked (table fingerprints, and a state diff against the old chain).
 Block H+1 is the first block produced by PulseVM. Nobody re-signs anything, nobody moves
 funds, and nothing depends on users doing anything.
 
@@ -217,8 +217,9 @@ stateDiagram-v2
 
 ## 5. Across the whole network
 
-Each producer runs its own agent with the same H. There is no runtime coordination:
-the scheduled snapshot guarantees the same cut, and the evidence is compared afterwards.
+Each producer runs its own agent with the same H. The scheduled snapshot keeps everyone on the same cut
+without runtime coordination; optionally, signed coordination (`pulse-cutover await`) distributes H to every
+producer, holds ignition until a quorum reports identical evidence, and can abort the whole fleet before ignition.
 
 ```mermaid
 sequenceDiagram
@@ -289,8 +290,10 @@ sequenceDiagram
 
 ## 7. Gates and rollback
 
-**Nothing public changes before LIVE.** Every gate before that has one failure path:
-abort, and the producer resumes the old chain as if nothing happened.
+**Nothing public changes before LIVE.** Every gate before that has one failure path *for that producer*:
+abort, and it resumes the old chain as if nothing happened. Across a fleet that is not yet enough: if some
+producers abort while others have already ignited, the network splits. The fleet gate and signed fleet-wide abort
+narrow this; a full authority boundary is still open (see [ATOMICITY.md › Known limits](../ATOMICITY.md#known-limits-independent-review-2026-09-29)).
 
 ```mermaid
 flowchart LR
@@ -327,7 +330,7 @@ the evidence is kept:
 |---|---|---|
 | A1 | every producer cut the same block | journal: cut id, snapshot sha256, fingerprints |
 | A2 | nothing landed after the cut | burn-off audit gate |
-| A3 | old@H and new@H are byte-identical | `tools/state-diff.mjs` |
+| A3 | old@H and new@H match on the surveyed state | `tools/state-diff.mjs` (not yet a whole-state commitment) |
 | A4 | exactly once across the boundary | `tools/replay-canary.mjs` + app ledgers |
 | A5 | all or nothing | abort path + LIVE-only flips |
 

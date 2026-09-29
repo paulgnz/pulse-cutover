@@ -68,7 +68,7 @@
   <path d="M442 244 C 442 318, 760 318, 760 250" fill="none" stroke="url(#beam)" stroke-width="4" marker-end="url(#arrow)"/>
   <rect x="468" y="288" width="270" height="44" rx="22" fill="#111827" stroke="#374151"/>
   <text x="603" y="309" class="f" font-size="13" fill="#e5e7eb" text-anchor="middle">snapshot of exactly H · verified twice</text>
-  <text x="603" y="325" class="f" font-size="12" fill="#9ca3af" text-anchor="middle">imported 1:1, byte-identical</text>
+  <text x="603" y="325" class="f" font-size="12" fill="#9ca3af" text-anchor="middle">imported 1:1, then verified</text>
 
   <!-- new chain -->
   <g filter="url(#glow)">
@@ -110,8 +110,8 @@
     <text x="378" y="494" font-size="22" font-weight="800" fill="#34d399" text-anchor="middle">0</text>
     <text x="378" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">transactions after the cut</text>
     <path d="M488 478V518" stroke="#1f2937"/>
-    <text x="598" y="494" font-size="22" font-weight="800" fill="#34d399" text-anchor="middle">byte-identical</text>
-    <text x="598" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">state before and after</text>
+    <text x="598" y="494" font-size="22" font-weight="800" fill="#34d399" text-anchor="middle">identical state</text>
+    <text x="598" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">digest before and after the cut</text>
     <path d="M708 478V518" stroke="#1f2937"/>
     <text x="818" y="494" font-size="22" font-weight="800" fill="#34d399" text-anchor="middle">exactly once</text>
     <text x="818" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">no replays, no losses</text>

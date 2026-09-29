@@ -66,7 +66,7 @@ flowchart LR
 | Single node, API-provider mode, live XPR testnet | **22/22 LIVE**, 99.8% read availability, 0.75 s flip |
 | History (`/v2`) continuity via hyperion-rs + federating router | one URL serves pre- and post-cut history |
 | **5 block producers on 5 continents** (Sydney · Singapore · Los Angeles · New Jersey · Frankfurt) | **LIVE on all 5, four runs**: byte-identical snapshot at exactly H, identical fingerprints, 0 post-cut transactions, ~72 s client write gap, fully automatic ([details](#multi-producer-cutover-5-bps-5-continents)) |
-| **Atomicity: same cut, same state, exactly once** ([ATOMICITY.md](ATOMICITY.md)) | 5/5 BPs: byte-identical state on both sides of the cut, 0 transactions after the cut, pre-cut transactions rejected as duplicates on the new chain, held ones executed exactly once |
+| **Atomicity: same cut, same state, exactly once** ([ATOMICITY.md](ATOMICITY.md)) | 5/5 BPs: identical state digest on both sides of the cut (surveyed state), 0 transactions after the cut, pre-cut transactions rejected as duplicates on the new chain, held ones executed exactly once |
 | **A live perps DEX + oracle + HFT bot across the cut** | the migrated perps contract kept trading on PulseVM unchanged; 0 duplicate orders; the oracle never went stale; 0 dropped transfers on the fixed build |
 
 ---
@@ -525,7 +525,7 @@ gantt
 | 2 | **LIVE on all 5** | Freeze at H−24: 0 transactions after the cut. Identical fingerprints and head block id on all 5 validators; balances continuous across the boundary. Needed a manual transaction to pass the LIVE gate. → `post_ignite` heartbeat |
 | 3 | **LIVE on all 5, unattended** | Public API edges + HFT bot: 143 clean 503s during the freeze, **73.5 s client write gap**, edges flipped on their own. Surfaced a mempool bug in our PulseVM build (below) |
 | 4 | **LIVE on all 5, with a perps DEX live** | Fixed plugin: **79/79 admitted transfers landed** (run 3: 108/193). A perps contract deployed on the old chain kept taking orders on PulseVM with no changes, with 0 duplicates and the oracle within its 120 s window across the cut. New: a **~50 s finality stall right after LIVE** (field note 10) |
-| 5 | **LIVE on all 5, atomicity proven**: mixed nginx + HAProxy TLS edges | Byte-identical state diff at H on every BP, replay canary exactly-once, 0 duplicate orders. See [ATOMICITY.md](ATOMICITY.md). HAProxy edges froze and flipped via the runtime socket with **zero reloads** |
+| 5 | **LIVE on all 5, atomicity checks passed**: mixed nginx + HAProxy TLS edges | State diff at H identical on every BP (surveyed state), replay canary exactly-once, 0 duplicate orders. See [ATOMICITY.md](ATOMICITY.md). HAProxy edges froze and flipped via the runtime socket with **zero reloads** |
 | 6 | **LIVE on all 5, unattended, one public URL** | Every client used `api-rehearsal.protonnz.com` (DNS across all 5 BPs, real TLS). Watched on [Cutover Mission Control](control/README.md): all 7 evidence rows agreed 5/5, the state diff at H ran automatically (identical on every BP), replay canary exactly-once. The post-LIVE stall (note 10) reproduced: 92 expired + 12 timeouts after the flip |
 
 Evidence (journals, fingerprints, snapshot hashes per BP) is kept with the
