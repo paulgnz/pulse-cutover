@@ -14,10 +14,10 @@
 import http from 'node:http';
 import net from 'node:net';
 import { createHash, createPublicKey, verify as edVerify } from 'node:crypto';
-import { readFileSync, existsSync, watchFile, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { readFileSync, existsSync, watchFile, renameSync, mkdirSync, openSync, writeSync, fsyncSync, closeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isPublicIp, normIp, resolvePublic, limiter, readCapped, safeFetch, safeJson, safeDecode, RE,
+import { isPublicIp, normIp, resolvePublic, limiter, safeRequest, safeJson, safeDecode, RE, UA, endpointId, endpointRef, reservedKey,
   isAppRoute, projectReport, isBad, silentAfterMs, redact } from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -26,6 +26,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 const NETWORKS_FILE = process.env.NETWORKS || join(HERE, 'networks.json');
 const TOKENS_FILE = process.env.TOKENS || '';
 const COORD_FILE = process.env.COORD_FILE || '/var/lib/pulse-control/coord.json';
+const REPLAY_FILE = process.env.REPLAY_FILE || join(dirname(COORD_FILE), 'replay.json');
 const OFFLINE = process.env.MC_OFFLINE === '1';
 const MAX_BODY = 256 * 1024;
 const TS_FUTURE_MS = 2 * 60e3, TS_PAST_MS = 5 * 60e3;
@@ -36,6 +37,9 @@ process.on('uncaughtException', (e) => console.error('uncaughtException:', e?.st
 
 const sha = (s) => createHash('sha256').update(s).digest('hex');
 const dict = () => Object.create(null);
+// Deep copy into null-prototype maps (keys like "constructor" or "__proto__" can never resolve to Object.prototype).
+const clone = (o) => JSON.parse(JSON.stringify(o), (k, v) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.assign(dict(), v) : v));
+const own = (o, k) => o != null && Object.prototype.hasOwnProperty.call(o, k);
 let cfg = JSON.parse(readFileSync(NETWORKS_FILE, 'utf8'));
 const netIds = () => cfg.networks.map((n) => n.id);
 
@@ -67,15 +71,13 @@ const pushEvent = (n, producer, text) => {
   events[n].length = Math.min(events[n].length, 200);
 };
 
-// Every outbound request identifies itself (some edges 403 Node's default user-agent).
-const UA = 'pulse-cutover-mission-control/1.0 (+https://control-rehearsal.protonnz.com)';
-const _fetch = globalThis.fetch;
-globalThis.fetch = (url, opts = {}) => _fetch(url, { ...opts, headers: { 'user-agent': UA, ...(opts.headers || {}) } });
+// Every outbound request identifies itself (some edges 403 Node's default user-agent). Producer-supplied URLs go
+// through safeRequest (DNS-validated and connection-pinned); only our own configured network RPCs use fetch.
 const outbound = limiter(16); // global cap on concurrent producer-directed probes
 
 // Network RPCs come from our own config (trusted), not from producers.
 async function rpc(url, path, body = {}) {
-  const r = await fetch(`${url}/v1/chain/${path}`, { method: 'POST', body: JSON.stringify(body), signal: AbortSignal.timeout(4000) });
+  const r = await fetch(`${url}/v1/chain/${path}`, { method: 'POST', body: JSON.stringify(body), headers: { 'user-agent': UA }, signal: AbortSignal.timeout(4000) });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
@@ -105,13 +107,13 @@ if (!OFFLINE) {
 }
 
 // ---- producer registry: eosio::producers (active) + each producer's chains.json → bp.json -------------
-// Everything fetched from producer-controlled URLs goes through safeFetch (public addresses only, manual
-// redirects re-validated, size-capped, globally rate-limited).
+// Everything fetched from producer-controlled URLs goes through safeRequest (public addresses only, the socket
+// pinned to the validated address, manual redirects re-validated, size-capped, globally rate-limited).
 const registry = dict(); // network id → { ts, producers: { owner → {owner, votes, rank, url, org{…}} } }
 const logos = new Map(); // `${net}/${owner}` → { type, buf, ts }
 const logoInflight = new Map();
 const safeUrl = (u) => { try { const x = new URL(u); return /^https?:$/.test(x.protocol) && !x.username && !x.password ? x.href.replace(/\/$/, '') : null; } catch { return null; } };
-const getJson = (url, ms = 5000) => outbound(() => safeJson(url, { signal: AbortSignal.timeout(ms), headers: { accept: 'application/json' } }, 1024 * 1024)).then((x) => x.json);
+const getJson = (url, ms = 5000) => outbound(() => safeJson(url, { timeoutMs: ms, headers: { accept: 'application/json' } }, 1024 * 1024)).then((x) => x.json);
 async function bpJson(base, chainId) {
   // chains.json maps chain_id → path of that chain's bp.json (EOSIO standard); fall back to /bp.json.
   try {
@@ -166,11 +168,10 @@ async function logo(netId, owner) {
   const src = registry[netId]?.producers?.[owner]?.org?.logo; if (!src) return null;
   const p = outbound(async () => {
     try {
-      const r = await safeFetch(src, { signal: AbortSignal.timeout(6000) });
+      const r = await safeRequest(src, { timeoutMs: 6000, maxBytes: 512 * 1024 });
       const type = (r.headers.get('content-type') || '').split(';')[0].trim();
-      if (!r.ok || !/^image\/[\w.+-]+$/.test(type)) { try { await r.body?.cancel(); } catch {} return null; }
-      const buf = await readCapped(r, 512 * 1024);
-      const v = { type, buf, ts: Date.now() }; logos.set(key, v); return v;
+      if (r.status < 200 || r.status >= 300 || !/^image\/[\w.+-]+$/.test(type)) return null;
+      const v = { type, buf: r.body, ts: Date.now() }; logos.set(key, v); return v;
     } catch { return null; }
   }).finally(() => logoInflight.delete(key));
   logoInflight.set(key, p);
@@ -219,7 +220,7 @@ function tcp(hostport) {
     });
   });
 }
-const probeJson = (url, opts) => outbound(() => safeJson(url, { signal: AbortSignal.timeout(6000), ...opts }, 256 * 1024));
+const probeJson = (url, opts) => outbound(() => safeJson(url, { timeoutMs: 6000, ...opts }, 256 * 1024));
 async function probeApi(url, chainId) {
   return timed(async () => {
     const { json: b, headers } = await probeJson(`${url}/v1/chain/get_info`, { method: 'POST', body: '{}' });
@@ -262,7 +263,7 @@ async function surveyInfra(n) {
       const features = [].concat(nd?.features || []).map((x) => clip(x, 32)).slice(0, 12);
       const url = safeUrl(nd?.ssl_endpoint || nd?.api_endpoint || '');
       const p2p = typeof nd?.p2p_endpoint === 'string' ? nd.p2p_endpoint.slice(0, 120) : null;
-      const e = { producer: p.owner, rank: p.rank, types, features, url, p2p, location: clip(nd?.location?.name || nd?.location?.country || null, 60) };
+      const e = { producer: p.owner, rank: p.rank, types, features, url, id: url ? endpointId(url) : null, ref: url ? endpointRef(url) : null, p2p, location: clip(nd?.location?.name || nd?.location?.country || null, 60) };
       const jobs = [];
       // bp.json "query" nodes whose only feature is a non-chain service (e.g. atomic-assets-api) are not chain APIs:
       // probing /v1/chain on them just reports a false 404.
@@ -280,13 +281,13 @@ async function surveyInfra(n) {
   // Endpoints apps and wallets point at that no active producer's bp.json lists (e.g. wallet defaults run by
   // non-producers). Probed like any other node, kept only when they serve THIS network's chain.
   const host = (u) => { try { return new URL(u).host.toLowerCase(); } catch { return ''; } };
-  const listed = new Set(found.filter((x) => x.url).map((x) => host(x.url)));
-  await pool((cfg.known_endpoints || []).filter((k) => safeUrl(k.url) && !listed.has(host(k.url))), 6, async (k) => {
+  const listed = new Set(found.filter((x) => x.url).map((x) => endpointId(x.url)));
+  await pool((cfg.known_endpoints || []).filter((k) => safeUrl(k.url) && !listed.has(endpointId(k.url))), 6, async (k) => {
     const url = safeUrl(k.url);
     const api = await probeApi(url, n.chain_id).catch(() => null);
     if (!api?.ok || api.chain_ok !== true) return;
     const e = { producer: null, unregistered: true, operator: k.operator || host(url), note: k.note || null, sources: k.sources || [],
-      rank: null, types: ['api'], features: [], url, p2p: null, location: null, api };
+      rank: null, types: ['api'], features: [], url, id: endpointId(url), ref: endpointRef(url), p2p: null, location: null, api };
     const hy = await probeHyperion(url, c.head).catch(() => null); if (hy?.ok) e.hyperion = hy;
     found.push(e);
   });
@@ -302,27 +303,80 @@ if (!OFFLINE) {
 }
 
 // ---- servers (beacon reports) --------------------------------------------------------------------------
-// Storage is keyed by token hash (one token = one server). The caller-chosen `node` label is display only;
-// two servers claiming the same label under one producer are both kept and shown as "api", "api (2)".
+// Storage key = token hash, plus the beacon's instance_id when it sends one (one token = one server; a token
+// reporting from a second machine is kept as a separate, conflict-flagged entry — never silently replaced).
+// The caller-chosen `node` label is display only; equal labels are shown as "api", "api (2)". Each entry also
+// gets a public `sid` (one-way hash of its key) so links/APIs address the exact server, not a label.
+const sidOf = (key) => sha(`sid:${key}`).slice(0, 16);
 function servers(netId, producer) {
-  const byTok = nodes[netId]?.[producer]; if (!byTok) return [];
-  const list = Object.entries(byTok).map(([tok, v]) => ({ tok, ...v })).sort((a, b) => a.first_seen - b.first_seen || a.tok.localeCompare(b.tok));
+  const byKey = nodes[netId]?.[producer]; if (!byKey) return [];
+  const list = Object.entries(byKey).map(([key, v]) => ({ key, sid: sidOf(key), ...v })).sort((a, b) => a.first_seen - b.first_seen || a.key.localeCompare(b.key));
   const seen = dict();
   for (const s of list) { const base = s.report.node; seen[base] = (seen[base] || 0) + 1; s.label = seen[base] > 1 ? `${base} (${seen[base]})` : base; }
   return list;
 }
-const isSilent = (s, now = Date.now()) => now - s.received > silentAfterMs(s.report);
+// Freshness is judged by the report's OWN timestamp (not when we received it), so a stale report replayed
+// within the acceptance window can't look fresh.
+const reportAge = (s, now = Date.now()) => Math.max(0, now - (Date.parse(s.report.ts) || s.received));
+const isSilent = (s, now = Date.now()) => reportAge(s, now) > silentAfterMs(s.report);
+// Preparation stages per server (display only; none of these is authorization to cut).
+const STAGE_CHECKS = {
+  metal: ['validator_running', 'metal_synced', 'metal_reachable'],
+  beacon: ['source_api', 'chain_id', 'producer_api', 'disk_free', 'staged_snapshot_absent'],
+  ceremony: ['hook_on_freeze', 'hook_post_ignite', 'hook_on_live', 'hook_on_abort', 'freeze_height', 'freeze_lead_blocks'],
+};
+function stages(s, now = Date.now()) {
+  const byName = dict(); for (const c of s.report.checks) byName[c.name] = c;
+  const judge = (names) => { const hit = names.filter((n) => byName[n]); if (!hit.length) return { ok: null, detail: 'not reported' };
+    const bad = hit.filter((n) => !byName[n].ok); return { ok: !bad.length, detail: bad.length ? `${bad.length} of ${hit.length} checks failing` : `${hit.length} checks ok` }; };
+  const silent = isSilent(s, now);
+  const beacon = judge(STAGE_CHECKS.beacon);
+  const ceremony = s.report.profile === 'readiness' ? { ok: false, detail: 'readiness profile: no ceremony configured on this server' } : judge(STAGE_CHECKS.ceremony);
+  return {
+    metal_prepared: judge(STAGE_CHECKS.metal),
+    beacon_healthy: silent ? { ok: false, detail: 'beacon silent' } : beacon,
+    ceremony_configured: ceremony,
+    admitted: { ok: null, detail: 'unknown: validator admission is not tracked yet' },
+    authorized: { ok: null, detail: 'none: no COMMIT certificate exists (authority boundary not implemented)' },
+    prepared: !silent && s.report.checks.every((c) => c.ok),
+  };
+}
 
 // ---- coordination: relay of SIGNED coordinator messages (event / arm / abort), persisted ----------------------
 // The server checks signatures against the network's configured coordinator keys so it can't be spammed,
 // but agents verify again with keys from their OWN config: this relay cannot forge anything. Readiness numbers
 // shown next to it are display data, not signed authorization.
-let coord = dict(); // network id → { event, arm, abort, history: [{type, event_id, at}] }  (each msg: { payload, sig, key })
-try { if (existsSync(COORD_FILE)) { const j = JSON.parse(readFileSync(COORD_FILE, 'utf8')); for (const [k, v] of Object.entries(j)) if (RE.net.test(k)) coord[k] = v; } }
-catch (e) { console.error(`coord: could not load ${COORD_FILE} (${e.message}); starting empty`); }
-function saveCoord() {
-  try { mkdirSync(dirname(COORD_FILE), { recursive: true }); const tmp = `${COORD_FILE}.tmp`; writeFileSync(tmp, JSON.stringify(coord, null, 1)); renameSync(tmp, COORD_FILE); }
-  catch (e) { console.error(`coord: persist failed (${e.message})`); }
+// The relay is an ACCEPTANCE BOUNDARY: a message counts as relayed only once it is on disk. Every change is made
+// on a copy, persisted atomically (write tmp + fsync + rename), and only then swapped into memory; a failed write
+// answers 503 and changes nothing. A corrupt store stops startup (never "start empty" and forget an event).
+// `used` = every event id ever published → sha256 of its payload: ids are never reusable.
+let coord = dict(); // network id → { event, arm, abort, history: [{type, event_id, at}], used: {event_id: payloadSha} }
+if (existsSync(COORD_FILE)) {
+  try { const j = JSON.parse(readFileSync(COORD_FILE, 'utf8')); if (!j || typeof j !== 'object' || Array.isArray(j)) throw new Error('not an object');
+    const safe = clone(j); for (const [k, v] of Object.entries(safe)) if (RE.net.test(k)) coord[k] = v; }
+  catch (e) { console.error(`coord: ${COORD_FILE} is unreadable or corrupt (${e.message}). Refusing to start: fix or restore it (a backup, or delete it ONLY if no event is live).`); process.exit(3); }
+}
+function atomicWrite(file, obj) {
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}`;
+  const fd = openSync(tmp, 'w'); try { writeSync(fd, JSON.stringify(obj, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
+  renameSync(tmp, file);
+}
+/** Persist `next` as the whole coordination state; returns true only if it is durably on disk. */
+function commitCoord(next) {
+  try { atomicWrite(COORD_FILE, next); coord = next; return true; }
+  catch (e) { console.error(`coord: persist failed (${e.message}); change NOT accepted`); return false; }
+}
+
+// Replay state (last accepted report timestamp per server key) survives restarts, so a captured report can't be
+// replayed just because mission control restarted. Written through, coalesced to at most once per second.
+const lastTs = dict();
+try { if (existsSync(REPLAY_FILE)) { const j = JSON.parse(readFileSync(REPLAY_FILE, 'utf8')); for (const [k, v] of Object.entries(j)) if (/^[0-9a-f]{64}(:[0-9a-f]{32})?$/.test(k) && Number.isFinite(v)) lastTs[k] = v; } }
+catch (e) { console.error(`replay: ${REPLAY_FILE} unreadable (${e.message}); starting with a fresh replay window (reports older than ${TS_PAST_MS / 60e3} min are still refused)`); }
+let replayDirty = false;
+function saveReplaySoon() {
+  if (replayDirty) return; replayDirty = true;
+  setTimeout(() => { replayDirty = false; try { atomicWrite(REPLAY_FILE, lastTs); } catch (e) { console.error(`replay: persist failed (${e.message})`); } }, 1000).unref();
 }
 function verifySigned(msg, keys) {
   try {
@@ -381,9 +435,14 @@ function agreement(n) {
     for (const [who, , v] of vals) (groups[JSON.stringify(v)] ||= []).push(who);
     const distinct = Object.keys(groups);
     const have = new Set(vals.map(([, p]) => p));
-    const missing = members.filter((p) => !have.has(p));
+    // Absent values are MISSING, never silently dropped: roster members without the value, plus (with no roster)
+    // every producer-role reporter that lacks it.
+    const reporters = [...new Set(all.filter((p) => servers(n.id, p).some((x) => (x.report.role || 'producer') === 'producer')))];
+    const missing = (members.length ? members : reporters).filter((p) => !have.has(p));
     const expectBad = key === 'burnoff_transactions' ? vals.some(([, , v]) => v !== 0) : false;
-    rows.push({ key, label, agree: distinct.length === 1 && !missing.length && !expectBad, reporting: vals.length, roster: members.length,
+    // No roster = no agreement verdict: "everyone who happened to report agrees" is not agreement.
+    const agree = !members.length ? null : distinct.length === 1 && !missing.length && !stale.length && !expectBad;
+    rows.push({ key, label, agree, verdict: !members.length ? 'no roster' : agree ? 'agree' : 'disagree', reporting: vals.length, roster: members.length,
       missing, stale, bad_value: expectBad, values: distinct.map((v) => ({ value: JSON.parse(v), producers: groups[v] })) });
   }
   return rows;
@@ -399,13 +458,13 @@ function status() {
       const reg = registry[n.id]?.producers || {};
       const names = [...new Set([...Object.keys(reg), ...(c.schedule || []), ...Object.keys(reported)])];
       const geo = n.geo || {};
-      let serversAll = 0, serversLive = 0, serversReady = 0; const states = {};
+      let serversAll = 0, serversLive = 0, serversReady = 0, serversConflict = 0; const states = {};
       const producers = names.map((name) => {
-        const beacons = servers(n.id, name).map((s) => ({ node: s.label, role: s.report.role || null, age_ms: now - s.received,
-          silent: isSilent(s, now), conflict: !!s.conflict, report: s.report }))
+        const beacons = servers(n.id, name).map((s) => ({ node: s.label, sid: s.sid, role: s.report.role || null, age_ms: reportAge(s, now),
+          silent: isSilent(s, now), conflict: !!s.conflict, stages: stages(s, now), report: s.report }))
           .sort((x, y) => (x.role === 'producer' ? -1 : 0) - (y.role === 'producer' ? -1 : 0));
         for (const b of beacons) {
-          serversAll++;
+          serversAll++; if (b.conflict) serversConflict++;
           if (!b.silent) { serversLive++; if (b.report.ready) serversReady++; const st = b.report.ceremony?.state || 'IDLE'; states[st] = (states[st] || 0) + 1; }
         }
         const r = beacons.length ? { report: beacons[0].report, received: now - beacons[0].age_ms } : null;
@@ -416,8 +475,9 @@ function status() {
         return { name, org: { ...org, logo: org.logo ? `/api/logo/${encodeURIComponent(n.id)}/${encodeURIComponent(name)}` : null },
           rank: g.rank || null, votes: g.votes || null, active: !!reg[name] || !!geo[name],
           scheduled: (c.schedule || []).includes(name), reporting: liveB.length > 0,
-          // a producer is ready only when every one of its servers reports and is ready
-          ready: beacons.length > 0 && liveB.length === beacons.length && liveB.every((b) => b.report.ready),
+          // "prepared" (API field kept as `ready` for compatibility): every one of its servers reports, all checks
+          // green, no identity conflict. Preparation only: not admission, not authorization to cut.
+          ready: beacons.length > 0 && liveB.length === beacons.length && liveB.every((b) => b.report.ready) && !beacons.some((b) => b.conflict),
           silent: r ? beacons.some((b) => b.silent) : null, age_ms: age, report: r?.report || null, beacons };
       }).sort((a, b) => (b.scheduled - a.scheduled) || ((a.rank || 999) - (b.rank || 999)) || a.name.localeCompare(b.name));
       return { id: n.id, name: n.name, label: n.label, priority: n.priority ?? 9, description: n.description || '',
@@ -425,7 +485,7 @@ function status() {
         summary: { producers: producers.length, active: producers.filter((p) => p.active).length, scheduled: (c.schedule || []).length,
           roster: roster(n).length,
           reporting: producers.filter((p) => p.reporting).length, ready: producers.filter((p) => p.ready).length,
-          servers: serversAll, servers_reporting: serversLive, servers_ready: serversReady, servers_silent: serversAll - serversLive, states },
+          servers: serversAll, servers_reporting: serversLive, servers_ready: serversReady, servers_prepared: serversReady, servers_silent: serversAll - serversLive, servers_conflict: serversConflict, states },
         producers, agreement: agreement(n), coordination: coordView(n), events: (events[n.id] || []).slice(0, 40) };
     }).sort((a, b) => a.priority - b.priority),
   };
@@ -512,12 +572,14 @@ async function handle(req, res) {
   const nm = path.match(/^\/api\/node\/([^/]+)\/([^/]+)\/([^/]+)$/);
   if (nm && req.method === 'GET') {
     // One server's latest (public projection of its) beacon report + short history, for its page and for agents.
+    // The last segment is the server's `sid` (exact) or its display label.
     const [netId, prod, nd] = nm.slice(1).map(safeDecode);
-    if ([netId, prod, nd].some((s) => s === null) || !RE.net.test(netId) || !RE.producer.test(prod) || !RE.label.test(nd)) return send(res, 400, { error: 'bad node path' });
-    const s = servers(netId, prod).find((x) => x.label === nd);
+    if ([netId, prod, nd].some((s) => s === null) || !RE.net.test(netId) || !RE.producer.test(prod) || !(RE.label.test(nd) || RE.sid.test(nd))) return send(res, 400, { error: 'bad node path' });
+    const list = servers(netId, prod);
+    const s = list.find((x) => x.sid === nd) || list.find((x) => x.label === nd);
     if (!s) return send(res, 404, { error: 'no such server' });
-    const age = Date.now() - s.received;
-    return send(res, 200, { network: netId, producer: prod, node: s.label, age_ms: age, silent: isSilent(s), conflict: !!s.conflict, report: s.report, history: s.hist || [] });
+    return send(res, 200, { network: netId, producer: prod, node: s.label, sid: s.sid, age_ms: reportAge(s), silent: isSilent(s), conflict: !!s.conflict,
+      stages: stages(s), report: s.report, history: s.hist || [] });
   }
   const mm = path.match(/^\/api\/manifest(?:\/([a-z0-9-]{1,32}))?$/);
   if (mm && req.method === 'GET') {
@@ -530,33 +592,62 @@ async function handle(req, res) {
     return n ? send(res, 200, one(n)) : send(res, 404, { error: 'unknown network' });
   }
   const cm = path.match(/^\/api\/coord\/([a-z0-9-]{1,32})$/);
-  if (cm && req.method === 'GET') { const c = coord[cm[1]]; return send(res, 200, c ? { event: c.event || null, arm: c.arm || null, abort: c.abort || null } : {}); }
+  if (cm && req.method === 'GET') { const c = own(coord, cm[1]) ? coord[cm[1]] : null; return send(res, 200, c ? { event: c.event || null, arm: c.arm || null, abort: c.abort || null } : {}); }
   if (cm && req.method === 'POST') {
     const n = cfg.networks.find((x) => x.id === cm[1]); if (!n) return send(res, 404, { error: 'unknown network' });
     const raw = await readBody(req, 16384); if (raw === null) return send(res, 413, { error: 'too large' });
     let msg; try { msg = JSON.parse(raw); } catch { return send(res, 400, { error: 'bad json' }); }
     const p = verifySigned(msg, n.coordinators);
     if (!p || p.network !== n.id || !['event', 'arm', 'abort'].includes(p.type)) return send(res, 403, { error: 'not a valid signed coordinator message for this network' });
-    const c = (coord[n.id] ||= { history: [] }); c.history ||= [];
+    const next = clone(coord);
+    if (reservedKey(p.event_id)) return send(res, 400, { error: 'reserved event id' });
+    const c = own(next, n.id) ? next[n.id] : (next[n.id] = Object.assign(dict(), { history: [], used: dict() })); c.history ||= []; c.used ||= dict();
     const cur = c.event ? JSON.parse(c.event.payload) : null;
+    const at = new Date().toISOString();
+    let note;
     if (p.type === 'event') {
       if (n.chain_id && p.chain_id !== n.chain_id) return send(res, 409, { error: 'event chain_id does not match this network' });
+      const h = sha(msg.payload);
       if (cur && !c.abort) {
         if (cur.event_id !== p.event_id) return send(res, 409, { error: `event ${cur.event_id} is active; abort it before publishing another` });
         if (c.event.payload !== msg.payload) return send(res, 409, { error: 'a different payload for this event_id is already published' });
-        return send(res, 200, { ok: true, type: 'event', event_id: p.event_id, unchanged: true });
+        return send(res, 200, { ok: true, type: 'event', event_id: p.event_id, event_hash: h, unchanged: true });
       }
-      coord[n.id] = { event: msg, history: [...c.history, { type: 'event', event_id: p.event_id, at: new Date().toISOString() }].slice(-100) };
-      pushEvent(n.id, 'coordinator', `published event ${p.event_id}: cut at H = ${Number(p.h) || '?'}`);
+      // Event ids are never reusable, not even after an abort: a new attempt needs a new id.
+      if (own(c.used, p.event_id)) return send(res, 409, { error: c.used[p.event_id] === h ? `event ${p.event_id} was already used (aborted or superseded); publish a new event id` : `event id ${p.event_id} was already used with a different payload` });
+      next[n.id] = Object.assign(dict(), { event: msg, history: [...c.history, { type: 'event', event_id: p.event_id, event_hash: h, at }].slice(-100), used: Object.assign(dict(), c.used, { [p.event_id]: h }) });
+      note = `published event ${p.event_id}: cut at H = ${Number(p.h) || '?'}`;
     } else {
       if (!cur || cur.event_id !== p.event_id) return send(res, 409, { error: 'no such event' });
+      // arm (required) and abort (optional, but checked when present) must name the exact event payload they refer
+      // to, so a message signed for one version of an event can never act on another.
+      const evHash = sha(c.event.payload);
+      if (p.type === 'arm' && p.event_hash !== evHash) return send(res, 409, { error: 'arm must carry event_hash = sha256 of the published event payload (update control/coord.mjs)', event_hash: evHash });
+      if (p.type === 'abort' && p.event_hash != null && p.event_hash !== evHash) return send(res, 409, { error: 'abort event_hash does not match the published event', event_hash: evHash });
       if (c.abort) return send(res, 409, { error: 'event already aborted' });
-      if (c[p.type]) return send(res, 200, { ok: true, type: p.type, event_id: p.event_id, unchanged: true });
-      c[p.type] = msg; c.history.push({ type: p.type, event_id: p.event_id, at: new Date().toISOString() });
-      pushEvent(n.id, 'coordinator', p.type === 'arm' ? `ARMED event ${p.event_id}` : `ABORTED event ${p.event_id}`);
+      if (own(c, p.type) && c[p.type]) return send(res, 200, { ok: true, type: p.type, event_id: p.event_id, unchanged: true });
+      c[p.type] = msg; c.history.push({ type: p.type, event_id: p.event_id, at });
+      note = p.type === 'arm' ? `ARMED event ${p.event_id}` : `ABORTED event ${p.event_id}`;
     }
-    saveCoord();
-    return send(res, 200, { ok: true, type: p.type, event_id: p.event_id });
+    if (!commitCoord(next)) return send(res, 503, { error: 'could not persist the message; nothing was relayed, retry' });
+    pushEvent(n.id, 'coordinator', note);
+    return send(res, 200, { ok: true, type: p.type, event_id: p.event_id, ...(p.type === 'event' ? { event_hash: sha(msg.payload) } : {}) });
+  }
+  if (req.method === 'POST' && path === '/api/admin/clear-server') {
+    // Operator-only, from the box itself: the reverse proxy always sets X-Real-IP, so a request that arrives on
+    // loopback WITHOUT it came from a local shell (curl on the mission-control host), never from the internet.
+    const sock = normIp(req.socket.remoteAddress);
+    if (!(sock === '127.0.0.1' || sock === '::1') || req.headers['x-real-ip'] || req.headers['x-forwarded-for']) return send(res, 403, { error: 'local operator only' });
+    const netId = url.searchParams.get('net'), prod = url.searchParams.get('producer'), sid = url.searchParams.get('sid');
+    if (!RE.net.test(netId || '') || !RE.producer.test(prod || '') || !RE.sid.test(sid || '')) return send(res, 400, { error: 'need ?net=&producer=&sid=' });
+    const byKey = nodes[netId]?.[prod]; const hit = byKey && Object.keys(byKey).find((k) => sidOf(k) === sid);
+    if (!hit) return send(res, 404, { error: 'no such server' });
+    const tok = hit.split(':')[0];
+    delete byKey[hit];
+    // clearing one side of a conflict un-flags the remaining entries of that token
+    for (const [k, v] of Object.entries(byKey)) if (k.split(':')[0] === tok) v.conflict = false;
+    pushEvent(netId, prod, `operator removed server ${sid}`);
+    return send(res, 200, { ok: true, removed: sid });
   }
   if (req.method === 'POST' && path === '/api/report') {
     const tokenHash = sha(String(req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
@@ -572,20 +663,27 @@ async function handle(req, res) {
     const ts = Date.parse(r.ts), now = Date.now();
     if (ts > now + TS_FUTURE_MS) return send(res, 400, { error: 'report timestamp is in the future (check the server clock)' });
     if (ts < now - TS_PAST_MS) return send(res, 400, { error: 'report is too old' });
-    const byTok = ((nodes[r.network] ||= dict())[r.producer] ||= dict());
-    const prevE = byTok[tokenHash];
-    if (prevE && ts <= Date.parse(prevE.report.ts)) return send(res, 409, { error: 'replayed or out-of-order report' });
-    // One token on two machines shows up as a changing instance_id: flag it instead of flapping silently.
-    const conflict = !!(prevE?.instance_id && r.instance_id && prevE.instance_id !== r.instance_id);
+    const byKey = ((nodes[r.network] ||= dict())[r.producer] ||= dict());
+    const key = r.instance_id ? `${tokenHash}:${r.instance_id}` : tokenHash;
+    if (ts <= (lastTs[key] || 0)) return send(res, 409, { error: 'replayed or out-of-order report' });
+    // Pre-instance_id entry of the same token upgrades in place to the keyed entry (same machine, newer beacon).
+    if (r.instance_id && !byKey[key] && byKey[tokenHash]) { byKey[key] = byKey[tokenHash]; delete byKey[tokenHash]; }
+    const prevE = byKey[key];
+    // One token on two machines shows up as a second instance_id: keep BOTH entries, flag both as a conflict,
+    // until an operator removes one (POST /api/admin/clear-server) or re-enrolls with separate tokens.
+    const siblings = Object.keys(byKey).filter((k) => k !== key && k.split(':')[0] === tokenHash && k.includes(':'));
+    const conflict = siblings.length > 0;
+    if (conflict) for (const k of siblings) byKey[k].conflict = true;
     const prev = prevE?.report;
     // Short in-memory history (about 2 h at a 10 s interval) for the per-server page's charts.
     const hist = (prevE?.hist || []).slice(-719);
     const lagNow = chain[r.network]?.head && r.source?.head ? Math.max(0, chain[r.network].head - r.source.head) : null;
-    hist.push({ t: now, head: r.source?.head ?? null, lag: lagNow, peers: r.metal?.peers ?? null, ok: r.checks.filter((c) => c.ok).length, n: r.checks.length });
-    byTok[tokenHash] = { report: r, received: now, hist, first_seen: prevE?.first_seen || now, instance_id: r.instance_id || prevE?.instance_id || null, conflict: conflict || !!prevE?.conflict };
-    const label = servers(r.network, r.producer).find((s) => s.tok === tokenHash)?.label || r.node;
-    const who = Object.keys(byTok).length > 1 || r.node ? `${r.producer} · ${label}` : r.producer;
-    if (conflict) pushEvent(r.network, who, 'the same beacon token is reporting from two machines (instance id changed)');
+    hist.push({ t: ts, head: r.source?.head ?? null, lag: lagNow, peers: r.metal?.peers ?? null, ok: r.checks.filter((c) => c.ok).length, n: r.checks.length });
+    byKey[key] = { report: r, received: now, hist, first_seen: prevE?.first_seen || now, instance_id: r.instance_id || null, conflict: conflict || !!prevE?.conflict };
+    lastTs[key] = ts; saveReplaySoon();
+    const label = servers(r.network, r.producer).find((s) => s.key === key)?.label || r.node;
+    const who = Object.keys(byKey).length > 1 || r.node ? `${r.producer} · ${label}` : r.producer;
+    if (conflict && !prevE?.conflict) pushEvent(r.network, who, 'the same beacon token is reporting from two machines (second instance id): both kept and flagged');
     if (prev && prev.node !== r.node) pushEvent(r.network, who, `renamed from ${prev.node}`);
     const was = prev?.ceremony?.state, is = r.ceremony?.state;
     if (!prev) pushEvent(r.network, who, `started reporting (${r.role || 'node'}, agent ${r.agent_version})`);

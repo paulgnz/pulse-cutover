@@ -154,7 +154,12 @@ section{margin-top:26px}
 .ribbon i{flex:1;border-radius:6px;position:relative;min-width:18px}
 .ribbon i::after{content:attr(data-p);position:absolute;inset:0;display:grid;place-items:center;font:600 9.5px var(--mono);color:rgba(0,0,0,.65)}
 .verdict{font:700 12px var(--mono);white-space:nowrap}
-.verdict.ok{color:var(--ok)}.verdict.bad{color:var(--bad)}
+.stages{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(190px,100%),1fr));gap:10px}
+.stage{border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;flex-direction:column;gap:4px;font-size:12px}
+.stage b{display:flex;align-items:center;gap:6px;font-size:12.5px}.stage span{color:var(--muted)}
+.stage.ok b{color:var(--ok)}.stage.todo b{color:var(--warn)}.stage.mute b{color:var(--muted)}
+.stchips{display:flex;flex-wrap:wrap;gap:5px;padding:10px 16px 0 18px}
+.verdict.ok{color:var(--ok)}.verdict.bad{color:var(--bad)}.verdict.mute{color:var(--muted)}
 .ev-empty{color:var(--muted);font-size:13px;line-height:1.6}
 .ev-empty b{color:var(--ink)}
 .feed{padding:20px;max-height:430px;overflow:auto}
@@ -397,7 +402,7 @@ a.tilelink{color:inherit;text-decoration:none;display:block}
         <div><div class="label" id="net-label">Network</div><h1 id="net-title">Loading…</h1><p id="net-desc"></p></div>
       </div>
       <div class="legend">
-        <span><i style="background:var(--ok)"></i>ready</span><span><i style="background:var(--warn)"></i>needs attention</span>
+        <span><i style="background:var(--ok)"></i>prepared</span><span><i style="background:var(--warn)"></i>needs attention</span>
         <span><i style="background:#c7cbe0"></i>scheduled</span><span><i style="background:#5b6480"></i>standby</span>
         <span><i style="background:var(--cut)"></i>producing now</span>
       </div>
@@ -432,7 +437,7 @@ a.tilelink{color:inherit;text-decoration:none;display:block}
     <div class="sec-h"><h2 id="t-infra">Infrastructure</h2><span id="infra-sub">every node every producer publishes in bp.json · probed read-only</span></div>
     <div class="inf-sum" id="inf-sum"></div>
     <div class="inf-tools" id="inf-tools"></div>
-    <div class="glass inf-table"><table><thead><tr><th>Operator</th><th title="Readiness of this producer's beacon servers (not measured per endpoint)">Cutover <span style="color:var(--dim);font-weight:500">· producer</span></th><th>Node</th><th>Endpoint</th><th>API</th><th>Version</th><th>Lag</th><th>Edge</th><th>Hyperion</th><th>Atomic</th><th>P2P</th></tr></thead><tbody id="inf-rows"></tbody></table><div class="inf-foot" id="inf-foot"></div></div>
+    <div class="glass inf-table"><table><thead><tr><th>Operator</th><th title="Preparation status of this producer's beacon servers (not measured per endpoint; preparation is not authorization to cut)">Prepared <span style="color:var(--dim);font-weight:500">· producer</span></th><th>Node</th><th>Endpoint</th><th>API</th><th>Version</th><th>Lag</th><th>Edge</th><th>Hyperion</th><th>Atomic</th><th>P2P</th></tr></thead><tbody id="inf-rows"></tbody></table><div class="inf-foot" id="inf-foot"></div></div>
   </section>
   <section class="duo">
     <div>
@@ -683,7 +688,7 @@ function statusOf(p) {
   if (sick) return { text: `${nodes}${sick} health issue${sick > 1 ? 's' : ''}`, dot: 'bad' };
   const todo = bs.reduce((a, b) => a + splitChecks(b.report.checks || []).todo.length, 0);
   if (todo) return { text: `${nodes}${todo} setup step${todo > 1 ? 's' : ''} left`, dot: 'warn' };
-  return { text: `${nodes}ready for cutover`, dot: 'ok' };
+  return { text: `${nodes}prepared (all checks green)`, dot: 'ok' };
 }
 function render() {
   if (!data) return;
@@ -784,7 +789,7 @@ function render() {
   $('ev').innerHTML = !net.agreement.length ? `<div class="ev-empty">When producers run a ceremony, their beacons report its evidence here: <b>cut block</b>, <b>snapshot hash</b>, <b>table fingerprints</b>, <b>transactions after the cut</b>, <b>state digest</b> and the <b>new chain's anchor</b>. Each value becomes a colour; every producer must show the same colour for the cut to be atomic.</div>`
     : net.agreement.map((a) => {
       const chips = withEv.map((p) => { const v = p.report.ceremony.evidence[a.key]; return v == null ? '' : `<i style="background:${color(JSON.stringify(v))}" data-p="${esc(p.name)}" title="${esc(p.name)}: ${esc(JSON.stringify(v))}"></i>`; }).join('');
-      return `<div class="ev-row"><div class="k">${esc(a.label)}</div><div class="ribbon">${chips}</div><div class="verdict ${a.agree ? 'ok' : 'bad'}" title="${esc([a.missing?.length ? 'missing: ' + a.missing.join(', ') : '', a.stale?.length ? 'stale (excluded): ' + a.stale.join(', ') : ''].filter(Boolean).join(' · '))}">${a.agree ? `✓ ${+a.reporting}/${+(a.roster || a.reporting)}` : a.bad_value ? '✗ NON-ZERO' : a.values.length > 1 ? '✗ MISMATCH' : `○ ${+a.reporting}/${+(a.roster || a.reporting)} · ${+(a.missing?.length || 0)} missing`}</div></div>`;
+      return `<div class="ev-row"><div class="k">${esc(a.label)}</div><div class="ribbon">${chips}</div><div class="verdict ${a.agree === null ? 'mute' : a.agree ? 'ok' : 'bad'}" title="${esc([a.missing?.length ? 'missing: ' + a.missing.join(', ') : '', a.stale?.length ? 'stale (excluded): ' + a.stale.join(', ') : ''].filter(Boolean).join(' · '))}">${a.agree === null ? `– no roster · ${+a.reporting} reporting${a.missing?.length ? `, ${+a.missing.length} missing` : ''}` : a.agree ? `✓ ${+a.reporting}/${+a.roster}` : a.bad_value ? '✗ NON-ZERO' : a.values.length > 1 ? '✗ MISMATCH' : `○ ${+a.reporting}/${+(a.roster || a.reporting)} · ${+(a.missing?.length || 0)} missing`}</div></div>`;
     }).join('');
 
   // feed
@@ -802,7 +807,7 @@ function render() {
 
 /* ---------------- infrastructure ---------------- */
 let infraData = {}, infraFilter = 'all', infraQuery = '';
-const FILTERS = [['all', 'All nodes'], ['api', 'API'], ['producer', 'Producer'], ['p2p', 'P2P peers'], ['hyperion', 'Hyperion'], ['atomic', 'AtomicAssets'], ['ready', 'Cutover ready'], ['nonprod', 'Not producers'], ['problems', 'Problems']];
+const FILTERS = [['all', 'All nodes'], ['api', 'API'], ['producer', 'Producer'], ['p2p', 'P2P peers'], ['hyperion', 'Hyperion'], ['atomic', 'AtomicAssets'], ['ready', 'Prepared'], ['nonprod', 'Not producers'], ['problems', 'Problems']];
 const MIXC = ['#8b5cf6', '#34d399', '#60a5fa', '#f5a524', '#fb7185', '#a3e635', '#f472b6', '#94a3b8'];
 function mix(counts) {
   const tot = counts.reduce((a, [, n]) => a + n, 0) || 1;
@@ -810,7 +815,7 @@ function mix(counts) {
     <div class="mixl">${counts.slice(0, 4).map(([k, n], i) => `<span><i class="sd" style="background:${MIXC[i % MIXC.length]};display:inline-block;width:7px;height:7px;margin-right:4px"></i><b>${esc(k)}</b> ${n}</span>`).join('')}</div>`;
 }
 const tally = (arr) => Object.entries(arr.reduce((m, k) => (m[k] = (m[k] || 0) + 1, m), {})).sort((a, b) => b[1] - a[1]);
-const problem = (n) => (n.url && !n.api?.ok) || (n.api?.lag > 30) || (n.api && n.api.chain_ok === false) || (n.p2p && n.p2p_probe && !n.p2p_probe.ok) || (n.hyperion && (!n.hyperion.ok || n.hyperion.lag > 120)) || (n.atomic && !n.atomic.ok) || n.missing_bp_json;
+const problem = (n) => (n.url && !n.api?.ok) || (n.api?.lag > 30) || (n.api && n.api.chain_ok === false) || (n.p2p && n.p2p_probe && !n.p2p_probe.ok) || (n.hyperion && (!n.hyperion.ok || n.hyperion.services_ok === false || n.hyperion.lag > 120)) || (n.atomic && (!n.atomic.ok || n.atomic.chain_ok === false)) || n.missing_bp_json;
 // Producer-level cutover readiness for the all-nodes table (beacons don't report which endpoint they serve).
 function cutCell(name) {
   const p = net?.producers.find((x) => x.name === name);
@@ -821,8 +826,9 @@ function cutCell(name) {
   const todo = bs.reduce((a, b) => a + splitChecks(b.report.checks || []).todo.length, 0);
   const ready = bs.filter((b) => !b.silent && b.report.ready).length;
   if (silent || sick) return { cls: 'r-bad', html: `<span class="cut bad" title="${bs.length} server(s) with a beacon">${ic('bad')}${silent ? silent + ' silent' : sick + ' issue' + (sick > 1 ? 's' : '')}</span>` };
-  if (ready === bs.length) return { cls: 'r-ok', html: `<span class="cut ok" title="all ${bs.length} beacon server(s) ready">${ic('ok')}ready · ${bs.length}/${bs.length}</span>` };
-  return { cls: 'r-warn', html: `<span class="cut warn" title="${ready}/${bs.length} beacon server(s) ready">${ic('todo')}${todo} to set up</span>` };
+  if (bs.some((b) => b.conflict)) return { cls: 'r-bad', html: `<span class="cut bad" title="one beacon token is reporting from two machines">${ic('bad')}identity conflict</span>` };
+  if (ready === bs.length) return { cls: 'r-ok', html: `<span class="cut ok" title="all ${bs.length} beacon server(s) have every preparation check green (not authorization to cut)">${ic('ok')}prepared · ${bs.length}/${bs.length}</span>` };
+  return { cls: 'r-warn', html: `<span class="cut warn" title="${ready}/${bs.length} beacon server(s) prepared">${ic('todo')}${todo} to set up</span>` };
 }
 function renderInfra() {
   const d = infraData[active];
@@ -880,8 +886,8 @@ function renderInfra() {
         <td data-l="version" class="mono">${a?.version ? esc(a.version.split('-')[0]) : '—'}</td>
         <td data-l="lag" class="mono">${a?.lag != null ? `<span style="color:${a.lag > 30 ? 'var(--warn)' : 'inherit'}">${fmt(a.lag)}</span>` : '—'}</td>
         <td data-l="edge">${a?.edge ? esc(a.edge) : '—'}</td>
-        <td data-l="hyperion">${h ? `<span class="st2">${dot(h.ok, h.lag > 120)}${h.ok ? esc(h.version || '?') + (h.lag != null ? ' · lag ' + fmt(h.lag) : '') : 'down'}</span>` : '—'}</td>
-        <td data-l="atomic">${at ? `<span class="st2">${dot(at.ok && at.chain_ok !== false)}${at.ok ? esc(at.version || 'up') : 'down'}</span>` : '—'}</td>
+        <td data-l="hyperion">${h ? `<span class="st2" title="${esc((h.services || []).map((x) => `${x.s}: ${x.ok ? 'OK' : 'NOT OK'}`).join(' · '))}">${dot(h.ok && h.services_ok !== false, h.lag > 120)}${!h.ok ? 'down' : h.services_ok === false ? 'degraded · ' + esc((h.services || []).filter((x) => !x.ok).map((x) => x.s).join(', ')) : esc(h.version || '?') + (h.lag != null ? ' · lag ' + fmt(h.lag) : '')}</span>` : '—'}</td>
+        <td data-l="atomic">${at ? `<span class="st2">${dot(at.ok && at.chain_ok !== false)}${!at.ok ? 'down' : at.chain_ok === false ? 'degraded · chain not OK' : esc(at.version || 'up')}</span>` : '—'}</td>
         <td data-l="p2p">${n.p2p ? `<span class="st2" title="${esc(n.p2p)}">${dot(pp?.ok)}${pp?.ok ? pp.ms + ' ms' : esc(pp?.error || '…')}</span>` : '—'}</td></tr>`;
     }).join('') || '<tr><td colspan="11" style="color:var(--muted)">No nodes match.</td></tr>';
     $('inf-rows').querySelectorAll('tr[data-p]').forEach((tr) => tr.onclick = (e) => { if (e.target.closest('a')) return; openProducer(tr.dataset.p); });
@@ -941,12 +947,16 @@ const ROLE_NAME = { producer: 'Block producer node', history: 'History / Hyperio
    /<net>/<producer>                      producer page (all servers + endpoints)
    /<net>/<producer>/<server>             one beacon server
    /<net>/<producer>/endpoint/<host>      one public endpoint                                */
-let openName = null, pageSel = null, pageData = null, pageFetchT = 0, pageSig = '';
+let openName = null, pageSel = null, pageData = null, pageFetchT = 0, pageSig = '', pageSeq = 0, pageSeqShown = 0;
 const enc = encodeURIComponent;
-// Endpoint pages are keyed by a canonical id: host plus path (no scheme, no trailing slash).
-const epId = (u) => { if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(String(u || ''))) return String(u || ''); try { const x = new URL(u); return (x.host + x.pathname).replace(/\/+$/, '').toLowerCase(); } catch { return String(u || ''); } };
-const hostOf = epId;
-const pathFor = (net, prod, sel) => '/' + [net, prod, ...(sel?.node ? [sel.node] : sel?.ep ? ['endpoint', epId(sel.ep)] : [])].filter(Boolean).map(enc).join('/');
+// Endpoint pages are keyed by a canonical id (same rule as control/lib.mjs endpointId): scheme://host[:port]/path,
+// scheme+host lower-cased, path case preserved, trailing slashes trimmed; the route carries it base64url-encoded.
+const epId = (u) => { try { const x = new URL(String(u)); if (!/^https?:$/.test(x.protocol)) return null; return `${x.protocol}//${x.host.toLowerCase()}${x.pathname.replace(/\/+$/, '')}`; } catch { return null; } };
+const b64u = (t) => btoa(String.fromCharCode(...new TextEncoder().encode(t))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const unb64u = (t) => { try { if (!/^[A-Za-z0-9_-]{4,600}$/.test(t)) return null; const b = atob(t.replace(/-/g, '+').replace(/_/g, '/')); return new TextDecoder().decode(Uint8Array.from(b, (ch) => ch.charCodeAt(0))); } catch { return null; } };
+const epFromRef = (ref) => { const id = unb64u(ref); return id && epId(id) === id ? id : null; };
+const hostOf = (u) => { try { return new URL(u).host; } catch { return String(u || ''); } };
+const pathFor = (net, prod, sel) => '/' + [net, prod, ...(sel?.node ? [sel.node] : sel?.ep ? ['endpoint', b64u(epId(sel.ep) || sel.ep)] : [])].filter(Boolean).map(enc).join('/');
 function readRoute() {
   const q = new URLSearchParams(location.search);
   if (q.get('net') || q.get('p')) {   // old ?net=&p=&node=&ep=&view= links → real paths
@@ -959,7 +969,8 @@ function readRoute() {
   catch { history.replaceState(null, '', '/' + (active || '')); seg = active ? [active] : []; }   // malformed link → overview
   if (seg[0]) active = seg[0];
   openName = seg[1] || null;
-  pageSel = !openName ? null : seg[2] === 'endpoint' && seg[3] ? { ep: seg[3] } : seg[2] ? { node: seg[2] } : { producer: true };
+  // endpoint segment: base64url canonical id; an old host[/path] link is kept as { legacy } and resolved once the survey is loaded
+  pageSel = !openName ? null : seg[2] === 'endpoint' && seg[3] ? (epFromRef(seg[3]) ? { ep: epFromRef(seg[3]) } : { ep: null, legacy: seg[3] }) : seg[2] ? { node: seg[2] } : { producer: true };
 }
 function go(path, { replace = false } = {}) {
   if (path === location.pathname) return;
@@ -1019,7 +1030,7 @@ async function renderPage() {
   if (pageSel.producer) {
     const bs = p.beacons || [], eps = (infraData[active]?.nodes || []).filter((x) => x.producer === p.name);
     const col = { ok: 'var(--ok)', warn: 'var(--warn)', bad: 'var(--bad)' };
-    const stOf = (b) => { const k = splitChecks(b.report.checks || []); return b.silent ? ['bad', 'silent'] : k.sick.length ? ['bad', `${k.sick.length} issue${k.sick.length > 1 ? 's' : ''}`] : k.todo.length ? ['warn', `${k.todo.length} to set up`] : ['ok', 'ready']; };
+    const stOf = (b) => { const k = splitChecks(b.report.checks || []); return b.silent ? ['bad', 'silent'] : k.sick.length ? ['bad', `${k.sick.length} issue${k.sick.length > 1 ? 's' : ''}`] : k.todo.length ? ['warn', `${k.todo.length} to set up`] : ['ok', 'prepared']; };
     const yn = (v, t, f) => v == null ? '<span style="color:var(--dim)">—</span>' : v ? `<span style="color:var(--ok)">${t}</span>` : `<span style="color:var(--warn)">${f}</span>`;
     const tiles = bs.map((b) => { const rp = b.report, k = splitChecks(rp.checks || []), [st, txt] = stOf(b), m = rp.metal, done = k.setup.length - k.todo.length;
       const lag = c.head && rp.source?.head ? Math.max(0, c.head - rp.source.head) : null;
@@ -1027,10 +1038,12 @@ async function renderPage() {
         <div class="srv-h"><div class="srv-ic">${ic(ROLE_ICON[b.role] || 'server', 'lg')}</div><div style="min-width:0"><h5>${esc(b.node)}</h5><div class="meta"><span>${esc(ROLE_NAME[b.role] || b.role || 'node')}</span><span>${ic('clock')}${b.silent ? 'silent' : `<span data-ts="${Date.parse(b.report.ts) || ''}"></span>`}</span></div></div><span class="pill ${st}">${ic(st === 'ok' ? 'ok' : st === 'bad' ? 'bad' : 'todo')}${txt}</span></div>
         <div class="srv-kv"><div><span>XPR head</span>${lag == null ? '—' : lag <= 30 ? '<span style="color:var(--ok)">in sync</span>' : fmt(lag) + ' behind'}</div><div><span>metal</span>${m ? esc(String(m.version || '').replace('metalgo/', '')) : '<span style="color:var(--dim)">—</span>'}</div><div><span>peers</span>${m ? fmt(m.peers) : '—'}</div>
           <div><span>P-Chain</span>${m ? yn(m.bootstrapped?.P, 'synced', 'syncing') : '—'}</div><div><span>port 9651</span>${m ? yn(m.staking_reachable, 'open', 'closed') : '—'}</div><div><span>setup</span>${done}/${k.setup.length}</div></div>
+        <div class="stchips">${b.conflict ? `<span class="pill bad">${ic('bad')}identity conflict</span>` : ''}${b.stages ? [['metal_prepared', 'Metal'], ['beacon_healthy', 'Beacon'], ['ceremony_configured', 'Ceremony'], ['admitted', 'Admitted'], ['authorized', 'Authorized']]
+          .map(([k2, l2]) => { const v = b.stages[k2] || {}; return `<span class="pill ${v.ok === true ? 'ok' : v.ok === false ? 'warn' : 'mute'}" title="${esc(v.detail || '')}">${esc(l2)}</span>`; }).join('') : ''}</div>
         <div style="padding:10px 16px 12px 18px;color:var(--muted);font-size:11.5px;display:flex;align-items:center;gap:6px">${m?.node_id ? `${ic('hex')}<span style="font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.node_id)}</span>` : ''}<span style="margin-left:auto;display:inline-flex;gap:4px;align-items:center">details ${ic('arrow')}</span></div></div>`; }).join('');
     const epTiles = eps.map((n) => { const t = n.types[0] || 'node', up = n.api ? n.api.ok && n.api.chain_ok !== false : n.p2p_probe ? n.p2p_probe.ok : null;
       const host = n.url ? n.url.replace(/^https?:\/\//, '') : n.p2p || (t + ' node');
-      return `<div class="ep ${n.url ? 'clickable' : ''}" ${n.url ? `data-go-ep="${esc(n.url)}"` : ''}><div class="ep-h"><div class="srv-ic">${ic(n.hyperion ? 'db' : ROLE_ICON[t] || 'server')}</div><div class="t"><b>${esc(host)}</b><small>${n.types.map((x) => `<span class="tp ${esc(x)}">${esc(x)}</span>`).join('')} ${n.location ? ic('pin') + esc(n.location) : ''}</small></div>
+      return `<div class="ep ${n.url ? 'clickable' : ''}" ${n.url ? `data-go-ep="${esc(epId(n.url) || '')}"` : ''}><div class="ep-h"><div class="srv-ic">${ic(n.hyperion ? 'db' : ROLE_ICON[t] || 'server')}</div><div class="t"><b>${esc(host)}</b><small>${n.types.map((x) => `<span class="tp ${esc(x)}">${esc(x)}</span>`).join('')} ${n.location ? ic('pin') + esc(n.location) : ''}</small></div>
         ${up == null ? `<span class="pill mute">${t === 'producer' ? ic('lock') + 'private' : '—'}</span>` : `<span class="pill ${up ? 'ok' : 'bad'}">${ic(up ? 'ok' : 'bad')}${n.api ? (up ? n.api.ms + ' ms' : 'down') : up ? 'open' : 'closed'}</span>`}</div>
         ${n.api ? `<div class="ep-m"><div><span>nodeos</span>${esc(n.api.version?.split('-')[0] || '—')}</div><div><span>behind</span>${n.api.lag != null ? (n.api.lag <= 30 ? 'in sync' : fmt(n.api.lag)) : '—'}</div><div><span>${n.hyperion ? 'hyperion' : 'edge'}</span>${esc(n.hyperion ? n.hyperion.version || (n.hyperion.ok ? 'up' : 'down') : n.api.edge || '—')}</div></div>` : ''}</div>`; }).join('');
     // checks × servers matrix
@@ -1043,28 +1056,36 @@ async function renderPage() {
       <div class="pg-h"><div class="logo" style="width:64px;height:64px;border-radius:18px;font-size:20px"><span>${esc(initials(o.name || p.name))}</span>${o.logo ? `<img src="${esc(o.logo)}" alt="" onerror="this.remove()">` : ''}</div>
         <div><h2>${esc(o.name || p.name)}</h2><div class="meta"><span>${flag(o.country)} ${esc(p.name)}</span>${o.city ? `<span>${ic('pin')}${esc(o.city)}</span>` : ''}<span>${ic('trophy')}${p.rank ? 'rank #' + p.rank : 'unranked'}</span><span>${p.scheduled ? 'in active schedule' : 'standby'}</span>${o.website ? `<span><a href="${esc(o.website)}" target="_blank" rel="noopener noreferrer" style="color:var(--muted)">website</a></span>` : ''}</div></div>
         <span class="pill ${statusOf(p).dot || 'mute'}">${esc(statusOf(p).text)}</span></div>
-      <div class="big3" style="grid-template-columns:repeat(4,minmax(0,1fr))"><div><span>servers with a beacon</span>${bs.length}</div><div><span>ready</span>${bs.filter((b) => stOf(b)[0] === 'ok').length}/${bs.length}</div><div><span>public endpoints</span>${eps.filter((n) => n.api?.ok).length}/${withUrl} up</div><div><span>metal nodes</span>${bs.filter((b) => b.report.metal).length}</div></div>
+      <div class="big3" style="grid-template-columns:repeat(4,minmax(0,1fr))"><div><span>servers with a beacon</span>${bs.length}</div><div><span>prepared</span>${bs.filter((b) => stOf(b)[0] === 'ok').length}/${bs.length}</div><div><span>public endpoints</span>${eps.filter((n) => n.api?.ok).length}/${withUrl} up</div><div><span>metal nodes</span>${bs.filter((b) => b.report.metal).length}</div></div>
       ${bs.length ? '' : `<div class="card2" style="margin-bottom:16px">None of this producer's servers report yet. One command connects each server: <b>docs/OPERATOR-QUICKSTART.md</b>.</div>`}
       <div class="ptiles">${tiles}</div>
       ${withUrl > bs.length ? `<div class="next" style="margin:0 0 16px">${ic('radio')}<div>${bs.length} of ${withUrl} public endpoints have a beacon. Every server that serves users needs one before a cutover.</div></div>` : ''}
       <div class="pg-grid">${matrix}
         <div class="card2 span"><h3>${ic('globe')}Public endpoints<span class="cnt">bp.json · probed every 10 min</span></h3><div class="tiles2">${epTiles || '<div class="ev-empty">No bp.json endpoints surveyed.</div>'}</div></div></div>`;
   } else if (pageSel.node) {
-    // Responses are bound to the route that asked for them: a slow reply for a page the user already left is dropped.
+    // Responses are bound to the route that asked for them (a slow reply for a page the user already left is
+    // dropped) and numbered (an older reply for the SAME page never overwrites a newer one). The API is addressed by
+    // the server's sid, so two servers with similar labels can never be confused.
     const routeKey = `${net.id}/${p.name}/${pageSel.node}`;
     if (pageData?.key !== routeKey) pageData = null;
+    const bcn = (p.beacons || []).find((b) => b.node === pageSel.node);
+    const ref = bcn?.sid || pageSel.node;
     if (Date.now() - pageFetchT > 9000 || !pageData) {
-      pageFetchT = Date.now();
-      fetch(`/api/node/${encodeURIComponent(net.id)}/${encodeURIComponent(p.name)}/${encodeURIComponent(pageSel.node)}`, { cache: 'no-store' })
-        .then(async (r) => ({ key: routeKey, status: r.status, data: r.ok ? await r.json() : null }))
-        .then((x) => { if (x.key !== `${net?.id}/${openName}/${pageSel?.node}`) return; pageData = x; renderPage(); })
-        .catch(() => {});
+      pageFetchT = Date.now(); const seq = ++pageSeq;
+      fetch(`/api/node/${enc(net.id)}/${enc(p.name)}/${enc(ref)}`, { cache: 'no-store' })
+        .then(async (r) => ({ key: routeKey, seq, status: r.status, data: r.ok ? await r.json() : null }))
+        .catch(() => ({ key: routeKey, seq, status: 0, data: null, neterr: true }))
+        .then((x) => { if (x.key !== `${net?.id}/${openName}/${pageSel?.node}` || x.seq < pageSeqShown) return;
+          pageSeqShown = x.seq;
+          if (x.neterr && pageData?.data) { pageData = { ...pageData, stale: true }; } else pageData = x;
+          renderPage(); });
     }
     const d = pageData?.data, rp = d?.report;
-    if (!rp) body = `<div class="card2" style="margin-top:14px">${!pageData ? 'Loading…' : pageData.status === 404 ? `No server called <b>${esc(pageSel.node)}</b> is reporting for ${esc(p.org?.name || p.name)}. <a data-nav href="${pathFor(net.id, p.name)}">See all of its servers</a>` : 'Could not load this server right now; retrying.'}</div>`;
+    if (!rp) body = `<div class="card2" style="margin-top:14px">${!pageData ? 'Loading…' : pageData.status === 404 ? `No server called <b>${esc(pageSel.node)}</b> is reporting for ${esc(p.org?.name || p.name)}. <a data-nav href="${pathFor(net.id, p.name)}">See all of its servers</a>`
+      : `<b>Could not load this server</b> (${pageData.neterr ? 'network error' : 'HTTP ' + (+pageData.status)}). It retries every 10 s. <button class="cp" id="pg-retry">retry now</button>`}</div>`;
     else {
       const k = splitChecks(rp.checks || []), done = k.setup.length - k.todo.length;
-      const st = d.silent ? ['bad', 'silent'] : k.sick.length ? ['bad', `${k.sick.length} issue${k.sick.length > 1 ? 's' : ''}`] : k.todo.length ? ['warn', `${k.todo.length} to set up`] : ['ok', 'ready'];
+      const st = d.silent ? ['bad', 'silent'] : k.sick.length ? ['bad', `${k.sick.length} issue${k.sick.length > 1 ? 's' : ''}`] : k.todo.length ? ['warn', `${k.todo.length} to set up`] : ['ok', 'prepared'];
       const lag = c.head && rp.source?.head ? c.head - rp.source.head : null, m = rp.metal;
       const row = (x, bad) => `<div class="ck"><span class="st ${x.ok ? 'ok' : bad}">${ic(x.ok ? 'ok' : bad === 'no' ? 'bad' : 'todo')}</span><span class="ci">${ic(CHECK_ICON[x.name] || 'wrench')}</span><div><b>${esc(label(x))}</b><span>${x.ok ? esc(x.detail || 'ok') : esc((CHECKS[x.name] || [])[2] || x.detail || '')}${!x.ok && (CHECKS[x.name] || [])[2] && x.detail ? ` · <i>${esc(x.detail)}</i>` : ''}</span></div></div>`;
       const yn = (v, t, f) => v == null ? '<span style="color:var(--dim)">unknown</span>' : v ? `<span style="color:var(--ok)">${t}</span>` : `<span style="color:var(--warn)">${f}</span>`;
@@ -1088,17 +1109,28 @@ async function renderPage() {
             <dt>health</dt><dd>${yn(m.healthy, 'healthy', 'unhealthy')}</dd></dl>
           <div style="color:var(--muted);font-size:11px;margin:10px 0 4px">peers, last ${h.length} reports</div>${sparkLine(h.map((x) => x.peers), 'var(--ok)')}`
           : `<div class="ev-empty">No Metal node details yet. Either metalgo isn't running here, or this beacon predates v0.5.0-rc.4. Setup: <b>docs/METAL-QUICKSTART.md</b>.</div>`}</div>
+        ${d.conflict ? `<div class="card2 span" style="border-color:var(--bad)"><h3 style="color:var(--bad)">${ic('bad')}Identity conflict</h3><div style="font-size:13px">This beacon token is reporting from more than one machine (different instance ids). Both are kept and flagged until the operator removes one or enrolls each machine with its own token.</div></div>` : ''}
+        ${pageData?.stale ? `<div class="card2 span" style="border-color:var(--warn)"><div style="font-size:12.5px;color:var(--warn)">Showing the last loaded report: the latest refresh failed (network error). Retrying.</div></div>` : ''}
+        ${d.stages ? `<div class="card2 span"><h3>${ic('list')}Preparation stages<span class="cnt">none of these is authorization to cut</span></h3><div class="stages">${[
+          ['metal_prepared', 'Metal prepared'], ['beacon_healthy', 'Beacon healthy'], ['ceremony_configured', 'Ceremony configured'], ['admitted', 'Validator admitted'], ['authorized', 'Authorized for an event']]
+          .map(([k2, l2]) => { const v = d.stages[k2] || {}; const cls = v.ok === true ? 'ok' : v.ok === false ? 'todo' : 'mute';
+            return `<div class="stage ${cls}"><b>${ic(v.ok === true ? 'ok' : v.ok === false ? 'todo' : 'clock')} ${esc(l2)}</b><span>${esc(v.detail || '')}</span></div>`; }).join('')}</div></div>` : ''}
         <div class="card2"><h3>${ic('wrench')}Cutover setup<span class="cnt">${done}/${k.setup.length}</span></h3>${k.setup.map((x) => row(x, 'todo')).join('')}</div>
         <div class="card2"><h3>${ic('shield')}Node health<span class="cnt">${k.health.length - k.sick.length}/${k.health.length}</span></h3>${k.health.map((x) => row(x, 'no')).join('')}</div>
         ${rp.ceremony?.state || rp.coord ? `<div class="card2 span"><h3>${ic('zap')}Ceremony</h3><dl class="kv"><dt>state</dt><dd>${esc(rp.ceremony?.state || 'idle')}</dd>${rp.coord ? `<dt>coordinated event</dt><dd>${esc(rp.coord.event_id || '—')} · ${rp.coord.accepted ? 'accepted' : 'not accepted'}${rp.coord.armed ? ' · armed' : ''}</dd>` : ''}${Object.entries(rp.ceremony?.evidence || {}).map(([kk, v]) => `<dt>${esc(kk.replace(/_/g, ' '))}</dt><dd>${esc(typeof v === 'string' ? v : JSON.stringify(v))}</dd>`).join('')}</dl></div>` : ''}
-        <div class="card2 span"><h3>${ic('code')}Raw report<span class="cnt"><a href="/api/node/${encodeURIComponent(net.id)}/${encodeURIComponent(p.name)}/${encodeURIComponent(rp.node)}" target="_blank" style="color:var(--muted)">JSON API ${ic('ext')}</a></span></h3><pre class="raw">${esc(JSON.stringify(rp, null, 2))}</pre></div>
+        <div class="card2 span"><h3>${ic('code')}Raw report<span class="cnt"><a href="/api/node/${enc(net.id)}/${enc(p.name)}/${enc(d.sid || ref)}" target="_blank" style="color:var(--muted)">JSON API ${ic('ext')}</a></span></h3><pre class="raw">${esc(JSON.stringify(rp, null, 2))}</pre></div>
       </div>`;
     }
   } else {
-    const same = (infraData[active]?.nodes || []).filter((x) => x.producer === p.name && x.url && epId(x.url) === pageSel.ep);
+    if (pageSel.legacy && infraData[active]) {   // old host-only link: resolve when exactly one endpoint of this producer matches
+      const want = pageSel.legacy.toLowerCase();
+      const cands = [...new Set((infraData[active].nodes || []).filter((x) => x.producer === p.name && x.url).map((x) => epId(x.url)).filter((id) => id && id.replace(/^https?:\/\//, '').toLowerCase() === want))];
+      if (cands.length === 1) { pageSel = { ep: cands[0] }; history.replaceState(null, '', pathFor(net.id, p.name, pageSel)); }
+    }
+    const same = (infraData[active]?.nodes || []).filter((x) => x.producer === p.name && x.url && pageSel.ep && epId(x.url) === pageSel.ep);
     // one URL can be listed several times in bp.json (e.g. as both 'full' and 'query'): show it once with all its roles
     const n = same.length ? { ...same[0], types: [...new Set(same.flatMap((x) => x.types || []))], features: [...new Set(same.flatMap((x) => x.features || []))] } : null;
-    if (!n) body = `<div class="card2" style="margin-top:14px">${infraData[active] ? `<b>${esc(pageSel.ep)}</b> is not in ${esc(p.org?.name || p.name)}'s bp.json as of the latest survey. <a data-nav href="${pathFor(net.id, p.name)}">See its endpoints</a>` : 'Loading the endpoint survey…'}</div>`;
+    if (!n) body = `<div class="card2" style="margin-top:14px">${infraData[active] ? `<b>${esc(pageSel.ep || pageSel.legacy || '')}</b> is not in ${esc(p.org?.name || p.name)}'s bp.json as of the latest survey. <a data-nav href="${pathFor(net.id, p.name)}">See its endpoints</a>` : 'Loading the endpoint survey…'}</div>`;
     else {
       const a = n.api, hy = n.hyperion, up = a?.ok && a.chain_ok !== false;
       body = `
@@ -1122,6 +1154,7 @@ async function renderPage() {
   pageSig = html; pg.innerHTML = html;
   [...pg.querySelectorAll('pre.raw, .mx')].forEach((el, i) => { if (keep[i]) { el.scrollTop = keep[i][0]; el.scrollLeft = keep[i][1]; } });
   pg.querySelectorAll('[data-go-node]').forEach((x) => x.onclick = () => openPage({ node: x.dataset.goNode }));
+  const rb = pg.querySelector('#pg-retry'); if (rb) rb.onclick = () => { pageFetchT = 0; pageData = null; renderPage(); };
   pg.querySelectorAll('[data-go-ep]').forEach((x) => x.onclick = () => openPage({ ep: x.dataset.goEp }));
   pg.querySelectorAll('[data-copy]').forEach((b) => b.onclick = () => { navigator.clipboard?.writeText(b.dataset.copy).then(() => { b.textContent = 'copied'; setTimeout(() => (b.textContent = 'copy'), 1200); }).catch(() => {}); });
 }
