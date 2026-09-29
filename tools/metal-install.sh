@@ -27,7 +27,8 @@
 #   --allow-unpinned       manifest unreachable: fall back to the pins built into this script (testnet only)
 #   --method binary|compat|docker|build   force an install method;  --build = --method build
 #   --adopt                take over a metalgo service this script did not install (only /var/lib/metalgo layout)
-#   --dry-run              show what would happen; writes nothing
+#   --dry-run              show what would happen; installs and changes nothing (the manifest is fetched to validate it)
+#   --i-have-backed-up     skip the interactive "keys copied off this server" confirmation (automation)
 #   --uninstall            remove the service this script installed (keys and chain data are kept)
 set -euo pipefail
 
@@ -44,13 +45,13 @@ die() { printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---- arguments ---------------------------------------------------------------------------------------
 parse_args() {
-  METAL=""; MANIFEST_URL=""; METHOD=""; CHECK=0; OPEN_PORT=0; DRY=0; UNINSTALL=0; ADOPT=0; ALLOW_UNPINNED=0
+  METAL=""; MANIFEST_URL=""; METHOD=""; CHECK=0; OPEN_PORT=0; DRY=0; UNINSTALL=0; ADOPT=0; ALLOW_UNPINNED=0; BACKED_UP=0
   while [ $# -gt 0 ]; do case "$1" in
     --metal) METAL=${2:-}; shift 2;; --manifest-url) MANIFEST_URL=${2:-}; shift 2;;
     --build) [ -z "$METHOD" ] || [ "$METHOD" = build ] || die "conflicting flags: --build and --method $METHOD"; METHOD=build; shift;;
     --method) [ -z "$METHOD" ] || [ "$METHOD" = "${2:-}" ] || die "conflicting flags: --method given twice"; METHOD=${2:-}; shift 2;;
     --dry-run) DRY=1; shift;; --check) CHECK=1; shift;; --open-port) OPEN_PORT=1; shift;; --uninstall) UNINSTALL=1; shift;;
-    --adopt) ADOPT=1; shift;; --allow-unpinned) ALLOW_UNPINNED=1; shift;;
+    --adopt) ADOPT=1; shift;; --allow-unpinned) ALLOW_UNPINNED=1; shift;; --i-have-backed-up) BACKED_UP=1; shift;;
     *) die "unknown option $1";; esac; done
   check_flags
 }
@@ -134,6 +135,81 @@ for k, env in [("subnet_id", "MF_SUBNET"), ("blockchain_id", "MF_CHAIN"), ("vm_i
 out["MF_NOTE"] = s("upgrades_note", False)[:300]
 for k, v in out.items(): print(f"{k}={shlex.quote(v)}")
 PY
+}
+
+# node_id_from_cert CERT.pem → NodeID-… derived exactly as metalgo does: cb58(ripemd160(sha256(DER))).
+# Used to prove a backup archive restores the SAME NodeID (not just the same bytes). Pure Python: RIPEMD-160
+# is implemented here because OpenSSL 3 often hides it behind the legacy provider.
+node_id_from_cert() {
+  python3 - "$1" <<'PY2'
+import base64, hashlib, re, struct, sys
+pem = open(sys.argv[1]).read()
+m = re.search(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", pem, re.S)
+if not m: sys.exit(1)
+der = base64.b64decode("".join(m.group(1).split()))
+def rmd160(msg):
+    try: return hashlib.new("ripemd160", msg).digest()
+    except Exception: pass
+    r1=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8,3,10,14,4,9,15,8,1,2,7,0,6,13,11,5,12,1,9,11,10,0,8,12,4,13,3,7,15,14,5,6,2,4,0,5,9,7,12,2,10,14,1,3,8,11,6,15,13]
+    r2=[5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2,15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13,8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14,12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11]
+    s1=[11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6]
+    s2=[8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11]
+    K1=[0,0x5A827999,0x6ED9EBA1,0x8F1BBCDC,0xA953FD4E]; K2=[0x50A28BE6,0x5C4DD124,0x6D703EF3,0x7A6D76E9,0]
+    M=0xffffffff
+    rol=lambda x,n:((x<<n)|(x>>(32-n)))&M
+    def f(j,x,y,z):
+        if j<16: return x^y^z
+        if j<32: return (x&y)|(~x&z)
+        if j<48: return (x|~y)^z
+        if j<64: return (x&z)|(y&~z)
+        return x^(y|~z)
+    h=[0x67452301,0xEFCDAB89,0x98BADCFE,0x10325476,0xC3D2E1F0]
+    ml=len(msg)*8; msg=msg+b"\x80"+b"\x00"*((55-len(msg))%64)+struct.pack("<Q",ml)
+    for i in range(0,len(msg),64):
+        X=struct.unpack("<16I",msg[i:i+64])
+        a1,b1,c1,d1,e1=h; a2,b2,c2,d2,e2=h
+        for j in range(80):
+            t=(rol((a1+(f(j,b1,c1,d1)&M)+X[r1[j]]+K1[j//16])&M,s1[j])+e1)&M
+            a1,e1,d1,c1,b1=e1,d1,rol(c1,10),b1,t
+            t=(rol((a2+(f(79-j,b2,c2,d2)&M)+X[r2[j]]+K2[j//16])&M,s2[j])+e2)&M
+            a2,e2,d2,c2,b2=e2,d2,rol(c2,10),b2,t
+        t=(h[1]+c1+d2)&M; h[1]=(h[2]+d1+e2)&M; h[2]=(h[3]+e1+a2)&M; h[3]=(h[4]+a1+b2)&M; h[4]=(h[0]+b1+c2)&M; h[0]=t
+    return struct.pack("<5I",*h)
+raw = rmd160(hashlib.sha256(der).digest())
+data = raw + hashlib.sha256(raw).digest()[-4:]
+A = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+n = int.from_bytes(data, "big"); out = ""
+while n: n, r = divmod(n, 58); out = A[r] + out
+out = "1" * (len(data) - len(data.lstrip(b"\0"))) + out
+print("NodeID-" + out)
+PY2
+}
+
+# identity_paths_ok DATA CONFIG_JSON EXECSTART → 0 when the existing node keeps its identity in DATA/staking at
+# the default file names (so this script's regenerated config keeps the same NodeID and BLS key). Prints why not.
+identity_paths_ok() {
+  python3 - "$1" "$2" "$3" <<'PY2'
+import json, os, re, sys
+data, cfgf, exec_ = sys.argv[1:4]
+cfg = {}
+if cfgf and os.path.isfile(cfgf):
+    try: cfg = json.load(open(cfgf))
+    except Exception: print(f"cannot parse {cfgf}"); sys.exit(1)
+def flag(k):
+    m = re.search(r"--%s[= ]([^ ;]+)" % re.escape(k), exec_)
+    return m.group(1) if m else None
+want = {"staking-tls-cert-file": f"{data}/staking/staker.crt", "staking-tls-key-file": f"{data}/staking/staker.key",
+        "staking-signer-key-file": f"{data}/staking/signer.key"}
+for k, dflt in want.items():
+    v = flag(k) or cfg.get(k)
+    if v and os.path.normpath(str(v)) != dflt:
+        print(f"{k} is '{v}', not the default {dflt}: adopting would switch this node to a different identity"); sys.exit(1)
+for k in ("staking-ephemeral-cert-enabled", "staking-ephemeral-signer-enabled"):
+    v = flag(k) or cfg.get(k)
+    if str(v).lower() in ("true", "1"): print(f"{k} is enabled: this node has no persistent identity to keep"); sys.exit(1)
+for k in ("staking-tls-key-file-content", "staking-tls-cert-file-content", "staking-signer-key-file-content"):
+    if flag(k) or cfg.get(k): print(f"{k} is set: the identity is not in files this script can back up"); sys.exit(1)
+PY2
 }
 
 # Pins built into this script, used only with --allow-unpinned on testnet when the manifest is unreachable.
@@ -301,6 +377,7 @@ do_check() {
   echo "  metalgo              ${ver:-?} · network-id ${net:-?} · peers ${peers:-?} · P-Chain synced: ${pb:-?}"
   identity_complete || warn "the node did not return a complete identity (NodeID + BLS key + PoP)"
   [ -f "$ETC/identity.txt" ] && echo "  (the record of the last install is in $ETC/identity.txt)"
+  if [ -f "$ETC/identity.json" ] && [ "$(jget custody < "$ETC/identity.json")" = unconfirmed ]; then warn "your key archive has not been confirmed as copied off this server (see $ETC/identity.txt)"; fi
   echo
   print_port
   echo
@@ -336,7 +413,9 @@ stage_artifact() {   # → $STAGE/metalgo (native methods) or pulls the pinned i
   say "staged and verified: $(head -1 "$STAGE/version.txt")"
 }
 
+require_build_commit() { [ -n "$MF_COMMIT" ] || die "--build needs the manifest to pin metalgo_commit (a 40-hex git commit): refusing to build from a movable tag"; }
 stage_build() {
+  require_build_commit
   say "building metalgo $MF_VERSION from source (nice 19; nodeos keeps priority)…"
   command -v git >/dev/null && command -v gcc >/dev/null || die "--build needs git and build-essential installed first (apt-get install git build-essential)"
   local commit gov gosha
@@ -344,7 +423,7 @@ stage_build() {
   [ -n "$commit" ] || die "tag $MF_VERSION not found upstream"
   local deref; deref=$(git ls-remote https://github.com/MetalBlockchain/metalgo "refs/tags/$MF_VERSION^{}" | awk '{print $1}')
   [ -n "$deref" ] && commit=$deref
-  if [ -n "$MF_COMMIT" ] && [ "$commit" != "$MF_COMMIT" ]; then die "tag $MF_VERSION resolves to $commit but the manifest pins $MF_COMMIT: refusing"; fi
+  if [ "$commit" != "$MF_COMMIT" ]; then die "tag $MF_VERSION resolves to $commit but the manifest pins $MF_COMMIT: refusing"; fi
   gov=$(curl -fsSL "https://raw.githubusercontent.com/MetalBlockchain/metalgo/$commit/go.mod" | sed -n "s/^go //p")
   [ -n "$gov" ] || die "could not read the Go version from go.mod at $commit"
   gosha=$(curl -fsSL "https://go.dev/dl/?mode=json&include=all" | python3 -c 'import json,sys
@@ -380,7 +459,7 @@ print(json.dumps(c, indent=2))
 PY
   local exec pre userline
   if [ "$METHOD" = docker ]; then
-    exec="/usr/bin/docker run --rm --name metalgo --network host -v $DATA:$DATA -v $ETC:$ETC --user $(id -u metalgo 2>/dev/null || echo 999):$(id -g metalgo 2>/dev/null || echo 999) --entrypoint /metalgo/build/metalgo $IMAGE_REF --config-file=$ETC/config.json"
+    exec="/usr/bin/docker run --rm --name metalgo --network host -v $DATA:$DATA -v $ETC:$ETC --user $(id -u metalgo):$(id -g metalgo) --entrypoint /metalgo/build/metalgo $IMAGE_REF --config-file=$ETC/config.json"
     pre="ExecStartPre=-/usr/bin/docker rm -f metalgo"; userline=""
   else exec="$BIN --config-file=$ETC/config.json"; pre=""; userline="User=metalgo"; fi
   cat > "$STAGE/metalgo.service" <<U
@@ -401,7 +480,10 @@ U
 }
 
 # ---- swap + verify + rollback -------------------------------------------------------------------------
-HAD_PREV=0
+# From the moment the old service is stopped until the new one is verified, ANY failure (a failed install/mv,
+# systemctl, start, validation, or an unexpected error under set -e) restores the previous binary, config and
+# unit, starts the previous node and checks it answers with its previous NodeID and BLS key.
+HAD_PREV=0; APPLYING=0; ROLLED=0
 swap_in() {
   HAD_PREV=0
   if existing_unit || [ -f "$BIN" ]; then
@@ -410,25 +492,53 @@ swap_in() {
     [ -f "$ETC/config.json" ] && cp -p "$ETC/config.json" "$ETC/config.json.prev"
     [ -f "$UNIT" ] && cp -p "$UNIT" "$UNIT.prev"
   fi
+  APPLYING=1   # armed: the EXIT trap rolls back from here on
   systemctl stop metalgo 2>/dev/null || true
   [ "$METHOD" = docker ] || install -m 755 "$STAGE/metalgo" "$BIN.new"
   [ "$METHOD" = docker ] || mv -f "$BIN.new" "$BIN"
-  install -m 644 "$STAGE/config.json" "$ETC/config.json.new" && mv -f "$ETC/config.json.new" "$ETC/config.json"
-  install -m 644 "$STAGE/metalgo.service" "$UNIT.new" && mv -f "$UNIT.new" "$UNIT"
+  install -m 644 "$STAGE/config.json" "$ETC/config.json.new"; mv -f "$ETC/config.json.new" "$ETC/config.json"
+  install -m 644 "$STAGE/metalgo.service" "$UNIT.new"; mv -f "$UNIT.new" "$UNIT"
+  ${FAULT_AFTER_STOP:-true}   # test hook: FAULT_AFTER_STOP=false forces a failure right after the stop
   systemctl daemon-reload; systemctl enable metalgo >/dev/null 2>&1; systemctl start metalgo
 }
-rollback() {
+# restore_previous REASON: put the previous installation back and prove it runs. Never exits by itself.
+restore_previous() {
+  ROLLED=1; APPLYING=0
   warn "$1"
   systemctl stop metalgo 2>/dev/null || true
   if [ "$HAD_PREV" = 1 ]; then
     [ -f "$BIN.prev" ] && mv -f "$BIN.prev" "$BIN"
     [ -f "$ETC/config.json.prev" ] && mv -f "$ETC/config.json.prev" "$ETC/config.json"
     [ -f "$UNIT.prev" ] && mv -f "$UNIT.prev" "$UNIT"
-    systemctl daemon-reload; systemctl start metalgo 2>/dev/null || true
-    die "upgrade failed and was rolled back: the previous metalgo is running again ($(systemctl is-active metalgo 2>/dev/null)). Nothing else changed. Details: journalctl -u metalgo -n 50"
+    rm -f "$BIN.new" "$ETC/config.json.new" "$UNIT.new"
+    systemctl daemon-reload 2>/dev/null || true; systemctl start metalgo 2>/dev/null || true
+    local nid="" bls="" _
+    for _ in $(seq 1 60); do
+      read_live_identity 2>/dev/null || true; nid=$NODEID; bls=$BLSPUB
+      [ -n "$nid" ] && break; sleep 2
+    done
+    if [ -n "$PREV_NODEID" ] && [ "$nid" = "$PREV_NODEID" ] && { [ -z "$PREV_BLS" ] || [ "$bls" = "$PREV_BLS" ]; }; then
+      RESTORE_MSG="rolled back: the previous metalgo is running again with the same NodeID and BLS key ($nid)"
+    elif [ -z "$PREV_NODEID" ]; then
+      RESTORE_MSG="rolled back: previous binary, config and unit restored (service $(systemctl is-active metalgo 2>/dev/null); no previous identity was running to compare)"
+    else
+      RESTORE_MSG="ROLLBACK INCOMPLETE: previous files restored but the node answers as '${nid:-nothing}' (expected $PREV_NODEID). Check: journalctl -u metalgo -n 50"
+    fi
+  else
+    systemctl disable metalgo >/dev/null 2>&1 || true
+    RESTORE_MSG="install failed: metalgo is stopped and disabled (there was no previous installation to restore)"
   fi
-  systemctl disable metalgo >/dev/null 2>&1 || true
-  die "install failed: metalgo is stopped and disabled. Details: journalctl -u metalgo -n 50"
+}
+rollback() { restore_previous "$1"; die "upgrade failed. $RESTORE_MSG. Details: journalctl -u metalgo -n 50"; }
+on_exit() {
+  local rc=$?
+  if [ "$APPLYING" = 1 ] && [ "$ROLLED" = 0 ]; then
+    restore_previous "unexpected failure (exit $rc) while applying: restoring the previous installation"
+    printf '\033[31m[x]\033[0m %s\n' "$RESTORE_MSG" >&2
+    rc=1
+  fi
+  [ -n "${TMP:-}" ] && rm -rf "$TMP"
+  exit $rc
 }
 verify_runtime() {   # PREV_NODEID set when an identity existed before this run
   say "starting metalgo and verifying it…"
@@ -442,8 +552,10 @@ verify_runtime() {   # PREV_NODEID set when an identity existed before this run
   if [ -n "$PREV_NODEID" ] && [ "$NODEID" != "$PREV_NODEID" ]; then rollback "NodeID changed ($PREV_NODEID → $NODEID): the staking identity was not preserved"; fi
   for _ in $(seq 1 20); do identity_complete && break; sleep 1; read_live_identity; done
   identity_complete || rollback "the node did not return a complete identity (NodeID + BLS public key + proof of possession)"
+  if [ -n "$PREV_BLS" ] && [ "$BLSPUB" != "$PREV_BLS" ]; then rollback "BLS public key changed ($PREV_BLS → $BLSPUB): the signer key was not preserved"; fi
   rm -f "$BIN.prev.keep"; [ -f "$BIN.prev" ] && mv -f "$BIN.prev" "$BIN.prev.keep" 2>/dev/null || true
   RUN_VERSION=$ver
+  APPLYING=0   # committed: the new installation is verified; the EXIT trap no longer rolls back
 }
 
 # ---- identity backup (verified) -----------------------------------------------------------------------
@@ -456,7 +568,12 @@ backup_identity() {
   for f in staker.crt staker.key signer.key; do
     [ "$(sha256sum < "$DATA/staking/$f")" = "$(sha256sum < "$tmpx/staking/$f")" ] || { rm -rf "$tmpx"; die "backup verification failed for $f: $BK is not a faithful copy"; }
   done
+  # Restore test: the archived certificate must derive the NodeID this node is running as.
+  local derived; derived=$(node_id_from_cert "$tmpx/staking/staker.crt" 2>/dev/null || true)
   rm -rf "$tmpx"
+  [ -n "$derived" ] || die "backup verification failed: could not derive a NodeID from the archived staker.crt"
+  [ "$derived" = "$NODEID" ] || die "backup verification failed: the archived certificate is NodeID $derived, but this node runs as $NODEID"
+  BK_NODEID_OK=1
   [ "$(tar tzf "$BK" | grep -c .)" = 3 ] || die "backup $BK does not contain exactly the three identity files"
   BKSHA=$(sha256sum "$BK" | cut -d' ' -f1)
   BK_USER=""; UH=""
@@ -487,9 +604,26 @@ print(json.dumps({"schema": "metal-identity-v1", "xpr_network": "$XPR", "produce
   "runtime_version": "$RUN_VERSION", "install_method": "$METHOD", "node_id": "$NODEID",
   "bls_public_key": "$BLSPUB", "bls_proof_of_possession": "$BLSPOP", "staking_address": "${PUBIP:-}",
   "staking_port_reachable": {"true": True, "false": False}.get("${REACH:-}"),
-  "key_backup": "$BK", "key_backup_sha256": "$BKSHA", "state": "metal-node-prepared"}, indent=1))
+  "key_backup": "$BK", "key_backup_sha256": "$BKSHA", "key_backup_restore_tested": True, "custody": "unconfirmed", "state": "metal-node-prepared"}, indent=1))
 PY
   chmod 644 "$ETC/identity.json"
+}
+
+# Off-host custody: the operator confirms the archive has been copied off this server. Read from the terminal
+# (stdin is this script under curl | bash). No terminal and no --i-have-backed-up: recorded as unconfirmed.
+custody_ack() {
+  CUSTODY=unconfirmed
+  if [ "$BACKED_UP" = 1 ]; then CUSTODY=acknowledged-by-flag; return 0; fi
+  [ -r /dev/tty ] && [ -w /dev/tty ] || return 0
+  printf "\n  Copy the key archive off this server now (step 2 above). Type 'copied' when done, or press Enter to skip: " > /dev/tty
+  local a=""; read -r a < /dev/tty || true
+  if [ "$a" = copied ]; then CUSTODY=acknowledged; say "recorded: key archive copied off this server"
+  else warn "not confirmed: the only copies of your validator keys are on this server. Re-run with --check any time; it reminds you."; fi
+  python3 - "$ETC/identity.json" "$CUSTODY" <<'PY2' || true
+import json, sys
+f, c = sys.argv[1:3]
+d = json.load(open(f)); d["custody"] = c; json.dump(d, open(f, "w"), indent=1)
+PY2
 }
 
 print_summary() {
@@ -514,7 +648,7 @@ print_summary() {
   [ -n "$BK_USER" ] && echo "         $BK_USER   (readable only by $SUDO_USER, so you can scp it)"
   echo "       From your own computer:"
   if [ -n "$BK_USER" ]; then echo "         scp $SUDO_USER@${PUBIP%:*}:$BK_USER ."; else echo "         scp root@${PUBIP%:*}:$BK ."; fi
-  echo "       archive sha256: $BKSHA"
+  echo "       archive sha256: $BKSHA · restore-tested: the archived certificate derives NodeID $NODEID"
   [ -n "$BK_USER" ] && echo "       then store it in your password manager / encrypted storage and delete the copy: rm $BK_USER"
   echo "       Never run a second node with these keys while this one is running."
   echo
@@ -536,6 +670,7 @@ print_summary() {
   [ -n "$MF_NOTE" ] && echo "  $MF_NOTE"
   echo "  Upgrade: re-run this same command (keys are kept; failed upgrades roll back) · Health: curl -s 127.0.0.1:9650/ext/health | head -c 300"
   echo "  Previous binary kept as $BIN.prev.keep · previous config as $ETC/config.json.prev"
+  custody_ack
 }
 
 main() {
@@ -557,7 +692,7 @@ main() {
   check_flags
 
   # ---- manifest: fetched, structurally validated, bound to this chain. Fail closed. -------------------
-  TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+  TMP=$(mktemp -d); trap on_exit EXIT
   [ -n "$MANIFEST_URL" ] || MANIFEST_URL="$CONTROL/api/manifest/$XPR"
   if curl -fsS -m10 -o "$TMP/manifest.json" "$MANIFEST_URL" 2>/dev/null; then say "manifest: $MANIFEST_URL"
   elif [ "$ALLOW_UNPINNED" = 1 ] && [ "$XPR" = testnet ]; then warn "manifest unreachable: using the checksum pins built into this script (--allow-unpinned)"; builtin_manifest > "$TMP/manifest.json"
@@ -578,15 +713,18 @@ main() {
   [ "$free" -ge 100 ] || warn "less than 100 GB free: the primary network (P/X/C chains) can outgrow this"
 
   # ---- ownership: only upgrade what this script installed, unless --adopt ---------------------------
-  PREV_NODEID=""
+  PREV_NODEID=""; PREV_BLS=""
   if existing_unit; then
     if [ ! -f "$MARKER" ]; then
       [ "$ADOPT" = 1 ] || die "a metalgo service already exists that this script did not install. Re-run with --adopt to take it over (supported only for the /var/lib/metalgo layout), or manage it with the tool that installed it."
       local dd; dd=$(existing_data_dir)
       [ "$dd" = "$DATA" ] || die "--adopt: the existing metalgo uses data dir '$dd', not $DATA. Adopting a custom layout is not supported (it would risk the node identity)."
+      local ex cf why; ex=$(systemctl show -p ExecStart --value metalgo 2>/dev/null || true)
+      cf=$(printf '%s' "$ex" | grep -o -- '--config-file[= ][^ ;]*' | head -1 | sed 's/--config-file[= ]//' || true)
+      why=$(identity_paths_ok "$DATA" "$cf" "$ex") || die "--adopt refused: $why"
       say "adopting the existing metalgo service (data dir $DATA)"
     else say "metalgo installed by this script found: upgrading in place (identity kept, rollback on failure)"; fi
-    if systemctl is-active --quiet metalgo; then read_live_identity; PREV_NODEID=$NODEID; fi
+    if systemctl is-active --quiet metalgo; then read_live_identity; PREV_NODEID=$NODEID; PREV_BLS=$BLSPUB; fi
   else
     for p in 9650 9651; do ss -ltn "sport = :$p" 2>/dev/null | grep -q LISTEN && die "port $p is already in use by something that is not a metalgo service this script knows about"; done
   fi
@@ -601,16 +739,18 @@ main() {
     Stopgap: re-run with --build (compiles the pinned metalgo commit here at lowest CPU priority, ~10 min; best effort)"
     fi
   fi
+  [ "$METHOD" = build ] && require_build_commit
   say "install method: $METHOD"
-  if [ "$DRY" = 1 ]; then say "dry run: nothing downloaded, installed or changed"; exit 0; fi
+  if [ "$DRY" = 1 ]; then say "dry run: nothing installed or changed (the manifest was fetched to validate it)"; exit 0; fi
 
   # ---- stage + verify everything before touching the running node --------------------------------------
   STAGE="$TMP/stage"; mkdir -p "$STAGE"; IMAGE_REF=""
   stage_artifact
+  # The service user must exist before the unit is staged: the Docker unit embeds its numeric uid/gid.
+  id metalgo >/dev/null 2>&1 || useradd --system --home "$DATA" --shell /usr/sbin/nologin metalgo
   stage_config
 
   # ---- apply ---------------------------------------------------------------------------------------------
-  id metalgo >/dev/null 2>&1 || useradd --system --home "$DATA" --shell /usr/sbin/nologin metalgo
   mkdir -p "$ETC"
   if [ ! -d "$DATA" ]; then mkdir -p "$DATA"/{db,logs,plugins,chains}; chown -R metalgo:metalgo "$DATA"
   else

@@ -85,11 +85,18 @@ curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/be
   From v0.5.0-rc.5 it is marked `profile = "readiness"` and the ceremony commands (`run`, `loop`, `await`)
   refuse it. Configs written by rc.4 and earlier lacked that guard; re-run the installer to upgrade.
 - `/etc/pulse-cutover/beacon.token`: a random token made on your server (root and the beacon's service user only).
+- `/etc/pulse-cutover/beacon.instance`: this server's stable instance id (kept across upgrades).
+- `/var/lib/pulse-beacon`: the beacon's own state dir, the **only** place it can write.
 - `pulse-beacon.service`: a systemd service, running as the unprivileged `pulse-beacon` user when it can read
-  what it needs (otherwise root limited to read-only file access), with a read-only filesystem.
+  what it needs (otherwise root limited to read-only file access), with a read-only filesystem. The ceremony's
+  directory `/var/lib/pulse-cutover` (journal, lock, staged snapshot) stays root-owned and read-only to the beacon,
+  so the observer can never alter ceremony evidence.
 
-Everything is downloaded, checksum-verified and test-run before the box changes; if the new beacon does not start,
-the previous binary and config are restored. The report URL must be HTTPS.
+Everything is downloaded, checksum-verified and test-run in a temp dir before the box changes (`--dry-run` writes
+nothing outside it). The update itself is a transaction: if anything fails before the new beacon is confirmed
+running, the previous binary, config, token, instance id and service are restored and the previous beacon restarted.
+The report URL must be HTTPS (plain http only to localhost); it is parsed, so `localhost.example.org` or
+`localhost@example.org` count as remote.
 
 What the beacon reads: your nodeos `get_info`, whether the producer API answers locally, whether a Metal
 validator service is running, and free disk. What it sends (the dashboard is public, so it is kept minimal):

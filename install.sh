@@ -1058,6 +1058,23 @@ fi
 # ---------- ceremony.toml (the agent's manifest) ----------
 # STOP_CMD/START_CMD were resolved above: manifest value, else derived from
 # the doctor-detected unit/container.
+# Where nodeos writes the scheduled snapshot-<block_id_at_H>.bin. Required for an exact-H cut in api mode
+# (and for schedule_at_h). Manifest value, else this nodeos' snapshots-dir, else <data-dir>/snapshots.
+SNAPDIR=$(mget_opt '.snapshot.dir')
+if [ -z "$SNAPDIR" ]; then
+  NCFG=$(jq -r '.nodeos.config_path // empty' "$DOC" 2>/dev/null || true)
+  [ -n "$NCFG" ] && [ -d "$NCFG" ] && NCFG="$NCFG/config.ini"
+  [ -n "$NCFG" ] && [ -f "$NCFG" ] && SNAPDIR=$(sed -n 's/^\s*snapshots-dir\s*=\s*//p' "$NCFG" | tail -1)
+  NDD=$(jq -r '.nodeos.data_dir // empty' "$DOC" 2>/dev/null || true)
+  if [ -n "$SNAPDIR" ] && [ "${SNAPDIR#/}" = "$SNAPDIR" ] && [ -n "$NDD" ]; then SNAPDIR="$NDD/$SNAPDIR"; fi   # relative → data dir
+  [ -z "$SNAPDIR" ] && [ -n "$NDD" ] && SNAPDIR="$NDD/snapshots"
+  [ -n "$SNAPDIR" ] && echo "snapshot dir (detected from nodeos): $SNAPDIR"
+fi
+SIM_PRE=$(mget_opt '.ceremony.simulate_freeze')
+if $API_LIKE && [ "${SIM_PRE:-false}" != "true" ] && [ -z "$SNAPDIR" ]; then
+  echo "ABORT: api/hyperion mode cuts at exactly H from a nodeos scheduled snapshot, so it needs the directory nodeos writes"
+  echo "       snapshots to. Could not detect it: set .snapshot.dir in the manifest."; exit 1
+fi
 FH=$(mget '.ceremony.freeze_height')
 FM=$(mget_opt '.ceremony.freeze_margin')
 SIM=$(mget_opt '.ceremony.simulate_freeze'); SIM=${SIM:-false}
@@ -1092,7 +1109,6 @@ PRESCAN=$(mget_opt '.snapshot.prescan_path')
   [ -n "$PRESCAN" ] && echo "prescan_path = \"$PRESCAN\""
   # Exact-H cut (api mode without simulate_freeze, schedule_at_h): where nodeos writes
   # the scheduled snapshot-<block_id_at_H>.bin.
-  SNAPDIR=$(mget_opt '.snapshot.dir')
   [ -n "$SNAPDIR" ] && echo "dir = \"$SNAPDIR\""
   echo ''
   echo '[target]'
@@ -1120,6 +1136,15 @@ PRESCAN=$(mget_opt '.snapshot.prescan_path')
   fi
 } > /etc/pulse-cutover/ceremony.toml
 cp "$MANIFEST" /etc/pulse-cutover/ceremony.json
+
+# The generated config must pass the agent's own validation (the same loader `run` uses) before we say
+# ARMED-READY: new releases reject configs older installers produced (e.g. api mode without snapshot.dir).
+if ! CHECK_OUT=$(pulse-cutover status --config /etc/pulse-cutover/ceremony.toml 2>&1); then
+  echo "ABORT: the generated /etc/pulse-cutover/ceremony.toml does not pass pulse-cutover's validation:"
+  printf '%s\n' "$CHECK_OUT" | sed 's/^/  /'
+  exit 1
+fi
+echo "ceremony.toml: validated by the installed pulse-cutover (same checks as run)"
 
 # ---------- stubbed-intrinsic preflight (advisory, never a gate) ----------
 # When a rehearsal/pre-downloaded snapshot is staged, print + save the
