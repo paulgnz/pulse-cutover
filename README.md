@@ -14,15 +14,17 @@ in a journal you can hand to anyone. Nothing a user can see changes until the
 new chain is verified and serving; aborting at any earlier point leaves your
 existing node exactly as it was.
 
+**New here? → [docs/PROCESS.md](docs/PROCESS.md)**: the whole cutover, step by step, with diagrams: who does what, the timeline around the cut, every gate, what apps see, and how rollback works.
+
 **How do we know the cut is atomic? → [ATOMICITY.md](ATOMICITY.md)**: five properties, each with a gate or a tool and the recorded proof.
 
 **Want to help test? → [TESTING.md](TESTING.md)** — rehearsals never touch
 production, take about 40 minutes, and give you operational familiarity before
 any real event (plus credit for every setup you help us support).
 
-**Using an AI agent (Claude Code etc.) to operate this? → [AGENTS.md](AGENTS.md)**
-— repo map, machine-readable contracts (`doctor --json`, the journal), and
-the safety rails an agent must follow.
+**Using an AI agent (Claude Code etc.) to operate this? → [AGENTS.md](AGENTS.md)**:
+the ten rules, the producer procedure step by step, the hook contract, how to prove
+atomicity, and the evidence to hand back.
 
 ## At a glance
 
