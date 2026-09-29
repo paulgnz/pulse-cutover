@@ -320,9 +320,12 @@ and exits non-zero. Some errors exit non-zero *without* writing `ABORTED` or
 finishing rollback, so after any non-zero exit check the journal and the
 actual state of nodeos and the edge. On a single box the ceremony changes
 nothing public before FLIPPED, and an abort at FLIPPED swaps the URL back; in
-bp mode the agent resumes your producer automatically (`./cutover.sh abort`
-does the same for a stuck/^C'd run). In a multi-producer event a local abort
-is not yet coordinated with the rest of the fleet. An aborted rehearsal is a
+bp mode the agent resumes your producer automatically before ignition starts.
+`./cutover.sh abort` does the same for a stuck/^C'd run, but only when the
+journal proves ignition has not started: it refuses (exit 3, nothing changed)
+on a missing, corrupt or locked journal or after ignition, and exits 4 if a
+rollback step failed (the source may NOT be producing). In a multi-producer
+event a local abort is not yet coordinated with the rest of the fleet. An aborted rehearsal is a
 *useful* rehearsal: go to Step 5.
 
 ### Step 5 — share the evidence: `pulse-cutover report`
@@ -614,9 +617,11 @@ stateDiagram-v2
     LIVE --> [*]
     FROZEN --> ABORTED
     SNAPSHOTTED --> ABORTED
-    VERIFIED --> ABORTED
-    IGNITED --> ABORTED: quorum timeout
+    VERIFIED --> ABORTED: before ignition starts
+    VERIFIED --> HALTED: failure after ignition started
+    IGNITED --> HALTED: lineage / quorum timeout / on_live
     ABORTED --> [*]: source producer resumed
+    HALTED --> [*]: sealed · source NOT resumed · human decides
 ```
 
 `ABORTED` is reachable only **before ignition starts**; for this agent rollback is resuming its
@@ -653,9 +658,12 @@ hyperion  ARMED → FROZEN → SNAPSHOTTED → VERIFIED → IGNITED* → FLIPPED
 
 Every transition is an fsynced JSONL journal line with timestamps and evidence
 (hashes, block ids, fingerprints, durations). A restarted agent resumes from the
-journal and re-runs its current step. Crash recovery is not yet certified: there is
-no exclusive journal lock, some side-effect flags are reconstructed as false, a torn
-last line stops replay, and hooks have no deadline (ATOMICITY Known limits #6).
+journal and re-runs its current step. Crash recovery is implemented but not yet
+certified on real boxes: an exclusive journal lock, torn-tail repair (only a fragment
+after the last newline; a complete corrupt record is fatal), journaled side-effect
+records (staged artifact, ignition start, flips), a durable HALTED, and hooks run in
+their own process group with a deadline (`hooks.timeout_secs`). None of it has been
+fault-injected on real hosts yet (ATOMICITY Known limits #6).
 
 ### Commands
 
@@ -1147,7 +1155,8 @@ what testers get out of it.
 
 ## Status & caveats
 
-- Operator tooling v0.5.0-rc.6 (beacon, installers, mission control) — rehearsal-grade.
+- Operator tooling v0.5.0-rc.7 (beacon, installers, mission control) — rehearsal-grade; the beacon installer
+  pins the latest *released* tag.
   The recorded ceremonies are real but ran the fork plugin (`v0.0.0-arena-mempoolfix.1`
   lineage, metalgo 1.13.5, plugin protocol 43), not upstream PulseVM v1.0.0 (protocol
   45, needs metalgo 1.14.x); no *mainnet* event has run. See the status box at the top.

@@ -5,9 +5,10 @@ P0 #3 (coordination model) once built. Parts need upstream PulseVM support (mark
 
 ## The problem
 
-Today every agent decides on its own. `abort()` resumes the source chain whenever `auto_rollback` is on
-([src/machine.rs:397](../src/machine.rs)), and `cutover.sh abort` resumes it unconditionally. Nothing stops one
-producer from resuming the old chain while others have already started producing on PulseVM. That is two
+Today every agent decides on its own. Since rc.6/rc.7 a producer never resumes the source after its OWN ignition
+started (it HALTS; `pulse-cutover rollback`/`cutover.sh abort` refuse unless `--force-after-ignite`, which first
+fences this box's target). But before its own ignition, a producer's abort still resumes the source without
+knowing whether OTHER producers have already started producing on PulseVM. That is two
 writable histories under the **same chain_id**, which is the one outcome the whole design exists to prevent.
 
 A rehearsal where everyone succeeds or everyone aborts together (runs 1–6) never exercises this. It only shows
@@ -83,5 +84,7 @@ At COMMIT, "paused" is not enough (a restart un-pauses nodeos). The fence must s
 ## Interim rule until this exists
 
 Until sealed start and certificates exist, **a public cut must not be scheduled** (see ATOMICITY Known limits).
-For rehearsals, `auto_rollback` after IGNITED is disabled (agent B, rc.5): a failure after ignition halts and
-alerts instead of resuming the source.
+Locally (rc.6/rc.7): ignition start is journaled before the ignite command runs; from then on every failure
+HALTS (durable, `unhalt --i-understand` to clear) instead of resuming the source; `pulse-cutover rollback` refuses
+(exit 3) unless `--force-after-ignite`, which stops this box's target first (`target.stop_cmd`) and does not
+resume the source if that fails (exit 4). None of this is fleet-wide.

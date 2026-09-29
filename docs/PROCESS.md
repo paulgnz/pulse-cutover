@@ -9,7 +9,7 @@ what is implemented and rehearsed today is marked where it differs, and the full
 status is in [ATOMICITY.md](../ATOMICITY.md).
 
 > [!IMPORTANT]
-> **Implemented vs intended (v0.5.0-rc.6).** Rehearsed: same cut on every producer, zero transactions
+> **Implemented vs intended (v0.5.0-rc.7).** Rehearsed: same cut on every producer, zero transactions
 > after H, a symmetric abort. Implemented since, not yet rehearsed: exact H in every mode (no fallback
 > to a later cut), a block-id-at-H lineage check on the target, a local point of no return at
 > ignition start (after it, any failure HALTS; the source is never resumed). Sampled only: state
@@ -305,7 +305,9 @@ sequenceDiagram
 ## 7. Gates and rollback
 
 **The write freeze is public; in producer mode the URL flip waits for LIVE, in API mode it happens at FLIPPED.**
-Every gate before LIVE has one failure path *for that producer*: abort, resume its old producer and reopen writes. Across a fleet that is not yet enough: if some
+Gates before ignition starts (G1–G3) have one failure path *for that producer*: abort, resume its old
+producer and reopen writes. Gates after ignition started (G4 lineage, G5 progress, `on_live`) HALT instead:
+sealed, the old chain is NOT resumed, a human decides. Across a fleet that is not yet enough: if some
 producers abort while others have already ignited, the network splits. The fleet gate and signed fleet-wide abort
 narrow this; a full authority boundary is still open (see [ATOMICITY.md › Known limits](../ATOMICITY.md#known-limits-independent-review-2026-09-29)).
 
@@ -320,12 +322,14 @@ flowchart LR
     G2 -- no --> X
     G2 -- yes --> G3{"2 imports agree<br/>(+ goldens)?"}:::gate
     G3 -- no --> X
-    G3 -- yes --> G4{"new chain shows<br/>chain_id, head ≥ H?"}:::gate
-    G4 -- no --> X
-    G4 -- yes --> G5{"head > H within<br/>quorum timeout?"}:::gate
-    G5 -- no --> X
+    G3 -- yes --> IG[/ignition starts · journaled first/]
+    IG --> G4{"new chain shows chain_id,<br/>head ≥ H, block id at H?"}:::gate
+    G4 -- no --> HX
+    G4 -- yes --> G5{"head keeps advancing<br/>(sustained)?"}:::gate
+    G5 -- no --> HX
     G5 -- yes --> L([LIVE → flip URLs]):::good
     X([ABORTED<br/>resume the old chain<br/>reopen writes]):::bad
+    HX([HALTED<br/>sealed · old chain NOT resumed<br/>human decides]):::bad
 ```
 
 > [!IMPORTANT]
@@ -333,7 +337,10 @@ flowchart LR
 > run 1 exercised this on all five at once (a symmetric abort). It is safe only while no producer
 > has authorized or started the target. Locally this is enforced from rc.6: once ignition has
 > started, every failure HALTS (durable; `pulse-cutover unhalt --i-understand` to clear) and nothing
-> resumes the old chain, and `cutover.sh abort` refuses. Fleet-wide, the boundary is still only a
+> resumes the old chain, and `cutover.sh abort` refuses (exit 3). From rc.7 a rollback that is
+> attempted but has a failed step exits 4 and names it; a coordinator-ordered
+> `--force-after-ignite` first stops this box's target (`target.stop_cmd`) and does not resume the
+> source if that fails; this is a local fence only. Fleet-wide, the boundary is still only a
 > design (`docs/DESIGN-authority-boundary.md`): one BP's local abort before ignition does not know
 > whether another BP has ignited.
 

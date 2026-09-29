@@ -94,7 +94,7 @@ snapshot, edit `ceremony.toml`, change the edge config, or send transactions of 
 | `on_freeze` | head ≥ H − `freeze_lead_blocks` | close writes at the public edge (reads stay open), return in < 5 s | nginx flag file → 503; HAProxy `add map … frozen 1` |
 | `post_ignite` | after IGNITED | give the new chain its first transactions (it builds blocks on demand); optionally run `state-diff` first (it only shows this box's view; it cannot stop peers that have already started producing). **Required: a failure halts.** | `setsid` a few local transfers with output to a log, return immediately |
 | `on_live` | producer mode: after the sustained-progress window, **before** LIVE is journaled | flip the edge backend to PulseVM and reopen writes. **Must succeed:** a failure HALTS and LIVE is never journaled | nginx upstream swap + reload; HAProxy `enable/disable server` (0 reloads) |
-| `on_abort` | on ABORTED (only possible before ignition starts) | undo `on_freeze`/flip; the agent resumes the producer itself | restore backend, reopen writes |
+| `on_abort` | on ABORTED: before ignition starts, or after a coordinator-ordered `rollback --force-after-ignite` (which first stops this box's target) | undo `on_freeze`/flip; the agent resumes the producer itself. A failure makes `rollback` exit 4 | restore backend, reopen writes |
 | `on_halt` | on HALTED (after ignition started) | page a human; change nothing | send an alert |
 
 Every hook: executable (`chmod +x`), idempotent (safe to run twice), exits 0 on success, prints one line
@@ -190,10 +190,15 @@ Mutating (see SAFETY RAILS before running):
   (journal has the evidence).
 - `./cutover.sh abort` — stops a running agent, then runs `pulse-cutover rollback`: it takes the
   journal's exclusive lock (waits for the stopping agent; never decides while another process holds the
-  journal) and rolls back (reverts flips / resumes the source producer) ONLY when the journal proves
-  ignition has NOT started. A missing, corrupt or unreadable journal, or ignition started, is refused
-  (exit 3, nothing changed): read the journal and escalate; do not force. `--no-journal-i-know` is only
-  for a box that never ran a ceremony; `--force-after-ignite` only on the coordinator's fleet-wide order.
+  journal), kills a hook the stopped agent left running, and rolls back (reverts flips / resumes the
+  source producer / moves the staged snapshot aside) ONLY when the journal proves ignition has NOT
+  started. Exit codes: 0 = rolled back (a repeat is a no-op); **3 = REFUSED, nothing changed** (missing,
+  corrupt or locked journal, unloadable config, or ignition started): read the journal and escalate, do
+  not force; **4 = attempted but INCOMPLETE** (a step failed and is printed; the source may NOT be
+  producing): fix by hand. `--no-journal-i-know` is only for a box that never ran a ceremony (it writes
+  a separate `journal.jsonl.rollback-<ms>.jsonl` audit record, not the ceremony journal);
+  `--force-after-ignite` only on the coordinator's fleet-wide order: it first stops THIS box's target
+  (`target.stop_cmd`) and refuses to resume the source if that fails (a local fence only).
 - `pulse-cutover unhalt --config c.toml --i-understand` — clears a durable HALTED (journaled with
   who ran it). Only after a human has decided; never as a retry.
 - `pulse-cutover loop --config c.toml --runs N` — repeated ceremonies with a
