@@ -355,7 +355,8 @@ impl ChainOps for MockOps {
             }
             let ours = pulse_cutover::beacon::journal_summary(&self.dir.join("journal.jsonl"))["evidence"].clone();
             let n = if polls >= self.fleet_agree_after.get() { self.fleet_agree.get() } else { 1 };
-            let producers: Vec<_> = (0..n).map(|i| serde_json::json!({"name": format!("bp{i}"),
+            // The relay always reports each report's age (the gate requires fresh reports).
+            let producers: Vec<_> = (0..n).map(|i| serde_json::json!({"name": format!("bp{i}"), "age_ms": 1000,
                 "report": {"coord": {"event_id": "e1"}, "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}}})).collect();
             return Ok(Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": producers}]})));
         }
@@ -2108,4 +2109,271 @@ network = "testnet"
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["instance_id"].as_str().map(str::len), Some(32));
     assert!(!jdir.exists(), "a preview must not create the journal dir or beacon.instance");
+}
+
+// ---- Astra second verification (2026-09-30): round 3 regressions ------------------------------------
+// Each test below reproduces a failing case from ~/dev/pulse-migration/study/ASTRA-verify2-2026-09-30.md.
+
+fn fail_live_config(dir: &std::path::Path) -> Config {
+    let base = std::fs::read_to_string({ test_config(dir, 120); dir.join("ceremony.toml") }).unwrap();
+    load_toml(dir, "fail-live.toml", &base.replace("on_live = \"flip-gateway\"", "on_live = \"fail-live\"")).unwrap()
+}
+
+#[test]
+fn r3_rc6_halt_error_without_its_transition_is_still_halted() {
+    // Astra #2: rc.6 wrote the HALTED error, then the HALTED transition. A crash between the two
+    // left a journal whose replayed state was still IGNITED, and a restart ran on to LIVE.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = fail_live_config(dir.path());
+    assert!(run_machine_result(&cfg, &MockOps::new(dir.path(), 110)).unwrap_err().starts_with("HALTED"));
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let keep: Vec<&str> = text.lines().take_while(|l| !l.contains("HALTED")).collect();
+    let seq = keep.len();
+    let rc6_error = serde_json::json!({"seq": seq, "ts_ms": 1, "ts": "t", "kind": "error", "state": "IGNITED",
+        "data": {"message": "HALTED: on_live hook failed", "detail": {"detail": {}, "sealed": true}}});
+    std::fs::write(&cfg.journal_path, keep.join("\n") + "\n" + &rc6_error.to_string() + "\n").unwrap();
+    let rec = Journal::replay(&cfg.journal_path).unwrap();
+    assert_eq!(rec.state, Some(State::Halted), "a halt-intent error record is HALTED even without its transition");
+    assert_eq!(rec.halted_from, Some(State::Ignited));
+    // Restart with a config whose on_live now succeeds: it must still refuse.
+    let good = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 200);
+    let err = run_machine_result(&good, &ops).unwrap_err();
+    assert!(err.contains("HALTED (journaled)"), "{err}");
+    assert!(!std::fs::read_to_string(&cfg.journal_path).unwrap().contains(r#""kind":"transition","state":"LIVE""#));
+}
+
+#[test]
+fn r3_halt_is_one_durable_record_carrying_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = fail_live_config(dir.path());
+    assert!(run_machine_result(&cfg, &MockOps::new(dir.path(), 110)).unwrap_err().starts_with("HALTED"));
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let halted: Vec<&str> = text.lines().filter(|l| l.contains("HALTED")).collect();
+    let first = halted.first().expect("a HALTED record");
+    assert!(first.contains(r#""kind":"transition","state":"HALTED""#), "the FIRST HALTED record is the durable transition: {first}");
+    assert!(first.contains("on_live hook failed"), "the transition carries the reason: {first}");
+    let s = pulse_cutover::beacon::journal_summary(&cfg.journal_path);
+    assert_eq!(s["state"], "HALTED");
+    assert!(s["last_error_class"].as_str().map(|x| x.contains("HALTED")).unwrap_or(false), "{s}");
+}
+
+#[test]
+fn r3_unhalt_keeps_the_verified_snapshot_evidence() {
+    // Astra #3: unhalt wrote a VERIFIED transition without `sha256`; the beacon summary then
+    // reported snapshot_sha256 = null and any fleet-gated retry could never agree.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.target_fork.set(true);
+    assert!(run_machine_result(&cfg, &ops).unwrap_err().starts_with("HALTED"));
+    let before = pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"].clone();
+    assert!(!before["snapshot_sha256"].is_null());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pulse-cutover"))
+        .args(["unhalt", "--config"]).arg(dir.path().join("ceremony.toml")).arg("--i-understand").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let after = pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"].clone();
+    assert_eq!(after["snapshot_sha256"], before["snapshot_sha256"], "unhalt must not erase the snapshot hash");
+    assert_eq!(after["fingerprints_digest"], before["fingerprints_digest"]);
+    assert!(Journal::replay(&cfg.journal_path).unwrap().sha256.is_some());
+}
+
+#[test]
+fn r3_unhalted_fleet_gated_retry_can_still_agree_and_reach_live() {
+    let probe = tempfile::tempdir().unwrap();
+    let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
+    let ours = pulse_cutover::beacon::journal_summary(&probe.path().join("journal.jsonl"))["evidence"].clone();
+    let rep = |id: &str| serde_json::json!({"instance_id": id, "coord": {"event_id": "e1"}, "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}});
+    let doc = serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aa")}]},
+        {"name": "bp2", "beacons": [{"age_ms": 1000, "report": rep("bb")}]}]}]});
+    let d = tempfile::tempdir().unwrap();
+    let cfg = roster_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    *ops.status_doc.borrow_mut() = Some(doc.clone());
+    ops.target_fork.set(true);
+    assert!(run_machine_result(&cfg, &ops).unwrap_err().starts_with("HALTED"));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pulse-cutover"))
+        .args(["unhalt", "--config"]).arg(d.path().join("roster.toml")).arg("--i-understand").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let rec = Journal::replay(&cfg.journal_path).unwrap();
+    let ops2 = MockOps::new(d.path(), rec.cut_height.unwrap() + 3);
+    ops2.paused.set(true);
+    ops2.target_head.set(rec.cut_height.unwrap());
+    *ops2.status_doc.borrow_mut() = Some(doc);
+    let st = run_machine_result(&cfg, &ops2);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert_eq!(st, Ok(State::Live), "{text}");
+}
+
+#[test]
+fn r3_roster_with_zero_quorum_is_a_config_error() {
+    // Astra (#9 table): roster configured, fleet_quorum left at 0 and no event id → the gate was
+    // skipped entirely and the ceremony reached LIVE with no fleet check.
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::read_to_string({ coord_config(dir.path(), 120, 0, 5); dir.path().join("ceremony-coord.toml") }).unwrap();
+    let text = base.replace("event_id = \"e1\"\n", "") + "\n[[coordination.roster]]\nproducer = \"bp1\"\n";
+    let err = load_toml(dir.path(), "zero.toml", &text).err().expect("roster + quorum 0 must not load");
+    assert!(err.contains("fleet_quorum"), "{err}");
+    let over = base.replace("fleet_quorum = 0", "fleet_quorum = 3") + "\n[[coordination.roster]]\nproducer = \"bp1\"\n";
+    assert!(load_toml(dir.path(), "over.toml", &over).is_err(), "quorum larger than the roster can never be met");
+}
+
+#[test]
+fn r3_conflicted_reports_never_count_toward_the_fleet_gate() {
+    // Astra #5: every roster report carried conflict=true (one token on two machines) and the
+    // machine still reached LIVE.
+    let probe = tempfile::tempdir().unwrap();
+    let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
+    let ours = pulse_cutover::beacon::journal_summary(&probe.path().join("journal.jsonl"))["evidence"].clone();
+    let rep = |id: &str| serde_json::json!({"instance_id": id, "ready": false, "coord": {"event_id": "e1"}, "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}});
+    let d = tempfile::tempdir().unwrap();
+    let cfg = roster_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "conflict": true, "report": rep("aa")}]},
+        {"name": "bp2", "beacons": [{"age_ms": 1000, "conflict": true, "report": rep("bb")}]}]}]}));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted, "conflicted evidence must not satisfy the roster");
+
+    // Legacy (no roster) gate: the same exclusion, and reports must be FRESH too.
+    let d2 = tempfile::tempdir().unwrap();
+    let cfg2 = coord_config(d2.path(), 120, 2, 5);
+    let ops2 = MockOps::new(d2.path(), 110);
+    *ops2.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
+        {"name": "bp1", "age_ms": 999_000, "report": rep("aa")},
+        {"name": "bp2", "beacons": [{"age_ms": 1000, "conflict": true, "report": rep("bb")}]}]}]}));
+    assert_eq!(run_machine(&cfg2, &ops2), State::Aborted, "a stale legacy report and a conflicted one are not a quorum of 2");
+}
+
+#[test]
+fn r3_completed_corrupt_record_before_a_cr_only_tail_is_fatal() {
+    // Astra #7: `valid\ncorrupt\n\r` — the tail after the last LF is whitespace, so the corrupt
+    // record is COMPLETE; it used to be treated as torn and silently dropped.
+    let dir = tempfile::tempdir().unwrap();
+    let good = serde_json::json!({"seq": 0, "ts_ms": 1, "ts": "t", "kind": "transition", "state": "ARMED",
+        "data": {"chain_id": "ab", "resolved_h": 120}}).to_string();
+    let path = dir.path().join("cr.jsonl");
+    std::fs::write(&path, format!("{good}\n{{\"seq\":1,\"garbled\n\r")).unwrap();
+    assert!(Journal::replay(&path).is_err(), "replay must not skip a completed corrupt record");
+    let err = Journal::open(&path).err().expect("open must refuse");
+    assert!(err.contains("corrupt"), "{err}");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("garbled"), "nothing was truncated");
+    // A genuinely torn tail (no LF after it) is still set aside.
+    let torn = dir.path().join("torn.jsonl");
+    std::fs::write(&torn, format!("{good}\n\r\n{{\"seq\":1,\"ts_ms\":2,\"kin")).unwrap();
+    let (_j, rec) = Journal::open(&torn).unwrap();
+    assert!(rec.torn_tail);
+    assert_eq!(rec.state, Some(State::Armed));
+}
+
+fn run_bin(args: &[&str], cfg: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_pulse-cutover")).args(&args[..1]).arg("--config").arg(cfg).args(&args[1..]).output().unwrap()
+}
+
+#[test]
+fn r3_rollback_refuses_without_affirmative_evidence() {
+    // Astra #1: `cutover.sh abort` treated a MISSING journal as safe and resumed the source.
+    let dir = tempfile::tempdir().unwrap();
+    let _ = test_config(dir.path(), 120);
+    let cfgp = dir.path().join("ceremony.toml");
+    let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
+    assert_eq!(out.status.code(), Some(3), "missing journal is not proof that ignition never started: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(!dir.path().join("journal.jsonl").exists());
+    let out = run_bin(&["rollback", "--wait", "1", "--no-journal-i-know"], &cfgp);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn r3_rollback_refuses_after_ignition_started_unless_forced() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.target_fork.set(true);
+    assert!(run_machine_result(&cfg, &ops).unwrap_err().starts_with("HALTED"));
+    let cfgp = dir.path().join("ceremony.toml");
+    let before = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&cfg.journal_path).unwrap(), before, "a refused rollback changes nothing");
+    let out = run_bin(&["rollback", "--wait", "1", "--force-after-ignite"], &cfgp);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""kind":"transition","state":"ABORTED""#) && text.contains("force_after_ignite"), "{text}");
+}
+
+#[test]
+fn r3_rollback_before_ignition_is_journaled_and_waits_for_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    assert_eq!(run_machine(&cfg, &MockOps::new(dir.path(), 110)), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let keep: Vec<&str> = text.lines().take_while(|l| !l.contains(r#""kind":"transition","state":"SNAPSHOTTED""#)).collect();
+    std::fs::write(&cfg.journal_path, keep.join("\n") + "\n").unwrap();
+    let cfgp = dir.path().join("ceremony.toml");
+    // Another process (a still-running agent) holds the journal: rollback must not decide.
+    let held = Journal::open(&cfg.journal_path).unwrap();
+    let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("holds"), "{}", String::from_utf8_lossy(&out.stderr));
+    drop(held);
+    let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""kind":"transition","state":"ABORTED""#) && text.contains("operator_rollback"), "{text}");
+}
+
+#[test]
+fn r3_cutover_sh_abort_with_missing_journal_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = test_config(dir.path(), 120);
+    let bindir = dir.path().join("bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_pulse-cutover"), bindir.join("pulse-cutover")).unwrap();
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cutover.sh");
+    let out = std::process::Command::new("bash").arg(&script).arg("abort")
+        .env("PULSE_CUTOVER_CONFIG", dir.path().join("ceremony.toml"))
+        .env("PULSE_CUTOVER_ABORT_WAIT", "1")
+        .env("PATH", format!("{}:{}", bindir.display(), std::env::var("PATH").unwrap()))
+        .output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn r3_recovered_flip_side_effect_is_reverted_by_a_forced_rollback() {
+    // Test-assurance: drive the machine from a crash right after the flip side effect started.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = api_test_config(dir.path(), 120);
+    assert_eq!(run_machine(&cfg, &MockOps::new(dir.path(), 110)), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines.iter().position(|l| l.contains(r#""side_effect":"flip_cmd""#)).expect("flip side effect journaled");
+    std::fs::write(&cfg.journal_path, lines[..=at].join("\n") + "\n").unwrap();
+    let ops = MockOps::new(dir.path(), 200);
+    let (journal, rec) = Journal::open(&cfg.journal_path).unwrap();
+    let mut m = Machine::new(&cfg, &ops, journal, rec);
+    assert!(m.operator_rollback(false).is_err(), "ignition started: refused without force");
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "revert-nginx"));
+    assert_eq!(m.operator_rollback(true).unwrap(), State::Aborted);
+    assert!(ops.hooks.borrow().iter().any(|h| h == "revert-nginx"), "the recovered flip was reverted: {:?}", ops.hooks.borrow());
+}
+
+#[test]
+fn r3_crash_mid_copy_restages_a_truncated_staged_snapshot() {
+    // Test-assurance: interrupt the staging COPY itself (half a file on disk), then resume.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    assert_eq!(run_machine(&cfg, &MockOps::new(dir.path(), 110)), State::Live);
+    let rec_full = Journal::replay(&cfg.journal_path).unwrap();
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let staged = lines.iter().position(|l| l.contains("staged_artifact")).unwrap();
+    std::fs::write(&cfg.journal_path, lines[..=staged].join("\n") + "\n").unwrap();
+    let full = std::fs::read(&cfg.snapshot.staged_path).unwrap();
+    std::fs::write(&cfg.snapshot.staged_path, &full[..full.len() / 2]).unwrap();
+    let ops = MockOps::new(dir.path(), rec_full.cut_height.unwrap() + 3);
+    ops.paused.set(true);
+    ops.target_head.set(rec_full.cut_height.unwrap());
+    let st = run_machine_result(&cfg, &ops);
+    assert_eq!(st, Ok(State::Live), "{}", std::fs::read_to_string(&cfg.journal_path).unwrap());
+    assert_eq!(std::fs::read(&cfg.snapshot.staged_path).unwrap(), full, "the partial copy was replaced by a full restage");
 }
