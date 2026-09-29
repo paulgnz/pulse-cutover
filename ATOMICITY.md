@@ -79,6 +79,7 @@ bot ledgers) is archived with the rehearsal notes.
 | 2 | A1, A2 | LIVE on all 5; identical fingerprints and anchor id; balances continuous |
 | 3 | A1, A2, apps | LIVE unattended through public edges; surfaced a mempool bug in the plugin build (fixed upstream, fork rebuilt) |
 | 4 | A1, A2, apps | LIVE with a perps DEX, oracle and keeper; 0 duplicate orders; 79/79 transfers landed |
+| 6 | **A1–A5, unattended, one public URL** | all 7 evidence values agreed 5/5 on mission control; `state-diff` ran automatically at H = 8539 on every BP: identical, digest `df0f4017e7ba97bc…`; replay canary exactly-once (0 pre-cut replays accepted, 10/10 held landed once) |
 
 ## Reproducing the proof
 

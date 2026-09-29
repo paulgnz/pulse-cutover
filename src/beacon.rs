@@ -135,6 +135,10 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     let journal = journal_summary(&cfg.journal_path);
     let state = journal["state"].as_str().unwrap_or("").to_string();
     let past_ignite = matches!(state.as_str(), "IGNITED" | "FLIPPED" | "LIVE");
+    // From VERIFIED on, the staged snapshot is supposed to exist, and ignition restarts the
+    // validator: judge those checks by phase, not by the pre-ceremony rule.
+    let past_verify = past_ignite || state == "VERIFIED";
+    let in_ignite = matches!(state.as_str(), "VERIFIED" | "IGNITED");
 
     // Source chain.
     let info = post_json(&a, &format!("{}/v1/chain/get_info", cfg.source.rpc_url.trim_end_matches('/')), json!({}));
@@ -177,11 +181,11 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
 
     // Target side.
     let staged = &cfg.snapshot.staged_path;
-    let staged_ok = past_ignite || !staged.exists();
-    checks.push(check("staged_snapshot_absent", staged_ok, if staged_ok { "not pre-staged".to_string() } else { format!("{} already exists (would boot the target from a stale cut)", staged.display()) }));
+    let staged_ok = past_verify || !staged.exists();
+    checks.push(check("staged_snapshot_absent", staged_ok, if past_verify { "staged by the ceremony (expected)".to_string() } else if staged_ok { "not pre-staged".to_string() } else { format!("{} already exists (would boot the target from a stale cut)", staged.display()) }));
     let unit = &cfg.target.metalgo_unit;
     let active = unit_active(unit);
-    checks.push(check("validator_running", active, format!("{unit} {}", if active { "active" } else { "not active" })));
+    checks.push(check("validator_running", active || in_ignite, format!("{unit} {}", if active { "active" } else if in_ignite { "restarting for ignition" } else { "not active" })));
     if let Some(dir) = cfg.snapshot.dir.as_ref().or(staged.parent().map(|p| p.to_path_buf()).as_ref()) {
         let gb = free_gb(dir);
         checks.push(check("disk_free", gb.map(|g| g >= 5.0).unwrap_or(false), gb.map(|g| format!("{g:.1} GB free in {}", dir.display())).unwrap_or_else(|| "unknown".into())));

@@ -462,6 +462,8 @@ flowchart TB
 
 ![5-BP cutover, recorded live (run 4, 6× speed)](docs/media/multibp-cutover.gif)
 
+![Run 6 on Cutover Mission Control: ARMED → LIVE on all five BPs, evidence agreeing 5/5](docs/media/mission-control-run6.gif)
+
 *Recorded live, run 4 at 6× speed ([asciinema cast](docs/media/multibp-cutover.cast)). Each row is one BP's public API edge:
 it serves nodeos, answers writes with 503 from H−24, then flips to PulseVM at LIVE. Underneath, three bots keep
 writing through those same edges: an HFT transfer bot, a perps order bot and an oracle feeder. The recording ends
@@ -524,6 +526,7 @@ gantt
 | 3 | **LIVE on all 5, unattended** | Public API edges + HFT bot: 143 clean 503s during the freeze, **73.5 s client write gap**, edges flipped on their own. Surfaced a mempool bug in our PulseVM build (below) |
 | 4 | **LIVE on all 5, with a perps DEX live** | Fixed plugin: **79/79 admitted transfers landed** (run 3: 108/193). A perps contract deployed on the old chain kept taking orders on PulseVM with no changes, with 0 duplicates and the oracle within its 120 s window across the cut. New: a **~50 s finality stall right after LIVE** (field note 10) |
 | 5 | **LIVE on all 5, atomicity proven**: mixed nginx + HAProxy TLS edges | Byte-identical state diff at H on every BP, replay canary exactly-once, 0 duplicate orders. See [ATOMICITY.md](ATOMICITY.md). HAProxy edges froze and flipped via the runtime socket with **zero reloads** |
+| 6 | **LIVE on all 5, unattended, one public URL** | Every client used `api-rehearsal.protonnz.com` (DNS across all 5 BPs, real TLS). Watched on [Cutover Mission Control](control/README.md): all 7 evidence rows agreed 5/5, the state diff at H ran automatically (identical on every BP), replay canary exactly-once. The post-LIVE stall (note 10) reproduced: 92 expired + 12 timeouts after the flip |
 
 Evidence (journals, fingerprints, snapshot hashes per BP) is kept with the
 rehearsal notes; the configs are reproducible from `examples/ceremony-bp.toml`.
@@ -547,6 +550,8 @@ upstream, or an open item with a workaround.
 | 10 | **~50 s finality stall right after LIVE** (run 4): blocks H+1…H+4 accepted within 5 s, then nothing accepted for 50 s while all 5 metalgo nodes were still re-peering after their ignite restarts (readiness passed ~15–45 s after ignite), under 4 bots' worth of backlog | Clients saw timeouts and "expired" for ~40 s after the flip, then full recovery at ~1 block/s | ⚠ open. Not seen in run 3 (lighter load). Mitigations to test: gate LIVE on *every* validator's readiness, not just local head > H; restart-less ignition (load the snapshot on chain retry instead of restarting metalgo); ramp traffic after the flip |
 | 11 | Imported chains log `onblock failed … resource usage row is missing for account pulse` on every block | None for contracts without `onblock` logic (the perps contract has none) | ⚠ open upstream item: the importer should seed the system account's resource row |
 | 12 | The perps writer's 750 ms read-back called 94 orders "admitted, not landed"; 93 were on the book, placed just outside the window by 5-producer propagation | Would have reported phantom drops | ✅ reconcile against a final chain read, not only a read-back timer |
+| 13 | A HAProxy flip done only through the runtime socket was **undone by a later `systemctl reload`** (for a cert change): HAProxy re-read `haproxy.cfg` and quietly served the retired chain again | A routine config reload after the cutover silently points users at the old chain | ✅ the flip hook now also persists the swap to `haproxy.cfg` (validated), as pulse-cutover's generated scripts already do; `abort` restores both |
+| 14 | Readiness checks judged by pre-ceremony rules during the ceremony (staged snapshot "present", validator "not running" while restarting) | Mission control showed every BP "needs attention" mid-ceremony | ✅ beacon checks are phase-aware |
 
 ## Building apps that survive a cutover
 

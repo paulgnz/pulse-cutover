@@ -5,6 +5,10 @@ rehearsal networks. Deployed for the rehearsals at **https://control-rehearsal.p
 
 ![Mission control, mainnet view](../docs/media/mission-control-mainnet.png)
 
+Run 6 of the 5-BP rehearsal, as seen on mission control (time-lapse):
+
+![Run 6 time-lapse](../docs/media/mission-control-run6.gif)
+
 | What you see | Where it comes from |
 |---|---|
 | Head, LIB, blocks/s, who is producing, block propagation arcs on the globe | public RPC of each network (read-only, polled every 3 s) |
