@@ -299,6 +299,7 @@ const send = (res, code, body, type = 'application/json') => {
   res.end(typeof body === 'string' ? body : JSON.stringify(body));
 };
 
+const reachSeen = new Map();
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html'))
@@ -327,6 +328,19 @@ http.createServer(async (req, res) => {
     res.writeHead(200, { 'content-type': l.type, 'cache-control': 'public, max-age=21600', 'x-content-type-options': 'nosniff',
       'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox" });
     return res.end(l.buf);
+  }
+  if (req.method === 'GET' && url.pathname === '/api/reach') {
+    // Can the internet reach the CALLER's Metal staking port? Only ever dials the requesting IP, only port 9651,
+    // at most once per 5 s per IP. Used by metal-install.sh to tell operators whether peers can connect in.
+    const local = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
+    const ip = (local && req.headers['x-real-ip']) || req.socket.remoteAddress;
+    const now = Date.now(); reachSeen.forEach((t, k) => { if (now - t > 60000) reachSeen.delete(k); });
+    if (now - (reachSeen.get(ip) || 0) < 5000) return send(res, 429, { error: 'slow down' });
+    reachSeen.set(ip, now);
+    const t0 = Date.now();
+    const ok = await new Promise((done) => { const sk = net.connect({ host: ip, port: 9651, timeout: 4000 });
+      sk.once('connect', () => { sk.destroy(); done(true); }); sk.once('timeout', () => { sk.destroy(); done(false); }); sk.once('error', () => done(false)); });
+    return send(res, 200, { ip, port: 9651, reachable: ok, ms: Date.now() - t0 });
   }
   const mm = url.pathname.match(/^\/api\/manifest(?:\/([a-z0-9-]+))?$/);
   if (mm && req.method === 'GET') {

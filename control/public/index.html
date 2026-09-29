@@ -241,6 +241,52 @@ footer a{color:var(--muted)}
 .evk{display:grid;grid-template-columns:150px minmax(0,1fr);gap:6px 12px;font-size:12px}.evk dt{color:var(--muted)}.evk dd{margin:0;font-family:var(--mono);overflow-wrap:anywhere}
 .clickable{cursor:pointer}
 @media (max-width:640px){.drawer{width:100vw;border-left:0}.facts{grid-template-columns:repeat(2,minmax(0,1fr))}.nodecard .grid2{grid-template-columns:repeat(2,minmax(0,1fr))}.chk{flex-wrap:wrap}.chk b{min-width:0}}
+
+/* drawer v2: per-node separation */
+.ic{width:15px;height:15px;flex:none;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;vertical-align:-2px}
+.ic.lg{width:20px;height:20px}
+.dr-sec h4{display:flex;align-items:center;gap:8px}
+.dr-sec h4 .cnt{margin-left:auto;font:600 11px var(--mono);letter-spacing:0;color:var(--dim);text-transform:none}
+.fact{display:flex;flex-direction:column;gap:2px}.fact .ic{color:var(--muted);margin-bottom:4px}
+.glance{display:flex;flex-direction:column;gap:6px}
+.gl{display:grid;grid-template-columns:28px minmax(0,1fr) 110px auto;align-items:center;gap:10px;padding:9px 12px;border-radius:12px;background:rgba(255,255,255,.03);border:1px solid var(--line);cursor:pointer;color:inherit;text-decoration:none}
+.gl:hover{border-color:rgba(255,255,255,.18)}
+.gl .nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gl .nm small{display:block;color:var(--muted);font-weight:400;font-size:11px}
+.pbar{height:6px;border-radius:6px;background:rgba(255,255,255,.07);overflow:hidden}.pbar i{display:block;height:100%;border-radius:6px;background:linear-gradient(90deg,var(--warn),var(--ok))}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;font:600 11px var(--sans);border:1px solid var(--line);white-space:nowrap}
+.pill.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 40%,transparent);background:color-mix(in srgb,var(--ok) 10%,transparent)}
+.pill.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 40%,transparent);background:color-mix(in srgb,var(--warn) 10%,transparent)}
+.pill.bad{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 40%,transparent);background:color-mix(in srgb,var(--bad) 10%,transparent)}
+.pill.mute{color:var(--muted)}
+.srv{position:relative;margin-bottom:14px;border-radius:16px;border:1px solid var(--line);background:rgba(255,255,255,.025);overflow:hidden;scroll-margin-top:110px}
+.srv::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--st,var(--muted))}
+.srv-h{display:flex;align-items:center;gap:12px;padding:14px 16px 12px 18px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.02)}
+.srv-ic{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;background:rgba(255,255,255,.05);color:var(--st,var(--ink));flex:none}
+.srv-h h5{margin:0;font:700 15px var(--sans)}.srv-h .meta{color:var(--muted);font-size:11.5px;margin-top:2px;display:flex;flex-wrap:wrap;gap:4px 10px}
+.srv-h .meta span{display:inline-flex;align-items:center;gap:4px}.srv-h .pill{margin-left:auto}
+.srv-kv{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;background:var(--line)}
+.srv-kv div{background:#0c1228;padding:9px 12px 9px 18px;font:600 13px var(--mono)}.srv-kv div span{display:block;font:500 10.5px var(--sans);color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:2px}
+.srv-grp{padding:10px 16px 4px 18px}
+.srv-grp h6{margin:4px 0 6px;display:flex;align-items:center;gap:8px;font:600 11px var(--sans);letter-spacing:1.4px;text-transform:uppercase;color:var(--muted)}
+.srv-grp h6 .pbar{flex:1;max-width:120px;margin-left:auto}
+.srv-grp h6 em{font-style:normal;font-family:var(--mono);letter-spacing:0;color:var(--ink)}
+.ck{display:grid;grid-template-columns:18px 18px minmax(0,1fr);gap:8px;align-items:start;padding:7px 0;border-top:1px dashed var(--line);font-size:12.5px}
+.ck:first-of-type{border-top:0}
+.ck .st.ok{color:var(--ok)}.ck .st.no{color:var(--bad)}.ck .st.todo{color:var(--warn)}.ck .ci{color:var(--muted)}
+.ck b{font-weight:600;display:block}.ck span{color:var(--muted);overflow-wrap:anywhere}
+.next{margin:6px 16px 14px 18px;padding:9px 12px;border-radius:10px;font-size:12px;background:color-mix(in srgb,var(--warn) 9%,transparent);border:1px solid color-mix(in srgb,var(--warn) 30%,transparent);display:flex;gap:8px;align-items:flex-start}
+.next .ic{color:var(--warn);margin-top:1px}
+.eps{display:flex;flex-direction:column;gap:10px}
+.ep{border-radius:14px;border:1px solid var(--line);background:rgba(255,255,255,.025);padding:12px 14px}
+.ep-h{display:flex;align-items:center;gap:10px}.ep-h .srv-ic{width:32px;height:32px;border-radius:10px}
+.ep-h .t{min-width:0}.ep-h .t b{display:block;font:600 13px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ep-h .t small{color:var(--muted);font-size:11px;display:inline-flex;align-items:center;gap:4px}
+.ep-h .pill{margin-left:auto}
+.ep-m{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px 12px;margin-top:10px;font-size:12px}
+.ep-m div span{display:block;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:1px}
+.chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:9px}
+.ep.mini{padding:9px 14px}.ep.mini .ep-h .srv-ic{width:26px;height:26px}
+@media (max-width:640px){.gl{grid-template-columns:24px minmax(0,1fr) auto}.gl .pbar{display:none}.srv-kv,.ep-m{grid-template-columns:repeat(2,minmax(0,1fr))}.srv-h{flex-wrap:wrap}.srv-h .pill{margin-left:50px}}
 @media (max-width:1100px){.hero{grid-template-columns:minmax(0,1fr)}.globe-card{min-height:440px}.duo{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:640px){
   .tile{padding-bottom:56px;min-height:128px}
@@ -748,6 +794,40 @@ async function pollInfra() {
 pollInfra(); setInterval(pollInfra, 30000);
 
 
+
+/* ---------------- icons (lucide-style, inline) ---------------- */
+const ICP = {
+  server: '<rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M6 7h.01M6 17h.01"/>',
+  cpu: '<rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v4M15 1v4M9 19v4M15 19v4M1 9h4M1 15h4M19 9h4M19 15h4"/>',
+  globe: '<circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20"/>',
+  db: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/>',
+  link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
+  pin: '<path d="M20 10c0 6-8 12-8 12S4 16 4 10a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+  ok: '<circle cx="12" cy="12" r="10"/><path d="m8 12 3 3 5-6"/>',
+  todo: '<circle cx="12" cy="12" r="10" stroke-dasharray="3 3"/>',
+  bad: '<circle cx="12" cy="12" r="10"/><path d="m15 9-6 6M9 9l6 6"/>',
+  hex: '<path d="M21 16V8l-9-5-9 5v8l9 5 9-5z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/>',
+  hdd: '<path d="M22 12H2M5.5 5h13L22 12v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z"/><path d="M6 16h.01M10 16h.01"/>',
+  lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+  zap: '<path d="M13 2 3 14h9l-1 8 10-12h-9z"/>',
+  undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-4"/>',
+  camera: '<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z"/><circle cx="12" cy="13" r="3"/>',
+  key: '<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/>',
+  shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+  wrench: '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9l-3.8 3.8z"/>',
+  arrow: '<path d="M5 12h14M12 5l7 7-7 7"/>',
+  box: '<path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="M3 8l9 5 9-5M12 13v8"/>',
+  radio: '<circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.5M7.8 16.2a6 6 0 0 1 0-8.5M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2"/>',
+  trophy: '<path d="M6 9H4a2 2 0 0 1 0-4h2M18 9h2a2 2 0 0 0 0-4h-2M6 3h12v7a6 6 0 0 1-12 0z"/><path d="M12 16v4M8 22h8"/>',
+  list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
+};
+const ic = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICP[n] || ICP.server}</svg>`;
+const CHECK_ICON = { source_api: 'globe', chain_id: 'key', producer_api: 'cpu', freeze_height: 'lock', freeze_lead_blocks: 'lock',
+  staged_snapshot_absent: 'camera', disk_free: 'hdd', hook_on_freeze: 'lock', hook_post_ignite: 'zap', hook_on_live: 'arrow',
+  hook_on_abort: 'undo', validator_running: 'hex' };
+const ROLE_ICON = { producer: 'cpu', history: 'db', api: 'globe', seed: 'link', query: 'db', full: 'globe' };
+const ROLE_NAME = { producer: 'Block producer node', history: 'History / Hyperion node', api: 'Public API node' };
 /* ---------------- producer detail drawer ---------------- */
 let openName = null; try { openName = new URLSearchParams(location.search).get('p'); } catch {}
 function openProducer(name) { openName = name; flyTo(name); renderDrawer(); try { const u = new URL(location); u.searchParams.set('p', name); u.searchParams.set('net', active); history.replaceState(null, '', u); } catch {} }
@@ -780,31 +860,66 @@ function renderDrawer() {
 
       ${co ? `<div class="dr-sec"><h4>Coordinated event</h4><div class="chk"><i class="${r?.coord?.accepted ? 'ok' : 'no'}">${r?.coord?.accepted ? '✓' : '·'}</i><b>${esc(co.event.event_id)}</b><span>${r?.coord?.event_id === co.event.event_id ? (r.coord.accepted ? `accepted · H ${fmt(r.coord.h)}${r.coord.armed ? ' · armed' : ''}` : 'rejected: ' + esc(r.coord.reason)) : 'not acknowledged yet'}</span></div></div>` : ''}
 
-      <div class="dr-sec"><h4>Nodes (${nodes.length})</h4>
-      ${nodes.length ? nodes.map((n) => `<div class="nodecard"><div class="r1"><div>${(n.types.length ? n.types : ['node']).map((t) => `<span class="tp ${esc(t)}">${esc(t)}</span>`).join('')}</div>${n.api ? `<span class="st2">${dot(n.api.ok && n.api.chain_ok !== false)}${n.api.ok ? n.api.ms + ' ms' : 'down'}</span>` : ''}</div>
-        ${n.url ? `<a class="url" style="max-width:100%;margin-top:6px" href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${esc(n.url)}</a>` : ''}
-        <div class="grid2">
-          <div><span>version</span>${esc(n.api?.version?.split('-')[0] || '—')}</div><div><span>head lag</span>${n.api?.lag != null ? fmt(n.api.lag) : '—'}</div><div><span>edge</span>${esc(n.api?.edge || '—')}</div>
-          <div><span>hyperion</span>${n.hyperion ? (n.hyperion.ok ? esc(n.hyperion.version) + (n.hyperion.lag != null ? ' · lag ' + fmt(n.hyperion.lag) : '') : 'down') : '—'}</div>
-          <div><span>atomicassets</span>${n.atomic ? (n.atomic.ok ? esc(n.atomic.version || 'up') : 'down') : '—'}</div>
-          <div><span>p2p</span>${n.p2p ? `${dot(n.p2p_probe?.ok)} ${esc(n.p2p)}` : '—'}</div>
-        </div>${n.features?.length ? `<div style="margin-top:8px">${n.features.map((f) => `<span class="tp">${esc(f)}</span>`).join('')}</div>` : ''}</div>`).join('')
-        : `<div class="ev-empty">${net.id === 'rehearsal' ? 'Rehearsal nodes are known from their beacons, not bp.json.' : 'No bp.json nodes surveyed yet (the survey runs every 10 minutes), or this producer publishes no bp.json.'}</div>`}
-      </div>
+      ${(() => {
+        const bs = p.beacons || [];
+        if (!bs.length) return '';
+        const stOf = (b) => { const k = splitChecks(b.report.checks || []);
+          return b.silent ? ['bad', 'silent'] : k.sick.length ? ['bad', `${k.sick.length} issue${k.sick.length > 1 ? 's' : ''}`] : k.todo.length ? ['warn', `${k.todo.length} to set up`] : ['ok', 'ready']; };
+        const col = { ok: 'var(--ok)', warn: 'var(--warn)', bad: 'var(--bad)' };
+        const ago = (ms) => ms < 90000 ? Math.round(ms / 1000) + 's ago' : Math.round(ms / 60000) + ' min ago';
+        const glance = bs.map((b, i) => { const k = splitChecks(b.report.checks || []), [st, txt] = stOf(b), done = k.setup.length - k.todo.length;
+          return `<a class="gl" href="#srv-${i}" data-srv="${i}"><span style="color:${col[st]}">${ic(ROLE_ICON[b.role] || 'server', 'lg')}</span>
+            <span class="nm">${esc(b.node)}<small>${esc(ROLE_NAME[b.role] || b.role || 'node')}</small></span>
+            <span class="pbar" title="cutover setup ${done}/${k.setup.length}"><i style="width:${k.setup.length ? Math.round(100 * done / k.setup.length) : 0}%"></i></span>
+            <span class="pill ${st}">${ic(st === 'ok' ? 'ok' : st === 'bad' ? 'bad' : 'todo')}${txt}</span></a>`; }).join('');
+        const cards = bs.map((b, i) => { const rp = b.report, k = splitChecks(rp.checks || []), [st, txt] = stOf(b), done = k.setup.length - k.todo.length;
+          const lag = c.head && rp.source?.head ? c.head - rp.source.head : null;
+          const row = (x, bad) => `<div class="ck"><span class="st ${x.ok ? 'ok' : bad}">${ic(x.ok ? 'ok' : bad === 'no' ? 'bad' : 'todo')}</span><span class="ci">${ic(CHECK_ICON[x.name] || 'wrench')}</span>
+            <div><b>${esc(label(x))}</b><span>${x.ok ? esc(x.detail || 'ok') : esc((CHECKS[x.name] || [])[2] || x.detail || '')}${!x.ok && (CHECKS[x.name] || [])[2] && x.detail ? ` · <i>${esc(x.detail)}</i>` : ''}</span></div></div>`;
+          const nxt = k.sick[0] || k.todo[0];
+          return `<div class="srv" id="srv-${i}" style="--st:${col[st]}">
+            <div class="srv-h"><div class="srv-ic">${ic(ROLE_ICON[b.role] || 'server', 'lg')}</div>
+              <div style="min-width:0"><h5>${esc(b.node)}</h5><div class="meta"><span>${esc(ROLE_NAME[b.role] || b.role || 'node')}</span><span>${ic('clock')}${b.silent ? 'silent' : ago(b.age_ms)}</span><span>${ic('radio')}beacon v${esc(rp.agent_version)}</span></div></div>
+              <span class="pill ${st}">${ic(st === 'ok' ? 'ok' : st === 'bad' ? 'bad' : 'todo')}${txt}</span></div>
+            <div class="srv-kv"><div><span>head</span>${rp.source?.head ? fmt(rp.source.head) : '—'}</div><div><span>irreversible</span>${rp.source?.lib ? fmt(rp.source.lib) : '—'}</div>
+              <div><span>behind chain</span>${lag == null ? '—' : lag <= 30 ? '<span style="color:var(--ok)">in sync</span>' : fmt(lag) + ' blocks'}</div></div>
+            <div class="srv-grp"><h6>${ic('wrench')}Cutover setup <em>${done}/${k.setup.length}</em><span class="pbar"><i style="width:${k.setup.length ? Math.round(100 * done / k.setup.length) : 0}%"></i></span></h6>${k.setup.map((x) => row(x, 'todo')).join('')}</div>
+            <div class="srv-grp"><h6>${ic('shield')}Node health <em>${k.health.length - k.sick.length}/${k.health.length}</em></h6>${k.health.map((x) => row(x, 'no')).join('')}</div>
+            ${nxt ? `<div class="next">${ic('arrow')}<div><b>Next:</b> ${esc(label(nxt))}: ${esc((CHECKS[nxt.name] || [])[2] || nxt.detail || '')}</div></div>` : '<div style="height:10px"></div>'}
+          </div>`; }).join('');
+        return `<div class="dr-sec"><h4>${ic('list')}At a glance<span class="cnt">${bs.length} server${bs.length > 1 ? 's' : ''} with a beacon</span></h4><div class="glance">${glance}</div></div>
+          <div class="dr-sec"><h4>${ic('server')}Servers<span class="cnt">live beacon reports</span></h4>${cards}</div>`;
+      })()}
 
-      ${(p.beacons && p.beacons.length ? p.beacons : []).map((b) => { const k = splitChecks(b.report.checks || []); return `<div class="dr-sec"><h4>${esc(b.node)} · ${esc(b.role || 'node')} · agent v${esc(b.report.agent_version)} · ${b.silent ? '<span style="color:var(--bad)">silent</span>' : Math.round(b.age_ms / 1000) + 's ago'}</h4>
-        <div class="chk" style="border:0;padding-bottom:2px"><i></i><b style="color:var(--muted);font-size:11px;letter-spacing:1px;text-transform:uppercase">Cutover setup · ${k.setup.length - k.todo.length} of ${k.setup.length} done</b></div>
-        ${k.setup.map((x) => `<div class="chk"><i class="${x.ok ? 'ok' : 'todo'}">${x.ok ? '✓' : '○'}</i><b>${esc(label(x))}</b><span>${x.ok ? esc(x.detail) : esc((CHECKS[x.name] || [])[2] || x.detail)}</span></div>`).join('')}
-        <div class="chk" style="border:0;padding-bottom:2px"><i></i><b style="color:var(--muted);font-size:11px;letter-spacing:1px;text-transform:uppercase">Node health · ${k.health.length - k.sick.length} of ${k.health.length} OK</b></div>
-        ${k.health.map((x) => `<div class="chk"><i class="${x.ok ? 'ok' : 'no'}">${x.ok ? '✓' : '✗'}</i><b>${esc(label(x))}</b><span>${esc(x.detail)}</span></div>`).join('')}</div>`; }).join('')}
       ${(() => { const withUrl = nodes.filter((n) => n.url); const covered = (p.beacons || []).length;
-        return !covered ? `<div class="dr-sec"><h4>Beacons</h4><div class="ev-empty">None of this producer's nodes report yet. One command connects each node: <b>docs/OPERATOR-QUICKSTART.md</b>.</div></div>`
-          : withUrl.length > covered ? `<div class="dr-sec"><div class="fail" style="color:var(--warn)">○ ${covered} of ${withUrl.length} public nodes have a beacon: every node that serves users needs one before a cutover.</div></div>` : ''; })()}
+        return !covered ? `<div class="dr-sec"><h4>${ic('radio')}Beacons</h4><div class="ev-empty">None of this producer's servers report yet. One command connects each server: <b>docs/OPERATOR-QUICKSTART.md</b>.</div></div>`
+          : withUrl.length > covered ? `<div class="dr-sec"><div class="next" style="margin:0">${ic('radio')}<div>${covered} of ${withUrl.length} public endpoints have a beacon. Every server that serves users needs one before a cutover.</div></div></div>` : ''; })()}
+
+      <div class="dr-sec"><h4>${ic('globe')}Public endpoints<span class="cnt">from bp.json · probed every 10 min</span></h4>
+      ${nodes.length ? `<div class="eps">${nodes.map((n) => {
+        const t = n.types[0] || 'node', icn = n.hyperion ? 'db' : ROLE_ICON[t] || 'server';
+        const host = n.url ? n.url.replace(/^https?:\/\//, '') : n.p2p || (t === 'producer' ? 'producer node' : t + ' node');
+        const up = n.api ? n.api.ok && n.api.chain_ok !== false : n.p2p_probe ? n.p2p_probe.ok : null;
+        const pill = up == null ? `<span class="pill mute">${t === 'producer' ? ic('lock') + 'private' : 'not probed'}</span>` : `<span class="pill ${up ? 'ok' : 'bad'}">${ic(up ? 'ok' : 'bad')}${up ? (n.api ? n.api.ms + ' ms' : 'open') : 'down'}</span>`;
+        const head = `<div class="ep-h"><div class="srv-ic">${ic(icn)}</div><div class="t"><b>${n.url ? `<a href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${esc(host)}</a>` : esc(host)}</b>
+          <small>${n.types.map((x) => `<span class="tp ${esc(x)}">${esc(x)}</span>`).join('')} ${n.location ? ic('pin') + esc(n.location) : ''}</small></div>${pill}</div>`;
+        if (!n.api && !n.hyperion && !n.atomic) return `<div class="ep mini">${head}</div>`;
+        return `<div class="ep">${head}
+          <div class="ep-m">
+            <div><span>nodeos</span>${esc(n.api?.version?.split('-')[0] || '—')}</div><div><span>behind</span>${n.api?.lag != null ? (n.api.lag <= 4 ? 'in sync' : fmt(n.api.lag)) : '—'}</div><div><span>edge</span>${esc(n.api?.edge || '—')}</div>
+            ${n.hyperion ? `<div><span>hyperion</span>${n.hyperion.ok ? esc(n.hyperion.version) : '<span style="color:var(--bad)">down</span>'}</div><div><span>indexed lag</span>${n.hyperion.lag != null ? fmt(n.hyperion.lag) : '—'}</div><div><span>hyperion ms</span>${n.hyperion.ms ?? '—'}</div>` : ''}
+            ${n.atomic ? `<div><span>atomicassets</span>${n.atomic.ok ? esc(n.atomic.version || 'up') : 'down'}</div>` : ''}
+          </div>
+          ${(n.hyperion?.services || []).length || n.features?.length ? `<div class="chips">${(n.hyperion?.services || []).map((x) => `<span class="pill ${x.ok ? 'ok' : 'bad'}">${ic(x.ok ? 'ok' : 'bad')}${esc(x.s)}</span>`).join('')}${(n.features || []).map((f) => `<span class="pill mute">${esc(f)}</span>`).join('')}</div>` : ''}
+        </div>`; }).join('')}</div>`
+        : `<div class="ev-empty">${net.id === 'rehearsal' ? 'Rehearsal nodes are known from their beacons, not bp.json.' : 'No bp.json endpoints surveyed yet (the survey runs every 10 minutes), or this producer publishes no bp.json.'}</div>`}
+      </div>
 
       ${r?.ceremony?.transitions?.length ? `<div class="dr-sec"><h4>Ceremony</h4><ul class="tl">${r.ceremony.transitions.map((t) => `<li><time>${esc(String(t.ts).slice(11, 23))}</time><b>${esc(t.state)}</b></li>`).join('')}</ul>${r.ceremony.last_error ? `<div class="fail" style="margin-top:6px">✗ ${esc(r.ceremony.last_error)}</div>` : ''}</div>` : ''}
       ${r?.ceremony?.evidence && Object.keys(r.ceremony.evidence).length ? `<div class="dr-sec"><h4>Evidence</h4><dl class="evk">${Object.entries(r.ceremony.evidence).map(([k, v]) => `<dt>${esc(k.replace(/_/g, ' '))}</dt><dd>${esc(typeof v === 'string' ? v : JSON.stringify(v))}</dd>`).join('')}</dl></div>` : ''}
     </div>`;
   $('dr-x').onclick = closeProducer;
+  dr.querySelectorAll('.gl').forEach((g) => g.onclick = (e) => { e.preventDefault(); dr.querySelector('#srv-' + g.dataset.srv)?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
   dr.classList.add('on'); sc.classList.add('on'); dr.setAttribute('aria-hidden', 'false');
 }
 

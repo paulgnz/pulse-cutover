@@ -24,7 +24,17 @@ Then it prints:
   All three are in:  /root/metalgo-identity-NodeID-….tar.gz
 ```
 
-Everything it prints is also saved in `/etc/metalgo/identity.txt`.
+Then a numbered **NEXT STEPS** list tells you exactly what to do:
+1. whether port 9651 is reachable from the internet (mission control dials back to your server's IP on 9651
+   only, via `/api/reach`) and how to fix it if not;
+2. the exact `scp` command to copy your key archive off the server. If you ran it with `sudo`, a copy is put in
+   your home directory so you can `scp` it as yourself;
+3. how to check sync;
+4. **one line to send to the operator** (`metal network=… producer=… node_id=… bls=… pop=…`, public values only);
+5. what you'll need later to register.
+
+Everything is also saved in `/etc/metalgo/identity.txt`, and machine-readable for scripts and agents in
+`/etc/metalgo/identity.json` (schema `metal-identity-v1`, public values only).
 
 > Want to look first? Add `-s -- --dry-run`. No nodeos on this box? Add `-s -- --metal tahoe` (testnet) or
 > `-s -- --metal mainnet`.

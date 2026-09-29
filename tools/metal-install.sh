@@ -185,37 +185,81 @@ Keys to back up:     $DATA/staking/staker.key, staker.crt (NodeID) and signer.ke
 T
 chmod 644 "$ETC/identity.txt"
 
-PUBIP=$(curl -fsS -m3 -X POST -H 'content-type:application/json' -d '{"jsonrpc":"2.0","id":1,"method":"info.getNodeIP"}' http://127.0.0.1:9650/ext/info 2>/dev/null | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p')
-NOTE=$(printf '%s' "$M" | sed -n 's/.*"upgrades_note":"\([^"]*\)".*/\1/p')
+PUBIP=$(curl -fsS -m3 -X POST -H 'content-type:application/json' -d '{"jsonrpc":"2.0","id":1,"method":"info.getNodeIP"}' http://127.0.0.1:9650/ext/info 2>/dev/null | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p' || true)
+NOTE=$(printf '%s' "$M" | sed -n 's/.*"upgrades_note":"\([^"]*\)".*/\1/p' || true)
+PRODUCER=$(sed -n 's/^producer *= *"\([a-z1-5.]*\)".*/\1/p' /etc/pulse-cutover/beacon.toml 2>/dev/null | head -1 || true)
+[ -n "$PRODUCER" ] || PRODUCER=youraccount
 
+# Is the staking port reachable from the internet? Mission control dials back to THIS server's IP on 9651 only.
+sleep 3
+REACH=$(curl -4 -fsS -m10 "$CONTROL/api/reach" 2>/dev/null | sed -n 's/.*"reachable":\(true\|false\).*/\1/p' || true)
+
+# Put a copy of the key archive where the sudo user can scp it (root-only /root is awkward to copy from).
+BK_USER=""
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+  UH=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+  if [ -n "$UH" ] && [ -d "$UH" ]; then BK_USER="$UH/$(basename "$BK")"; install -m 600 -o "$SUDO_USER" "$BK" "$BK_USER"; fi
+fi
+
+# Machine-readable identity for agents and tooling (public values only).
+cat > "$ETC/identity.json" <<JSON
+{"schema":"metal-identity-v1","xpr_network":"$XPR","producer":"$PRODUCER","metal_network":"$METAL","network_id":$NETID,
+ "metalgo_version":"$VERSION","install_method":"$METHOD","node_id":"$NODEID","bls_public_key":"$BLSPUB",
+ "bls_proof_of_possession":"$BLSPOP","staking_address":"${PUBIP:-}","staking_port_reachable":${REACH:-null},
+ "key_backup":"$BK","key_backup_sha256":"$BKSHA"}
+JSON
+chmod 644 "$ETC/identity.json"
+
+G='\033[32m'; Y='\033[33m'; B='\033[1m'; N='\033[0m'
 echo
-echo "  ✓ Metal node installed and running ($METHOD, metalgo $VERSION, $METAL)"
+printf "  ${G}✓${N} ${B}Metal node installed and running${N} ($METHOD, metalgo $VERSION, $METAL)\n"
 echo
-echo "  ── Your validator identity (PUBLIC: share these to register) ───────────────────────────────"
+echo "  ── Your validator identity (public) ───────────────────────────────────────────────────────"
 echo "  NodeID               $NODEID"
 echo "  BLS public key       $BLSPUB"
 echo "  Proof of possession  $BLSPOP"
-echo "  Advertised address   ${PUBIP:-unknown}   (staking port 9651/tcp must be reachable from the internet)"
-echo "  saved in $ETC/identity.txt"
+echo "  Staking address      ${PUBIP:-unknown}"
+echo "  (also in $ETC/identity.txt and, for scripts/agents, $ETC/identity.json)"
 echo
-echo "  ── BACK UP YOUR KEYS NOW (PRIVATE: never share, never commit) ──────────────────────────────"
-echo "  $DATA/staking/staker.key + staker.crt   → your NodeID. Lose them and you get a new NodeID."
-echo "  $DATA/staking/signer.key                → your BLS key. Lose it and you must re-register a new key + PoP."
-echo "  All three are in:  $BK"
-echo "                     (root-only, sha256 $BKSHA)"
-echo "  Copy it OFF this server (password manager / encrypted storage):"
-echo "      scp root@<this-server>:$BK ."
-echo "  Chain data is NOT needed in the backup: it re-syncs. Never run two nodes with the same keys at once."
+printf "  ${B}── NEXT STEPS ──────────────────────────────────────────────────────────────────────────────${N}\n"
 echo
-echo "  ── What you will need to register as a PulseVM validator ───────────────────────────────────"
-echo "  1. The NodeID, BLS public key and proof of possession above."
-echo "  2. A Metal P-Chain address you control ($( [ "$METAL" = mainnet ] && echo 'P-metal1…' || echo 'P-tahoe1…')): it receives any unused validator balance"
-echo "     and can disable the validator. Use a key you already back up; not a key on this server."
-echo "  3. METAL on the P-Chain to prepay the validator's continuous fee (the amount is announced with the event)."
-echo "  Nothing is registered or spent by this script."
+if [ "$REACH" = true ]; then printf "  ${G}✓${N} 1. Staking port 9651 is reachable from the internet. Nothing to do.\n"
+elif [ "$REACH" = false ]; then
+  printf "  ${Y}✗${N} 1. ${B}Open port 9651/tcp.${N} Mission control could not connect to ${PUBIP:-this server}.\n"
+  echo "       Peers can't reach you, so the node only has outbound peers. Check, in order:"
+  echo "         • your provider's cloud firewall / security group: allow inbound TCP 9651"
+  echo "         • this server:  sudo ufw allow 9651/tcp   (or: sudo iptables -I INPUT -p tcp --dport 9651 -j ACCEPT)"
+  echo "       Re-check any time:  curl -s $CONTROL/api/reach"
+else printf "  ${Y}?${N} 1. Could not test port 9651 (mission control unreachable). Make sure inbound TCP 9651 is open.\n"; fi
 echo
+printf "  ${Y}!${N} 2. ${B}Back up your keys off this server.${N} They ARE your validator; chain data is not needed.\n"
+echo "       staker.key + staker.crt = your NodeID · signer.key = your BLS key  (all three in one archive)"
+if [ -n "$BK_USER" ]; then
+  echo "       From your own computer, run:"
+  echo "         scp $SUDO_USER@${PUBIP%:*}:$BK_USER ."
+  echo "       then store it in your password manager / encrypted storage, and delete the copy in $UH:"
+  echo "         rm $BK_USER"
+else
+  echo "       From your own computer, run:"
+  echo "         scp root@${PUBIP%:*}:$BK ."
+fi
+echo "       archive sha256: $BKSHA"
+echo "       Never run a second node with these keys while this one is running."
+echo
+echo "  → 3. Let it sync. Check progress (true = synced):"
+echo "         curl -s -X POST -H content-type:application/json -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"info.isBootstrapped\",\"params\":{\"chain\":\"P\"}}' 127.0.0.1:9650/ext/info"
+echo
+echo "  → 4. Send this ONE line to the mission-control operator (all public values):"
+echo
+echo "       metal network=$XPR producer=$PRODUCER node_id=$NODEID bls=$BLSPUB pop=$BLSPOP"
+echo
+echo "  → 5. Later, to register as a validator (announced with the event) you will also need:"
+echo "       • a Metal P-Chain address you control ($( [ "$METAL" = mainnet ] && echo 'P-metal1…' || echo 'P-tahoe1…')), from a key you already back up, not on this server"
+echo "       • METAL on the P-Chain to prepay the validator's continuous fee"
+echo "       This script never registers, stakes or spends anything."
+echo
+echo "  ── Good to know ────────────────────────────────────────────────────────────────────────────"
 if [ -n "$CHAIN" ]; then echo "  Tracking PulseVM subnet $SUBNET (chain $CHAIN)."; else echo "  No PulseVM chain is published for XPR $XPR yet: this node syncs the Metal $METAL primary network for now."; fi
-[ -n "$NOTE" ] && echo "  Note: $NOTE"
-echo "  Upgrades: re-run this same command. It keeps your keys and installs the version the manifest pins."
-echo "  Health:   curl -s 127.0.0.1:9650/ext/health | head -c 300"
-echo "  Logs:     journalctl -u metalgo -f"
+[ -n "$NOTE" ] && echo "  $NOTE"
+echo "  Upgrade: re-run this same command (keys are kept) · Health: curl -s 127.0.0.1:9650/ext/health | head -c 300"
+echo "  Logs: journalctl -u metalgo -f · Your beacon on mission control now shows \"Metal validator: running\"."
