@@ -56,6 +56,9 @@ print("must be https:// (plain http only to localhost / 127.0.0.1 / [::1])"); sy
 PY2
   ) || die "mission-control URL rejected: $why (the beacon token is sent with every report): got '$1'"
 }
+# existing_ancestor PATH → PATH itself or its nearest existing parent (free space is measured there when the
+# snapshots dir does not exist yet).
+existing_ancestor() { local p=$1; while [ -n "$p" ] && [ "$p" != / ] && [ ! -e "$p" ]; do p=$(dirname "$p"); done; printf '%s' "${p:-/}"; }
 check_producer() { [[ "$1" =~ ^[a-z1-5.]{1,12}$ ]] || die "--producer must be an Antelope account name (got '$1')"; }
 mode_for_role() { [ "$1" = producer ] && echo producer || echo api; }
 # toml_read FILE → shell-quoted OLD_<section>_<key>=value lines for the simple `key = value` TOML this script
@@ -343,7 +346,7 @@ for c in r.get("checks",[]): print("   ", "ok " if c.get("ok") else "-- ", c.get
   if runuser -u "$SVC_USER" -- test -r "$ETC/beacon.token" 2>/dev/null \
      && runuser -u "$SVC_USER" -- test -x "$(dirname "$JOURNAL")" 2>/dev/null \
      && { [ ! -e "$JOURNAL" ] || runuser -u "$SVC_USER" -- test -r "$JOURNAL" 2>/dev/null; } \
-     && runuser -u "$SVC_USER" -- df -P "$SNAPDIR" >/dev/null 2>&1; then RUNAS=$SVC_USER
+     && runuser -u "$SVC_USER" -- df -P "$(existing_ancestor "$SNAPDIR")" >/dev/null 2>&1; then RUNAS=$SVC_USER
   else
     warn "the beacon user cannot read the ceremony journal or snapshots dir: running the beacon as root with read-only file access (CAP_DAC_READ_SEARCH only)"
     chmod 600 "$ETC/beacon.token"; chown root:root "$ETC/beacon.token"

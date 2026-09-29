@@ -142,6 +142,7 @@ if [ $rc -ne 0 ] && [ "$(cat "$R/bin/pulse-cutover")" = old-bin ] && [ "$(cat "$
    && [ "$(cat "$R/etc/beacon.token")" = enrolled-token ] && [ "$(cat "$R/etc/beacon.instance")" = 0123456789abcdef0123456789abcdef ] && grep -q "systemctl restart pulse-beacon" "$R/sys.log"; then
   ok "beacon update: failure restores binary, config, unit, instance id and the enrolled token"
 else bad "beacon update: failure restores everything (rc=$rc; $(tr '\n' ' ' < "$T/bi.out" | head -c 300))"; fi
+mkdir -p "$T/ea/x"; if [ "$(existing_ancestor "$T/ea/x/y/z")" = "$T/ea/x" ] && [ "$(existing_ancestor "$T/ea/x")" = "$T/ea/x" ]; then ok "beacon: free-space probe uses the nearest existing dir"; else bad "beacon: existing_ancestor"; fi
 expect_die "beacon: producer name validated"     check_producer "Bad.Name!"
 expect_ok  "beacon: producer name ok"            check_producer protonnz
 printf '[ceremony]\nmode = "api"\n[source]\nrpc_url = "http://127.0.0.1:8889"\nproducer_api_url = "http://127.0.0.1:8890"\n[snapshot]\ndir = "/data/snap"\n[beacon]\nurl = "https://x.example/api/report"\nproducer = "protonnz"\nnetwork = "testnet"\nnode = "hyperion-testnet"\nrole = "history"\ninterval_secs = 15\n' > "$T/b.toml"

@@ -613,12 +613,13 @@ PY
 # (stdin is this script under curl | bash). No terminal and no --i-have-backed-up: recorded as unconfirmed.
 custody_ack() {
   CUSTODY=unconfirmed
-  if [ "$BACKED_UP" = 1 ]; then CUSTODY=acknowledged-by-flag; return 0; fi
-  [ -r /dev/tty ] && [ -w /dev/tty ] || return 0
-  printf "\n  Copy the key archive off this server now (step 2 above). Type 'copied' when done, or press Enter to skip: " > /dev/tty
-  local a=""; read -r a < /dev/tty || true
-  if [ "$a" = copied ]; then CUSTODY=acknowledged; say "recorded: key archive copied off this server"
-  else warn "not confirmed: the only copies of your validator keys are on this server. Re-run with --check any time; it reminds you."; fi
+  if [ "$BACKED_UP" = 1 ]; then CUSTODY=acknowledged-by-flag
+  elif { : > /dev/tty; } 2>/dev/null; then
+    printf "\n  Copy the key archive off this server now (step 2 above). Type 'copied' when done, or press Enter to skip: " > /dev/tty
+    local a=""; read -r a < /dev/tty || true
+    if [ "$a" = copied ]; then CUSTODY=acknowledged; say "recorded: key archive copied off this server"
+    else warn "not confirmed: the only copies of your validator keys are on this server. Re-run with --check any time; it reminds you."; fi
+  else warn "no terminal to confirm the key archive was copied off this server: recorded as unconfirmed (--check reminds you)"; fi
   python3 - "$ETC/identity.json" "$CUSTODY" <<'PY2' || true
 import json, sys
 f, c = sys.argv[1:3]
