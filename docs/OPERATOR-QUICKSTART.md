@@ -41,7 +41,7 @@ your server.
 ## 3. Watch your node
 
 Once you're approved, your node appears on the dashboard with its readiness checks:
-`https://control-rehearsal.protonnz.com/?net=testnet&p=youraccount`
+`https://control-rehearsal.protonnz.com/testnet/youraccount`
 
 A few red items are expected today (for example "validator not running" until the Metal node is set up).
 That list **is** your to-do list for the cutover.

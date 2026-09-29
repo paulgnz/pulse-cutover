@@ -419,5 +419,8 @@ http.createServer(async (req, res) => {
     if (prev && prev.ready !== r.ready) pushEvent(r.network, who, r.ready ? 'READY' : `not ready: ${(r.checks || []).filter((c) => !c.ok).map((c) => c.name).join(', ')}`);
     return send(res, 200, { ok: true });
   }
+  // App routes (/<net>/<producer>/…) are client-side: serve the dashboard for any other GET that isn't an API call.
+  if (req.method === 'GET' && !url.pathname.startsWith('/api/') && /^\/[A-Za-z0-9._~%\/:-]*$/.test(url.pathname))
+    return send(res, 200, readFileSync(join(HERE, 'public', 'index.html'), 'utf8'), 'text/html; charset=utf-8');
   send(res, 404, { error: 'not found' });
 }).listen(PORT, '127.0.0.1', () => console.log(`mission control on 127.0.0.1:${PORT} · ${cfg.networks.length} networks · tokens ${Object.keys(tokens).length}`));

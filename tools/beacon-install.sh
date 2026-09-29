@@ -165,12 +165,12 @@ say "beacon running: $(systemctl is-active pulse-beacon)"
 echo
 if [ "$UPGRADE" = 1 ] && [ "$(tr -d '\n' < "$ETC/beacon.token" | sha256sum | cut -d' ' -f1)" = "$HASH" ]; then
   echo "  ✓ Upgraded to $VERSION. Same token, so there is nothing to send: your page updates within 10 seconds."
-  echo "      ${URL%/}/?net=$NETWORK&p=$PRODUCER&node=$NODE"
+  echo "      ${URL%/}/$NETWORK/$PRODUCER/$NODE"
   exit 0
 fi
 echo "  ✓ Done. Last step: send this ONE line to the mission-control operator (it is only a hash):"
 echo
 echo "      network=$NETWORK producer=$PRODUCER token_sha256=$HASH"
 echo
-echo "  Then watch your node here: ${URL%/}/?net=$NETWORK&p=$PRODUCER"
+echo "  Then watch your node here: ${URL%/}/$NETWORK/$PRODUCER"
 echo "  To remove it later:  curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh | sudo bash -s -- --uninstall"

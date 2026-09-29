@@ -328,6 +328,20 @@ table.mx td:first-child{text-align:left;color:var(--ink)}table.mx td:first-child
 table.mx .kind{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-left:6px}
 table.mx .st.ok{color:var(--ok)}table.mx .st.no{color:var(--bad)}table.mx .st.todo{color:var(--warn)}
 @media (max-width:760px){.pg-grid{grid-template-columns:minmax(0,1fr)}.big3{grid-template-columns:repeat(2,minmax(0,1fr))}.pg-h h2{font-size:22px}.pg-h .pill{margin-left:0}}
+
+/* routing chrome */
+.hsearch{position:relative;display:flex;align-items:center;gap:8px;margin-left:auto;padding:0 12px;height:38px;border-radius:12px;border:1px solid var(--line);background:rgba(255,255,255,.04);color:var(--muted);min-width:220px}
+.hsearch input{background:none;border:0;outline:0;color:var(--ink);font:500 13px var(--sans);width:100%}
+.hsearch:focus-within{border-color:rgba(255,255,255,.25)}
+[hidden]{display:none!important}
+.crumbs{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-height:40px;font-size:13px;color:var(--muted);border-top:1px solid var(--line)}
+.crumbs a{color:var(--muted);text-decoration:none}.crumbs a:hover{color:var(--ink)}
+.crumbs .cur{color:var(--ink);font-weight:600}
+.crumbs .sep{color:var(--dim)}
+.crumbs .bk{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--line);border-radius:999px;margin-right:6px}
+#v-page .pg{max-width:none;padding:6px 0 40px}
+a.tilelink{color:inherit;text-decoration:none;display:block}
+@media (max-width:760px){.hsearch{min-width:0;flex:1;margin-left:0}.bar{flex-wrap:wrap;padding:8px 0}.brand span{display:none}}
 @media (max-width:1100px){.hero{grid-template-columns:minmax(0,1fr)}.globe-card{min-height:440px}.duo{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:640px){
   .tile{padding-bottom:56px;min-height:128px}
@@ -350,11 +364,15 @@ table.mx .st.ok{color:var(--ok)}table.mx .st.no{color:var(--bad)}table.mx .st.to
 <header><div class="wrap bar">
   <div class="mark" aria-hidden="true"><i></i></div>
   <div class="brand"><b>Cutover Mission Control</b><span>Readiness and ceremony status for moving Antelope chains onto PulseVM</span></div>
+  <div class="hsearch"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg><input id="q" list="q-list" placeholder="Jump to a producer…" aria-label="Jump to a producer" autocomplete="off"><datalist id="q-list"></datalist></div>
   <div class="clock"><span class="live"><i></i>live</span><b id="clock">--:--:--</b></div>
-</div></header>
+</div>
+<div class="wrap crumbs" id="crumbs" hidden></div></header>
 
 <main class="wrap">
   <nav class="switch" id="switch" role="tablist" aria-label="Network"><span class="pill" id="pill"></span></nav>
+  <div id="v-page" hidden></div>
+  <div id="v-overview">
 
   <div class="hero">
     <div class="glass globe-card">
@@ -411,10 +429,8 @@ table.mx .st.ok{color:var(--ok)}table.mx .st.no{color:var(--bad)}table.mx .st.to
     </div>
   </section>
   <p class="sr" aria-live="polite" id="announce"></p>
+  </div>
 </main>
-<div class="scrim" id="scrim"></div>
-<section class="page" id="page" aria-live="polite"></section>
-<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="dr-title" aria-hidden="true"></aside>
 <footer class="wrap">pulse-cutover mission control · read-only view of public chain data and opt-in producer beacons · <a href="https://github.com/paulgnz/pulse-cutover">github.com/paulgnz/pulse-cutover</a></footer>
 
 <script type="module">
@@ -656,7 +672,8 @@ function statusOf(p) {
 function render() {
   if (!data) return;
   const nets = data.networks;
-  if (!active || !nets.some((n) => n.id === active)) active = nets[0].id;
+  if (!active || !nets.some((n) => n.id === active)) { active = nets[0].id; openName = null; pageSel = null; }
+  if (location.pathname.split('/').filter(Boolean)[0] !== active) history.replaceState(null, '', pathFor(active, openName, pageSel?.producer ? null : pageSel));
   net = nets.find((n) => n.id === active);
   // switcher
   const sw = $('switch');
@@ -665,7 +682,7 @@ function render() {
     return `<button role="tab" aria-selected="${n.id === active}" data-id="${esc(n.id)}"><span class="sd ${cls}"></span>${esc(n.name)} · ${esc(n.label)}<span class="count">${s.ready}/${s.active || s.producers}</span></button>`;
   }).join('');
   if (sw.dataset.sig !== btns) { sw.innerHTML = '<span class="pill" id="pill"></span>' + btns; sw.dataset.sig = btns;
-    sw.querySelectorAll('button').forEach((b) => b.onclick = () => { active = b.dataset.id; try { localStorage.setItem('mc-net', active); } catch {} G.arcs = []; showAll = false; lastHead = {}; render(); }); }
+    sw.querySelectorAll('button').forEach((b) => b.onclick = () => { try { localStorage.setItem('mc-net', b.dataset.id); } catch {} G.arcs = []; showAll = false; lastHead = {}; go(pathFor(b.dataset.id)); }); }
   const on = sw.querySelector('button[aria-selected=true]'), pill = sw.querySelector('.pill');
   if (on && pill) { pill.style.left = on.offsetLeft + 'px'; pill.style.width = on.offsetWidth + 'px'; }
 
@@ -742,7 +759,6 @@ function render() {
     </article>`;
   }).join('');
   $('prods').querySelectorAll('.pc').forEach((el) => { const go = () => openProducer(el.dataset.name); el.onclick = go; el.onkeydown = (e) => { if (e.key === 'Enter') go(); }; });
-  if (openName) renderDrawer();
   const hidden = prods.length - list.length;
   $('more').innerHTML = hidden > 0 || showAll ? `<button id="more-btn">${showAll ? 'Show scheduled only' : `Show all ${prods.length} active producers (+${hidden} standby)`}</button>` : '';
   const mb = $('more-btn'); if (mb) mb.onclick = () => { showAll = !showAll; render(); };
@@ -887,111 +903,66 @@ const CHECK_ICON = { source_api: 'globe', chain_id: 'key', producer_api: 'cpu', 
   hook_on_abort: 'undo', validator_running: 'hex', metal_synced: 'hex', metal_reachable: 'radio' };
 const ROLE_ICON = { producer: 'cpu', history: 'db', api: 'globe', seed: 'link', query: 'db', full: 'globe' };
 const ROLE_NAME = { producer: 'Block producer node', history: 'History / Hyperion node', api: 'Public API node' };
-/* ---------------- producer detail drawer ---------------- */
-let openName = null; try { openName = new URLSearchParams(location.search).get('p'); } catch {}
-function openProducer(name) { openName = name; flyTo(name); renderDrawer(); try { const u = new URL(location); u.searchParams.set('p', name); u.searchParams.set('net', active); history.replaceState(null, '', u); } catch {} }
-function closeProducer() { openName = null; renderDrawer(); try { const u = new URL(location); u.searchParams.delete('p'); history.replaceState(null, '', u); } catch {} }
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && openName) closeProducer(); });
-$('scrim').onclick = closeProducer;
-function renderDrawer() {
-  const dr = $('drawer'), sc = $('scrim');
-  const p = openName && net?.producers.find((x) => x.name === openName);
-  if (!p) { dr.classList.remove('on'); sc.classList.remove('on'); dr.setAttribute('aria-hidden', 'true'); return; }
-  const r = p.report, c = net.chain || {}, o = p.org || {};
-  const nodes = (infraData[active]?.nodes || []).filter((n) => n.producer === p.name);
-  const logo = o.logo ? `<img src="${esc(o.logo)}" alt="" onerror="this.remove()">` : '';
-  const dot = (ok, warn) => `<span class="sd ${ok ? (warn ? 'warn' : 'ok') : 'bad'}"></span>`;
-  const status = statusOf(p).text;
-  const co = net.coordination;
-  dr.innerHTML = `
-    <div class="dr-head"><div class="logo"><span>${esc(initials(o.name || p.name))}</span>${logo}</div>
-      <div style="min-width:0"><h3 id="dr-title">${esc(o.name || p.name)}</h3><div class="sub2">${flag(o.country)} ${esc(p.name)}${o.city ? ' · ' + esc(o.city) : ''}${o.website ? ` · <a href="${esc(o.website)}" target="_blank" rel="noopener noreferrer">website</a>` : ''}</div></div>
-      <button class="openfull" id="dr-full" style="align-self:flex-start;margin-left:auto">${ic('ext')}Full page</button><button class="dr-x" id="dr-x" aria-label="Close" style="margin-left:8px">×</button></div>
-    <div class="dr-body">
-      <div class="facts">
-        <div class="fact"><b>${p.rank ? '#' + p.rank : '—'}</b><span>vote rank</span></div>
-        <div class="fact"><b>${p.scheduled ? 'yes' : 'no'}</b><span>in active schedule</span></div>
-        <div class="fact"><b style="color:${c.head_producer === p.name ? 'var(--cut)' : 'inherit'}">${c.head_producer === p.name ? 'now' : '—'}</b><span>producing</span></div>
-        <div class="fact"><b>${nodes.length || '—'}</b><span>nodes in bp.json</span></div>
-        <div class="fact"><b>${nodes.filter((n) => n.api?.ok).length}/${nodes.filter((n) => n.url).length}</b><span>APIs answering</span></div>
-        <div class="fact"><b style="color:${{ok: 'var(--ok)', warn: 'var(--warn)', bad: 'var(--bad)'}[statusOf(p).dot] || 'var(--muted)'}">${!r ? 'no beacon' : p.silent ? 'silent' : splitChecks(r.checks).sick.length ? 'issue' : splitChecks(r.checks).todo.length ? splitChecks(r.checks).todo.length + ' to set up' : 'ready'}</b><span>cutover readiness</span></div>
-      </div>
-
-      ${co ? `<div class="dr-sec"><h4>Coordinated event</h4><div class="chk"><i class="${r?.coord?.accepted ? 'ok' : 'no'}">${r?.coord?.accepted ? '✓' : '·'}</i><b>${esc(co.event.event_id)}</b><span>${r?.coord?.event_id === co.event.event_id ? (r.coord.accepted ? `accepted · H ${fmt(r.coord.h)}${r.coord.armed ? ' · armed' : ''}` : 'rejected: ' + esc(r.coord.reason)) : 'not acknowledged yet'}</span></div></div>` : ''}
-
-      ${(() => {
-        const bs = p.beacons || [];
-        if (!bs.length) return '';
-        const stOf = (b) => { const k = splitChecks(b.report.checks || []);
-          return b.silent ? ['bad', 'silent'] : k.sick.length ? ['bad', `${k.sick.length} issue${k.sick.length > 1 ? 's' : ''}`] : k.todo.length ? ['warn', `${k.todo.length} to set up`] : ['ok', 'ready']; };
-        const col = { ok: 'var(--ok)', warn: 'var(--warn)', bad: 'var(--bad)' };
-        const ago = (ms) => ms < 90000 ? Math.round(ms / 1000) + 's ago' : Math.round(ms / 60000) + ' min ago';
-        const glance = bs.map((b, i) => { const k = splitChecks(b.report.checks || []), [st, txt] = stOf(b), done = k.setup.length - k.todo.length;
-          return `<a class="gl" href="#srv-${i}" data-srv="${i}"><span style="color:${col[st]}">${ic(ROLE_ICON[b.role] || 'server', 'lg')}</span>
-            <span class="nm">${esc(b.node)}<small>${esc(ROLE_NAME[b.role] || b.role || 'node')}</small></span>
-            <span class="pbar" title="cutover setup ${done}/${k.setup.length}"><i style="width:${k.setup.length ? Math.round(100 * done / k.setup.length) : 0}%"></i></span>
-            <span class="pill ${st}">${ic(st === 'ok' ? 'ok' : st === 'bad' ? 'bad' : 'todo')}${txt}</span></a>`; }).join('');
-        const cards = bs.map((b, i) => { const rp = b.report, k = splitChecks(rp.checks || []), [st, txt] = stOf(b), done = k.setup.length - k.todo.length;
-          const lag = c.head && rp.source?.head ? c.head - rp.source.head : null;
-          const row = (x, bad) => `<div class="ck"><span class="st ${x.ok ? 'ok' : bad}">${ic(x.ok ? 'ok' : bad === 'no' ? 'bad' : 'todo')}</span><span class="ci">${ic(CHECK_ICON[x.name] || 'wrench')}</span>
-            <div><b>${esc(label(x))}</b><span>${x.ok ? esc(x.detail || 'ok') : esc((CHECKS[x.name] || [])[2] || x.detail || '')}${!x.ok && (CHECKS[x.name] || [])[2] && x.detail ? ` · <i>${esc(x.detail)}</i>` : ''}</span></div></div>`;
-          const nxt = k.sick[0] || k.todo[0];
-          return `<div class="srv" id="srv-${i}" style="--st:${col[st]}">
-            <div class="srv-h"><div class="srv-ic">${ic(ROLE_ICON[b.role] || 'server', 'lg')}</div>
-              <div style="min-width:0"><h5>${esc(b.node)}</h5><div class="meta"><span>${esc(ROLE_NAME[b.role] || b.role || 'node')}</span><span>${ic('clock')}${b.silent ? 'silent' : ago(b.age_ms)}</span><span>${ic('radio')}beacon v${esc(rp.agent_version)}</span></div></div>
-              <span class="pill ${st}">${ic(st === 'ok' ? 'ok' : st === 'bad' ? 'bad' : 'todo')}${txt}</span></div>
-            <div style="padding:8px 16px 0 18px"><button class="openfull" data-node="${esc(b.node)}">${ic('ext')}Server page</button></div>
-            <div class="srv-kv" style="margin-top:8px"><div><span>head</span>${rp.source?.head ? fmt(rp.source.head) : '—'}</div><div><span>irreversible</span>${rp.source?.lib ? fmt(rp.source.lib) : '—'}</div>
-              <div><span>behind chain</span>${lag == null ? '—' : lag <= 30 ? '<span style="color:var(--ok)">in sync</span>' : fmt(lag) + ' blocks'}</div></div>
-            <div class="srv-grp"><h6>${ic('wrench')}Cutover setup <em>${done}/${k.setup.length}</em><span class="pbar"><i style="width:${k.setup.length ? Math.round(100 * done / k.setup.length) : 0}%"></i></span></h6>${k.setup.map((x) => row(x, 'todo')).join('')}</div>
-            <div class="srv-grp"><h6>${ic('shield')}Node health <em>${k.health.length - k.sick.length}/${k.health.length}</em></h6>${k.health.map((x) => row(x, 'no')).join('')}</div>
-            ${nxt ? `<div class="next">${ic('arrow')}<div><b>Next:</b> ${esc(label(nxt))}: ${esc((CHECKS[nxt.name] || [])[2] || nxt.detail || '')}</div></div>` : '<div style="height:10px"></div>'}
-          </div>`; }).join('');
-        return `<div class="dr-sec"><h4>${ic('list')}At a glance<span class="cnt">${bs.length} server${bs.length > 1 ? 's' : ''} with a beacon</span></h4><div class="glance">${glance}</div></div>
-          <div class="dr-sec"><h4>${ic('server')}Servers<span class="cnt">live beacon reports</span></h4>${cards}</div>`;
-      })()}
-
-      ${(() => { const withUrl = nodes.filter((n) => n.url); const covered = (p.beacons || []).length;
-        return !covered ? `<div class="dr-sec"><h4>${ic('radio')}Beacons</h4><div class="ev-empty">None of this producer's servers report yet. One command connects each server: <b>docs/OPERATOR-QUICKSTART.md</b>.</div></div>`
-          : withUrl.length > covered ? `<div class="dr-sec"><div class="next" style="margin:0">${ic('radio')}<div>${covered} of ${withUrl.length} public endpoints have a beacon. Every server that serves users needs one before a cutover.</div></div></div>` : ''; })()}
-
-      <div class="dr-sec"><h4>${ic('globe')}Public endpoints<span class="cnt">from bp.json · probed every 10 min</span></h4>
-      ${nodes.length ? `<div class="eps">${nodes.map((n) => {
-        const t = n.types[0] || 'node', icn = n.hyperion ? 'db' : ROLE_ICON[t] || 'server';
-        const host = n.url ? n.url.replace(/^https?:\/\//, '') : n.p2p || (t === 'producer' ? 'producer node' : t + ' node');
-        const up = n.api ? n.api.ok && n.api.chain_ok !== false : n.p2p_probe ? n.p2p_probe.ok : null;
-        const pill = up == null ? `<span class="pill mute">${t === 'producer' ? ic('lock') + 'private' : 'not probed'}</span>` : `<span class="pill ${up ? 'ok' : 'bad'}">${ic(up ? 'ok' : 'bad')}${up ? (n.api ? n.api.ms + ' ms' : 'open') : 'down'}</span>`;
-        const head = `<div class="ep-h"><div class="srv-ic">${ic(icn)}</div><div class="t"><b>${n.url ? `<a href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${esc(host)}</a>` : esc(host)}</b>
-          <small>${n.types.map((x) => `<span class="tp ${esc(x)}">${esc(x)}</span>`).join('')} ${n.location ? ic('pin') + esc(n.location) : ''}</small></div>${pill}</div>`;
-        if (!n.api && !n.hyperion && !n.atomic) return `<div class="ep mini">${head}</div>`;
-        return `<div class="ep">${head}<div style="margin-top:8px"><button class="openfull" data-ep="${esc(n.url)}">${ic('ext')}Endpoint page</button></div>
-          <div class="ep-m">
-            <div><span>nodeos</span>${esc(n.api?.version?.split('-')[0] || '—')}</div><div><span>behind</span>${n.api?.lag != null ? (n.api.lag <= 4 ? 'in sync' : fmt(n.api.lag)) : '—'}</div><div><span>edge</span>${esc(n.api?.edge || '—')}</div>
-            ${n.hyperion ? `<div><span>hyperion</span>${n.hyperion.ok ? esc(n.hyperion.version) : '<span style="color:var(--bad)">down</span>'}</div><div><span>indexed lag</span>${n.hyperion.lag != null ? fmt(n.hyperion.lag) : '—'}</div><div><span>hyperion ms</span>${n.hyperion.ms ?? '—'}</div>` : ''}
-            ${n.atomic ? `<div><span>atomicassets</span>${n.atomic.ok ? esc(n.atomic.version || 'up') : 'down'}</div>` : ''}
-          </div>
-          ${(n.hyperion?.services || []).length || n.features?.length ? `<div class="chips">${(n.hyperion?.services || []).map((x) => `<span class="pill ${x.ok ? 'ok' : 'bad'}">${ic(x.ok ? 'ok' : 'bad')}${esc(x.s)}</span>`).join('')}${(n.features || []).map((f) => `<span class="pill mute">${esc(f)}</span>`).join('')}</div>` : ''}
-        </div>`; }).join('')}</div>`
-        : `<div class="ev-empty">${net.id === 'rehearsal' ? 'Rehearsal nodes are known from their beacons, not bp.json.' : 'No bp.json endpoints surveyed yet (the survey runs every 10 minutes), or this producer publishes no bp.json.'}</div>`}
-      </div>
-
-      ${r?.ceremony?.transitions?.length ? `<div class="dr-sec"><h4>Ceremony</h4><ul class="tl">${r.ceremony.transitions.map((t) => `<li><time>${esc(String(t.ts).slice(11, 23))}</time><b>${esc(t.state)}</b></li>`).join('')}</ul>${r.ceremony.last_error ? `<div class="fail" style="margin-top:6px">✗ ${esc(r.ceremony.last_error)}</div>` : ''}</div>` : ''}
-      ${r?.ceremony?.evidence && Object.keys(r.ceremony.evidence).length ? `<div class="dr-sec"><h4>Evidence</h4><dl class="evk">${Object.entries(r.ceremony.evidence).map(([k, v]) => `<dt>${esc(k.replace(/_/g, ' '))}</dt><dd>${esc(typeof v === 'string' ? v : JSON.stringify(v))}</dd>`).join('')}</dl></div>` : ''}
-    </div>`;
-  $('dr-x').onclick = closeProducer; $('dr-full').onclick = () => openPage({ producer: true });
-  dr.querySelectorAll('.openfull[data-node], .openfull[data-ep]').forEach((x) => x.onclick = () => openPage(x.dataset.node ? { node: x.dataset.node } : { ep: x.dataset.ep }));
-  dr.querySelectorAll('.gl').forEach((g) => g.onclick = (e) => { e.preventDefault(); dr.querySelector('#srv-' + g.dataset.srv)?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
-  dr.classList.add('on'); sc.classList.add('on'); dr.setAttribute('aria-hidden', 'false');
-}
-
-
 /* ---------------- full page: one server (beacon) or one public endpoint ---------------- */
-let pageSel = null; try { const q = new URLSearchParams(location.search); const bad = (v) => !v || v === 'undefined' || v === 'null'; if (q.get('view') === 'producer' || (q.has('ep') && bad(q.get('ep'))) || (q.has('node') && bad(q.get('node')))) pageSel = { producer: true }; else if (q.get('node')) pageSel = { node: q.get('node') }; else if (q.get('ep')) pageSel = { ep: q.get('ep') }; } catch {}
-let pageData = null, pageFetchT = 0;
-function setQ(k, v) { try { const u = new URL(location); ['node', 'ep', 'view'].forEach((x) => u.searchParams.delete(x)); if (k) u.searchParams.set(k, v); history.replaceState(null, '', u); } catch {} }
-function openPage(sel) { pageSel = sel; pageData = null; pageFetchT = 0; if (sel.producer) setQ('view', 'producer'); else setQ(sel.node ? 'node' : 'ep', sel.node || sel.ep); renderPage(); $('page').scrollTop = 0; }
-function closePage() { pageSel = null; setQ(null); renderPage(); }
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && pageSel) { e.stopImmediatePropagation(); closePage(); } }, true);
+/* ---------------- router: real paths, one view at a time, Back works ----------------
+   /<net>                                 network overview
+   /<net>/<producer>                      producer page (all servers + endpoints)
+   /<net>/<producer>/<server>             one beacon server
+   /<net>/<producer>/endpoint/<host>      one public endpoint                                */
+let openName = null, pageSel = null, pageData = null, pageFetchT = 0, pageSig = '';
+const enc = encodeURIComponent;
+const pathFor = (net, prod, sel) => '/' + [net, prod, ...(sel?.node ? [sel.node] : sel?.ep ? ['endpoint', hostOf(sel.ep)] : [])].filter(Boolean).map(enc).join('/');
+const hostOf = (u) => { try { return new URL(u).host; } catch { return String(u || ''); } };
+function readRoute() {
+  const q = new URLSearchParams(location.search);
+  if (q.get('net') || q.get('p')) {   // old ?net=&p=&node=&ep=&view= links → real paths
+    const bad = (v) => !v || v === 'undefined' || v === 'null';
+    const sel = !bad(q.get('node')) ? { node: q.get('node') } : !bad(q.get('ep')) ? { ep: q.get('ep') } : null;
+    history.replaceState(null, '', pathFor(q.get('net') || active, q.get('p'), sel));
+  }
+  const seg = location.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+  if (seg[0]) active = seg[0];
+  openName = seg[1] || null;
+  pageSel = !openName ? null : seg[2] === 'endpoint' && seg[3] ? { ep: seg[3] } : seg[2] ? { node: seg[2] } : { producer: true };
+}
+function go(path, { replace = false } = {}) {
+  if (path === location.pathname) return;
+  history[replace ? 'replaceState' : 'pushState'](null, '', path);
+  readRoute(); pageData = null; pageFetchT = 0; pageSig = ''; window.scrollTo(0, 0); render(); renderPage();
+}
+window.addEventListener('popstate', () => { readRoute(); pageData = null; pageFetchT = 0; pageSig = ''; render(); renderPage(); });
+// Any <a data-nav> is an in-app link: real href (open in new tab works), handled here on a plain click.
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('a[data-nav]'); if (!a || e.metaKey || e.ctrlKey || e.shiftKey || e.button) return;
+  e.preventDefault(); go(a.getAttribute('href'));
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && openName && !/INPUT|TEXTAREA/.test(document.activeElement?.tagName)) history.back(); });
+function openProducer(name) { go(pathFor(active, name)); }
+function openPage(sel) { go(pathFor(active, openName, sel.producer ? null : sel)); }
+function closePage() { go(pathFor(active)); }
+readRoute();
+// search: jump to any producer on the current network
+$('q').addEventListener('change', () => { const v = $('q').value.trim().toLowerCase(); if (!v || !net) return;
+  const p = net.producers.find((x) => x.name === v || (x.org?.name || '').toLowerCase() === v) || net.producers.find((x) => x.name.startsWith(v) || (x.org?.name || '').toLowerCase().includes(v));
+  if (p) { $('q').value = ''; $('q').blur(); openProducer(p.name); } });
+function renderChrome() {
+  if (!net) return;
+  const dl = $('q-list'), sig = net.id + net.producers.length;
+  if (dl.dataset.sig !== sig) { dl.dataset.sig = sig; dl.innerHTML = net.producers.map((p) => `<option value="${esc(p.name)}">${esc(p.org?.name || p.name)}</option>`).join(''); }
+  const cr = $('crumbs'), p = openName && net.producers.find((x) => x.name === openName);
+  cr.hidden = !openName;
+  document.title = openName ? `${p?.org?.name || openName}${pageSel?.node ? ' · ' + pageSel.node : pageSel?.ep ? ' · ' + pageSel.ep : ''} · ${net.label} · Mission Control` : `${net.name} ${net.label} · Mission Control`;
+  if (!openName) return;
+  const parts = [`<a data-nav href="${pathFor(net.id)}">${esc(net.name)} ${esc(net.label)}</a>`];
+  parts.push(pageSel?.producer ? `<span class="cur">${esc(p?.org?.name || openName)}</span>` : `<a data-nav href="${pathFor(net.id, openName)}">${esc(p?.org?.name || openName)}</a>`);
+  if (pageSel?.node) parts.push(`<span class="cur">${ic('server')} ${esc(pageSel.node)}</span>`);
+  if (pageSel?.ep) parts.push(`<span class="cur">${ic('globe')} ${esc(pageSel.ep)}</span>`);
+  const up = pageSel?.producer ? pathFor(net.id) : pathFor(net.id, openName);
+  const html = `<a data-nav class="bk" href="${up}">${ic('back')} ${pageSel?.producer ? 'Overview' : esc(p?.org?.name || openName)}</a>` + parts.join('<span class="sep">›</span>');
+  if (cr.dataset.sig !== html) { cr.dataset.sig = html; cr.innerHTML = html; }
+}
+// relative ages tick locally so pages don't need re-rendering every poll
+setInterval(() => document.querySelectorAll('[data-ts]').forEach((el) => { const s = Math.max(0, Math.round((Date.now() - +el.dataset.ts) / 1000)); el.textContent = s < 90 ? s + 's ago' : Math.round(s / 60) + ' min ago'; }), 1000);
 const copyBtn = (v) => `<button class="cp" data-copy="${esc(v)}">copy</button>`;
 function sparkLine(vals, color) {
   const v = vals.filter((x) => x != null); if (v.length < 2) return '<div style="color:var(--dim);font-size:12px">collecting… (history builds while this page is open on the server)</div>';
@@ -999,12 +970,14 @@ function sparkLine(vals, color) {
   return `<svg class="pspark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><polyline fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke" points="${pts.map((p) => p.join(',')).join(' ')}"/></svg><div style="display:flex;justify-content:space-between;color:var(--dim);font:11px var(--mono)"><span>min ${fmt(mn)}</span><span>now ${fmt(v.at(-1))}</span><span>max ${fmt(mx)}</span></div>`;
 }
 async function renderPage() {
-  const pg = $('page');
-  const p = openName && net?.producers.find((x) => x.name === openName);
-  if (!pageSel || !p) { pg.classList.remove('on'); document.body.style.overflow = ''; return; }
-  pg.classList.add('on'); document.body.style.overflow = 'hidden';
+  const pg = $('v-page'), ov = $('v-overview');
+  renderChrome();
+  if (!pageSel || !net) { pg.hidden = true; ov.hidden = false; pageSig = ''; return; }
+  pg.hidden = false; ov.hidden = true;
+  const p = net.producers.find((x) => x.name === openName);
+  if (!p) { pg.innerHTML = `<div class="card2" style="margin-top:20px">No producer <b>${esc(openName)}</b> on ${esc(net.name)} ${esc(net.label)}. <a data-nav href="${pathFor(net.id)}">Back to the overview</a></div>`; return; }
   const o = p.org || {}, c = net.chain || {};
-  const crumb = `<div class="crumb"><a id="pg-back">${ic('back')} Back</a><span>·</span><span>${esc(net.name)} ${esc(net.label || '')}</span><span>›</span><a id="pg-prod">${esc(o.name || p.name)}</a>${pageSel.producer ? '' : `<span>›</span><b style="color:var(--ink)">${esc(pageSel.node || (pageSel.ep || '').replace(/^https?:\/\//, ''))}</b>`}</div>`;
+  const crumb = '';
   let body = '';
 
   if (pageSel.producer) {
@@ -1015,7 +988,7 @@ async function renderPage() {
     const tiles = bs.map((b) => { const rp = b.report, k = splitChecks(rp.checks || []), [st, txt] = stOf(b), m = rp.metal, done = k.setup.length - k.todo.length;
       const lag = c.head && rp.source?.head ? Math.max(0, c.head - rp.source.head) : null;
       return `<div class="srv ptile clickable" data-go-node="${esc(b.node)}" style="--st:${col[st]}">
-        <div class="srv-h"><div class="srv-ic">${ic(ROLE_ICON[b.role] || 'server', 'lg')}</div><div style="min-width:0"><h5>${esc(b.node)}</h5><div class="meta"><span>${esc(ROLE_NAME[b.role] || b.role || 'node')}</span><span>${ic('clock')}${b.silent ? 'silent' : Math.round(b.age_ms / 1000) + 's'}</span></div></div><span class="pill ${st}">${ic(st === 'ok' ? 'ok' : st === 'bad' ? 'bad' : 'todo')}${txt}</span></div>
+        <div class="srv-h"><div class="srv-ic">${ic(ROLE_ICON[b.role] || 'server', 'lg')}</div><div style="min-width:0"><h5>${esc(b.node)}</h5><div class="meta"><span>${esc(ROLE_NAME[b.role] || b.role || 'node')}</span><span>${ic('clock')}${b.silent ? 'silent' : `<span data-ts="${Date.parse(b.report.ts) || ''}"></span>`}</span></div></div><span class="pill ${st}">${ic(st === 'ok' ? 'ok' : st === 'bad' ? 'bad' : 'todo')}${txt}</span></div>
         <div class="srv-kv"><div><span>XPR head</span>${lag == null ? '—' : lag <= 30 ? '<span style="color:var(--ok)">in sync</span>' : fmt(lag) + ' behind'}</div><div><span>metal</span>${m ? esc(String(m.version || '').replace('metalgo/', '')) : '<span style="color:var(--dim)">—</span>'}</div><div><span>peers</span>${m ? fmt(m.peers) : '—'}</div>
           <div><span>P-Chain</span>${m ? yn(m.bootstrapped?.P, 'synced', 'syncing') : '—'}</div><div><span>port 9651</span>${m ? yn(m.staking_reachable, 'open', 'closed') : '—'}</div><div><span>setup</span>${done}/${k.setup.length}</div></div>
         <div style="padding:10px 16px 12px 18px;color:var(--muted);font-size:11.5px;display:flex;align-items:center;gap:6px">${m?.node_id ? `${ic('hex')}<span style="font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.node_id)}</span>` : ''}<span style="margin-left:auto;display:inline-flex;gap:4px;align-items:center">details ${ic('arrow')}</span></div></div>`; }).join('');
@@ -1053,7 +1026,7 @@ async function renderPage() {
       const h = d.history || [];
       body = `
       <div class="pg-h"><div class="srv-ic" style="color:${{ ok: 'var(--ok)', warn: 'var(--warn)', bad: 'var(--bad)' }[st[0]]}">${ic(ROLE_ICON[rp.role] || 'server', 'lg')}</div>
-        <div><h2>${esc(rp.node)}</h2><div class="meta"><span>${esc(ROLE_NAME[rp.role] || rp.role)}</span><span>${flag(o.country)} ${esc(o.name || p.name)}</span><span>${ic('clock')}${d.silent ? 'silent' : Math.round(d.age_ms / 1000) + 's ago'}</span><span>${ic('radio')}beacon v${esc(rp.agent_version)}</span></div></div>
+        <div><h2>${esc(rp.node)}</h2><div class="meta"><span>${esc(ROLE_NAME[rp.role] || rp.role)}</span><span>${flag(o.country)} ${esc(o.name || p.name)}</span><span>${ic('clock')}${d.silent ? 'silent' : `<span data-ts="${Date.parse(rp.ts) || ''}"></span>`}</span><span>${ic('radio')}beacon v${esc(rp.agent_version)}</span></div></div>
         <span class="pill ${st[0]}">${ic(st[0] === 'ok' ? 'ok' : st[0] === 'bad' ? 'bad' : 'todo')}${st[1]}</span></div>
       <div class="pg-grid">
         <div class="card2"><h3>${ic('activity')}XPR chain position</h3>
@@ -1096,9 +1069,11 @@ async function renderPage() {
       </div>`;
     }
   }
-  pg.innerHTML = `<div class="pg">${crumb}${body}</div>`;
-  $('pg-back').onclick = () => pageSel.producer ? closePage() : openPage({ producer: true });
-  $('pg-prod').onclick = () => openPage({ producer: true });
+  const html = `<div class="pg">${crumb}${body}</div>`;
+  if (html === pageSig) return;           // nothing changed: keep scroll positions, selections, focus
+  const keep = [...pg.querySelectorAll('pre.raw, .mx')].map((el) => [el.scrollTop, el.scrollLeft]);
+  pageSig = html; pg.innerHTML = html;
+  [...pg.querySelectorAll('pre.raw, .mx')].forEach((el, i) => { if (keep[i]) { el.scrollTop = keep[i][0]; el.scrollLeft = keep[i][1]; } });
   pg.querySelectorAll('[data-go-node]').forEach((x) => x.onclick = () => openPage({ node: x.dataset.goNode }));
   pg.querySelectorAll('[data-go-ep]').forEach((x) => x.onclick = () => openPage({ ep: x.dataset.goEp }));
   pg.querySelectorAll('[data-copy]').forEach((b) => b.onclick = () => { navigator.clipboard?.writeText(b.dataset.copy).then(() => { b.textContent = 'copied'; setTimeout(() => (b.textContent = 'copy'), 1200); }).catch(() => {}); });
@@ -1111,7 +1086,7 @@ async function poll() {
     const n = data.networks.find((x) => x.id === (active || data.networks[0].id));
     if (n?.chain?.head && lastHead[n.id] && n.chain.head > lastHead[n.id]) fireBlock(n.chain.head_producer);
     if (n?.chain?.head) lastHead[n.id] = n.chain.head;
-    render(); if (pageSel) renderPage();
+    render(); renderPage();
     $('clock').textContent = new Date(data.generated_at).toISOString().slice(11, 19) + ' UTC';
   } catch { $('clock').textContent = 'reconnecting'; }
 }
