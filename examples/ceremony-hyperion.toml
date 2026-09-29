@@ -43,6 +43,10 @@ path_map_to = "/root/nodeos/data/snapshots"
 capture_roots = "/root/api-cutover/hyperion/captured-roots.txt" # rehearsal: capture; real event: golden_roots  [CHANGE per event]
 
 [target]
+# stop_cmd = "systemctl stop metalgo-pulse && ! systemctl is-active --quiet metalgo-pulse"
+#   Local fence for `pulse-cutover rollback --force-after-ignite` (coordinator's fleet-wide order only):
+#   stops THIS box's target before the source is resumed. Default = stop metalgo_unit as above. Set it
+#   if the target runs elsewhere or under another supervisor. Runs under hooks.timeout_secs.
 metalgo_unit = "metalgo-pulse"                                  # [LEAVE]
 rpc_url = "http://127.0.0.1:9650/ext/bc/<blockchainID>/rpc"     # [installer fills this]
 quorum_timeout_secs = 900                                       # [LEAVE]

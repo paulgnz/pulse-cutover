@@ -9,7 +9,7 @@ what is implemented and rehearsed today is marked where it differs, and the full
 status is in [ATOMICITY.md](../ATOMICITY.md).
 
 > [!IMPORTANT]
-> **Implemented vs intended (v0.5.0-rc.7).** Rehearsed: same cut on every producer, zero transactions
+> **Implemented vs intended (v0.5.0-rc.8).** Rehearsed: same cut on every producer, zero transactions
 > after H, a symmetric abort. Implemented since, not yet rehearsed: exact H in every mode (no fallback
 > to a later cut), a block-id-at-H lineage check on the target, a local point of no return at
 > ignition start (after it, any failure HALTS; the source is never resumed). Sampled only: state
@@ -340,7 +340,10 @@ flowchart LR
 > resumes the old chain, and `cutover.sh abort` refuses (exit 3). From rc.7 a rollback that is
 > attempted but has a failed step exits 4 and names it; a coordinator-ordered
 > `--force-after-ignite` first stops this box's target (`target.stop_cmd`) and does not resume the
-> source if that fails; this is a local fence only. Fleet-wide, the boundary is still only a
+> source if that fails; this is a local fence only. From rc.8 each rollback step is journaled as it
+> completes and a rollback counts as finished only after `on_abort` and the unstage (a rollback killed
+> part-way is re-run, not skipped); every abort path moves the staged snapshot aside and stops a hook or
+> pipeline step a dead agent left running. Fleet-wide, the boundary is still only a
 > design (`docs/DESIGN-authority-boundary.md`): one BP's local abort before ignition does not know
 > whether another BP has ignited.
 

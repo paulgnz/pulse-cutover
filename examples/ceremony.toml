@@ -70,6 +70,10 @@ capture_roots = "/root/cutover-rehearsal/captured-roots.txt"
 # upstream_fingerprint_args = ["{snapshot}"]   # {snapshot}/{staged} expand to paths
 
 [target]
+# stop_cmd = "systemctl stop metalgo-pulse && ! systemctl is-active --quiet metalgo-pulse"
+#   Local fence for `pulse-cutover rollback --force-after-ignite` (coordinator's fleet-wide order only):
+#   stops THIS box's target before the source is resumed. Default = stop metalgo_unit as above. Set it
+#   if the target runs elsewhere or under another supervisor. Runs under hooks.timeout_secs.
 metalgo_unit = "metalgo-cutover"     # systemd unit of the PulseVM node
 rpc_url = "http://127.0.0.1:9652/ext/bc/CHAIN_ID_HERE/rpc"   # the new chain's local RPC
 live_blocks = 1                      # LIVE = head at least this far past the cut

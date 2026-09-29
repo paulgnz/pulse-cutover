@@ -296,9 +296,11 @@ ceremony starting — journal: /root/api-cutover/journal.jsonl
 LIVE. Evidence journal: /root/api-cutover/journal.jsonl
 ```
 
-That output is from a single API-provider box. Its line "abort is always safe before FLIPPED" holds for that
-box: nothing public changed yet. It is not a fleet guarantee: once other producers may have ignited, a local
-abort that resumes the old chain can split the network (ATOMICITY Known limits #1).
+That output is from a single API-provider box on an older build. Its banner "abort is always safe before
+FLIPPED" is outdated: in every mode ignition precedes FLIPPED, and from rc.7 an abort is only performed
+**before ignition starts**; after that `./cutover.sh abort` refuses (exit 3) and a failure HALTS instead. It
+was never a fleet guarantee either: once other producers may have ignited, a local abort that resumes the
+old chain can split the network (ATOMICITY Known limits #1).
 
 How long each part takes (recorded, testnet-sized state; a bigger chain
 mostly stretches the snapshot and verify phases):
@@ -319,12 +321,18 @@ timings) for every step.
 and exits non-zero. Some errors exit non-zero *without* writing `ABORTED` or
 finishing rollback, so after any non-zero exit check the journal and the
 actual state of nodeos and the edge. On a single box the ceremony changes
-nothing public before FLIPPED, and an abort at FLIPPED swaps the URL back; in
-bp mode the agent resumes your producer automatically before ignition starts.
-`./cutover.sh abort` does the same for a stuck/^C'd run, but only when the
-journal proves ignition has not started: it refuses (exit 3, nothing changed)
-on a missing, corrupt or locked journal or after ignition, and exits 4 if a
-rollback step failed (the source may NOT be producing). In a multi-producer
+nothing public before FLIPPED; before ignition starts the agent aborts and rolls back itself (bp mode:
+resumes your producer; api mode: reverts what it changed) and moves the snapshot it staged aside, so the
+box is clean for the next run. `./cutover.sh abort` does the same for a stuck/^C'd run (it first stops a
+hook the killed agent left running), but only when the journal proves ignition has not started: it
+refuses (exit 3, nothing changed) on a missing, corrupt or locked journal, when an orphaned hook cannot be
+stopped, or after ignition; and exits 4 if a rollback step failed (the source may NOT be producing).
+Each step is journaled as it completes, so re-running after a failure or crash redoes only what is left;
+"already rolled back" means the journal proves every step, `on_abort` included, finished.
+`--force-after-ignite` (coordinator's fleet-wide order only) first stops this box's target with
+`target.stop_cmd` (default `systemctl stop <metalgo_unit> && ! systemctl is-active --quiet <metalgo_unit>`;
+set it if your target runs elsewhere or under another supervisor; it runs under `hooks.timeout_secs`, so a
+unit with a longer stop timeout counts as a failed fence) and refuses to resume the source if that fails. In a multi-producer
 event a local abort is not yet coordinated with the rest of the fleet. An aborted rehearsal is a
 *useful* rehearsal: go to Step 5.
 
@@ -620,12 +628,15 @@ stateDiagram-v2
     VERIFIED --> ABORTED: before ignition starts
     VERIFIED --> HALTED: failure after ignition started
     IGNITED --> HALTED: lineage / quorum timeout / on_live
+    HALTED --> ABORTED: rollback --force-after-ignite (this box's target fenced first)
     ABORTED --> [*]: source producer resumed
     HALTED --> [*]: sealed · source NOT resumed · human decides
 ```
 
-`ABORTED` is reachable only **before ignition starts**; for this agent rollback is resuming its
-source producer. From the moment ignition starts (journaled first), any failure goes to a durable
+On its own the agent reaches `ABORTED` only **before ignition starts**; for this agent rollback is
+resuming its source producer. The one other way in is an operator's `rollback --force-after-ignite`
+on the coordinator's fleet-wide order, from `HALTED`, after this box's target was fenced
+(`target.stop_cmd`); the beacon reports that ABORTED as `forced_rollback`. From the moment ignition starts (journaled first), any failure goes to a durable
 `HALTED` instead: nothing is rolled back and the source is never resumed (`unhalt --i-understand` to
 clear). That is the local point of no return. There is no fleet-wide "target authorized" state yet,
 so one BP aborting before its ignition cannot know whether another has ignited (ATOMICITY Known
@@ -693,9 +704,11 @@ nodeos outlives ignition**. Reads must never gap, so nodeos keeps answering
 the public URL while PulseVM boots and verifies; the only user-visible step is
 the **FLIPPED** transition (nginx upstream swap, health-checked: same
 chain_id, head agreeing with the target RPC), and only after that does the
-operator's own `source.stop_cmd` retire nodeos. An abort before FLIPPED
-touches nothing public; an abort at FLIPPED reverts the swap — nodeos was
-still running either way.
+operator's own `source.stop_cmd` retire nodeos. An abort before ignition
+touches nothing public. The flip runs after ignition, so a failure at FLIPPED
+HALTS (nothing is reverted automatically; nodeos was still running) and the
+operator decides; a coordinator-ordered `rollback --force-after-ignite` then
+reverts the swap after fencing this box's target.
 
 - No producer pause: the freeze is observed (`LIB ≥ H`), not caused.
 - Snapshot via the node's **own** `producer_api` `create_snapshot` (works
@@ -1155,7 +1168,7 @@ what testers get out of it.
 
 ## Status & caveats
 
-- Operator tooling v0.5.0-rc.7 (beacon, installers, mission control) — rehearsal-grade; the beacon installer
+- Operator tooling v0.5.0-rc.8 (beacon, installers, mission control) — rehearsal-grade; the beacon installer
   pins the latest *released* tag.
   The recorded ceremonies are real but ran the fork plugin (`v0.0.0-arena-mempoolfix.1`
   lineage, metalgo 1.13.5, plugin protocol 43), not upstream PulseVM v1.0.0 (protocol

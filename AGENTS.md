@@ -191,14 +191,22 @@ Mutating (see SAFETY RAILS before running):
 - `./cutover.sh abort` — stops a running agent, then runs `pulse-cutover rollback`: it takes the
   journal's exclusive lock (waits for the stopping agent; never decides while another process holds the
   journal), kills a hook the stopped agent left running, and rolls back (reverts flips / resumes the
-  source producer / moves the staged snapshot aside) ONLY when the journal proves ignition has NOT
-  started. Exit codes: 0 = rolled back (a repeat is a no-op); **3 = REFUSED, nothing changed** (missing,
-  corrupt or locked journal, unloadable config, or ignition started): read the journal and escalate, do
-  not force; **4 = attempted but INCOMPLETE** (a step failed and is printed; the source may NOT be
-  producing): fix by hand. `--no-journal-i-know` is only for a box that never ran a ceremony (it writes
+  source producer) ONLY when the journal proves ignition has NOT started. On every path, including
+  "already rolled back", it first kills an orphaned hook and moves a staged snapshot aside (the agent's
+  own abort also moves aside the snapshot it staged). Each step is journaled as it completes; re-running
+  redoes only what is left, and "already rolled back" requires the journal to prove every step, `on_abort`
+  included. Exit codes: 0 = rolled back / already rolled back; **3 = REFUSED, nothing changed** (missing,
+  corrupt or locked journal, unloadable config, an orphaned hook that cannot be stopped, or ignition
+  started): read the journal and escalate, do not force; **4 = attempted but INCOMPLETE** (a step failed
+  and is printed; the source may NOT be producing): fix it, then re-run. `--no-journal-i-know` is only for a box that never ran a ceremony (it writes
   a separate `journal.jsonl.rollback-<ms>.jsonl` audit record, not the ceremony journal);
   `--force-after-ignite` only on the coordinator's fleet-wide order: it first stops THIS box's target
-  (`target.stop_cmd`) and refuses to resume the source if that fails (a local fence only).
+  (`target.stop_cmd`, default `systemctl stop <metalgo_unit> && ! systemctl is-active --quiet
+  <metalgo_unit>`; runs under `hooks.timeout_secs`) and refuses to resume the source if that fails (a
+  local fence only).
+- A resumed `run` first stops a hook (or upstream pipeline step) that the previous agent left running,
+  and refuses to resume if it cannot. Hooks and pipeline steps record their process group (and its
+  start time) in `<journal>.hook.pgid` while they run.
 - `pulse-cutover unhalt --config c.toml --i-understand` — clears a durable HALTED (journaled with
   who ran it). Only after a human has decided; never as a retry.
 - `pulse-cutover loop --config c.toml --runs N` — repeated ceremonies with a

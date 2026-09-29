@@ -37,6 +37,10 @@ snapshot_timeout_secs = 900
 staged_path = "/root/upstream-run/snapshot-cut.bin"
 
 [target]
+# stop_cmd = "systemctl stop metalgo-pulse && ! systemctl is-active --quiet metalgo-pulse"
+#   Local fence for `pulse-cutover rollback --force-after-ignite` (coordinator's fleet-wide order only):
+#   stops THIS box's target before the source is resumed. Default = stop metalgo_unit as above. Set it
+#   if the target runs elsewhere or under another supervisor. Runs under hooks.timeout_secs.
 metalgo_unit = "metalgo-pulse"
 rpc_url = "http://127.0.0.1:9650/ext/bc/CHAIN_ID_HERE/rpc"
 auto_rollback = true

@@ -84,6 +84,10 @@ path_map_to = "/root/nodeos/data/snapshots"
 capture_roots = "/root/bp-cutover/captured-roots.txt"
 
 [target]
+# stop_cmd = "systemctl stop metalgo-pulse && ! systemctl is-active --quiet metalgo-pulse"
+#   Local fence for `pulse-cutover rollback --force-after-ignite` (coordinator's fleet-wide order only):
+#   stops THIS box's target before the source is resumed. Default = stop metalgo_unit as above. Set it
+#   if the target runs elsewhere or under another supervisor. Runs under hooks.timeout_secs.
 metalgo_unit = "metalgo-local"        # the PulseVM node's systemd unit        [LEAVE — installer sets it]
 rpc_url = "http://127.0.0.1:9657/"    # the new chain's local RPC              [installer fills this]
 live_blocks = 1                       # LIVE = head at least this far past the cut (proof the new chain really produces)  [LEAVE]
