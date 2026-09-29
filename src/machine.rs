@@ -1077,7 +1077,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 }
             }
         };
-        let snapshot_wall_ms = self.ops.now_ms() - started;
+        let snapshot_wall_ms = self.ops.now_ms().saturating_sub(started);
         let cut_height = snap.head_block_num;
         if !self.cut_is_exact(cut_height)? {
             return Ok(()); // aborted inside
@@ -1215,7 +1215,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             State::Frozen,
             json!({
                 "scheduled_snapshot_file": expected.display().to_string(),
-                "file_wait_ms": self.ops.now_ms() - waited_from,
+                "file_wait_ms": self.ops.now_ms().saturating_sub(waited_from),
                 "pinned_to_h": h,
             }),
         )?;
@@ -1257,7 +1257,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 }
             }
         };
-        let snapshot_wall_ms = self.ops.now_ms() - started;
+        let snapshot_wall_ms = self.ops.now_ms().saturating_sub(started);
         if !self.cut_is_exact(snap.head_block_num)? {
             return Ok(()); // aborted inside (production never paused)
         }
@@ -1497,7 +1497,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     .map(|_| "MATCH")
                     .unwrap_or("not configured"),
                 "state_root": outcome.state_root,
-                "verify_wall_ms": self.ops.now_ms() - started,
+                "verify_wall_ms": self.ops.now_ms().saturating_sub(started),
             }),
         )?;
         Ok(())
@@ -1628,7 +1628,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "fingerprints": roots,
                 "golden_mode": golden_mode,
                 "dual_import": "identical",
-                "verify_wall_ms": self.ops.now_ms() - started,
+                "verify_wall_ms": self.ops.now_ms().saturating_sub(started),
                 "staged_path": self.cfg.snapshot.staged_path.display().to_string(),
                 "accounts": outcome.report.accounts,
                 "code_objects": outcome.report.code_objects,
@@ -1746,7 +1746,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "cut_height": cut_height,
                 "target_block_id_at_cut": target_id_at_cut,
                 "lineage_at_cut": lineage,
-                "ignite_wall_ms": self.ops.now_ms() - started,
+                "ignite_wall_ms": self.ops.now_ms().saturating_sub(started),
             }),
         )?;
         Ok(())
@@ -1938,7 +1938,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         "hyperion_flip_cmd_output": v2_flip_out,
                         "health": evidence,
                         "v2_health": v2_health,
-                        "flip_wall_ms": self.ops.now_ms() - started,
+                        "flip_wall_ms": self.ops.now_ms().saturating_sub(started),
                         "note": "public /v1 now serves PulseVM; source nodeos still running (reads never gapped)",
                     }),
                 )?;
@@ -2115,14 +2115,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let sustained = self.sustain_live(State::Flipped)?;
         let Some(on_live) = self.run_on_live(State::Flipped)? else { return Ok(()) };
         let live_ts = self.ops.now_ms();
-        let write_gap_ms = self.frozen_ts_ms.map(|f| live_ts - f);
+        let write_gap_ms = self.frozen_ts_ms.map(|f| live_ts.saturating_sub(f));
         self.state = State::Live;
         self.journal.transition(
             State::Live,
             json!({
                 "sustained": sustained,
                 "source_stop_output": stop_out,
-                "stop_wall_ms": self.ops.now_ms() - started,
+                "stop_wall_ms": self.ops.now_ms().saturating_sub(started),
                 "public_health": health,
                 "v2_health": v2_health,
                 "cut_height": self.cut_height,
@@ -2169,14 +2169,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let live_ts = self.ops.now_ms();
         // Outage = freeze to LIVE declared (after the sustain window and on_live). The older
         // "first progress" figure is kept for comparison with runs 1-6.
-        let write_gap_ms = self.frozen_ts_ms.map(|f| live_ts - f);
-        let first_progress_gap_ms = self.frozen_ts_ms.map(|f| reached_goal_ts - f);
+        let write_gap_ms = self.frozen_ts_ms.map(|f| live_ts.saturating_sub(f));
+        let first_progress_gap_ms = self.frozen_ts_ms.map(|f| reached_goal_ts.saturating_sub(f));
         self.state = State::Live;
         self.journal.transition(
             State::Live,
             json!({
                 "sustained": sustained,
-                "live_declared_after_sustain_ms": live_ts - reached_goal_ts,
+                "live_declared_after_sustain_ms": live_ts.saturating_sub(reached_goal_ts),
                 "target_head": info.head_block_num,
                 "target_head_id": info.head_block_id,
                 "first_post_cut_block_time": info.head_block_time,

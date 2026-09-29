@@ -160,7 +160,7 @@ pub fn run_pipeline<O: ChainOps>(
                 "upstream_export": "ok",
                 "output_tail": out.chars().rev().take(400).collect::<String>().chars().rev().collect::<String>(),
                 "ship_log": log.display().to_string(),
-                "export_wall_ms": ops.now_ms() - started,
+                "export_wall_ms": ops.now_ms().saturating_sub(started),
             }));
             (log, env, false)
         }
@@ -236,7 +236,7 @@ pub fn run_pipeline<O: ChainOps>(
             "checkpoint_revision": checkpoint_revision,
             "source_block_id": source_block_id,
             "summary_tail": import_out.lines().last().unwrap_or(""),
-            "import_wall_ms": ops.now_ms() - started,
+            "import_wall_ms": ops.now_ms().saturating_sub(started),
         }
     }));
     // Gates: the checkpoint is OF the pinned cut.
@@ -284,7 +284,7 @@ pub fn run_pipeline<O: ChainOps>(
                     "result": "MATCH",
                     "tables": out.lines().collect::<Vec<_>>(),
                     "report": report.display().to_string(),
-                    "compare_wall_ms": ops.now_ms() - started,
+                    "compare_wall_ms": ops.now_ms().saturating_sub(started),
                 }
             }));
             (Some(out), Some(report))
