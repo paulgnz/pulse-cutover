@@ -5,6 +5,26 @@ import net from 'node:net';
 import dns from 'node:dns/promises';
 import http from 'node:http';
 import https from 'node:https';
+import { readFileSync } from 'node:fs';
+
+// Beacon check names that are PREPARATION ("setup") checks; every other name, including ones this
+// version does not know, is a HEALTH check. One shared list (check-kinds.json) for the agent's fleet
+// gate (src/beacon.rs SETUP_CHECKS), this relay and the dashboard; tests on each side assert equality.
+export const SETUP_CHECKS = Object.freeze(JSON.parse(readFileSync(new URL('./check-kinds.json', import.meta.url), 'utf8')).setup);
+/** A report with any failing HEALTH check (failing setup checks do not count). Same rule as the agent's gate. */
+export const hasFailingHealth = (report) => (report?.checks || []).some((c) => c && c.ok === false && !SETUP_CHECKS.includes(c.name));
+/**
+ * What an ABORTED actually did to the old chain: 'resumed' (rollback proven complete, before ignition),
+ * 'forced' (forced rollback after ignition: this box's target was fenced first), 'incomplete' (a rollback
+ * step failed: the old chain may NOT be producing), 'unknown' (older beacon: not reported). null if not ABORTED.
+ */
+export function abortKind(ce) {
+  if (!ce || ce.state !== 'ABORTED') return null;
+  if (ce.forced_rollback === true) return ce.rollback_complete === false ? 'incomplete' : 'forced';
+  if (ce.rollback_complete === false) return 'incomplete';
+  if (ce.rollback_complete === true) return 'resumed';
+  return 'unknown';
+}
 
 // ---- address classification ---------------------------------------------------------------------------
 const V4_BLOCKED = [
@@ -331,6 +351,9 @@ export function projectReport(r) {
       // ignition. An ABORTED with ignition_started is not "pre-ceremony": its target may still run.
       ignition_started: bool(ce.ignition_started, 'ceremony.ignition_started'),
       forced_rollback: bool(ce.forced_rollback, 'ceremony.forced_rollback'),
+      // rc.8+: the journal proves every rollback step completed (false = a step failed or the rollback
+      // died part-way: the old chain may NOT be producing). null for older beacons.
+      rollback_complete: bool(ce.rollback_complete, 'ceremony.rollback_complete'),
     };
   }
   const co = r.coord ?? null;

@@ -18,7 +18,7 @@ import { readFileSync, existsSync, watchFile, renameSync, mkdirSync, openSync, w
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isPublicIp, normIp, resolvePublic, limiter, safeRequest, safeJson, safeDecode, RE, UA, endpointId, endpointRef, reservedKey,
-  isAppRoute, projectReport, isBad, silentAfterMs, redact } from './lib.mjs';
+  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth } from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = +(process.env.PORT ?? 8787);
@@ -494,17 +494,20 @@ function agreement(n) {
   const members = roster(n);
   const all = [...new Set([...members, ...Object.keys(nodes[n.id] || {})])];
   for (const [key, label] of EVIDENCE_KEYS) {
-    const vals = [], stale = [], conflicted = [];
+    const vals = [], stale = [], conflicted = [], unhealthy = [];
     for (const p of all) {
       for (const s of servers(n.id, p).filter((x) => (x.report.role || 'producer') === 'producer')) {
         const v = s.report.ceremony?.evidence?.[key];
         if (v === undefined || v === null) continue;
         const who = servers(n.id, p).length > 1 ? `${p}/${s.label}` : p;
         // Evidence from a server whose identity is in conflict never counts toward agreement.
-        if (s.conflict) conflicted.push(who); else if (isSilent(s, now)) stale.push(who); else vals.push([who, p, v]);
+        // A report with a failing HEALTH check is excluded exactly as the agent's fleet gate excludes it
+        // (setup checks, e.g. hooks, do not count): the dashboard must not show "agree" where the gate won't.
+        if (s.conflict) conflicted.push(who); else if (isSilent(s, now)) stale.push(who);
+        else if (hasFailingHealth(s.report)) unhealthy.push(who); else vals.push([who, p, v]);
       }
     }
-    if (!vals.length && !stale.length && !conflicted.length) continue;
+    if (!vals.length && !stale.length && !conflicted.length && !unhealthy.length) continue;
     const groups = {};
     for (const [who, , v] of vals) (groups[JSON.stringify(v)] ||= []).push(who);
     const distinct = Object.keys(groups);
@@ -515,9 +518,9 @@ function agreement(n) {
     const missing = (members.length ? members : reporters).filter((p) => !have.has(p));
     const expectBad = key === 'burnoff_transactions' ? vals.some(([, , v]) => v !== 0) : false;
     // No roster = no agreement verdict: "everyone who happened to report agrees" is not agreement.
-    const agree = !members.length ? null : distinct.length === 1 && !missing.length && !stale.length && !conflicted.length && !expectBad;
+    const agree = !members.length ? null : distinct.length === 1 && !missing.length && !stale.length && !conflicted.length && !unhealthy.length && !expectBad;
     rows.push({ key, label, agree, verdict: !members.length ? 'no roster' : agree ? 'agree' : 'disagree', reporting: vals.length, roster: members.length,
-      missing, stale, conflicted, bad_value: expectBad, values: distinct.map((v) => ({ value: JSON.parse(v), producers: groups[v] })) });
+      missing, stale, conflicted, unhealthy, bad_value: expectBad, values: distinct.map((v) => ({ value: JSON.parse(v), producers: groups[v] })) });
   }
   return rows;
 }

@@ -757,7 +757,15 @@ function render() {
     return `<div class="stage ${i <= reachedIdx ? 'reached' : ''} ${here.length ? 'current' : ''}"><div class="node">${i + 1}</div><h3>${k}</h3><p>${d}</p><div class="stack">${here.slice(0, 8).map(avatar).join('')}${here.length > 8 ? `<span class="av">+${here.length - 8}</span>` : ''}</div></div>`;
   }).join('') + (aborted.length ? `` : '');
   requestAnimationFrame(() => { const f = $('flow'); const nodes = $('stages').querySelectorAll('.stage'); if (f && nodes.length) { const last = reachedIdx >= 0 ? nodes[reachedIdx] : null; f.style.width = last ? (last.offsetLeft + 18 - 18) + 'px' : '0px'; } });
-  $('track-sub').textContent = aborted.length ? `${aborted.length} producer(s) ABORTED and resumed the old chain` : s.reporting ? `${s.reporting} producer beacon${s.reporting > 1 ? 's' : ''} reporting` : 'Every producer runs the same six steps; nothing public changes before LIVE.';
+  // What an ABORTED did to the old chain (same rule as control/lib.mjs abortKind): never claim a resume the
+  // journal does not prove.
+  const abortKind = (ce) => ce?.state !== 'ABORTED' ? null : ce.forced_rollback === true ? (ce.rollback_complete === false ? 'incomplete' : 'forced')
+    : ce.rollback_complete === false ? 'incomplete' : ce.rollback_complete === true ? 'resumed' : 'unknown';
+  const ak = (k) => aborted.filter((p) => abortKind(p.report?.ceremony) === k).length;
+  const abortText = [[ak('resumed'), 'ABORTED before ignition, old chain resumed'], [ak('forced'), 'ABORTED after a forced rollback (target fenced on that box only)'],
+    [ak('incomplete'), 'ABORTED with an INCOMPLETE rollback (old chain may not be producing)'], [ak('unknown'), 'ABORTED (older beacon: rollback result not reported)']]
+    .filter(([n]) => n).map(([n, t]) => `${n} ${t}`).join(' · ');
+  $('track-sub').textContent = aborted.length ? abortText : s.reporting ? `${s.reporting} producer beacon${s.reporting > 1 ? 's' : ''} reporting` : 'Every producer runs the same six steps; nothing public changes before LIVE.';
 
   // producers
   const list = showAll ? prods : prods.filter((p) => p.scheduled || p.reporting);
@@ -789,7 +797,7 @@ function render() {
   $('ev').innerHTML = !net.agreement.length ? `<div class="ev-empty">When producers run a ceremony, their beacons report its evidence here: <b>cut block</b>, <b>snapshot hash</b>, <b>table fingerprints</b>, <b>transactions after the cut</b>, <b>state digest</b> and the <b>new chain's anchor</b>. Each value becomes a colour; every producer must show the same colour for the cut to be atomic.</div>`
     : net.agreement.map((a) => {
       const chips = withEv.map((p) => { const v = p.report.ceremony.evidence[a.key]; return v == null ? '' : `<i style="background:${color(JSON.stringify(v))}" data-p="${esc(p.name)}" title="${esc(p.name)}: ${esc(JSON.stringify(v))}"></i>`; }).join('');
-      return `<div class="ev-row"><div class="k">${esc(a.label)}</div><div class="ribbon">${chips}</div><div class="verdict ${a.agree === null ? 'mute' : a.agree ? 'ok' : 'bad'}" title="${esc([a.missing?.length ? 'missing: ' + a.missing.join(', ') : '', a.stale?.length ? 'stale (excluded): ' + a.stale.join(', ') : ''].filter(Boolean).join(' · '))}">${a.agree === null ? `– no roster · ${+a.reporting} reporting${a.missing?.length ? `, ${+a.missing.length} missing` : ''}` : a.agree ? `✓ ${+a.reporting}/${+a.roster}` : a.bad_value ? '✗ NON-ZERO' : a.values.length > 1 ? '✗ MISMATCH' : `○ ${+a.reporting}/${+(a.roster || a.reporting)} · ${+(a.missing?.length || 0)} missing`}</div></div>`;
+      return `<div class="ev-row"><div class="k">${esc(a.label)}</div><div class="ribbon">${chips}</div><div class="verdict ${a.agree === null ? 'mute' : a.agree ? 'ok' : 'bad'}" title="${esc([a.missing?.length ? 'missing: ' + a.missing.join(', ') : '', a.stale?.length ? 'stale (excluded): ' + a.stale.join(', ') : '', a.conflicted?.length ? 'identity conflict (excluded): ' + a.conflicted.join(', ') : '', a.unhealthy?.length ? 'failing health check (excluded, as the agent gate does): ' + a.unhealthy.join(', ') : ''].filter(Boolean).join(' · '))}">${a.agree === null ? `– no roster · ${+a.reporting} reporting${a.missing?.length ? `, ${+a.missing.length} missing` : ''}` : a.agree ? `✓ ${+a.reporting}/${+a.roster}` : a.bad_value ? '✗ NON-ZERO' : a.values.length > 1 ? '✗ MISMATCH' : `○ ${+a.reporting}/${+(a.roster || a.reporting)} · ${+(a.missing?.length || 0)} missing`}</div></div>`;
     }).join('');
 
   // feed
