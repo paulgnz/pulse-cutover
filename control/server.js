@@ -284,7 +284,7 @@ function status() {
       }).sort((a, b) => (b.scheduled - a.scheduled) || ((a.rank || 999) - (b.rank || 999)) || a.name.localeCompare(b.name));
       const live = producers.filter((p) => p.reporting && !p.silent);
       return { id: n.id, name: n.name, label: n.label, priority: n.priority ?? 9, description: n.description || '',
-        expected_chain_id: n.chain_id, event: n.event || null, chain: { ...c, schedule: undefined }, schedule: c.schedule || [],
+        expected_chain_id: n.chain_id, metal: n.metal || null, event: n.event || null, chain: { ...c, schedule: undefined }, schedule: c.schedule || [],
         summary: { producers: producers.length, active: producers.filter((p) => p.active).length, scheduled: (c.schedule || []).length, reporting: live.length,
           ready: live.filter((p) => p.report?.ready).length,
           states: live.reduce((m, p) => { const s = p.report?.ceremony?.state || 'IDLE'; m[s] = (m[s] || 0) + 1; return m; }, {}) },
@@ -327,6 +327,15 @@ http.createServer(async (req, res) => {
     res.writeHead(200, { 'content-type': l.type, 'cache-control': 'public, max-age=21600', 'x-content-type-options': 'nosniff',
       'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox" });
     return res.end(l.buf);
+  }
+  const mm = url.pathname.match(/^\/api\/manifest(?:\/([a-z0-9-]+))?$/);
+  if (mm && req.method === 'GET') {
+    // Network manifest: which Metal network, subnet, blockchain and VM each XPR network maps to, plus pinned
+    // metalgo/plugin versions and checksums. metal-install.sh reads this, so nobody copies IDs by hand.
+    const one = (n) => ({ xpr_network: n.id, xpr_chain_id: n.chain_id, ...(n.metal || {}) });
+    if (!mm[1]) return send(res, 200, { updated: cfg.manifest_updated || null, networks: cfg.networks.map(one) });
+    const n = cfg.networks.find((x) => x.id === mm[1]);
+    return n ? send(res, 200, one(n)) : send(res, 404, { error: 'unknown network' });
   }
   const cm = url.pathname.match(/^\/api\/coord\/([a-z0-9-]+)$/);
   if (cm && req.method === 'GET') return send(res, 200, coord[cm[1]] || {});

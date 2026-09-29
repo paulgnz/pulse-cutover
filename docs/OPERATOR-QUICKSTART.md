@@ -46,6 +46,11 @@ Once you're approved, your node appears on the dashboard with its readiness chec
 A few red items are expected today (for example "validator not running" until the Metal node is set up).
 That list **is** your to-do list for the cutover.
 
+## 4. Set up your Metal node
+
+One more command installs metalgo and prints your NodeID, BLS key and proof of possession:
+[METAL-QUICKSTART.md](METAL-QUICKSTART.md).
+
 ---
 
 ## If something goes wrong

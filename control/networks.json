@@ -13,7 +13,25 @@
         "https://proton.protonuk.io"
       ],
       "event": null,
-      "coordinators": []
+      "coordinators": [],
+      "metal": {
+        "network": "mainnet",
+        "network_id": 1,
+        "hrp": "metal",
+        "metalgo_version": "v1.13.5",
+        "sha256_linux_amd64": "3ace215f1fdc77e862ad6e74ca77c49aeaa896b04a09083c69992d78a25af8d3",
+        "sha256_linux_arm64": "27e1303c8a1d6c73ac89f1e841a8786f015e33d3b3a4379ac2fd9b74bfde23f7",
+        "docker_image": "metalblockchain/metalgo:v1.13.5",
+        "min_glibc": "2.34",
+        "subnet_id": null,
+        "blockchain_id": null,
+        "vm_id": null,
+        "pulsevm_version": null,
+        "plugin_sha256": null,
+        "status": "No PulseVM chain for XPR mainnet yet: validators sync the Metal primary network and get their NodeID ready.",
+        "rpcchainvm_protocol": 43,
+        "upgrades_note": "PulseVM v1.0.0 speaks plugin protocol 45 (metalgo 1.14.x). Metal mainnet's current release v1.13.5 speaks 43, so a PulseVM chain on Metal mainnet needs a mainnet 1.14.x metalgo release first. Granite is unscheduled on mainnet."
+      }
     },
     {
       "id": "testnet",
@@ -27,7 +45,25 @@
         "https://test.proton.eosusa.io"
       ],
       "event": null,
-      "coordinators": []
+      "coordinators": [],
+      "metal": {
+        "network": "tahoe",
+        "network_id": 5,
+        "hrp": "tahoe",
+        "metalgo_version": "v1.14.2-tahoe",
+        "sha256_linux_amd64": "7732b814168d6c34bca209a4429ae73b3fb22629dd7e2f286e3d85ca35c90b2a",
+        "sha256_linux_arm64": "99ff38889599e401c3fbcc8226e3fa92db20da27f959317ad1dfee83a99ed45b",
+        "docker_image": "metalblockchain/metalgo:v1.14.2-tahoe",
+        "min_glibc": "2.34",
+        "subnet_id": null,
+        "blockchain_id": null,
+        "vm_id": null,
+        "pulsevm_version": null,
+        "plugin_sha256": null,
+        "status": "No PulseVM chain for XPR testnet yet: validators sync the Tahoe primary network and get their NodeID ready.",
+        "rpcchainvm_protocol": 45,
+        "upgrades_note": "Granite activated on Tahoe 2026-09-21 10:00 UTC: nodes older than v1.14.2-tahoe fall off the network."
+      }
     },
     {
       "id": "rehearsal",
@@ -80,7 +116,21 @@
       },
       "coordinators": [
         "998a3a52e3bc1ab6826bd1736fe4914c8d4dc4a42332b9ba27eb8208460b510f"
-      ]
+      ],
+      "metal": {
+        "network": "rehearsal (private)",
+        "network_id": 88888,
+        "hrp": "custom",
+        "metalgo_version": "v1.13.5",
+        "subnet_id": "2HUXeGyofdf2jubCwvZAbCmR5maFfgqxCUMTNv5xgPZLvXjxG2",
+        "blockchain_id": "2FosFtJPpMSQfyFMeQMgXx77G3QDZiFFWhM7zBE9UJ8HcsAF2y",
+        "vm_id": "snFL9jZNLx8Ey5BvcEvvBQHV3iUcP9bwgSw6UhuG8jqqNCXLZ",
+        "pulsevm_version": "v0.0.0-arena-mempoolfix.1",
+        "plugin_sha256": null,
+        "status": "Private 5-validator network; joined by invitation (custom genesis), not via metal-install.",
+        "rpcchainvm_protocol": 43
+      }
     }
-  ]
+  ],
+  "manifest_updated": "2026-09-29"
 }

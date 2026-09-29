@@ -16,7 +16,7 @@ in a journal you can hand to anyone. Nothing a user can see changes until the
 new chain is verified and serving; aborting at any earlier point leaves your
 existing node exactly as it was.
 
-> **Block producer? Connect your node in 2 minutes → [docs/OPERATOR-QUICKSTART.md](docs/OPERATOR-QUICKSTART.md)**
+> **Block producer? Connect your node in 2 minutes → [docs/OPERATOR-QUICKSTART.md](docs/OPERATOR-QUICKSTART.md) · set up your Metal validator and get your NodeID → [docs/METAL-QUICKSTART.md](docs/METAL-QUICKSTART.md)**
 > ```bash
 > curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh | sudo bash
 > ```
