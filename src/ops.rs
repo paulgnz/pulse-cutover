@@ -195,11 +195,23 @@ pub fn kill_recorded_hook_group(pgid_file: &Path, grace: Duration) -> Result<Opt
         let leader = String::from_utf8_lossy(&o.stdout).trim().to_string();
         if !leader.is_empty() {
             let ours = match &start {
-                Some(want) => process_start(pgid).as_deref() == Some(want.as_str()),
+                // The leader can exit between the two `ps` calls: then only members remain, and
+                // they are still ours (the group id is not reused while any member lives).
+                Some(want) => match process_start(pgid) {
+                    None => true,
+                    Some(now) => now == *want,
+                },
                 None => {
                     let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_string();
                     let leader_prog = leader.split_whitespace().next().map(base).unwrap_or_default();
-                    let cmd_prog = cmd.split_whitespace().next().map(base).unwrap_or_default();
+                    // rc.7 records: `sh -c <hook>` usually execs a simple hook in place, so the
+                    // leader shows the hook's own program: compare against that, not `sh`.
+                    let hook = cmd.trim_start().strip_prefix("sh -c ").unwrap_or(&cmd);
+                    let cmd_prog = hook.split_whitespace().next().map(base).unwrap_or_default();
+                    // A script hook exec'd in place shows as `<interpreter> <script>`: accept the
+                    // hook's program as the first OR second word of the leader's command line.
+                    let second = leader.split_whitespace().nth(1).map(base).unwrap_or_default();
+                    let leader_prog = if !cmd_prog.is_empty() && second == cmd_prog { second } else { leader_prog };
                     leader.starts_with("sh -c") || (!cmd_prog.is_empty() && leader_prog == cmd_prog)
                 }
             };

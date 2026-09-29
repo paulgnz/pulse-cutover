@@ -526,17 +526,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     return Some("identity conflict (one token, two machines)".into());
                 }
                 if !age.map(|a| a <= max_age_ms).unwrap_or(false) {
-                    return Some(format!("stale report (age {:?} ms > {max_age_ms})", age));
+                    // A reason CLASS, not the changing age: the record is journaled only when the set
+                    // of (report, reason) changes, not on every poll of a steadily stale report.
+                    return Some(format!("stale report (older than {} s)", co.report_max_age_secs));
                 }
                 let failing: Vec<String> = r["checks"].as_array().map(|cs| cs.iter()
                     .filter(|c| c["ok"].as_bool() == Some(false)
                         && !c["name"].as_str().map(|n| crate::beacon::SETUP_CHECKS.contains(&n)).unwrap_or(false))
-                    .map(|c| format!("{}: {}", c["name"].as_str().unwrap_or("?"), c["detail"].as_str().unwrap_or("")))
+                    .map(|c| c["name"].as_str().unwrap_or("?").to_string())
                     .collect()).unwrap_or_default();
                 (!failing.is_empty()).then(|| format!("failing health check(s): {}", failing.join("; ")))
             };
             let mut excluded: Vec<serde_json::Value> = vec![];
             for p in &producers {
+                // Only the event's roster is named (a non-roster producer is simply not counted).
+                if !co.roster.is_empty()
+                    && !co.roster.iter().any(|m| p["name"].as_str() == Some(m.producer.as_str())) {
+                    continue;
+                }
                 let mut v: Vec<(serde_json::Value, Option<u64>, bool)> = p["beacons"].as_array().map(|bs| bs.iter()
                     .map(|b| (b["report"].clone(), b["age_ms"].as_u64(), b["conflict"].as_bool().unwrap_or(false)))
                     .collect()).unwrap_or_default();
@@ -674,7 +681,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // resume the ceremony (see `rollback_pending`); re-running `rollback` finishes the job.
         self.journal.evidence(self.state, json!({"rollback_requested": true, "force_after_ignite": force && past}))?;
         self.rollback_pending = true;
-        if force && past && !self.step_done("target_fence") {
+        // The fence runs on EVERY forced attempt: it is a precondition checked now, not a revert that
+        // stays done (the target may have been restarted since an earlier attempt).
+        if force && past {
             // Local fence FIRST: resuming the source while this box's target still runs would
             // create two writable histories under one chain_id, by our own hand.
             let fence = self.cfg.target.fence_cmd();

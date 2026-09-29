@@ -75,6 +75,7 @@ It never resumes the source chain or reverts routing itself.";
 
 const HELP_ROLLBACK: &str = "\
 pulse-cutover rollback --config ceremony.toml [--wait SECS] [--force-after-ignite] [--no-journal-i-know]
+pulse-cutover rollback --config ceremony.toml --cancel-intent --i-understand
 
 What `./cutover.sh abort` runs. It takes the journal's exclusive lock (waiting up to --wait
 seconds, default 30, for a stopping agent to let go; it never decides while another process
@@ -103,7 +104,13 @@ fence only: other producers' targets are not affected. A staged snapshot is move
 is journaled as it completes (`rollback_step`); the rollback counts as finished only when a final
 `rollback_done` record follows on_abort and the unstage. Every rollback is journaled (ABORTED, `operator_rollback`,
 `force_after_ignite`); with --no-journal-i-know the record goes to <journal>.rollback-<ms>.jsonl
-and the ceremony journal is not created.";
+and the ceremony journal is not created.
+
+A rollback records its intent (`rollback_requested`) before doing anything. If it dies before
+reaching ABORTED, `run` refuses to continue (`status` shows `rollback_pending: yes`); re-run
+`rollback` to finish it. `unhalt` does not clear it. Only if NO rollback step has completed yet,
+`--cancel-intent --i-understand` withdraws it (journaled with who ran it) so `run` may continue.
+The forced target fence runs on every forced attempt (never reused from an earlier attempt).";
 
 const HELP_BEACON: &str = "\
 pulse-cutover beacon --config ceremony.toml [--once]
@@ -388,6 +395,19 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         Err(e) => return Err(e),
     };
     println!("{terminal}");
+    if terminal == state::State::Aborted {
+        // Only a rollback the journal PROVES finished (`rollback_done`) may be called safe.
+        let rec = Journal::replay(&cfg.journal_path)?;
+        if !rec.aborted_rollback_complete {
+            eprintln!(
+                "ceremony ended in ABORTED but rollback INCOMPLETE: the journal does not prove every rollback \
+                 step finished (the source may NOT be producing, writes may still be closed). Run \
+                 `pulse-cutover rollback --config …` to finish it. Journal: {}",
+                cfg.journal_path.display()
+            );
+            std::process::exit(4);
+        }
+    }
     if terminal == state::State::Live {
         Ok(())
     } else {
@@ -490,6 +510,9 @@ fn cmd_rollback(args: &[String]) -> Result<(), String> {
     // Every failure before any rollback action runs is a refusal (exit 3): nothing changed.
     let cfg = load_config(args).unwrap_or_else(|e| refuse(format!("cannot load the config: {e}")));
     cfg.ensure_ceremony_profile().unwrap_or_else(|e| refuse(e));
+    if flag(args, "--cancel-intent") {
+        return cancel_rollback_intent(&cfg, flag(args, "--i-understand")).map_err(|e| refuse(e));
+    }
     let force = flag(args, "--force-after-ignite");
     let wait: u64 = match arg(args, "--wait").map(|s| s.parse::<u64>()) {
         None => 30,
@@ -559,6 +582,33 @@ fn cmd_rollback(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// `rollback --cancel-intent --i-understand`: withdraw a recorded operator rollback intent so `run`
+/// may continue, ONLY while no rollback step has completed in this episode (after a step ran, the
+/// only way forward is to finish the rollback). Journaled with who and when.
+fn cancel_rollback_intent(cfg: &Config, understood: bool) -> Result<(), String> {
+    if !understood {
+        return Err("--cancel-intent withdraws a recorded rollback so the ceremony may continue: pass \
+                    --i-understand to confirm".into());
+    }
+    let (mut journal, rec) = Journal::open(&cfg.journal_path)
+        .map_err(|e| format!("cannot take and read the journal: {e}"))?;
+    if !rec.rollback_pending {
+        return Err("no pending rollback intent in this journal: nothing to cancel".into());
+    }
+    if !rec.rollback_steps_done.is_empty() {
+        return Err(format!(
+            "rollback step(s) already completed ({}): the rollback cannot be cancelled, only finished \
+             (re-run `pulse-cutover rollback`)",
+            rec.rollback_steps_done.join(", ")
+        ));
+    }
+    let by = std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "unknown".into());
+    let st = rec.state.unwrap_or(state::State::Armed);
+    journal.evidence(st, serde_json::json!({"rollback_intent_cancelled": true, "cancelled_by": by}))?;
+    println!("rollback intent cancelled (journaled, by {by}); `run` may continue from state {st}");
+    Ok(())
+}
+
 fn cmd_status(args: &[String]) -> Result<(), String> {
     let cfg = load_config(args)?;
     if !cfg.journal_path.exists() {
@@ -589,6 +639,17 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     }
     // cutover.sh reads this: once ignition may have started, a local rollback is refused.
     println!("ignition_started: {}", if recovered.reached_ignited { "yes" } else { "no" });
+    // An operator rollback that started and did not finish blocks `run` until it is finished
+    // (re-run `rollback`) or, if no step ran yet, cancelled (`rollback --cancel-intent`).
+    let rollback = if recovered.rollback_pending {
+        "pending (an operator rollback started and did not finish: re-run `pulse-cutover rollback`)"
+    } else if recovered.state == Some(state::State::Aborted) {
+        if recovered.aborted_rollback_complete { "complete" } else { "INCOMPLETE (run `pulse-cutover rollback`)" }
+    } else {
+        "none"
+    };
+    println!("rollback_pending: {}", if recovered.rollback_pending { "yes" } else { "no" });
+    println!("rollback: {rollback}");
     Ok(())
 }
 

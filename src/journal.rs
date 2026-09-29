@@ -384,6 +384,9 @@ impl Journal {
             if entry.data.get("rollback_requested").and_then(|v| v.as_bool()) == Some(true) {
                 out.rollback_pending = true;
             }
+            if entry.data.get("rollback_intent_cancelled").and_then(|v| v.as_bool()) == Some(true) {
+                out.rollback_pending = false;
+            }
             if entry.data.get("rollback_incomplete").is_some() {
                 out.aborted_rollback_complete = false;
             }

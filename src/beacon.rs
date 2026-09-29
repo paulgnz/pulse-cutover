@@ -281,6 +281,8 @@ struct Acc {
     forced_rollback: bool,
     /// For an ABORTED journal: did the rollback provably finish (`rollback_done`)? None otherwise.
     rollback_complete: Option<bool>,
+    /// An operator rollback recorded its intent and has not reached ABORTED (see journal.rs).
+    rollback_pending: bool,
 }
 
 static JOURNALS: Mutex<Option<HashMap<PathBuf, Acc>>> = Mutex::new(None);
@@ -330,6 +332,12 @@ fn apply_line(acc: &mut Acc, v: &Value) {
     if d["rollback_done"].as_bool() == Some(true) {
         acc.rollback_complete = Some(true);
     }
+    if d["rollback_requested"].as_bool() == Some(true) {
+        acc.rollback_pending = true;
+    }
+    if d["rollback_intent_cancelled"].as_bool() == Some(true) {
+        acc.rollback_pending = false;
+    }
     if d.get("rollback_incomplete").is_some() {
         acc.rollback_complete = Some(false);
     }
@@ -340,8 +348,14 @@ fn apply_line(acc: &mut Acc, v: &Value) {
                 acc.ignition_started = true;
             }
             acc.forced_rollback = v["state"].as_str() == Some("ABORTED") && d["force_after_ignite"].as_bool() == Some(true);
-            // An ABORTED is unfinished until its `rollback_done` record follows.
-            acc.rollback_complete = (v["state"].as_str() == Some("ABORTED")).then_some(false);
+            if v["state"].as_str() == Some("ABORTED") {
+                acc.rollback_pending = false;
+            }
+            // An rc.8+ ABORTED (it carries `reverts_ok`) is unfinished until its `rollback_done`
+            // record follows. An older ABORTED has no step records at all: unknown, not "incomplete".
+            acc.rollback_complete = (v["state"].as_str() == Some("ABORTED"))
+                .then(|| d.get("reverts_ok").map(|_| false))
+                .flatten();
             acc.last_ts = v["ts"].clone();
             acc.transitions.push(json!({"state": v["state"], "ts": v["ts"]}));
             let ev = &mut acc.ev;
@@ -428,7 +442,8 @@ pub fn journal_summary(path: &Path) -> Value {
            "armed_ts_ms": acc.armed_ts_ms,
            "ignition_started": acc.ignition_started,
            "forced_rollback": acc.forced_rollback,
-           "rollback_complete": acc.rollback_complete})
+           "rollback_complete": acc.rollback_complete,
+           "rollback_pending": acc.rollback_pending})
 }
 
 /// Coordination status for the report, with free-text fields sanitized.

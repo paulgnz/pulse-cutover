@@ -1931,7 +1931,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-cutover"
-version = "0.5.0-rc.8"
+version = "0.5.0-rc.9"
 dependencies = [
  "chrono",
  "ed25519-dalek",
