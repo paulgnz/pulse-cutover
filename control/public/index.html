@@ -349,6 +349,15 @@ a.tilelink{color:inherit;text-decoration:none;display:block}
 .inf-table tr.r-ok{background:color-mix(in srgb,var(--ok) 5%,transparent)}
 .inf-table tr.r-warn td:first-child{box-shadow:inset 3px 0 0 color-mix(in srgb,var(--warn) 70%,transparent)}
 .inf-table tr.r-bad td:first-child{box-shadow:inset 3px 0 0 var(--bad)}
+
+/* all-nodes table: every cell stays one line; long values clip with … and show in full on hover */
+@media (min-width:761px){
+  .inf-table table{table-layout:auto}
+  .inf-table td{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+  .inf-table td[data-l="api"],.inf-table td[data-l="p2p"],.inf-table td[data-l="hyperion"],.inf-table td[data-l="atomic"]{max-width:150px}
+  .inf-table td[data-l="endpoint"]{max-width:260px}
+  .inf-table td .st2{display:inline-flex;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+}
 @media (max-width:1100px){.hero{grid-template-columns:minmax(0,1fr)}.globe-card{min-height:440px}.duo{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:640px){
   .tile{padding-bottom:56px;min-height:128px}
@@ -852,7 +861,7 @@ function renderInfra() {
         return `<tr><td><div class="who2"><div class="logo"><span>${esc(initials(n.operator || '?'))}</span></div><div><b>${esc(n.operator || '—')}</b><div style="font-size:11px"><span class="tp" title="Not a registered producer: listed by ${esc((n.sources || []).map((u) => u.split('/').slice(3, 5).join('/')).join(', '))}" style="color:var(--warn);border-color:color-mix(in srgb,var(--warn) 40%,transparent)">not a producer</span>${n.note ? ` <span style="color:var(--muted)">${esc(n.note)}</span>` : ''}</div></div></div></td>
         <td data-l="cutover"><span class="cut none">not a producer</span></td>
         <td data-l="node"><span class="tp api">api</span></td>
-        <td data-l="endpoint"><a class="url" href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${esc(n.url.replace(/^https?:\/\//, ''))}</a></td>
+        <td data-l="endpoint"><a class="url" title="${esc(n.url)}" href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${esc(n.url.replace(/^https?:\/\//, ''))}</a></td>
         <td data-l="api"><span class="st2">${dot(a.ok)}${a.ms} ms</span></td>
         <td data-l="version" class="mono">${a?.version ? esc(a.version.split('-')[0]) : '—'}</td>
         <td data-l="lag" class="mono">${a?.lag != null ? fmt(a.lag) : '—'}</td>
@@ -866,8 +875,8 @@ function renderInfra() {
         <td><div class="who2"><div class="logo"><span>${esc(initials(n.org?.name || n.producer))}</span>${logo}</div><div><b>${esc(n.org?.name || n.producer)}</b><div style="color:var(--muted);font-size:11px">${flag(n.org?.country)} ${esc(n.producer)}${n.rank ? ' · #' + n.rank : ''}</div></div></div></td>
         <td data-l="cutover">${cc.html}</td>
         <td data-l="node">${(n.types.length ? n.types : ['node']).map((t) => `<span class="tp ${esc(t)}">${esc(t)}</span>`).join('')}</td>
-        <td data-l="endpoint">${n.url ? `<a class="url" href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${esc(n.url.replace(/^https?:\/\//, ''))}</a>` : n.p2p ? `<span class="url" title="p2p">${esc(n.p2p)}</span>` : '<span style="color:var(--dim)">—</span>'}</td>
-        <td data-l="api">${a ? `<span class="st2">${dot(a.ok && a.chain_ok !== false)}${a.ok ? (a.chain_ok === false ? 'wrong chain' : a.ms + ' ms') : esc(a.error || 'down')}</span>` : '<span style="color:var(--dim)">—</span>'}</td>
+        <td data-l="endpoint">${n.url ? `<a class="url" title="${esc(n.url)}" href="${esc(n.url)}/v1/chain/get_info" target="_blank" rel="noopener noreferrer">${esc(n.url.replace(/^https?:\/\//, ''))}</a>` : n.p2p ? `<span class="url" title="p2p">${esc(n.p2p)}</span>` : '<span style="color:var(--dim)">—</span>'}</td>
+        <td data-l="api">${a ? `<span class="st2" title="${esc(a.error_detail || a.error || '')}">${dot(a.ok && a.chain_ok !== false)}${a.ok ? (a.chain_ok === false ? 'wrong chain' : a.ms + ' ms') : esc(a.error || 'down')}</span>` : '<span style="color:var(--dim)">—</span>'}</td>
         <td data-l="version" class="mono">${a?.version ? esc(a.version.split('-')[0]) : '—'}</td>
         <td data-l="lag" class="mono">${a?.lag != null ? `<span style="color:${a.lag > 30 ? 'var(--warn)' : 'inherit'}">${fmt(a.lag)}</span>` : '—'}</td>
         <td data-l="edge">${a?.edge ? esc(a.edge) : '—'}</td>

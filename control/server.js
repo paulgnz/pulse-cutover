@@ -70,6 +70,9 @@ cfg.networks.forEach((n) => pollNetwork(n).catch(() => {}));
 // ---- producer registry: eosio::producers (active) + each producer's chains.json → bp.json -------------
 const registry = {}; // network id → { ts, producers: { owner → {owner, votes, rank, url, org{…}} } }
 const logos = new Map(); // `${net}/${owner}` → { type, buf, ts }
+const UA = 'pulse-cutover-mission-control/1.0 (+https://control-rehearsal.protonnz.com)';
+const _fetch = globalThis.fetch;
+globalThis.fetch = (url, opts = {}) => _fetch(url, { ...opts, headers: { 'user-agent': UA, ...(opts.headers || {}) } });
 const safeUrl = (u) => { try { const x = new URL(u); return /^https?:$/.test(x.protocol) ? x.href.replace(/\/$/, '') : null; } catch { return null; } };
 async function getJson(url, ms = 5000) {
   const r = await fetch(url, { signal: AbortSignal.timeout(ms), headers: { accept: 'application/json' } });
@@ -147,7 +150,20 @@ const edgeOf = (h) => {
   for (const k of ['openresty', 'nginx', 'haproxy', 'caddy', 'apache', 'envoy', 'traefik']) if (sv.includes(k) || via.includes(k)) return k;
   return sv.startsWith('nodeos') ? 'direct / hidden' : sv ? sv.slice(0, 20) : 'hidden';
 };
-async function timed(fn) { const t = Date.now(); try { const r = await fn(); return { ok: true, ms: Date.now() - t, ...r }; } catch (e) { return { ok: false, ms: Date.now() - t, error: String(e.message || e).slice(0, 80) }; } }
+// Probe failures become a short, human label for the table; the raw message is kept (trimmed) for tooltips.
+function shortErr(e) {
+  const m = String(e?.message || e), code = e?.cause?.code || e?.code || '';
+  if (e?.name === 'SyntaxError' || /Unexpected token|not valid JSON|JSON/.test(m)) return /'<'|<!DOCTYPE|<html/i.test(m) ? 'HTML page, not API' : 'not JSON';
+  if (e?.name === 'TimeoutError' || e?.name === 'AbortError' || /timeout|aborted/i.test(m)) return 'timeout';
+  if (/ECONNREFUSED/.test(code)) return 'refused';
+  if (/ENOTFOUND|EAI_AGAIN/.test(code)) return 'DNS failed';
+  if (/ECONNRESET|UND_ERR_SOCKET/.test(code)) return 'connection reset';
+  if (/CERT|SSL|TLS|self.signed/i.test(code + m)) return 'TLS error';
+  if (/^HTTP \d+/.test(m)) return m.slice(0, 12);
+  if (/fetch failed/.test(m)) return code ? code.toLowerCase() : 'unreachable';
+  return m.slice(0, 24);
+}
+async function timed(fn) { const t = Date.now(); try { const r = await fn(); return { ok: true, ms: Date.now() - t, ...r }; } catch (e) { return { ok: false, ms: Date.now() - t, error: shortErr(e), error_detail: String(e?.message || e).slice(0, 160) }; } }
 function tcp(hostport) {
   return new Promise((res) => {
     const m = String(hostport).trim().match(/^\[?([^\]]+?)\]?:(\d+)$/); if (!m) return res({ ok: false, error: 'bad endpoint' });
@@ -160,6 +176,7 @@ function tcp(hostport) {
 async function probeApi(url, chainId, head) {
   return timed(async () => {
     const r = await fetch(`${url}/v1/chain/get_info`, { method: 'POST', body: '{}', signal: AbortSignal.timeout(6000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const b = await r.json();
     return { edge: edgeOf(r.headers), version: b.server_version_string || null, head: b.head_block_num, lag: chain[n_id(chainId)]?.head && b.head_block_num ? Math.max(0, chain[n_id(chainId)].head - b.head_block_num) : null,
       chain_ok: !chainId || b.chain_id === chainId };
