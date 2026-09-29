@@ -76,7 +76,9 @@ curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/be
 - `/etc/pulse-cutover/beacon.token`: a random token made on your server, readable only by root.
 - `pulse-beacon.service`: a systemd service with a read-only filesystem, reporting every 10 seconds.
 
-What the beacon reads: your nodeos `get_info`, whether production is paused, whether a Metal validator
-service is running, and free disk. What it sends: those check results and your pulse-cutover version. Nothing
-else.
+What the beacon reads: your nodeos `get_info`, whether the producer API answers locally, whether a Metal
+validator service is running, and free disk. What it sends (the dashboard is public, so it is kept minimal):
+pass/fail for each check with a short verdict (e.g. "83 GB free", "running"), head/LIB, your account, a node
+label you choose (default: its role), and the pulse-cutover version. **Never** sent: keys, tokens, IP addresses,
+hostnames, file paths, config contents or unit names.
 </details>

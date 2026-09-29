@@ -37,9 +37,10 @@ fn post_json(a: &ureq::Agent, url: &str, body: Value) -> Result<Value, String> {
 /// First word of a hook command is the program; a hook is ready when it exists
 /// and is executable (the run-5 rehearsal stalled on a hook without +x).
 fn hook_ready(cmd: &str) -> (bool, String) {
+    // Details are public on mission control: never include paths, only the verdict.
     let prog = cmd.split_whitespace().next().unwrap_or("");
     if !prog.starts_with('/') {
-        return (true, format!("{prog} (on PATH; not checked)"));
+        return (true, "configured (command on PATH)".into());
     }
     match std::fs::metadata(prog) {
         Ok(m) => {
@@ -47,13 +48,13 @@ fn hook_ready(cmd: &str) -> (bool, String) {
             {
                 use std::os::unix::fs::PermissionsExt;
                 if m.permissions().mode() & 0o111 == 0 {
-                    return (false, format!("{prog} is not executable (chmod +x)"));
+                    return (false, "configured but not executable (chmod +x)".into());
                 }
             }
             let _ = m;
-            (true, prog.to_string())
+            (true, "configured and executable".into())
         }
-        Err(_) => (false, format!("{prog} does not exist")),
+        Err(_) => (false, "configured but the script does not exist".into()),
     }
 }
 
@@ -129,12 +130,6 @@ pub fn journal_summary(path: &Path) -> Value {
            "evidence": Value::Object(ev), "last_error": last_error})
 }
 
-fn hostname() -> String {
-    std::fs::read_to_string("/etc/hostname").ok().map(|h| h.trim().to_string()).filter(|h| !h.is_empty())
-        .or_else(|| std::process::Command::new("hostname").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()))
-        .unwrap_or_else(|| "node".into())
-}
-
 pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     let a = agent();
     let mut checks = vec![];
@@ -152,14 +147,14 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         Ok(v) => (v["head_block_num"].as_u64(), v["last_irreversible_block_num"].as_u64(), v["chain_id"].as_str().map(String::from)),
         Err(_) => (None, None, None),
     };
-    checks.push(check("source_api", info.is_ok(), match &info { Ok(_) => format!("head {} lib {}", head.unwrap_or(0), lib.unwrap_or(0)), Err(e) => e.clone() }));
+    checks.push(check("source_api", info.is_ok(), match &info { Ok(_) => format!("head {} lib {}", head.unwrap_or(0), lib.unwrap_or(0)), Err(_) => "not reachable".into() }));
     if let Some(want) = &cfg.ceremony.chain_id {
         let ok = chain_id.as_deref() == Some(want.as_str());
         checks.push(check("chain_id", ok, if ok { format!("{}…", &want[..16.min(want.len())]) } else { format!("node reports {:?}, config expects {}…", chain_id, &want[..16.min(want.len())]) }));
     }
     if cfg.ceremony.mode == crate::config::Mode::Producer {
         let p = post_json(&a, &format!("{}/v1/producer/paused", cfg.source.producer_api_url.trim_end_matches('/')), json!({}));
-        checks.push(check("producer_api", p.is_ok(), match &p { Ok(v) => format!("paused={v}"), Err(e) => e.clone() }));
+        checks.push(check("producer_api", p.is_ok(), match &p { Ok(_) => "reachable locally".to_string(), Err(_) => "not reachable locally".into() }));
     }
 
     // Declared H.
@@ -188,13 +183,13 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     // Target side.
     let staged = &cfg.snapshot.staged_path;
     let staged_ok = past_verify || !staged.exists();
-    checks.push(check("staged_snapshot_absent", staged_ok, if past_verify { "staged by the ceremony (expected)".to_string() } else if staged_ok { "not pre-staged".to_string() } else { format!("{} already exists (would boot the target from a stale cut)", staged.display()) }));
+    checks.push(check("staged_snapshot_absent", staged_ok, if past_verify { "staged by the ceremony (expected)".to_string() } else if staged_ok { "not pre-staged".to_string() } else { "a snapshot is already staged (would boot the target from a stale cut)".to_string() }));
     let unit = &cfg.target.metalgo_unit;
     let active = unit_active(unit);
-    checks.push(check("validator_running", active || in_ignite, format!("{unit} {}", if active { "active" } else if in_ignite { "restarting for ignition" } else { "not active" })));
+    checks.push(check("validator_running", active || in_ignite, if active { "running" } else if in_ignite { "restarting for ignition" } else { "not running" }));
     if let Some(dir) = cfg.snapshot.dir.as_ref().or(staged.parent().map(|p| p.to_path_buf()).as_ref()) {
         let gb = free_gb(dir);
-        checks.push(check("disk_free", gb.map(|g| g >= 5.0).unwrap_or(false), gb.map(|g| format!("{g:.1} GB free in {}", dir.display())).unwrap_or_else(|| "unknown".into())));
+        checks.push(check("disk_free", gb.map(|g| g >= 5.0).unwrap_or(false), gb.map(|g| format!("{:.0} GB free", g.floor())).unwrap_or_else(|| "unknown".into())));
     }
 
     // State diff (A3), if the post_ignite hook produced one next to the journal.
@@ -214,7 +209,10 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         "schema": REPORT_SCHEMA,
         "producer": producer,
         "network": network,
-        "node": cfg.beacon.as_ref().and_then(|b| b.node.clone()).unwrap_or_else(hostname),
+        // Public on mission control: the operator's chosen label, never the machine's hostname.
+        "node": cfg.beacon.as_ref().and_then(|b| b.node.clone()).unwrap_or_else(|| {
+            cfg.beacon.as_ref().and_then(|b| b.role.clone()).unwrap_or_else(|| "node".into())
+        }),
         "role": cfg.beacon.as_ref().and_then(|b| b.role.clone()).unwrap_or_else(|| {
             if cfg.ceremony.mode == crate::config::Mode::Producer { "producer".into() } else { "api".into() }
         }),

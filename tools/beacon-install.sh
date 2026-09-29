@@ -20,7 +20,7 @@
 #          [--version v0.5.0-rc.1] [--api http://127.0.0.1:8888] [--producer-api <url>]
 #          [--snapshots-dir <dir>] [--interval 10] [--dry-run] [--uninstall]
 set -euo pipefail
-NETWORK=""; PRODUCER=""; NODE=""; ROLE=""; CFG_PRODUCER=""; URL="https://control-rehearsal.protonnz.com"; VERSION="v0.5.0-rc.2"
+NETWORK=""; PRODUCER=""; NODE=""; ROLE=""; CFG_PRODUCER=""; URL="https://control-rehearsal.protonnz.com"; VERSION="v0.5.0-rc.3"
 API=""; PAPI=""; SNAPDIR=""; INTERVAL=10; DRY=0; UNINSTALL=0
 while [ $# -gt 0 ]; do case "$1" in
   --network) NETWORK=$2; shift 2;; --producer) PRODUCER=$2; shift 2;; --node) NODE=$2; shift 2;; --role) ROLE=$2; shift 2;; --url) URL=$2; shift 2;;
@@ -82,13 +82,13 @@ if [ -z "$PRODUCER" ]; then
   [ -n "$PRODUCER" ] || { echo "could not find producer-name in nodeos config: pass --producer <your-account>" >&2; exit 2; }
 fi
 [[ "$PRODUCER" =~ ^[a-z1-5.]{1,12}$ ]] || { echo "--producer must be an Antelope account name" >&2; exit 2; }
-[ -n "$NODE" ] || NODE=$(hostname -f 2>/dev/null || hostname)
 if [ -z "$ROLE" ]; then
   if [ -n "$CFG_PRODUCER" ]; then ROLE=producer
   elif curl -fsS -m3 http://127.0.0.1:7000/v2/health 2>/dev/null | grep -q '"health"'; then ROLE=history
   else ROLE=api; fi
 fi
-say "node: $NODE · role $ROLE"
+[ -n "$NODE" ] || NODE=$ROLE   # public label; the hostname is never sent
+say "node label: $NODE · role $ROLE"
 say "nodeos: $API · chain ${CHAIN_ID:0:16}… ($NETWORK) · head $HEAD · producer $PRODUCER · snapshots $SNAPDIR · validator unit $MG_UNIT"
 
 mkdir -p "$ETC" && chmod 750 "$ETC"
