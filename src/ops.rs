@@ -69,26 +69,78 @@ pub trait ChainOps {
     fn sleep_ms(&self, ms: u64);
 }
 
+/// Captured output is capped per stream: the first and last `OUTPUT_CAP / 2` bytes are kept.
+pub const OUTPUT_CAP: usize = 64 * 1024;
+/// After the shell itself exits, how long its output pipes may stay open (a background
+/// descendant holding them) before the process group is killed.
+pub const PIPE_GRACE: Duration = Duration::from_secs(5);
+
+/// Bounded capture of one pipe: head + tail, with a count of what was dropped in between.
+fn capture(mut r: impl std::io::Read) -> Vec<u8> {
+    let half = OUTPUT_CAP / 2;
+    let (mut head, mut tail) = (Vec::new(), std::collections::VecDeque::new());
+    let mut dropped = 0usize;
+    let mut buf = [0u8; 8192];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                for &b in &buf[..n] {
+                    if head.len() < half {
+                        head.push(b);
+                    } else {
+                        tail.push_back(b);
+                        if tail.len() > half {
+                            tail.pop_front();
+                            dropped += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if dropped > 0 {
+        head.extend_from_slice(format!("\n…[{dropped} bytes of output dropped]…\n").as_bytes());
+    }
+    head.extend(tail);
+    head
+}
+
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    let _ = std::process::Command::new("kill").arg("-KILL").arg(format!("-{pid}")).status();
+}
+#[cfg(not(unix))]
+fn kill_group(_pid: u32) {}
+
 /// Run a shell command with a deadline. The command runs in its own process group so a
 /// timeout kills the whole tree (sh + whatever it started), and a timeout is a FAILURE.
+/// Completion is bounded too: after the shell exits, output pipes still held open by a
+/// descendant get `PIPE_GRACE`, then the group is killed. Output is capped (`OUTPUT_CAP`).
+/// Hooks that must leave work running should detach it (`setsid … >log 2>&1 &`).
 pub fn run_shell_timeout(cmd: &str, timeout: Duration) -> Result<String, String> {
-    use std::io::Read;
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
+    use std::sync::mpsc;
     let mut command = std::process::Command::new("sh");
     command
         .arg("-c")
         .arg(cmd)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().map_err(|e| format!("spawn `{cmd}`: {e}"))?;
-    // Drain pipes on threads so a chatty command can't block on a full pipe.
-    let mut so = child.stdout.take().expect("piped");
-    let mut se = child.stderr.take().expect("piped");
-    let t_out = std::thread::spawn(move || { let mut b = Vec::new(); let _ = so.read_to_end(&mut b); b });
-    let t_err = std::thread::spawn(move || { let mut b = Vec::new(); let _ = se.read_to_end(&mut b); b });
+    let pid = child.id();
+    // Drain pipes on threads (a chatty command can't block on a full pipe); results arrive on a
+    // channel so waiting for them can be bounded instead of an unconditional join.
+    let so = child.stdout.take().expect("piped");
+    let se = child.stderr.take().expect("piped");
+    let (tx_out, rx_out) = mpsc::channel();
+    let (tx_err, rx_err) = mpsc::channel();
+    std::thread::spawn(move || { let _ = tx_out.send(capture(so)); });
+    std::thread::spawn(move || { let _ = tx_err.send(capture(se)); });
     let started = std::time::Instant::now();
     let status = loop {
         match child.try_wait().map_err(|e| format!("wait `{cmd}`: {e}"))? {
@@ -98,20 +150,29 @@ pub fn run_shell_timeout(cmd: &str, timeout: Duration) -> Result<String, String>
         }
     };
     let Some(status) = status else {
-        #[cfg(unix)]
-        {
-            let _ = std::process::Command::new("kill").arg("-KILL").arg(format!("-{}", child.id())).status();
-        }
+        kill_group(pid);
         let _ = child.kill();
         let _ = child.wait();
         return Err(format!("`{cmd}` timed out after {}s and was killed", timeout.as_secs()));
     };
-    let stdout = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).trim().to_string();
-    let stderr = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).trim().to_string();
+    // The shell exited. Its pipes close unless a descendant still holds them.
+    let deadline = std::time::Instant::now() + PIPE_GRACE;
+    let recv = |rx: &mpsc::Receiver<Vec<u8>>| rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    let (mut out, mut err) = (recv(&rx_out).ok(), recv(&rx_err).ok());
+    let mut note = String::new();
+    if out.is_none() || err.is_none() {
+        kill_group(pid);
+        note = format!(" [descendant processes still held the output after {}s and were killed]", PIPE_GRACE.as_secs());
+        let grace2 = Duration::from_secs(1);
+        if out.is_none() { out = rx_out.recv_timeout(grace2).ok(); }
+        if err.is_none() { err = rx_err.recv_timeout(grace2).ok(); }
+    }
+    let stdout = String::from_utf8_lossy(&out.unwrap_or_default()).trim().to_string();
+    let stderr = String::from_utf8_lossy(&err.unwrap_or_default()).trim().to_string();
     if status.success() {
-        Ok(if stdout.is_empty() { stderr } else { stdout })
+        Ok(format!("{}{note}", if stdout.is_empty() { stderr } else { stdout }))
     } else {
-        Err(format!("`{cmd}` exited {status}: {stderr} {stdout}"))
+        Err(format!("`{cmd}` exited {status}: {stderr} {stdout}{note}"))
     }
 }
 
