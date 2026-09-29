@@ -2,9 +2,18 @@
 
 <p align="center"><img src="media/cutover-hero.svg" alt="One block, one cut, same chain" width="100%"></p>
 
-How a running Antelope chain moves onto PulseVM **in one atomic step**, with every
+How a running Antelope chain is meant to move onto PulseVM **in one atomic step**, with every
 block producer cutting the same block, the chain keeping its chain_id, and users
-keeping their keys, balances and URLs.
+keeping their keys, balances and URLs. This page describes the intended protocol;
+what is implemented and rehearsed today is marked where it differs, and the full
+status is in [ATOMICITY.md](../ATOMICITY.md).
+
+> [!IMPORTANT]
+> **Implemented vs intended (2026-09-29).** Rehearsed: same cut on every producer, zero transactions
+> after H, a symmetric abort. Sampled only: state equality and exactly-once. Not implemented: a
+> fleet-wide authority boundary (all-or-nothing), exact H in API mode and on restart, block-id-at-H
+> lineage check on the target, per-validator producer keys, validator registration/funding. The
+> rehearsal ran a fork plugin on a private network, not upstream PulseVM v1.0.0 on Tahoe.
 
 > [!NOTE]
 > Numbers on this page come from the recorded 5-producer rehearsal (Sydney · Singapore ·
@@ -47,14 +56,15 @@ flowchart LR
 ```
 
 **One block, H, is the boundary.** Everything up to and including H is carried over: every producer writes a byte-identical snapshot of H, it is imported, and the result is checked (table fingerprints, and a state diff against the old chain).
-Block H+1 is the first block produced by PulseVM. Nobody re-signs anything, nobody moves
-funds, and nothing depends on users doing anything.
+Block H+1 is the first block produced by PulseVM. Accounts, keys and endpoints carry over, so
+most integrations keep working without changes; each operator and integrator should still
+qualify their retry, TAPOS/expiry, finality and inclusion handling against the cut.
 
 | Stays the same | Changes |
 |---|---|
 | chain_id, accounts, keys, permissions, balances, contracts, table rows | the engine producing blocks (Leap DPoS → PulseVM on Metal/Avalanche consensus) |
 | block numbering (H+1 follows H) | who finalizes blocks (Metal validators) |
-| public API URLs and the `/v1/chain` API | a write pause of about a minute during the switch |
+| public API URLs and the `/v1/chain` API | a write pause during the switch (71–114 s in the unattended rehearsal runs; measured per qualified stack) |
 
 ---
 
@@ -76,10 +86,10 @@ flowchart TB
 
 | Role | Runs | Their job at the cut | Their users notice |
 |---|---|---|---|
-| **Coordinator** | nothing on-chain | Publishes H, the target chain config and the pinned versions; later compares everyone's evidence | — |
-| **Block producer** | `pulse-cutover` in **producer mode** | Closes writes before H, snapshots exactly H, imports, becomes a validator of the new chain | ~1 min of HTTP 503 on writes |
-| **API provider** | `pulse-cutover` in **api mode** | Follows the cut, imports the same H, flips its public URL to the new chain | ~1 min of 503 on writes; reads never stop |
-| **History provider** | api mode + `[hyperion]` | Starts indexing at H+1, serves old and new history through one URL | nothing |
+| **Coordinator** | today: a signed-message relay (mission control + `pulse-cutover await`); proposed: an on-chain/governance declaration | Publishes H, the target chain config and the pinned versions; later compares everyone's evidence | — |
+| **Block producer** | `pulse-cutover` in **producer mode** | Closes writes before H, snapshots exactly H, imports, becomes a validator of the new chain | HTTP 503 on writes for the write pause |
+| **API provider** | `pulse-cutover` in **api mode** | Follows the cut, imports H, flips its public URL to the new chain. *Unfinished: api mode does not yet enforce an exact-H artifact* | 503 on writes for the write pause; reads keep being served |
+| **History provider** | api mode + `[hyperion]` | Starts indexing at H+1, serves old and new history through one URL. *Unfinished: migrating an existing legacy Hyperion archive across H* | nothing, once qualified |
 | **App / exchange** | nothing | Retry on 503 with a fresh transaction (see [§6](#6-what-users-and-apps-see)) | a short write pause |
 
 ---
@@ -124,12 +134,12 @@ gantt
 | Moment | What it means |
 |---|---|
 | **T − days** | Everyone installs and rehearses (`doctor` → `install.sh` → rehearsal). H, versions and target config are published. |
-| **H − 24 blocks** | **Write freeze.** API edges start answering writes with 503. Blocks keep coming, but they are empty. |
+| **H − 24 blocks** | **Write freeze.** API edges start answering writes with 503. Already-admitted transactions drain by H; blocks after H must be empty, which the burn-off audit checks. The edge freeze alone does not prove that no other write path (a private RPC, a direct peer) is still admitting transactions. |
 | **H** | **The cut.** Every producer's nodeos has been told in advance to snapshot exactly this block. |
 | **H final** (≈ 35–50 s later) | The snapshot file lands (Leap writes it once H is irreversible). Producers pause. |
 | **+1 s** | Verified: imported twice, fingerprints must match, no transactions after H. |
-| **+10–20 s** | Ignited: PulseVM boots from the snapshot and presents the same chain_id at block H. |
-| **+5 s** | LIVE: block H+1 exists, so the new chain is really producing. Only now do URLs flip. |
+| **+10–20 s** | Ignited: PulseVM boots from the snapshot and reports the same chain_id at a height ≥ H. |
+| **+5 s** | LIVE: this producer's view of the new chain is past H. In producer mode the URL flips now. |
 
 ---
 
@@ -148,7 +158,7 @@ stateDiagram-v2
     ARMED --> FROZEN: head ≥ H − 24
     FROZEN --> SNAPSHOTTED: H final, snapshot of H, burn-off = 0
     SNAPSHOTTED --> VERIFIED: 2 imports agree
-    VERIFIED --> IGNITED: new chain serves chain_id at H
+    VERIFIED --> IGNITED: new chain serves chain_id, head ≥ H
     IGNITED --> LIVE: head > H
     LIVE --> [*]
     FROZEN --> ABORTED
@@ -192,17 +202,17 @@ stateDiagram-v2
 
 | | |
 |---|---|
-| **Action** | Hashes the snapshot, imports it into two independent fresh databases, computes table fingerprints (19–21 tables). |
+| **Action** | Hashes the snapshot, imports it twice into fresh databases (two runs of the same importer), computes table fingerprints (19–21 tables, 64-bit). |
 | **Users see** | Still 503 on writes. |
-| **Gate** | Both imports agree, and match the published goldens when provided. Every producer ends up with the same numbers. |
+| **Gate** | Both imports agree, and match the published goldens when provided. Every producer ends up with the same numbers. This catches a nondeterministic import, not a bug shared by both runs of the same importer. |
 
 ### ⑤ IGNITED: PulseVM boots from block H
 
 | | |
 |---|---|
-| **Action** | Stages the verified snapshot where the PulseVM chain expects it and restarts the validator. The chain imports it and presents **the source chain_id at block H with H's block id**. |
+| **Action** | Stages the verified snapshot where the PulseVM chain expects it and restarts the validator. The chain imports it and presents the source chain_id. |
 | **Users see** | Still 503 on writes. |
-| **Gate** | Target chain_id == source chain_id, and target head == H with the cut's block id. |
+| **Gate** | Target chain_id == source chain_id, and target head ≥ H. *Intended but not yet enforced: the target's block id at H equals the cut's block id (it is recorded in the journal, not compared).* |
 | **Then** | The `post_ignite` hook sends a few transactions: PulseVM builds blocks on demand, so an idle new chain would never pass H. |
 
 ### ⑥ LIVE: the new chain is producing, URLs flip
@@ -211,7 +221,7 @@ stateDiagram-v2
 |---|---|
 | **Action** | Waits for head > H, meaning the validator set is really producing. Then the `on_live` hook flips the API edge's backend to PulseVM and reopens writes. |
 | **Users see** | Writes work again, at the same URL, with the same keys. |
-| **Gate** | Head past H before `quorum_timeout_secs`, otherwise abort and resume the old chain. |
+| **Gate** | Head past H before `quorum_timeout_secs`, otherwise abort. LIVE is a local head-progress check, not sustained all-validator health or inclusion (the ~50 s post-LIVE stall in run 4 is unexplained). |
 
 ---
 
@@ -238,21 +248,22 @@ sequenceDiagram
     BP->>N: pause · audit H+1… (0 transactions)
     BP->>BP: verify: 2 imports, fingerprints
     BP->>P: ignite from the snapshot
-    P-->>BP: chain_id + block id at H ✓
+    P-->>BP: chain_id ✓, head ≥ H (block id at H: recorded, not yet compared)
     BP->>P: first transactions → block H+1
     BP->>E: flip backend, reopen writes
     BP-->>C: journals, hashes, fingerprints, state diff
     C->>C: all producers agree? → cutover confirmed
 ```
 
-What must be identical on every producer (it was, on all 5, in every rehearsal run):
+What must be identical on every producer. Cut id, snapshot hash and fingerprints matched on all 5 in every
+rehearsal run; the state-diff digest exists only for runs 5 and 6:
 
 | Evidence | Where it comes from |
 |---|---|
 | cut height + block id | `SNAPSHOTTED` journal line |
 | snapshot sha256 | `VERIFIED` journal line |
 | table fingerprints | `VERIFIED` journal line |
-| state digest, old@H vs new@H | `tools/state-diff.mjs` report |
+| state digest, old vs new@H (sampled state) | `tools/state-diff.mjs` report (runs 5–6) |
 | anchor block id on PulseVM | `IGNITED` journal line |
 
 ---
@@ -270,7 +281,7 @@ sequenceDiagram
     URL-->>App: 503 · migration in progress
     App->>App: wait, build a FRESH transaction
     App->>URL: get_info, get_table_rows …
-    URL-->>App: ✓ reads keep working (state frozen at H)
+    URL-->>App: ✓ reads keep working (application state as of H)
     Note over URL: LIVE: backend is now PulseVM
     App->>URL: transfer (new tx, same key)
     URL-->>App: ✓ accepted by the new chain
@@ -280,7 +291,7 @@ sequenceDiagram
 
 | Do | Why |
 |---|---|
-| Treat **503 as "hold"**, then retry with a **freshly built** transaction | Never re-send old signed bytes. A transaction that executed before the cut is rejected on the new chain as a duplicate; a fresh one is clean. |
+| Treat **503 as "hold"**; after a 503 retry with a **freshly built** transaction | A 503 means the write was not accepted. If the outcome is ambiguous (timeout, no answer), first reconcile: look up the original transaction and your application state. Re-signing creates a new transaction id and can repeat an operation whose first attempt landed. |
 | Use `expireSeconds ≥ 120` | The chain clock is frozen at the cut until the first new block. |
 | Fail over across several endpoints | During the rehearsal every producer's edge answered reads throughout. |
 | Confirm inclusion (read your state back) | On PulseVM an accepted transaction is in the mempool, not yet executed. |
@@ -290,8 +301,8 @@ sequenceDiagram
 
 ## 7. Gates and rollback
 
-**Nothing public changes before LIVE.** Every gate before that has one failure path *for that producer*:
-abort, and it resumes the old chain as if nothing happened. Across a fleet that is not yet enough: if some
+**The write freeze is public; in producer mode the URL flip waits for LIVE, in API mode it happens at FLIPPED.**
+Every gate before LIVE has one failure path *for that producer*: abort, resume its old producer and reopen writes. Across a fleet that is not yet enough: if some
 producers abort while others have already ignited, the network splits. The fleet gate and signed fleet-wide abort
 narrow this; a full authority boundary is still open (see [ATOMICITY.md › Known limits](../ATOMICITY.md#known-limits-independent-review-2026-09-29)).
 
@@ -306,7 +317,7 @@ flowchart LR
     G2 -- no --> X
     G2 -- yes --> G3{"2 imports agree<br/>(+ goldens)?"}:::gate
     G3 -- no --> X
-    G3 -- yes --> G4{"new chain shows<br/>chain_id + block id at H?"}:::gate
+    G3 -- yes --> G4{"new chain shows<br/>chain_id, head ≥ H?"}:::gate
     G4 -- no --> X
     G4 -- yes --> G5{"head > H within<br/>quorum timeout?"}:::gate
     G5 -- no --> X
@@ -315,24 +326,25 @@ flowchart LR
 ```
 
 > [!IMPORTANT]
-> Rollback is simply **resuming the paused producer** and reopening writes. The old chain was
-> never modified; it just stopped for a minute. Rehearsal run 1 exercised this on all
-> five producers at once.
+> For one producer, rollback is **resuming its paused producer** and reopening writes; rehearsal
+> run 1 exercised this on all five at once (a symmetric abort). It is safe only while no producer
+> has authorized or started the target. Once the target may be producing, a local timeout must not
+> independently resume the old chain. That boundary is not enforced by the tooling yet.
 
 ---
 
 ## 8. After the cut: proving it
 
-The cutover is atomic when five properties hold. Each is checked by a gate or a tool, and
-the evidence is kept:
+The cutover is atomic when five properties hold. A1 and A2 are gates; A3 and A4 are tools
+(sampled evidence); A5 is not yet implemented:
 
 | | Property | Checked by |
 |---|---|---|
 | A1 | every producer cut the same block | journal: cut id, snapshot sha256, fingerprints |
 | A2 | nothing landed after the cut | burn-off audit gate |
 | A3 | old@H and new@H match on the surveyed state | `tools/state-diff.mjs` (not yet a whole-state commitment) |
-| A4 | exactly once across the boundary | `tools/replay-canary.mjs` + app ledgers |
-| A5 | all or nothing | abort path + LIVE-only flips |
+| A4 | exactly once across the boundary | `tools/replay-canary.mjs` + app ledgers (a sample, not a general proof) |
+| A5 | all or nothing | **open**: per-producer abort only; no fleet-wide authority boundary |
 
 Full definitions and the recorded proof: **[ATOMICITY.md](../ATOMICITY.md)**.
 Lessons from the real-world runs: **[README → Field notes](../README.md#field-notes-what-real-world-rehearsals-taught-us)**.

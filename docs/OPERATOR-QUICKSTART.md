@@ -82,8 +82,8 @@ curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/be
 - `/usr/local/bin/pulse-cutover`: the prebuilt binary from the
   [GitHub release](https://github.com/paulgnz/pulse-cutover/releases), checked against its sha256.
 - `/etc/pulse-cutover/beacon.toml`: a readiness config for reporting only. **Never run `pulse-cutover run` with it.**
-  Newer releases mark it `profile = "readiness"` so the ceremony refuses it; older releases can't, and the
-  installer warns you.
+  From v0.5.0-rc.5 it is marked `profile = "readiness"` and the ceremony commands (`run`, `loop`, `await`)
+  refuse it. Configs written by rc.4 and earlier lacked that guard; re-run the installer to upgrade.
 - `/etc/pulse-cutover/beacon.token`: a random token made on your server (root and the beacon's service user only).
 - `pulse-beacon.service`: a systemd service, running as the unprivileged `pulse-beacon` user when it can read
   what it needs (otherwise root limited to read-only file access), with a read-only filesystem.
@@ -96,6 +96,7 @@ validator service is running, and free disk. What it sends (the dashboard is pub
 pass/fail for each check with a short verdict (e.g. "83 GB free", "running"), head/LIB, your account, a node
 label you choose (default: its role; use `--node` to tell several servers of the same role apart), your Metal
 node's public identity (NodeID, BLS public key, version, peers), and the pulse-cutover version. Not sent: private
-keys, IP addresses, hostnames or config contents. If a ceremony step fails, its error message is included and may
-mention a command or path from your hooks.
+keys, hostnames, file paths or config contents. If a ceremony step fails, only a short error class is sent (paths,
+URLs and IP addresses stripped, and mission control redacts again); the full error stays in your local journal.
+Mission control does see the IP address your reports come from; it uses it only for the 9651 reachability check.
 </details>

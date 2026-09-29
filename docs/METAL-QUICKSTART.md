@@ -12,6 +12,8 @@ It works out mainnet or testnet from your nodeos and installs the metalgo versio
 the box changes** (sha256, the binary's reported version and plugin protocol). Then it swaps the binary in, starts
 the `metalgo` service and checks the running node's version, network and identity. If an upgrade fails at any
 point, the previous binary and config are put back and the previous node is started again.
+It **fails closed**: if the manifest can't be fetched, doesn't match your chain, or has no checksum for your
+platform, it stops instead of installing an unpinned binary.
 
 The result is a **prepared Metal node**. Being admitted as a validator (registered, funded) and being ready for a
 cutover are separate steps with their own checks.

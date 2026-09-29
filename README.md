@@ -1,6 +1,6 @@
 # pulse-cutover
 
-<p align="center"><img src="docs/media/cutover-hero.svg" alt="One block, one cut, same chain: 5 block producers on 5 continents cut the same block H; a verified snapshot of exactly H is imported 1:1 into PulseVM, which continues at H+1 with the same chain_id. Results: 5/5 same block, 0 transactions after the cut, byte-identical state, exactly once, ~72 s write pause." width="100%"></p>
+<p align="center"><img src="docs/media/cutover-hero.svg" alt="One block, one cut, same chain: 5 block producers on 5 continents cut the same block H; a verified snapshot of exactly H is imported 1:1 into PulseVM, which continues at H+1 with the same chain_id. Results: 5/5 same block, 0 transactions after the cut, identical state on the sampled accounts and tables, replay canary passed, 71–114 s write pause in unattended runs." width="100%"></p>
 
 [![How the cutover works — 106s explainer](https://pulsevm.dev/media/cutover-explainer.png)](https://pulsevm.dev/guide/migrate-antelope-chain)
 
@@ -9,22 +9,34 @@
 > **Status: proposed — community project.** This is a **proposed** migration approach, built and rehearsed by XPR Network block producer **protonnz** ([github.com/paulgnz](https://github.com/paulgnz)). It is **not an official Metallicus product and not an announced migration plan.** Core pieces are being contributed upstream to [MetalBlockchain/pulsevm](https://github.com/MetalBlockchain/pulsevm), and the **authoritative migration plan and documentation will come from Metallicus** — this repo is for demonstration, testing, and contribution in the meantime. Any production migration is subject to Metallicus and the relevant network's governance.
 
 pulse-cutover moves a running Antelope chain (XPR Network) onto the PulseVM
-engine without users noticing: **same public URL, same chain_id, same account
-state, zero read downtime**. One binary drives the whole ceremony unattended —
-freeze, snapshot, verify, ignite, flip — and records every step, with evidence,
-in a journal you can hand to anyone. Nothing a user can see changes until the
-new chain is verified and serving; aborting at any earlier point leaves your
-existing node exactly as it was.
+engine while keeping the **same public URL, the same chain_id and the same
+account state**. One binary drives the ceremony — freeze, snapshot, verify,
+ignite, flip — and records every step, with evidence, in a journal you can hand
+to anyone. Writes pause for the cut (71–114 s in the unattended rehearsals);
+reads keep being served. A producer that aborts before ignition resumes its
+existing node; a fleet-wide rollback guarantee is **not yet implemented** (see
+the status box below).
+
+> [!IMPORTANT]
+> **Status (2026-09-29)**
+> - **Proven in rehearsal** (5 BPs on a private Metal network, fork plugin): same cut block, snapshot hash and
+>   fingerprints on every BP; zero transactions after H; a symmetric abort where every BP resumed the old chain.
+> - **Demonstrated on a sample**: state equality on 19 accounts / 5 contracts / 32 table scopes; a replay canary
+>   (10 held + 10 pre-cut transfers).
+> - **Not done yet**: fleet-wide all-or-nothing (no authority boundary; a partial abort can split the network), exact H
+>   in API mode and on restart, per-validator producer keys, crash recovery, validator registration/funding, and any
+>   run on upstream PulseVM v1.0.0 (protocol 45) on Tahoe. Details: [ATOMICITY.md](ATOMICITY.md#known-limits-independent-review-2026-09-29).
 
 > **Block producer? Connect your node in 2 minutes → [docs/OPERATOR-QUICKSTART.md](docs/OPERATOR-QUICKSTART.md) · set up your Metal validator and get your NodeID → [docs/METAL-QUICKSTART.md](docs/METAL-QUICKSTART.md)**
 > ```bash
 > curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh | sudo bash
 > ```
-> Read-only, safe on a producing node; it detects your network and account and prints one line to send us.
+> The running beacon only observes; installing it writes a binary, a readiness-only config, a token and a systemd
+> service (it never touches nodeos). It detects your network and account and prints one line to send us.
 
 **New here? → [docs/PROCESS.md](docs/PROCESS.md)**: the whole cutover, step by step, with diagrams: who does what, the timeline around the cut, every gate, what apps see, and how rollback works.
 
-**How do we know the cut is atomic? → [ATOMICITY.md](ATOMICITY.md)**: five properties, each with a gate or a tool and the recorded proof.
+**How atomic is the cut today? → [ATOMICITY.md](ATOMICITY.md)**: five properties, the gate or tool for each, the recorded evidence, and what is still open.
 
 **Watch it live → [Cutover Mission Control](control/README.md)**: readiness of every producer on mainnet, testnet and the rehearsal network, the ceremony as it happens, and cross-producer agreement on the evidence (live at [control-rehearsal.protonnz.com](https://control-rehearsal.protonnz.com)).
 
@@ -60,10 +72,10 @@ flowchart LR
 
 | What stays the same for users | How it is proven |
 |---|---|
-| **chain_id** — signatures, wallets and keys keep working | target must present the source chain_id at the cut block id before anything flips |
-| **Every account, permission, contract and table row** | snapshot imported into two independent arenas; 19–21 table fingerprints must match |
-| **The URL** | the API edge swaps its backend only after the new chain is producing (LIVE gate) |
-| **Nothing is lost at the boundary** | burn-off audit: zero transactions allowed after the cut, or the ceremony aborts and the old chain resumes |
+| **chain_id** — signatures, wallets and keys keep working | target must report the source chain_id and a height ≥ H before anything flips (block-id-at-H lineage is not yet checked) |
+| **Accounts, permissions, contracts and table rows** | snapshot imported twice by the same importer; 19–21 table fingerprints must match. `state-diff` compares a discovered sample against the old chain; a whole-state commitment is still open |
+| **The URL** | producer mode: the edge swaps its backend at `on_live`. API mode: the flip happens before the FLIPPED/LIVE transitions |
+| **Nothing is lost at the boundary** | burn-off audit: zero transactions allowed after the cut, or this producer's ceremony aborts and resumes its old chain (not fleet-wide) |
 
 **Proven so far** (rehearsals, never mainnet):
 
@@ -71,9 +83,9 @@ flowchart LR
 |---|---|
 | Single node, API-provider mode, live XPR testnet | **22/22 LIVE**, 99.8% read availability, 0.75 s flip |
 | History (`/v2`) continuity via hyperion-rs + federating router | one URL serves pre- and post-cut history |
-| **5 block producers on 5 continents** (Sydney · Singapore · Los Angeles · New Jersey · Frankfurt) | **LIVE on all 5, four runs**: byte-identical snapshot at exactly H, identical fingerprints, 0 post-cut transactions, ~72 s client write gap, fully automatic ([details](#multi-producer-cutover-5-bps-5-continents)) |
-| **Atomicity: same cut, same state, exactly once** ([ATOMICITY.md](ATOMICITY.md)) | 5/5 BPs: identical state digest on both sides of the cut (surveyed state), 0 transactions after the cut, pre-cut transactions rejected as duplicates on the new chain, held ones executed exactly once |
-| **A live perps DEX + oracle + HFT bot across the cut** | the migrated perps contract kept trading on PulseVM unchanged; 0 duplicate orders; the oracle never went stale; 0 dropped transfers on the fixed build |
+| **5 block producers on 5 continents** (Sydney · Singapore · Los Angeles · New Jersey · Frankfurt) | **LIVE on all 5 in runs 2–6** (run 1 aborted on all 5, as designed): byte-identical snapshot at exactly H, identical fingerprints, 0 post-cut transactions. Journal write gaps ≈ 243, 72, 71, 553 and 101–114 s; runs 2 and 5 needed a manual step, runs 3, 4 and 6 were unattended ([details](#multi-producer-cutover-5-bps-5-continents)). Fork plugin on a private network, one shared producer key |
+| **Atomicity evidence** ([ATOMICITY.md](ATOMICITY.md)) | runs 5 and 6, 5/5 BPs: identical state digest on the sampled state, 0 transactions after the cut, pre-cut transactions rejected as duplicates on the new chain, 10 held transfers executed once. A5 (fleet-wide all-or-nothing) not proven |
+| **A live perps DEX + oracle + HFT bot across the cut** | the migrated perps contract kept trading on PulseVM unchanged; 0 duplicate orders; the oracle never went stale; the sampled transfers reconciled on the fixed build. Some orders admitted after LIVE never executed (admission is not inclusion) |
 
 ---
 
@@ -102,8 +114,8 @@ use is defined in the [Glossary](#glossary).
 ### Step 1 — get the tools
 
 **Just want your node on Cutover Mission Control?** One command installs the prebuilt,
-checksum-verified binary and a **read-only** readiness beacon (it never touches nodeos, its config or
-production). Try it with `--dry-run` first; it changes nothing:
+checksum-verified binary and a readiness beacon that only observes (it never touches nodeos, its config or
+production; installing it writes the binary, a readiness-only config, a token and a systemd service). Try it with `--dry-run` first; it changes nothing:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh -o beacon-install.sh
@@ -111,8 +123,9 @@ sudo bash beacon-install.sh --dry-run   # shows what it detected; changes nothin
 sudo bash beacon-install.sh             # detects network + producer from your node
 ```
 
-It ends by printing `token_sha256=…`: send that line (only a hash; the token never leaves your box) to
-the mission-control operator to be listed. See [control/README.md](control/README.md).
+It ends by printing `token_sha256=…`: send that line to the mission-control operator to be listed. Only the
+hash is enrolled and stored by mission control; the token itself is sent (over HTTPS) with every report, which is how
+mission control authenticates it. See [control/README.md](control/README.md).
 
 **For a rehearsal or a ceremony,** install the binary itself. Every release ships **static musl binaries**
 (x86_64 + aarch64) that run on any supported Ubuntu regardless of glibc. **Don't build from source on a
@@ -215,8 +228,10 @@ from:
 sudo ./install.sh --mode api --manifest ceremony.json
 ```
 
-It re-runs `doctor` first and refuses (politely, with reasons and nothing
-half-installed) if the box isn't ready. On success it ends with the
+It re-runs `doctor` first and refuses, with reasons, if the box isn't ready.
+Discovery supports specific layouts (see Step 2 and the support matrix), and some
+files are written before every check has run, so a refusal can leave a partial
+install behind: fix the reason and re-run. On success it ends with the
 ARMED-READY banner — this one is from our rehearsal box:
 
 ```
@@ -244,8 +259,8 @@ ARMED-READY banner — this one is from our rehearsal box:
 ```
 
 Note the last block: it tells you, before anything happens, exactly what the
-ceremony will do. Re-running `install.sh` is always safe — it re-verifies and
-converges instead of duplicating.
+ceremony will do. Re-running `install.sh` before a ceremony starts re-verifies and
+converges instead of duplicating; don't re-run it during a ceremony.
 
 **If it didn't:** every refusal prints the precise reason and the fix (missing
 plugin, stale snapshot file, no `/v1` route in nginx pointing at your nodeos,
@@ -281,6 +296,10 @@ ceremony starting — journal: /root/api-cutover/journal.jsonl
 LIVE. Evidence journal: /root/api-cutover/journal.jsonl
 ```
 
+That output is from a single API-provider box. Its line "abort is always safe before FLIPPED" holds for that
+box: nothing public changed yet. It is not a fleet guarantee: once other producers may have ignited, a local
+abort that resumes the old chain can split the network (ATOMICITY Known limits #1).
+
 How long each part takes (recorded, testnet-sized state; a bigger chain
 mostly stretches the snapshot and verify phases):
 
@@ -288,19 +307,23 @@ mostly stretches the snapshot and verify phases):
   the countdown lines show progress.
 - **FROZEN → VERIFIED** — snapshot + verification, ~1–3 minutes.
 - **IGNITED** — new engine boots from the snapshot, ~15 seconds.
-- **FLIPPED → LIVE** — the URL swap itself took **0.75 seconds** across 22
-  recorded runs; reads never stopped being answered.
+- **FLIPPED → LIVE** — in API mode the public URL swap happens as part of the
+  FLIPPED step (it took **0.75 seconds** across 22 recorded runs; reads never
+  stopped being answered); LIVE follows after health checks and the source stop.
 
 **What LIVE means:** exit code 0, your public URL now serves the same chain
 from the new engine, and the journal holds the evidence (hashes, block ids,
 timings) for every step.
 
 **What ABORT looks like:** the run stops, prints `[ABORTED]` with the reason,
-and exits non-zero. This is safe by design — the ceremony changes nothing
-user-visible until FLIPPED, and an abort at FLIPPED swaps the URL straight
-back. Your original node was still running the whole time; in bp mode the
-agent resumes it automatically (`./cutover.sh abort` does the same for a
-stuck/^C'd run). An aborted rehearsal is a *useful* rehearsal: go to Step 5.
+and exits non-zero. Some errors exit non-zero *without* writing `ABORTED` or
+finishing rollback, so after any non-zero exit check the journal and the
+actual state of nodeos and the edge. On a single box the ceremony changes
+nothing public before FLIPPED, and an abort at FLIPPED swaps the URL back; in
+bp mode the agent resumes your producer automatically (`./cutover.sh abort`
+does the same for a stuck/^C'd run). In a multi-producer event a local abort
+is not yet coordinated with the rest of the fleet. An aborted rehearsal is a
+*useful* rehearsal: go to Step 5.
 
 ### Step 5 — share the evidence: `pulse-cutover report`
 
@@ -357,7 +380,7 @@ One agent, one manifest format, three operator roles — pick with
 | Who runs it | block producer | RPC/API provider | API provider w/ Hyperion |
 | What freezes | the chain (writes at API edge) | observed only (LIB ≥ H) | observed only |
 | Snapshot | at **exactly H** | at ~finality (R17) | at ~finality |
-| What flips | nothing public | `/v1` upstream | `/v1` **and** `/v2` together |
+| What flips | via your hooks: `on_freeze` closes writes, `on_live` flips the edge | `/v1` upstream | `/v1` **and** `/v2` together |
 | What continues | production, numbering, chain_id | reads — zero gap | reads **and history** |
 
 - **bp** — you help freeze the chain and become a producer/validator of the
@@ -405,9 +428,12 @@ Plain-English versions of every term this repo uses:
   imported twice, fingerprints match. `IGNITED`: the new engine is up,
   serving the same chain. `FLIPPED` (api modes): the public URL now points
   at the new engine. `LIVE`: done — new chain producing/serving, old node
-  retired. `ABORTED`: stopped safely; the old chain is still the real one.
-- **Flip** — the single user-visible action: the public URL's edge (nginx or
-  haproxy) is swapped so it answers from the new engine. Health-checked,
+  retired. `ABORTED`: this agent stopped and (in bp mode) resumed its old
+  producer; whether the old chain is still the real one depends on the rest
+  of the fleet (no fleet-wide authority boundary yet).
+- **Flip** — the public URL's edge (nginx or haproxy) is swapped so it answers
+  from the new engine. (The write freeze before it is also visible to users:
+  writes get HTTP 503.) Health-checked,
   instantly revertible. On nginx it's one upstream line + graceful reload;
   on haproxy it's an enable/disable server pair on the admin socket (or the
   same `disabled`-marker swap + reload without one).
@@ -517,11 +543,11 @@ gantt
 | Run | Outcome | What we learned |
 |---|---|---|
 | 1 | **ABORTED on all 5** (correctly) | Byte-identical snapshot at H on all 5, but writes froze *at* H: 3 in-flight transfers landed in H+1. The burn-off audit caught it everywhere; every BP resumed the old chain automatically. → added `freeze_lead_blocks` |
-| 2 | **LIVE on all 5** | Freeze at H−24: 0 transactions after the cut. Identical fingerprints and head block id on all 5 validators; balances continuous across the boundary. Needed a manual transaction to pass the LIVE gate. → `post_ignite` heartbeat |
-| 3 | **LIVE on all 5, unattended** | Public API edges + HFT bot: 143 clean 503s during the freeze, **73.5 s client write gap**, edges flipped on their own. Surfaced a mempool bug in our PulseVM build (below) |
+| 2 | **LIVE on all 5** | Freeze at H−24: 0 transactions after the cut. Identical fingerprints and head block id on all 5 validators; balances continuous across the boundary. Needed a manual transaction to pass the LIVE gate (write gap ≈ 243 s). → `post_ignite` heartbeat |
+| 3 | **LIVE on all 5, unattended** | Public API edges + HFT bot: 143 clean 503s during the freeze, **73.5 s client write gap** (journal: 71.8–72.4 s), edges flipped on their own. Surfaced a mempool bug in our PulseVM build (below) |
 | 4 | **LIVE on all 5, with a perps DEX live** | Fixed plugin: **79/79 admitted transfers landed** (run 3: 108/193). A perps contract deployed on the old chain kept taking orders on PulseVM with no changes, with 0 duplicates and the oracle within its 120 s window across the cut. New: a **~50 s finality stall right after LIVE** (field note 10) |
-| 5 | **LIVE on all 5, atomicity checks passed**: mixed nginx + HAProxy TLS edges | State diff at H identical on every BP (surveyed state), replay canary exactly-once, 0 duplicate orders. See [ATOMICITY.md](ATOMICITY.md). HAProxy edges froze and flipped via the runtime socket with **zero reloads** |
-| 6 | **LIVE on all 5, unattended, one public URL** | Every client used `api-rehearsal.protonnz.com` (DNS across all 5 BPs, real TLS). Watched on [Cutover Mission Control](control/README.md): all 7 evidence rows agreed 5/5, the state diff at H ran automatically (identical on every BP), replay canary exactly-once. The post-LIVE stall (note 10) reproduced: 92 expired + 12 timeouts after the flip |
+| 5 | **LIVE on all 5, A1–A4 checks passed**, with a manual step: mixed nginx + HAProxy TLS edges | The `post_ignite` hook shipped without +x and the ceremony did not stop on it; the heartbeat was sent by hand (write gap ≈ 553 s). State diff at H identical on every BP (sampled state), replay canary passed, 0 duplicate orders. See [ATOMICITY.md](ATOMICITY.md). HAProxy edges froze and flipped via the runtime socket with **zero reloads** |
+| 6 | **LIVE on all 5, unattended, one public URL** | Every client used `api-rehearsal.protonnz.com` (DNS across all 5 BPs, real TLS). Write gap 101–114 s; local LIVE times spread over ~13 s. Watched on [Cutover Mission Control](control/README.md): all 7 evidence rows agreed 5/5, the state diff at H ran automatically (identical on the sampled state, every BP), replay canary passed. The post-LIVE stall (note 10) reproduced: 92 expired + 12 timeouts after the flip |
 
 Evidence (journals, fingerprints, snapshot hashes per BP) is kept with the
 rehearsal notes; the configs are reproducible from `examples/ceremony-bp.toml`.
@@ -553,7 +579,7 @@ upstream, or an open item with a workaround.
 What a bot, wallet or exchange integration should do. All of this was
 exercised by the rehearsal bots.
 
-- [x] **Treat HTTP 503 during a migration as "hold", not "failed"**: retry with a *freshly built* transaction, never re-send the same signed bytes.
+- [x] **Treat HTTP 503 during a migration as "hold", not "failed"**. A 503 at the edge means the write was not accepted, so retry with a *freshly built* transaction. If the outcome is ambiguous (timeout, no response), first reconcile: look the original transaction up and check your application state. Re-signing creates a new transaction id and can repeat a business operation whose first attempt did land.
 - [x] **Fail over across several BP endpoints.** During run 3 every edge answered reads throughout; writes resumed on all of them at the same moment.
 - [x] **Use `expireSeconds` ≥ 120**, and don't derive expiration from an old block (finding 4).
 - [x] **Confirm inclusion, not just acceptance.** On PulseVM a gateway "admitted" response means accepted into the mempool; read your state back (or check the block) before treating it as final.
@@ -593,8 +619,10 @@ stateDiagram-v2
     ABORTED --> [*]: source producer resumed
 ```
 
-`ABORTED` is reachable from every state before `LIVE`; the source chain stays
-authoritative until then, and rollback is simply resuming it.
+`ABORTED` is reachable from every state before `LIVE`, and for this agent
+rollback is resuming its source producer. That is only safe while no other
+producer has started the target: there is no fleet-wide "target authorized"
+state yet, so the point of no return is not enforced (ATOMICITY Known limits #1).
 
 Per-mode ceremony:
 
@@ -606,21 +634,26 @@ hyperion  ARMED → FROZEN → SNAPSHOTTED → VERIFIED → IGNITED* → FLIPPED
 ```
 
 - **ARMED** — preflight, watch the source chain head until freeze height `H`.
-- **FROZEN** — producers paused; the cut pinned by height *and block id* after a
-  quiescence window (late blocks are detected and absorbed).
+- **FROZEN** — writes are closed at the edge before H (`freeze_lead_blocks`). With
+  `schedule_at_h` the source keeps producing empty blocks through H to finality and is
+  paused only after the snapshot; the cut is pinned by height *and block id*.
 - **SNAPSHOTTED** — nodeos `create_snapshot`, hard-asserted to be *of the pinned cut*.
 - **VERIFIED** — streaming sha256 + the 19-table state fingerprints computed by
-  importing the snapshot into **two independent fresh arenas** through the exact
+  importing the snapshot into **two fresh arenas** (two runs of the same importer) through the exact
   code path a PulseVM node boots with (`pulsevm_snapshot_import`); compared
   against pre-published goldens (multi-BP) or captured with provenance (rehearsal).
 - **IGNITED** — verified snapshot staged into the pre-staged PulseVM chain config,
-  metalgo (re)started; target must present the **source chain_id at the cut height**.
-- **LIVE** — target head advances past the cut (quorum is really producing);
-  only now do traffic hooks flip anything user-visible.
+  metalgo (re)started; target must report the **source chain_id and a height ≥ H**
+  (matching the block id at H is not yet checked).
+- **LIVE** — local target head advances past the cut. In bp mode the `on_live` hook
+  flips the edge now; in api mode the flip already happened at FLIPPED. LIVE is a
+  local head-progress check, not sustained all-validator health or inclusion.
 
 Every transition is an fsynced JSONL journal line with timestamps and evidence
-(hashes, block ids, fingerprints, durations). A crashed agent resumes from the
-journal and re-runs its (idempotent) current step.
+(hashes, block ids, fingerprints, durations). A restarted agent resumes from the
+journal and re-runs its current step. Crash recovery is not yet certified: there is
+no exclusive journal lock, some side-effect flags are reconstructed as false, a torn
+last line stops replay, and hooks have no deadline (ATOMICITY Known limits #6).
 
 ### Commands
 
@@ -659,8 +692,11 @@ still running either way.
   read-only on non-producers; keep it localhost-bound — R10).
 - `simulate_freeze = true` rehearses against a live chain that will *not*
   stop: when LIB ≥ H the agent proceeds as if frozen; the journal records the
-  actual cut block. In a real event H is exact because the BPs freeze — the
-  agent trusts the declared H either way.
+  actual cut block. api mode today snapshots once LIB ≥ H and accepts its own
+  height, so its cut can be later than H: a producer write-freeze does not stop
+  empty source blocks at H. Exact-H for API providers is open (ATOMICITY Known
+  limits #2); until then an API provider must obtain and verify the exact-H
+  artifact rather than rely on its own snapshot.
 
 ### hyperion mode (`mode = "api"` + `[hyperion]`)
 
@@ -739,6 +775,13 @@ reason — e.g. caddy on the public edge, kube-managed nodeos) plus a pointer
 at `pulse-cutover report` so unsupported setups become supported ones.
 
 #### Supported setups matrix
+
+"Detected & handled" means doctor recognises the setup and install.sh generates
+the stop/flip scripts for it. It is not the same as qualified: the rehearsed
+combinations are nginx and HAProxy edges (native and docker) on Ubuntu 20.04–24.04
+with systemd- or script-managed nodeos. Apache, CDN/load-balancer rules in front of
+the box, direct-origin access, IPv6 paths and WebSocket/streaming endpoints have
+not been qualified and need an adapter plus a rehearsal.
 
 | dimension | detected & handled | detected, NOT yet handled (UNSUPPORTED + explain) |
 |---|---|---|
@@ -874,16 +917,22 @@ The flip and revert are identical in both modes: the public route swaps its back
   staged.
 
 Beyond that it installs the agent, PulseVM plugin, metalgo, and (api mode)
-the /v1 REST gateway — all **pinned + sha256-verified, fail-closed**;
+the /v1 REST gateway from the manifest's artifacts, each **sha256-verified,
+failing closed on a mismatch** (other install paths, such as `tools/metal-install.sh`
+and Docker images, have their own, weaker pinning; see docs/METAL-QUICKSTART.md);
 extracts any tarball safely (`--no-same-owner`, staging dir); stages the
 metalgo/chain configs with the manifest's values; enforces R12 (no stale
 staged snapshot); and ends with an ARMED-READY print of exactly what will
-happen at H. Idempotent — re-run it freely. It never touches your running
-nodeos and never flips traffic.
+happen at H. Re-running it before a ceremony converges rather than duplicating.
+It never touches your running nodeos and never flips traffic. It does not yet
+generate the full coordination, scheduling and mandatory-hook configuration a
+multi-producer event needs.
 
 `cutover.sh` validates the manifest against the live chain, runs the agent,
-and streams each state transition in plain language. Exit 0 = LIVE; anything
-else = ABORTED with the journal path (the source chain is still authoritative).
+and streams each state transition in plain language. Exit 0 = LIVE. A non-zero
+exit usually means ABORTED (the journal path is printed), but some errors exit
+without writing ABORTED or finishing rollback: check the journal and the actual
+state of nodeos, metalgo and the edge before assuming the source is authoritative.
 `cutover.sh status` and `cutover.sh abort` do what they say.
 
 ### The ceremony.json manifest
@@ -1000,7 +1049,7 @@ config format.
 
 ## Upstream alignment
 
-> **Cross-validated:** the two verification stacks agree in practice — upstream's #61 pipeline and this project's importer were run against the same XPR testnet snapshot and produced byte-identical state (including row order) on every table both carry, measured with upstream's own `xpr_state_fingerprint` / `xpr_19_table_compare` ([results](https://github.com/MetalBlockchain/pulsevm/pull/61#issuecomment-5485633926)). The upstream tools are the spec; that one-time cross-check is what lets the interim fork path be trusted until #61 ships.
+> **Cross-validated:** the two verification stacks agree in practice — upstream's #61 pipeline and this project's importer were run against the same XPR testnet snapshot and produced byte-identical state (including row order) on every table both carry, measured with upstream's own `xpr_state_fingerprint` / `xpr_19_table_compare` ([results](https://github.com/MetalBlockchain/pulsevm/pull/61#issuecomment-5485633926)). The upstream tools are the spec. That was a one-time cross-check on one snapshot; it supports using the interim fork path in rehearsals, not a standing guarantee for other snapshots or releases.
 
 Metallicus is building the node-side migration path in
 [MetalBlockchain/pulsevm#61](https://github.com/MetalBlockchain/pulsevm/pull/61)
@@ -1011,7 +1060,7 @@ migration, so the two stacks map onto each other rather than competing:
 | Upstream (#61 branch) | pulse-cutover | Relationship |
 |---|---|---|
 | `tools/xpr-chainbase-export/export.sh` (nodeos→SHiP full-state export) | freeze + snapshot stages (nodeos `create_snapshot` → portable `.bin`) — and `import_backend = "upstream"` drives export.sh itself from that `.bin` | The ceremony feeds the official pipeline |
-| `xpr_state_fingerprint` / `xpr_19_table_compare` (whole-state root + per-table SHA-256) | `verify` — dual fresh-arena import + 19-table `DefaultHasher` goldens (fork backend only) | Same goal; equivalence was established once by the published cross-check below — in upstream mode the ceremony verifies with the official tools |
+| `xpr_state_fingerprint` / `xpr_19_table_compare` (whole-state root + per-table SHA-256) | `verify` — dual fresh-arena import + 19-table `DefaultHasher` (64-bit) goldens (fork backend only) | Same goal; equivalence was checked once by the published cross-check below — in upstream mode the ceremony verifies with the official tools |
 | `host-function-audit.sh` (Leap registry ↔ PulseVM import map, source-based) | `scan-contracts` (wasm imports of every *deployed* code object vs the served set) | Complementary: theirs finds surface gaps, ours finds real-world exposure |
 | five-node runner / EC2 scripts | ignite + flip + hyperion federation (endpoint keeps its memory) | Upstream boots the network; the ceremony keeps operators' public surfaces alive across the cut |
 
@@ -1027,17 +1076,17 @@ selected by `[ceremony] import_backend = "fork" | "upstream"`:
   a manifest binding checkpoint bytes to the source block id) — and
   **verification is upstream's own tooling**: `xpr_19_table_compare` (a
   wire-level nodeos-vs-Arena comparison of all 19 tables; any mismatch fails
-  the ceremony) plus `xpr_state_fingerprint` (whole-state root — journaled,
-  and golden-comparable across operators via `[upstream] golden_state_root`).
+  the ceremony, **but only when `compare_bin` is configured**: it is optional
+  today and skipped otherwise) plus `xpr_state_fingerprint` (whole-state root —
+  journaled, and golden-comparable across operators via `[upstream] golden_state_root`).
   Every artifact is bound back to the ceremony's pinned cut: the export
   manifest's `INPUT_SNAPSHOT_SHA256` must equal the cut snapshot's hash, and
   the checkpoint manifest's `source_block_id`/`checkpoint_revision` must
-  equal the pinned cut block id/height. **IGNITED from the checkpoint is
-  pending the #61 merge** (the checkpoint-consuming node — migration genesis
-  committing the checkpoint sha256 + `migration_checkpoint` node-config
-  knobs — exists only on the PR branch); until then an upstream-mode
-  ceremony stops after VERIFIED with the precise remaining list in the
-  journal. Config: `[upstream]` (work_dir, export_cmd, import_bin,
+  equal the pinned cut block id/height. **Upstream verification is not
+  upstream ignition:** #61 is merged and PulseVM v1.0.0 is tagged, but this
+  agent's ignition from the upstream checkpoint is not wired yet, so an
+  upstream-mode ceremony deliberately stops after VERIFIED with the remaining
+  list in the journal. Config: `[upstream]` (work_dir, export_cmd, import_bin,
   compare_bin, fingerprint_bin) — see `src/config.rs` for the documented
   fields and `examples/ceremony-upstream.toml` for a working shape.
 
@@ -1045,9 +1094,9 @@ selected by `[ceremony] import_backend = "fork" | "upstream"`:
   `feat/arena-snapshot-import` branch reads the Leap `.bin` directly and the
   target chain boots via `snapshot_path`; verification is the dual
   fresh-arena import + 19-table fingerprints. It is the default **only
-  because #61 is unmerged** (it is the path that can actually IGNITE today);
-  when #61 lands, the default flips to `upstream` and the fork path is
-  slated for retirement. Its correctness was established by a **one-time
+  because it is the path that can actually IGNITE today**; once upstream
+  ignition is wired and qualified, the default flips to `upstream` and the
+  fork path is slated for retirement. Its correctness was established by a **one-time
   published cross-check** against the #61 pipeline — byte-identical state,
   row order included, on every table both implementations carry, measured
   with upstream's own tools
@@ -1096,8 +1145,10 @@ what testers get out of it.
 
 ## Status & caveats
 
-- v0.4.0 — rehearsal-grade. The recorded ceremonies are real, on live-testnet
-  state, but no *mainnet* event has run yet.
+- Operator tooling v0.5.0-rc.4 (beacon, installers, mission control) — rehearsal-grade.
+  The recorded ceremonies are real but ran the fork plugin (`v0.0.0-arena-mempoolfix.1`
+  lineage, metalgo 1.13.5, plugin protocol 43), not upstream PulseVM v1.0.0 (protocol
+  45, needs metalgo 1.14.x); no *mainnet* event has run. See the status box at the top.
 - Ubuntu 20.04/22.04/24.04 + systemd only; nginx and haproxy traffic flips
   (apache/caddy detected and refused with reasons). `report` bundles are how
   new setups get added.

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" width="1200" height="560" role="img" aria-labelledby="t d">
   <title id="t">pulse-cutover: moving a live Antelope chain onto PulseVM in one atomic step</title>
-  <desc id="d">Blocks on the old Leap chain lead to block H, the cut. A verified snapshot of exactly block H is imported into PulseVM, which continues at H+1 with the same chain_id. Five block producers on five continents cut the same block. Results: same block on 5 of 5 producers, zero transactions after the cut, byte-identical state, exactly-once across the boundary, about 72 seconds of paused writes.</desc>
+  <desc id="d">Blocks on the old Leap chain lead to block H, the cut. A verified snapshot of exactly block H is imported into PulseVM, which continues at H+1 with the same chain_id. Five block producers on five continents cut the same block. Results: same block on 5 of 5 producers, zero transactions after the cut, identical state on the sampled accounts and tables, a passing replay canary, and 71 to 114 seconds of paused writes in the unattended runs. Rehearsal on a fork plugin, not upstream PulseVM.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0b1020"/><stop offset="1" stop-color="#140c24"/>
@@ -110,13 +110,13 @@
     <text x="378" y="494" font-size="22" font-weight="800" fill="#34d399" text-anchor="middle">0</text>
     <text x="378" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">transactions after the cut</text>
     <path d="M488 478V518" stroke="#1f2937"/>
-    <text x="598" y="494" font-size="22" font-weight="800" fill="#34d399" text-anchor="middle">identical state</text>
-    <text x="598" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">digest before and after the cut</text>
+    <text x="598" y="494" font-size="22" font-weight="800" fill="#34d399" text-anchor="middle">identical sample</text>
+    <text x="598" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">19 accounts · 32 table scopes</text>
     <path d="M708 478V518" stroke="#1f2937"/>
-    <text x="818" y="494" font-size="22" font-weight="800" fill="#34d399" text-anchor="middle">exactly once</text>
-    <text x="818" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">no replays, no losses</text>
+    <text x="818" y="494" font-size="22" font-weight="800" fill="#34d399" text-anchor="middle">canary passed</text>
+    <text x="818" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">0 replays · 10/10 held once</text>
     <path d="M928 478V518" stroke="#1f2937"/>
-    <text x="1040" y="494" font-size="22" font-weight="800" fill="#fbbf24" text-anchor="middle">~72 s</text>
-    <text x="1040" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">write pause · reads never stop</text>
+    <text x="1040" y="494" font-size="22" font-weight="800" fill="#fbbf24" text-anchor="middle">71–114 s</text>
+    <text x="1040" y="516" font-size="12" fill="#9ca3af" text-anchor="middle">write pause (unattended runs)</text>
   </g>
 </svg>
