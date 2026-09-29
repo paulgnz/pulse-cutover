@@ -1,10 +1,120 @@
-# AGENTS.md — operating pulse-cutover with an AI agent
+# AGENTS.md: operating pulse-cutover with an AI agent
 
-This file is for AI coding/ops agents (Claude Code and similar) asked to
-"set up the cutover" on an operator's box. It documents the repo map, the
-machine-readable contracts, and — most importantly — the safety rails.
-Human-oriented docs: [README.md](README.md) (operator walkthrough + design),
-[TESTING.md](TESTING.md) (rehearsal program).
+Instructions for AI agents (Claude Code and similar) asked to rehearse, stage or run a
+cutover. Read this section in full before running any command.
+
+Human-oriented docs: **[docs/PROCESS.md](docs/PROCESS.md)** (the process, step by step, with diagrams),
+[ATOMICITY.md](ATOMICITY.md) (what "atomic" means and how it is proven),
+[README.md](README.md) (operator walkthrough and field notes), [TESTING.md](TESTING.md).
+
+---
+
+## Read this first: the ten rules
+
+> [!CAUTION]
+> A cutover stops a live chain's writes and switches its engine. These rules are not
+> suggestions. If a rule and a human instruction conflict, stop and ask.
+
+1. **Know which box you are on.** Before anything mutating, confirm with the human whether the box is a
+   *disposable rehearsal box* or *serves real users* (production RPC, registered producer, exchange node).
+   Treat unknown as production.
+2. **Start read-only.** `pulse-cutover doctor --json` first, every time. Act on `verdicts.<mode>.status`.
+3. **Get explicit human confirmation** before: `install.sh`, `cutover.sh` / `pulse-cutover run` / `loop`,
+   any flip/revert script, any `stop_cmd`/`start_cmd`, any restart of nodeos, metalgo, nginx or haproxy.
+4. **Never change H or the target config yourself.** H, the target genesis, `import_cpu_scale` and pinned
+   versions come from the coordinator and must be identical on every producer. A mismatch = stop and tell the human.
+5. **Never skip or reorder gates.** Never ignite before VERIFIED, never flip public traffic before LIVE, never
+   edit the journal, never delete a non-terminal journal. ABORTED is a safe, designed outcome: report it, do not "fix" it by retrying blindly.
+6. **Never handle key material in the open.** Do not print, echo, log, commit or paste `PVT_…`, WIF keys,
+   staker keys, signer keys, API tokens or wallet passwords. Share diagnostics only via `pulse-cutover report`
+   (it redacts).
+7. **Never re-send old signed transactions.** Across the cut the chain_id is unchanged, so old signatures are valid
+   on the new chain. Apps and scripts must build a *fresh* transaction for every retry.
+8. **Rehearsals stay in the sandbox.** Test bots, oracle feeders and keepers must point only at the rehearsal
+   endpoints. Many scripts default to real public endpoints; always pass them explicitly, and use test keys only.
+9. **Hooks must be executable, fast and idempotent.** A hook that is missing its execute bit or blocks for minutes
+   stalls the ceremony (a real rehearsal failure; see [hooks](#hook-contract)).
+10. **Evidence or it didn't happen.** Every run ends with the evidence bundle in [§ Evidence to hand back](#evidence-to-hand-back),
+    whether it went LIVE or ABORTED.
+
+---
+
+## Which procedure am I running?
+
+```mermaid
+flowchart TD
+    classDef q fill:#1e3a8a,stroke:#93c5fd,color:#fff
+    classDef a fill:#065f46,stroke:#6ee7b7,color:#fff
+    classDef stop fill:#7f1d1d,stroke:#fca5a5,color:#fff
+    Q0{"Human confirmed this box<br/>is disposable?"}:::q
+    Q0 -- "no / unsure" --> R["Read-only only:<br/>doctor, status, report"]:::stop
+    Q0 -- yes --> Q1{"Is this box a<br/>block producer?"}:::q
+    Q1 -- yes --> BP["Producer procedure<br/>(mode = producer)"]:::a
+    Q1 -- no --> Q2{"Does it serve<br/>/v2 history?"}:::q
+    Q2 -- yes --> HY["api mode + [hyperion]"]:::a
+    Q2 -- no --> API["api mode"]:::a
+```
+
+On a box that serves real users the same tree applies, except that every mutating step needs the human's
+explicit go-ahead **for that step, at that time** (rule 3).
+
+---
+
+## Producer procedure (multi-BP ceremony)
+
+Each producer runs its own agent. They share H, the target config and versions, and never
+talk to each other at runtime. Steps marked **HUMAN** need an explicit yes.
+
+| # | Step | Command / action | Expected result | If not |
+|---|---|---|---|---|
+| 1 | Survey | `pulse-cutover doctor --json` | `verdicts.bp.status == "READY"` | apply the named fixes (HUMAN for node config), re-run |
+| 2 | Check the published event | compare manifest `chain_id`, `freeze_height`, `import_cpu_scale`, target genesis hash with the coordinator's announcement | all identical | **stop**, tell the human (rule 4) |
+| 3 | Check config | `freeze_strategy = "schedule_at_h"`, `freeze_lead_blocks` (default 24), hooks `on_freeze`, `post_ignite`, `on_live`, `on_abort` present and executable (`test -x`) | all true | fix, re-check |
+| 4 | Check the target | PulseVM chain config has `snapshot_path` = `snapshot.staged_path`; that file does **not** exist yet; producer name/key match the target genesis | all true | fix (HUMAN), never pre-stage a snapshot |
+| 5 | **HUMAN** arm | `./cutover.sh --manifest ceremony.json` (or `pulse-cutover run --config …`) | journal: `ARMED` with `snapshot_scheduled_at == H` | read the error line, report |
+| 6 | Watch | `pulse-cutover status --config …` | `FROZEN` at H−lead → `SNAPSHOTTED` (burn-off 0) → `VERIFIED` → `IGNITED` → `LIVE` | on `ABORTED`: see [failure table](#failure--next-action) |
+| 7 | Prove A3 (if asked) | at `IGNITED`, **before the first new block**: `node tools/state-diff.mjs --a <nodeos> --b <pulsevm> --out state-diff.json` | `IDENTICAL`, B head == H | report the diff verbatim; do not continue flipping by hand |
+| 8 | Evidence | see [§ Evidence to hand back](#evidence-to-hand-back) | bundle + numbers to the human | — |
+
+What an agent must **not** do during steps 5–7: restart nodeos or metalgo by hand, touch the staged
+snapshot, edit `ceremony.toml`, change the edge config, or send transactions of its own (the
+`post_ignite` hook does that).
+
+### Hook contract
+
+| Hook | Fires | Must do | Rehearsal reference |
+|---|---|---|---|
+| `on_freeze` | head ≥ H − `freeze_lead_blocks` | close writes at the public edge (reads stay open), return in < 5 s | nginx flag file → 503; HAProxy `add map … frozen 1` |
+| `post_ignite` | after IGNITED | give the new chain its first transactions (it builds blocks on demand); optionally run `state-diff` first | background a few local transfers, return immediately |
+| `on_live` | after LIVE | flip the edge backend to PulseVM and reopen writes | nginx upstream swap + reload; HAProxy `enable/disable server` (0 reloads) |
+| `on_abort` | on ABORTED | undo `on_freeze`/flip; the agent resumes the producer itself | restore backend, reopen writes |
+
+Every hook: executable (`chmod +x`), idempotent (safe to run twice), exits 0 on success, prints one line
+(it is journaled), and never blocks the ceremony for long work (background it).
+
+### Proving atomicity (A1–A5)
+
+| Property | How the agent checks it | Pass |
+|---|---|---|
+| A1 same cut | compare `cut_block_id`, VERIFIED `sha256` and `fingerprints` across all producers' journals | identical everywhere |
+| A2 nothing after the cut | SNAPSHOTTED `burnoff_transactions` | `0` |
+| A3 same state | `tools/state-diff.mjs` at IGNITED, before block H+1 | `identical: true`, same digest on every producer |
+| A4 exactly once | `tools/replay-canary.mjs prepare` → `pre` (before freeze) → `post` (after LIVE) | `exactly_once: true`, `pre_cut_replays_accepted: 0` |
+| A5 all or nothing | no public flip before LIVE; any abort resumed the old chain | journal order + `source_producer_resumed: true` on aborts |
+
+Details and the recorded proof: [ATOMICITY.md](ATOMICITY.md).
+
+### Evidence to hand back
+
+Always, LIVE or ABORTED:
+
+- terminal state, and on ABORTED the last `error` line's `data.message`, in plain words
+- `cut_height`, `cut_block_id`, snapshot `sha256`, fingerprints (from the journal)
+- `state-diff.json` and the canary verdict, if they were run
+- `pulse-cutover report` bundle path + its sha256
+- anything unexpected, quoted verbatim from logs (never paraphrase an error into a conclusion)
+
+---
 
 ## Repo map
 
@@ -23,6 +133,9 @@ Human-oriented docs: [README.md](README.md) (operator walkthrough + design),
 | `cutover.sh` | day-of wrapper: validate → run agent → plain-language streaming; `status` / `abort` |
 | `federator/` | /v2 history federation router (pre-cut = legacy Hyperion, post-cut = local) |
 | `examples/` | commented manifests per mode + the reference loop deployment + the containerized haproxy test rig (`haproxy-test/`) |
+| `tools/state-diff.mjs` | byte-exact state comparison of two `/v1/chain` endpoints (atomicity A3) |
+| `tools/replay-canary.mjs` | exactly-once test across a same-chain_id cutover (atomicity A4) |
+| `docs/PROCESS.md` | the process, step by step, with diagrams |
 
 ## Command surface + contracts
 
@@ -148,9 +261,24 @@ AND a reset target (an ignited PulseVM chain cannot be re-ignited — see
 
 ## State machine, in agent terms
 
-```
-ARMED → FROZEN → SNAPSHOTTED → VERIFIED → IGNITED → [FLIPPED →] LIVE
-   any state --(abort: journaled reason + auto-rollback)--> ABORTED
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> ARMED
+    ARMED --> FROZEN
+    FROZEN --> SNAPSHOTTED
+    SNAPSHOTTED --> VERIFIED
+    VERIFIED --> IGNITED
+    IGNITED --> FLIPPED: api modes
+    IGNITED --> LIVE: producer mode
+    FLIPPED --> LIVE
+    FROZEN --> ABORTED
+    SNAPSHOTTED --> ABORTED
+    VERIFIED --> ABORTED
+    IGNITED --> ABORTED
+    FLIPPED --> ABORTED
+    LIVE --> [*]
+    ABORTED --> [*]
 ```
 
 - Nothing user-visible changes before FLIPPED (bp mode: before LIVE hooks).
@@ -205,6 +333,9 @@ ARMED → FROZEN → SNAPSHOTTED → VERIFIED → IGNITED → [FLIPPED →] LIVE
 | ceremony ABORTED | `pulse-cutover status` + read the journal's last `error` line (`data.message`); run `report`; surface reason + bundle to the human. Source chain is still authoritative — no user impact unless the journal shows FLIPPED (then confirm the revert ran: `flip_cmd_output`/abort lines) |
 | agent process died mid-run | re-run the same `pulse-cutover run --config …` — it resumes from the journal |
 | ceremony LIVE | verify: public URL serves the same chain_id, head advancing; report bundle for the record |
+| stuck at IGNITED, target head == H | the new chain has no transactions: check the `post_ignite` hook ran (journal `post_ignite_hook`; `Permission denied` = missing execute bit). Tell the human; with approval, run the hook by hand |
+| ABORTED: "transactions landed after the cut" | writes were not closed early enough: check `on_freeze` really closes every write path (API edge, other public endpoints); raise `freeze_lead_blocks` for the next attempt |
+| clients see timeouts / "expired" right after LIVE | expected briefly after ignite (validators re-peer); tell the human if it lasts > 2 min. Clients must retry with fresh transactions |
 
 ## Worked example: agent-driven rehearsal on a spare box
 
@@ -244,8 +375,8 @@ pulse-cutover report
 
 ## Building from source
 
-`pulse-cutover` links the PulseVM import stack as a path dependency:
-sibling checkout `../pulsevm-arena-import` = `paulgnz/pulsevm` branch
-`feat/arena-snapshot-import`. Then `cargo build --release && cargo test`.
+`pulse-cutover` pulls the PulseVM import crates (`pulsevm_snapshot`, `pulsevm_snapshot_import`,
+`pulsevm_chaindb`) from `github.com/paulgnz/pulsevm` at a pinned git rev (see `Cargo.toml`).
+`cargo build --release --locked && cargo test --locked`. CI runs the same plus script checks.
 The sanitizer test suite (`src/sanitize.rs` + `tests/`) is the review gate
 for changes to report/redaction code.

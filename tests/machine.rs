@@ -60,6 +60,10 @@ struct MockOps {
     /// late block arriving over p2p — quiescence must absorb + journal it).
     late_block: Cell<bool>,
     paused_polls: Cell<u32>,
+    /// Fault injection for the burn-off audit: transactions in each
+    /// post-cut block, or an unreadable post-cut block.
+    burnoff_tx_per_block: Cell<u64>,
+    burnoff_read_fails: Cell<bool>,
     hooks: RefCell<Vec<String>>,
     now: Cell<u64>,
     // --- api-mode world ---
@@ -86,6 +90,8 @@ struct MockOps {
     /// schedule_snapshot succeeds and stages the scheduled file.
     schedule_ok: Cell<bool>,
     scheduled_h: Cell<u64>,
+    /// Source head at the moment the write-freeze hook ran.
+    freeze_head: Cell<u64>,
 }
 
 impl MockOps {
@@ -100,6 +106,8 @@ impl MockOps {
             target_head: Cell::new(0),
             late_block: Cell::new(false),
             paused_polls: Cell::new(0),
+            burnoff_tx_per_block: Cell::new(0),
+            burnoff_read_fails: Cell::new(false),
             hooks: RefCell::new(Vec::new()),
             now: Cell::new(1_000_000),
             drift: Cell::new(1),
@@ -112,6 +120,7 @@ impl MockOps {
             flipped_v2: Cell::new(false),
             schedule_ok: Cell::new(false),
             scheduled_h: Cell::new(0),
+            freeze_head: Cell::new(0),
         }
     }
 
@@ -154,7 +163,10 @@ impl ChainOps for MockOps {
     }
 
     fn source_block_tx_count(&self, _block_num: u64) -> Result<u64, String> {
-        Ok(0) // writes are frozen: burn-off blocks are empty
+        if self.burnoff_read_fails.get() {
+            return Err("get_block timed out".into());
+        }
+        Ok(self.burnoff_tx_per_block.get()) // default 0: writes are frozen
     }
 
     fn producer_paused(&self) -> Result<bool, String> {
@@ -256,6 +268,9 @@ impl ChainOps for MockOps {
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
         self.hooks.borrow_mut().push(cmd.to_string());
+        if cmd == "freeze-writes" {
+            self.freeze_head.set(self.head.get());
+        }
         // Upstream-pipeline commands reference generated fake tools in the
         // test dir — execute them for real: the pipeline verifies their
         // file outputs (SHiP log, manifest.env, checkpoint + manifest).
@@ -499,6 +514,37 @@ fn late_block_after_pause_is_absorbed_and_cut_repinned() {
     assert_eq!(snapped["data"]["cut_height"].as_u64().unwrap(), 120);
     assert_eq!(snapped["data"]["burnoff_blocks"].as_u64().unwrap(), 2);
     assert_eq!(snapped["data"]["burnoff_transactions"].as_u64().unwrap(), 0);
+}
+
+#[test]
+fn post_cut_transactions_abort_and_roll_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.late_block.set(true); // guarantees at least one post-cut block
+    ops.burnoff_tx_per_block.set(1); // and it carries a transaction
+
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Aborted);
+    assert!(!ops.ignited.get());
+    assert_eq!(ops.resumes.get(), 1);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("transactions landed after the cut"));
+}
+
+#[test]
+fn unreadable_post_cut_block_aborts_instead_of_counting_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.late_block.set(true);
+    ops.burnoff_read_fails.set(true);
+
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Aborted);
+    assert!(!ops.ignited.get());
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("burn-off audit could not read a post-cut block"));
 }
 
 #[test]
@@ -915,6 +961,70 @@ on_live = "flip-gateway"
 }
 
 #[test]
+fn producer_schedule_at_h_freezes_writes_before_h() {
+    // Multi-BP rehearsal finding: freezing at head >= H left in-flight
+    // transfers in H+1 on all five producers. With a lead, the write freeze
+    // runs `freeze_lead_blocks` before H while the cut stays exactly H.
+    let dir = tempfile::tempdir().unwrap();
+    let toml_text = format!(
+        r#"
+journal_path = "{dir}/journal.jsonl"
+poll_ms = 1
+
+[ceremony]
+freeze_height = 120
+freeze_strategy = "schedule_at_h"
+freeze_lead_blocks = 20
+quiescence_polls = 3
+
+[source]
+rpc_url = "http://mock"
+producer_api_url = "http://mock"
+quiesce_cmd = "quiesce-p2p"
+
+[snapshot]
+staged_path = "{dir}/staged.bin"
+capture_roots = "{dir}/captured-roots.txt"
+dir = "{dir}"
+
+[target]
+metalgo_unit = "mock.service"
+rpc_url = "http://mock"
+quorum_timeout_secs = 60
+
+[hooks]
+on_freeze = "freeze-writes"
+post_ignite = "resume-traffic"
+"#,
+        dir = dir.path().display(),
+    );
+    let path = dir.path().join("ceremony-lead.toml");
+    std::fs::write(&path, toml_text).unwrap();
+    let cfg = Config::load(&path).unwrap();
+
+    let ops = MockOps::new(dir.path(), 50);
+    ops.schedule_ok.set(true);
+
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Live);
+    assert_eq!(ops.freeze_head.get(), 100, "writes froze at H - lead");
+
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let lines: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let frozen = lines
+        .iter()
+        .find(|v| v["state"] == "FROZEN" && v["kind"] == "transition")
+        .unwrap();
+    assert_eq!(frozen["data"]["freeze_at"].as_u64().unwrap(), 100);
+    assert_eq!(frozen["data"]["declared_h"].as_u64().unwrap(), 120);
+    let snapped = lines
+        .iter()
+        .find(|v| v["state"] == "SNAPSHOTTED" && v["kind"] == "transition")
+        .unwrap();
+    assert_eq!(snapped["data"]["cut_height"].as_u64().unwrap(), 120, "cut is still exactly H");
+}
+
+#[test]
 fn ceremony_journals_advisory_stubbed_intrinsic_scan() {
     // The VERIFIED step scans the ACTUAL cut snapshot for unserved env
     // imports and journals the result — advisory evidence, never a gate.
@@ -1092,6 +1202,7 @@ fn stage_fake_upstream_tools(dir: &std::path::Path, compare_exit: i32) {
              sha() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi | awk '{{print $1}}'; }}\n\
              mkdir -p \"$out/work/state-history\"\n\
              printf SHIPLOG > \"$out/work/state-history/chain_state_history.log\"\n\
+             if [ -z \"$NO_SIDECAR\" ]; then printf '{{}}' > \"$out/work/deferred-transactions.json\"; fi\n\
              {{ echo \"XPR_CORE_REVISION=d133c641\"; echo \"INPUT_SNAPSHOT_SHA256=$(sha \"$snap\")\"; \
                 echo \"CHAIN_STATE_HISTORY_SHA256=$(sha \"$out/work/state-history/chain_state_history.log\")\"; }} > \"$out/work/manifest.env\"\n\
              echo \"exported full XPR chain-state history to $out/work\"\n"
@@ -1104,6 +1215,7 @@ fn stage_fake_upstream_tools(dir: &std::path::Path, compare_exit: i32) {
         &format!(
             "#!/bin/sh\nset -e\n. {d}/cut-facts.env\n\
              sha() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi | awk '{{print $1}}'; }}\n\
+             [ -f \"$4\" ] || {{ echo 'usage: sidecar (4th arg) missing' >&2; exit 2; }}\n\
              printf CKPT > \"$3\"\n\
              printf '{{\"checkpoint_sha256\":\"%s\",\"checkpoint_revision\":%s,\"source_block_id\":\"%s\"}}' \
                \"$(sha \"$3\")\" \"$CUT_HEIGHT\" \"$CUT_BLOCK_ID\" > \"$3.manifest.json\"\n\
@@ -1114,6 +1226,7 @@ fn stage_fake_upstream_tools(dir: &std::path::Path, compare_exit: i32) {
         &dir.join("fake-compare.sh"),
         &format!(
             "#!/bin/sh\n\
+             [ -f \"$5\" ] || {{ echo 'usage: sidecar (5th arg) missing' >&2; exit 2; }}\n\
              if [ {compare_exit} -ne 0 ]; then echo 'table permission: nodeos=1 arena=2' >&2; exit {compare_exit}; fi\n\
              echo 'table account: rows=1 sha256=aa55'\necho 'table permission: rows=2 sha256=bb66'\nexit 0\n"
         ),
@@ -1200,7 +1313,30 @@ fn upstream_backend_verifies_with_official_tools_and_stubs_ignite() {
         .find(|v| v["kind"] == "error")
         .expect("journaled abort reason");
     assert!(abort_err["data"]["message"].as_str().unwrap().contains("#61"));
+    let remaining = abort_err["data"]["detail"]["remaining"].to_string();
+    assert!(remaining.contains("TAPOS") && remaining.contains("chain_id"));
     assert!(abort_err["data"]["detail"]["remaining"].is_array());
+}
+
+#[test]
+fn upstream_export_without_sidecar_fails_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    // An export that does not write deferred-transactions.json (no
+    // --deferred-sidecar): the dedupe set would be missing on the target.
+    let export = dir.path().join("fake-export.sh");
+    let body = std::fs::read_to_string(&export).unwrap();
+    let body: String = body.lines().filter(|l| !l.contains("deferred-transactions.json")).collect::<Vec<_>>().join("\n");
+    write_script(&export, &format!("{body}\n"));
+    let cfg = upstream_test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("no deferred-transactions.json sidecar"));
+    assert!(!text.lines().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["state"] == "VERIFIED" && v["kind"] == "transition"
+    }));
 }
 
 #[test]

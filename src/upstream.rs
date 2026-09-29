@@ -165,6 +165,17 @@ pub fn run_pipeline<O: ChainOps>(
             (log, env, false)
         }
     };
+    // The deferred/input-transaction sidecar carries what SHiP cannot: the
+    // input-transaction dedupe set (replay protection across the cut) and
+    // deferred transactions. The importer restores it atomically with the
+    // SHiP rows and the compare gate checks it, so it is mandatory.
+    let sidecar = find_file(&export_dir, "deferred-transactions.json").ok_or(
+        "export produced no deferred-transactions.json sidecar — run export.sh with \
+         --deferred-sidecar /out/deferred-transactions.json on a nodeos build with the \
+         deferred-sidecar plugin; without it the migrated chain has no transaction dedupe \
+         set (post-cut replay protection) and deferred transactions are lost",
+    )?;
+    progress(json!({"upstream_sidecar": sidecar.display().to_string()}));
     let manifest_env = parse_manifest_env(
         &std::fs::read_to_string(&manifest_path)
             .map_err(|e| format!("read {}: {e}", manifest_path.display()))?,
@@ -191,11 +202,12 @@ pub fn run_pipeline<O: ChainOps>(
     let started = ops.now_ms();
     let import_out = ops
         .run_hook(&format!(
-            "'{}' '{}' '{}' '{}'",
+            "'{}' '{}' '{}' '{}' '{}'",
             up.import_bin.display(),
             ship_log.display(),
             arena_import.display(),
-            checkpoint_path.display()
+            checkpoint_path.display(),
+            sidecar.display()
         ))
         .map_err(|e| format!("xpr_import_check failed: {e}"))?;
     let checkpoint_manifest: Value = serde_json::from_str(
@@ -252,12 +264,13 @@ pub fn run_pipeline<O: ChainOps>(
             // verification FAILURE — run_hook errors and we propagate.
             let out = ops
                 .run_hook(&format!(
-                    "'{}' '{}' '{}' '{}' '{}' '{}'",
+                    "'{}' '{}' '{}' '{}' '{}' '{}' '{}'",
                     bin.display(),
                     ship_log.display(),
                     checkpoint_path.display(),
                     arena_cmp.display(),
                     chain_id,
+                    sidecar.display(),
                     report.display()
                 ))
                 .map_err(|e| {
@@ -349,17 +362,21 @@ fn manifest_json_path(checkpoint: &Path) -> PathBuf {
 /// verbatim every time the stub fires.
 pub fn ignite_pending_reasons() -> Vec<&'static str> {
     vec![
-        "MetalBlockchain/pulsevm#61 must merge and ship a released node build \
-         (the checkpoint-consuming node is only on the PR branch; building it \
-         needs LLVM 22 for the Wasmer backend)",
-        "a migration genesis committing migration_checkpoint_sha256 must be \
-         created for the target chain (the node rejects a checkpoint its \
-         genesis does not commit to)",
-        "the target chain config must carry the #61 knobs: migration_checkpoint \
-         + its .manifest.json path (this branch's node_config), replacing the \
-         fork plugin's snapshot_path boot",
-        "the released VM id / plugin binary must be staged in place of the fork \
-         plugin, and the subnet's validators must run it",
+        "a released PulseVM build that contains the #61 migration path (merged \
+         2026-09-14) must be staged; the latest release, v0.7.1, predates it",
+        "a migration genesis committing migration_checkpoint_sha256, and a target \
+         chain config carrying migration_checkpoint + its .manifest.json path, \
+         must replace the fork plugin's snapshot_path boot",
+        "the checkpoint manifest must carry the exact source block anchor for a \
+         fresh boot (the importer leaves source_block absent today)",
+        "same-chain-id cutover: the signing chain_id must be pinned to the source \
+         chain_id and enforced at node startup (upstream signs with the id metalgo \
+         passes at initialize and only warns on a mismatch)",
+        "same-chain-id cutover: PulseVM must enforce TAPOS (block-summary ring seeded \
+         at the cut, checked at admission and block application) so transactions \
+         signed on a leftover source chain cannot replay onto the target",
+        "every validator must run the released plugin, with the cut height, block id \
+         and state root agreed across the fleet before ignition",
     ]
 }
 

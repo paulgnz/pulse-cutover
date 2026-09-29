@@ -414,10 +414,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 }
             }
         }
+        // Multi-BP: close writes `freeze_lead_blocks` before H so in-flight
+        // transactions land at or before the cut, not in H+1.. (the cut
+        // itself stays pinned to exactly H by the scheduled snapshot).
+        let freeze_at = if self.scheduled {
+            self.h().saturating_sub(self.cfg.ceremony.freeze_lead_blocks)
+        } else {
+            self.h()
+        };
         let mut last_heartbeat = 0u64;
         let info = loop {
             let info = self.ops.source_info()?;
-            if info.head_block_num >= self.h() {
+            if info.head_block_num >= freeze_at {
                 break info;
             }
             let now = self.ops.now_ms();
@@ -425,7 +433,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.journal.evidence(
                     State::Armed,
                     json!({"head": info.head_block_num, "lib": info.last_irreversible_block_num,
-                           "blocks_to_h": self.h() - info.head_block_num}),
+                           "blocks_to_h": self.h().saturating_sub(info.head_block_num),
+                           "blocks_to_freeze": freeze_at.saturating_sub(info.head_block_num)}),
                 )?;
                 last_heartbeat = now;
             }
@@ -451,6 +460,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             State::Frozen,
             json!({
                 "declared_h": self.h(),
+                "freeze_at": freeze_at,
                 "head_at_freeze": info.head_block_num,
                 "lib_at_freeze": info.last_irreversible_block_num,
                 "chain_id": info.chain_id,
@@ -743,12 +753,37 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
 
-        // Burn-off audit (R2 evidence): blocks after the cut, up to the
-        // pause head, are outside the migrated state. With writes frozen
-        // they must be empty; any transactions here are journaled loudly.
+        // Burn-off audit (R2): blocks after the cut, up to the pause head,
+        // are outside the migrated state. With writes frozen they must be
+        // empty. Fail closed: a transaction here would be accepted on the
+        // source chain and missing from the migrated state, and a block we
+        // cannot read is not evidence that it was empty.
         let mut burnoff_txs = 0u64;
+        let mut burnoff_nonempty: Vec<serde_json::Value> = Vec::new();
         for n in (cut_height + 1)..=at_pause.head_block_num {
-            burnoff_txs += self.ops.source_block_tx_count(n).unwrap_or(0);
+            match self.ops.source_block_tx_count(n) {
+                Ok(0) => {}
+                Ok(count) => {
+                    burnoff_txs += count;
+                    burnoff_nonempty.push(json!({"block": n, "transactions": count}));
+                }
+                Err(e) => {
+                    self.abort(
+                        "burn-off audit could not read a post-cut block",
+                        json!({"block": n, "cut_height": cut_height, "error": e}),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        if burnoff_txs > 0 {
+            self.abort(
+                "transactions landed after the cut and would be missing from the migrated state",
+                json!({"cut_height": cut_height, "burnoff_transactions": burnoff_txs,
+                       "blocks": burnoff_nonempty,
+                       "fix": "close every admission path (API edge, p2p, producer) before the cut, then re-run"}),
+            )?;
+            return Ok(());
         }
 
         let host_path = self.cfg.map_snapshot_path(&snap.snapshot_name);
@@ -1033,17 +1068,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// VERIFIED: ignite the target and wait for it to present the source
     /// chain at the cut height.
     fn step_verified(&mut self) -> Result<(), String> {
-        // Upstream backend: igniting FROM the #61 checkpoint needs the
-        // checkpoint-consuming node, which only exists on the unmerged PR
-        // branch (migration genesis committing the checkpoint sha256 +
-        // node-config migration_checkpoint knobs). Verification is done and
-        // journaled; stop here with the precise remaining list rather than
-        // pretending the fork plugin could boot his checkpoint.
+        // Upstream backend: the #61 migration path is merged, but igniting
+        // FROM its checkpoint is not wired yet, and a same-chain-id mainnet
+        // cutover has hard prerequisites (see ignite_pending_reasons).
+        // Verification is done and journaled; stop here with the precise
+        // remaining list rather than booting anything unsafe.
         if self.cfg.ceremony.import_backend == ImportBackend::Upstream {
             self.abort(
-                "upstream ignite pending MetalBlockchain/pulsevm#61 merge — verification \
-                 completed with the official tools; ignition from the checkpoint is not \
-                 yet available",
+                "upstream ignite not yet available — verification completed with the \
+                 official #61 tools; booting from the checkpoint needs the remaining items",
                 json!({"remaining": upstream::ignite_pending_reasons()}),
             )?;
             return Ok(());
