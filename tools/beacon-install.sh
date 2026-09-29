@@ -274,6 +274,11 @@ main() {
   local MODE; MODE=$(mode_for_role "$ROLE")
   [ -n "$NODE" ] || NODE=$ROLE   # public label; the hostname is never sent
   local MG_UNIT=${OLD_target_metalgo_unit:-}
+  # A re-run keeps the saved unit only while it still exists (e.g. a node moved from metalgo-local to metalgo).
+  if [ -n "$MG_UNIT" ] && ! systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "$MG_UNIT.service"; then
+    warn "saved Metal service '$MG_UNIT' no longer exists: detecting again"
+    MG_UNIT=""
+  fi
   if [ -z "$MG_UNIT" ]; then
     local units; units=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -iE '^(metalgo|avalanchego)[^ ]*\.service$' | sed 's/\.service$//' || true)
     MG_UNIT=$(printf '%s\n' "$units" | grep -x metalgo || printf '%s\n' "$units" | head -1)
