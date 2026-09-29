@@ -77,6 +77,8 @@ pub trait ChainOps {
 
 /// Captured output is capped per stream: the first and last `OUTPUT_CAP / 2` bytes are kept.
 pub const OUTPUT_CAP: usize = 64 * 1024;
+/// Deadline for long pipeline steps (`run_long`): effectively none.
+pub const LONG_STEP_DEADLINE: Duration = Duration::from_secs(30 * 24 * 3600);
 /// After the shell itself exits, how long its output pipes may stay open (a background
 /// descendant holding them) before the process group is killed.
 pub const PIPE_GRACE: Duration = Duration::from_secs(5);
@@ -137,6 +139,26 @@ fn group_members(pgid: u32) -> Vec<u32> {
         .collect()
 }
 
+/// The pgid recorded in `pgid_file` if that group still has live members.
+#[cfg(not(unix))]
+fn recorded_live_group(_pgid_file: &Path) -> Option<u32> {
+    None
+}
+#[cfg(unix)]
+fn recorded_live_group(pgid_file: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(pgid_file).ok()?;
+    let pgid: u32 = text.lines().next()?.trim().parse().ok()?;
+    (pgid > 1 && !group_members(pgid).is_empty()).then_some(pgid)
+}
+
+/// A process's start time as `ps -o lstart=` prints it (same on Linux procps and macOS), used
+/// to tell a recorded hook group leader from an unrelated process that later got the same pid.
+pub fn process_start(pid: u32) -> Option<String> {
+    let o = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().ok()?;
+    let s = String::from_utf8_lossy(&o.stdout).split_whitespace().collect::<Vec<_>>().join(" ");
+    (!s.is_empty()).then_some(s)
+}
+
 /// Kill a hook process group recorded by `run_shell_timeout_tracked` (an agent that died
 /// mid-hook leaves it running): SIGTERM the group, wait up to `grace`, then SIGKILL. Returns
 /// Ok(None) when nothing was recorded or the group is already gone, Ok(Some(description)) when
@@ -155,24 +177,39 @@ pub fn kill_recorded_hook_group(pgid_file: &Path, grace: Duration) -> Result<Opt
             return Ok(None);
         }
     };
-    let cmd = lines.next().unwrap_or("").to_string();
+    // Record format: pgid, then (rc.8+) `start=<ps lstart of the leader>`, then the command.
+    let rest: Vec<&str> = lines.collect();
+    let (start, cmd) = match rest.first() {
+        Some(l) if l.starts_with("start=") => (Some(l.trim_start_matches("start=").trim().to_string()), rest[1..].join("\n")),
+        _ => (None, rest.join("\n")),
+    };
     if group_members(pgid).is_empty() {
         let _ = std::fs::remove_file(pgid_file);
         return Ok(None);
     }
-    // Guard against a recycled pid: if the group leader still exists it must be our `sh -c`, or
-    // the recorded command itself (`sh -c` execs a simple command in place).
+    // Guard against a recycled pid. While any member of the group lives, the kernel does not hand
+    // the group id out again, so members without a living leader are still ours. A living leader
+    // must be the process we recorded: same start time (rc.8+ records carry it). Older records
+    // fall back to the command-name check (weaker: any `sh -c …` leader passed it).
     if let Ok(o) = std::process::Command::new("ps").args(["-o", "command=", "-p", &pgid.to_string()]).output() {
         let leader = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_string();
-        let leader_prog = leader.split_whitespace().next().map(base).unwrap_or_default();
-        let cmd_prog = cmd.split_whitespace().next().map(base).unwrap_or_default();
-        let ours = leader.starts_with("sh -c") || (!cmd_prog.is_empty() && leader_prog == cmd_prog);
-        if !leader.is_empty() && !ours {
-            let _ = std::fs::remove_file(pgid_file);
-            return Err(format!(
-                "recorded hook process group {pgid} now belongs to `{leader}` (pid reused?): not killed"
-            ));
+        if !leader.is_empty() {
+            let ours = match &start {
+                Some(want) => process_start(pgid).as_deref() == Some(want.as_str()),
+                None => {
+                    let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_string();
+                    let leader_prog = leader.split_whitespace().next().map(base).unwrap_or_default();
+                    let cmd_prog = cmd.split_whitespace().next().map(base).unwrap_or_default();
+                    leader.starts_with("sh -c") || (!cmd_prog.is_empty() && leader_prog == cmd_prog)
+                }
+            };
+            if !ours {
+                let _ = std::fs::remove_file(pgid_file);
+                return Err(format!(
+                    "recorded hook process group {pgid} now belongs to `{leader}` (a different process: pid \
+                     reused?): not killed. The record was removed; re-running proceeds without it."
+                ));
+            }
         }
     }
     let _ = std::process::Command::new("kill").arg("-TERM").arg(format!("-{pgid}")).status();
@@ -241,11 +278,24 @@ pub fn run_shell_timeout_tracked(cmd: &str, timeout: Duration, pgid_file: Option
         .stderr(std::process::Stdio::piped());
     #[cfg(unix)]
     command.process_group(0);
+    // Never overwrite (and later delete) the record of a group that is still running: that is a
+    // hook left by a dead agent, and its record is the only way to find and stop it.
+    if let Some(p) = pgid_file {
+        if let Some(live) = recorded_live_group(p) {
+            return Err(format!(
+                "refusing to start `{cmd}`: process group {live} recorded in {} is still running (left by \
+                 a previous agent). Stop it first (`pulse-cutover rollback` or re-running does).",
+                p.display()
+            ));
+        }
+    }
     let mut child = command.spawn().map_err(|e| format!("spawn `{cmd}`: {e}"))?;
     let pid = child.id();
     let _record = PgidRecord(pgid_file.and_then(|p| {
-        // pgid (= the shell's pid: process_group(0)) and the command, for the operator.
-        std::fs::write(p, format!("{pid}\n{cmd}\n")).ok().map(|_| p.to_path_buf())
+        // pgid (= the shell's pid: process_group(0)), the leader's start time (recycled-pid guard)
+        // and the command, for the operator.
+        let start = process_start(pid).map(|s| format!("start={s}\n")).unwrap_or_default();
+        std::fs::write(p, format!("{pid}\n{start}{cmd}\n")).ok().map(|_| p.to_path_buf())
     }));
     // Drain pipes on threads (a chatty command can't block on a full pipe); results arrive on a
     // channel so waiting for them can be bounded instead of an unconditional join.
@@ -537,7 +587,11 @@ impl ChainOps for HttpOps {
     }
 
     fn run_long(&self, cmd: &str) -> Result<String, String> {
-        run_shell(cmd)
+        // Pipeline steps (upstream export/import over a mainnet snapshot) take far longer than any
+        // hook timeout, but they run exactly like hooks otherwise: their own process group, recorded
+        // for this journal, so `pkill` of the agent cannot leave an untracked import running that
+        // re-creates the staged artifact after a rollback. No practical deadline (30 days).
+        run_shell_timeout_tracked(cmd, LONG_STEP_DEADLINE, self.pgid_file.as_deref())
     }
 
     fn get_json(&self, url: &str) -> Result<Option<Value>, String> {

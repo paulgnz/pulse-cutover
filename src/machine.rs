@@ -62,8 +62,10 @@ pub struct Machine<'a, O: ChainOps> {
     staged_sha256: Option<String>,
     /// An operator cleared a previous HALT: continue forward instead of halting on resume.
     unhalted: bool,
-    /// The journal ends in an ABORTED whose rollback actions all succeeded.
+    /// The journal ends in an ABORTED whose rollback provably finished (`rollback_done`).
     aborted_rollback_complete: bool,
+    /// Rollback steps already journaled as done in this abort episode (resumable rollback).
+    rollback_steps_done: Vec<String>,
 }
 
 /// What `pulse-cutover rollback` did. `failed` lists every step that did not succeed; the
@@ -136,6 +138,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let staged_sha256 = recovered.staged_sha256.clone();
         let unhalted = recovered.unhalted;
         let aborted_rollback_complete = recovered.aborted_rollback_complete;
+        let rollback_steps_done = recovered.rollback_steps_done.clone();
         Machine {
             cfg,
             ops,
@@ -163,6 +166,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             staged_sha256,
             unhalted,
             aborted_rollback_complete,
+            rollback_steps_done,
         }
     }
 
@@ -175,6 +179,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     pub fn run(&mut self) -> Result<State, String> {
         // Defense in depth (main.rs checks too): a readiness-only config never drives anything.
         self.cfg.ensure_ceremony_profile()?;
+        // A previous agent that died mid-hook (or mid pipeline step) left that process group
+        // running: stop it before this run does anything, or it would race the resumed step (e.g.
+        // a still-running on_freeze beside on_abort). Refuse to resume if it cannot be stopped.
+        match self.ops.kill_orphan_hooks() {
+            Ok(None) => {}
+            Ok(Some(desc)) => {
+                eprintln!("{desc}");
+                self.journal.evidence(self.state, json!({"orphan_hook_killed": desc, "at": "run resume"}))?;
+            }
+            Err(e) => {
+                self.journal.evidence(self.state, json!({"orphan_hook_kill_error": e, "resume_blocked": true}))?;
+                return Err(format!(
+                    "refusing to resume: a hook left running by the previous agent could not be stopped ({e}). \
+                     Stop it by hand (see {}), then re-run.",
+                    crate::ops::hook_pgid_path(self.journal.path()).display()
+                ));
+            }
+        }
         if self.state == State::Halted {
             return Err(format!(
                 "HALTED (journaled): this ceremony was sealed after ignition may have started. It will \
@@ -452,6 +474,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let deadline = self.ops.now_ms() + co.fleet_timeout_secs * 1000;
         let status_url = format!("{}/api/status", co.url.trim_end_matches('/'));
         let mut last_seen = usize::MAX;
+        let mut last_excluded: Vec<serde_json::Value> = vec![json!("none yet")];
         loop {
             if self.coordinator_aborted(true) {
                 self.abort("coordinator aborted the event (signed) before ignition", json!({"event_id": co.event_id}))?;
@@ -487,6 +510,36 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // token reporting from two machines), a stale one, or one with a failing HEALTH check
             // (setup checks such as hooks are ignored: the dashboard's health/setup split) never counts.
             let max_age_ms = co.report_max_age_secs * 1000;
+            // Why a report does not count (journaled: an excluded producer costs quorum, and the
+            // operator must be able to see why).
+            let exclusion = |r: &serde_json::Value, age: Option<u64>, conflict: bool| -> Option<String> {
+                if conflict {
+                    return Some("identity conflict (one token, two machines)".into());
+                }
+                if !age.map(|a| a <= max_age_ms).unwrap_or(false) {
+                    return Some(format!("stale report (age {:?} ms > {max_age_ms})", age));
+                }
+                let failing: Vec<String> = r["checks"].as_array().map(|cs| cs.iter()
+                    .filter(|c| c["ok"].as_bool() == Some(false)
+                        && !c["name"].as_str().map(|n| crate::beacon::SETUP_CHECKS.contains(&n)).unwrap_or(false))
+                    .map(|c| format!("{}: {}", c["name"].as_str().unwrap_or("?"), c["detail"].as_str().unwrap_or("")))
+                    .collect()).unwrap_or_default();
+                (!failing.is_empty()).then(|| format!("failing health check(s): {}", failing.join("; ")))
+            };
+            let mut excluded: Vec<serde_json::Value> = vec![];
+            for p in &producers {
+                let mut v: Vec<(serde_json::Value, Option<u64>, bool)> = p["beacons"].as_array().map(|bs| bs.iter()
+                    .map(|b| (b["report"].clone(), b["age_ms"].as_u64(), b["conflict"].as_bool().unwrap_or(false)))
+                    .collect()).unwrap_or_default();
+                if v.is_empty() && !p["report"].is_null() {
+                    v.push((p["report"].clone(), p["age_ms"].as_u64(), p["conflict"].as_bool().unwrap_or(false)));
+                }
+                for (r, age, conflict) in v {
+                    if let Some(why) = exclusion(&r, age, conflict) {
+                        excluded.push(json!({"producer": p["name"], "instance_id": r["instance_id"], "why": why}));
+                    }
+                }
+            }
             let reports_of = |p: &serde_json::Value| -> Vec<serde_json::Value> {
                 let mut v: Vec<(serde_json::Value, Option<u64>, bool)> = p["beacons"].as_array().map(|bs| bs.iter()
                     .map(|b| (b["report"].clone(), b["age_ms"].as_u64(), b["conflict"].as_bool().unwrap_or(false)))
@@ -515,10 +568,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 }).count()
             };
             let quorum = if co.fleet_quorum > 0 { co.fleet_quorum } else { co.roster.len() };
-            if agreeing != last_seen {
+            if agreeing != last_seen || excluded != last_excluded {
                 self.journal.evidence(State::Verified, json!({"fleet_gate": {"agreeing": agreeing, "quorum": quorum,
-                    "roster": if co.roster.is_empty() { json!("unbound (any producer)") } else { json!(co.roster.len()) }}}))?;
+                    "roster": if co.roster.is_empty() { json!("unbound (any producer)") } else { json!(co.roster.len()) }},
+                    "fleet_gate_excluded": excluded.clone()}))?;
                 last_seen = agreeing;
+                last_excluded = excluded;
             }
             if agreeing >= quorum {
                 return Ok(true);
@@ -570,9 +625,33 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// Err = refused/nothing changed (message starts with "refusing") or a journal I/O error.
     pub fn operator_rollback(&mut self, force: bool) -> Result<RollbackOutcome, String> {
         let past = self.past_point_of_no_return();
+        let mut notes = vec![];
+        // FIRST, on every path (including "already rolled back"): an agent killed mid-hook or mid
+        // pipeline step leaves that process group running (they run in their own group). Stop it
+        // before anything below, or e.g. a still-running on_freeze could close writes again after
+        // on_abort reopened them, or a late import could re-create the staged artifact. If it cannot
+        // be stopped nothing is done: that is a refusal (nothing changed), not an incomplete rollback.
+        match self.ops.kill_orphan_hooks() {
+            Ok(None) => {}
+            Ok(Some(desc)) => {
+                self.journal.evidence(self.state, json!({"orphan_hook_killed": desc}))?;
+                notes.push(desc);
+            }
+            Err(e) => {
+                self.journal.evidence(self.state, json!({"orphan_hook_kill_error": e, "rollback_blocked": true}))?;
+                return Err(format!(
+                    "refusing to roll back: a hook left running by a killed agent could not be stopped ({e}). \
+                     Nothing was rolled back. Stop that process group by hand, then re-run."
+                ));
+            }
+        }
         if self.state == State::Aborted && self.aborted_rollback_complete {
-            return Ok(RollbackOutcome { state: self.state, failed: vec![], already: true,
-                notes: vec!["already rolled back (the journal ends in a complete rollback): nothing done again".into()] });
+            // Idempotent even here: a staged artifact that appeared after the rollback (e.g. a late
+            // pipeline write) is moved aside too.
+            let mut failed = vec![];
+            self.unstage(true, &mut failed, &mut notes)?;
+            notes.push("already rolled back (the journal proves every rollback step completed): nothing done again".into());
+            return Ok(RollbackOutcome { state: self.state, failed, notes, already: true });
         }
         if past && !force {
             return Err(format!(
@@ -582,23 +661,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.state
             ));
         }
-        let mut notes = vec![];
-        // An agent killed mid-hook leaves its hook's process group running (hooks run in their
-        // own group). Stop it before anything below runs, or e.g. a still-running on_freeze could
-        // close writes again after on_abort reopened them.
-        match self.ops.kill_orphan_hooks() {
-            Ok(None) => {}
-            Ok(Some(desc)) => {
-                self.journal.evidence(self.state, json!({"orphan_hook_killed": desc}))?;
-                notes.push(desc);
-            }
-            Err(e) => {
-                self.journal.evidence(self.state, json!({"orphan_hook_kill_error": e, "rollback_blocked": true}))?;
-                return Ok(RollbackOutcome { state: self.state, notes, already: false,
-                    failed: vec![format!("an orphaned hook could not be stopped ({e}); nothing was rolled back")] });
-            }
-        }
-        if force && past {
+        if force && past && !self.step_done("target_fence") {
             // Local fence FIRST: resuming the source while this box's target still runs would
             // create two writable histories under one chain_id, by our own hand.
             let fence = self.cfg.target.fence_cmd();
@@ -606,6 +669,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             match self.ops.run_hook(&fence) {
                 Ok(out) => {
                     self.journal.evidence(self.state, json!({"target_fenced": true, "output": out}))?;
+                    self.mark_step("target_fence")?;
                     notes.push("this box's target was stopped first (local fence only: other producers' targets are unaffected)".into());
                 }
                 Err(e) => {
@@ -615,36 +679,55 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         failed: vec![format!("target fence failed ({e}): the source was NOT resumed and routing was NOT reverted")] });
                 }
             }
+        }
+        if force && past {
             // Operator decision: every configured flip revert runs (a flip may have half-applied).
             self.flip_ran = self.flip_ran || self.cfg.flip.is_some();
             self.hyperion_flip_ran = self.hyperion_flip_ran || self.cfg.hyperion.is_some();
         }
         let detail = json!({"by": "operator_rollback", "force_after_ignite": force && past,
                             "ignition_started": past, "state_before": self.state.as_str()});
-        let mut failed = self.rollback("operator rollback (pulse-cutover rollback)", detail, true)?;
-        // Unstage: a staged snapshot left behind makes the next preflight refuse and, worse, a
-        // metalgo restart for any reason would import this (now abandoned) cut.
+        let (failed, mut more) = self.rollback_steps("operator rollback (pulse-cutover rollback)", detail, true, true)?;
+        notes.append(&mut more);
+        Ok(RollbackOutcome { state: self.state, failed, notes, already: false })
+    }
+
+    fn step_done(&self, name: &str) -> bool {
+        self.rollback_steps_done.iter().any(|s| s == name)
+    }
+
+    /// Journal that a rollback step completed (a rollback that dies later redoes only the rest).
+    fn mark_step(&mut self, name: &str) -> Result<(), String> {
+        self.journal.evidence(self.state, json!({"rollback_step": name, "ok": true}))?;
+        if !self.step_done(name) {
+            self.rollback_steps_done.push(name.to_string());
+        }
+        Ok(())
+    }
+
+    /// Move the staged snapshot aside (never delete it): left in place it makes the next preflight
+    /// refuse and, worse, a metalgo restart would import the abandoned cut. `any`: the operator's
+    /// rollback moves any staged file; the agent's own abort only the one this ceremony staged.
+    fn unstage(&mut self, any: bool, failed: &mut Vec<String>, notes: &mut Vec<String>) -> Result<(), String> {
         let staged = self.cfg.snapshot.staged_path.clone();
-        if staged.exists() {
-            let mut to = staged.as_os_str().to_owned();
-            to.push(format!(".rolled-back-{}", self.ops.now_ms()));
-            let to = std::path::PathBuf::from(to);
-            match std::fs::rename(&staged, &to) {
-                Ok(()) => {
-                    self.journal.evidence(State::Aborted, json!({"unstaged": {"from": staged, "to": to}}))?;
-                    notes.push(format!("staged snapshot moved aside to {}", to.display()));
-                }
-                Err(e) => {
-                    let msg = format!("unstage {} failed: {e}", staged.display());
-                    self.journal.evidence(State::Aborted, json!({"unstage_error": msg}))?;
-                    failed.push(msg);
-                }
+        if !staged.exists() || !(any || self.staged_sha256.is_some()) {
+            return Ok(());
+        }
+        let mut to = staged.as_os_str().to_owned();
+        to.push(format!(".rolled-back-{}", self.ops.now_ms()));
+        let to = std::path::PathBuf::from(to);
+        match std::fs::rename(&staged, &to) {
+            Ok(()) => {
+                self.journal.evidence(self.state, json!({"unstaged": {"from": staged, "to": to}}))?;
+                notes.push(format!("staged snapshot moved aside to {}", to.display()));
+            }
+            Err(e) => {
+                let msg = format!("unstage {} failed: {e}", staged.display());
+                self.journal.evidence(self.state, json!({"unstage_error": msg}))?;
+                failed.push(msg);
             }
         }
-        if !failed.is_empty() {
-            self.journal.evidence(State::Aborted, json!({"rollback_incomplete": failed}))?;
-        }
-        Ok(RollbackOutcome { state: self.state, failed, notes, already: false })
+        Ok(())
     }
 
     fn abort(&mut self, reason: &str, detail: serde_json::Value) -> Result<(), String> {
@@ -652,19 +735,22 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return self.halt(reason, detail);
         }
         let perform = self.cfg.target.auto_rollback;
-        let failed = self.rollback(reason, detail, perform)?;
+        let (failed, _notes) = self.rollback_steps(reason, detail, perform, false)?;
         if !failed.is_empty() {
             eprintln!("ABORTED, but the rollback is INCOMPLETE: {}", failed.join("; "));
-            self.journal.evidence(State::Aborted, json!({"rollback_incomplete": failed}))?;
         }
         Ok(())
     }
 
-    /// Journal the abort and (if `perform`) undo this node's changes. Returns the rollback steps
-    /// that FAILED (empty = everything that was attempted succeeded).
-    fn rollback(&mut self, reason: &str, detail: serde_json::Value, perform: bool) -> Result<Vec<String>, String> {
+    /// Journal the abort and (if `perform`) undo this node's changes, step by step: each step that
+    /// succeeds is journaled (`rollback_step`) and skipped if the rollback is re-run, and the
+    /// rollback is only recorded as finished (`rollback_done`) AFTER every step, on_abort and the
+    /// unstage included, succeeded. Returns (failed steps, notes). `unstage_any`: see `unstage`.
+    fn rollback_steps(&mut self, reason: &str, detail: serde_json::Value, perform: bool, unstage_any: bool)
+        -> Result<(Vec<String>, Vec<String>), String> {
         self.journal.error(self.state, reason, detail.clone())?;
         let mut failed: Vec<String> = vec![];
+        let mut notes: Vec<String> = vec![];
         let mut rollback = json!({"reason": reason, "auto_rollback": self.cfg.target.auto_rollback, "rollback_performed": perform});
         if let Some(obj) = detail.as_object() {
             for k in ["by", "force_after_ignite", "ignition_started"] {
@@ -673,25 +759,40 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 }
             }
         }
+        if !self.rollback_steps_done.is_empty() {
+            rollback["steps_already_done"] = json!(self.rollback_steps_done.clone());
+        }
         if perform {
             match self.cfg.ceremony.mode {
                 // Producer mode: un-pausing nodeos IS the entire rollback.
-                Mode::Producer => match self.ops.resume() {
-                    Ok(()) => rollback["source_producer_resumed"] = json!(true),
-                    Err(e) => {
-                        failed.push(format!("resume the source producer: {e}"));
-                        rollback["source_producer_resume_error"] = json!(e);
+                Mode::Producer => {
+                    if !self.step_done("resume") {
+                        match self.ops.resume() {
+                            Ok(()) => {
+                                rollback["source_producer_resumed"] = json!(true);
+                                self.mark_step("resume")?;
+                            }
+                            Err(e) => {
+                                failed.push(format!("resume the source producer: {e}"));
+                                rollback["source_producer_resume_error"] = json!(e);
+                            }
+                        }
+                    } else {
+                        rollback["source_producer_resumed"] = json!("earlier (journaled)");
                     }
-                },
+                }
                 // api mode: nodeos was never paused (it isn't ours to pause).
                 // Undo whatever user-visible steps already happened, in
                 // reverse order: restart the source if we stopped it, then
                 // swap the public URL back to it.
                 Mode::Api => {
-                    if self.source_stopped {
-                        if let Some(cmd) = &self.cfg.source.start_cmd {
-                            match self.ops.run_hook(cmd) {
-                                Ok(o) => rollback["source_restarted"] = json!(o),
+                    if self.source_stopped && !self.step_done("source_restart") {
+                        if let Some(cmd) = self.cfg.source.start_cmd.clone() {
+                            match self.ops.run_hook(&cmd) {
+                                Ok(o) => {
+                                    rollback["source_restarted"] = json!(o);
+                                    self.mark_step("source_restart")?;
+                                }
                                 Err(e) => {
                                     failed.push(format!("restart the source: {e}"));
                                     rollback["source_restart_error"] = json!(e);
@@ -702,12 +803,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                             rollback["source_stopped_no_start_cmd"] = json!(true);
                         }
                     }
-                    if self.hyperion_flip_ran {
-                        if let Some(cmd) =
-                            self.cfg.hyperion.as_ref().and_then(|h| h.revert_cmd.clone())
-                        {
+                    if self.hyperion_flip_ran && !self.step_done("hyperion_revert") {
+                        if let Some(cmd) = self.cfg.hyperion.as_ref().and_then(|h| h.revert_cmd.clone()) {
                             match self.ops.run_hook(&cmd) {
-                                Ok(o) => rollback["hyperion_flip_reverted"] = json!(o),
+                                Ok(o) => {
+                                    rollback["hyperion_flip_reverted"] = json!(o);
+                                    self.mark_step("hyperion_revert")?;
+                                }
                                 Err(e) => {
                                     failed.push(format!("revert the /v2 flip: {e}"));
                                     rollback["hyperion_flip_revert_error"] = json!(e);
@@ -715,12 +817,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                             }
                         }
                     }
-                    if self.flip_ran {
-                        if let Some(cmd) =
-                            self.cfg.flip.as_ref().and_then(|f| f.revert_cmd.clone())
-                        {
+                    if self.flip_ran && !self.step_done("flip_revert") {
+                        if let Some(cmd) = self.cfg.flip.as_ref().and_then(|f| f.revert_cmd.clone()) {
                             match self.ops.run_hook(&cmd) {
-                                Ok(o) => rollback["flip_reverted"] = json!(o),
+                                Ok(o) => {
+                                    rollback["flip_reverted"] = json!(o);
+                                    self.mark_step("flip_revert")?;
+                                }
                                 Err(e) => {
                                     failed.push(format!("revert the public flip: {e}"));
                                     rollback["flip_revert_error"] = json!(e);
@@ -732,20 +835,30 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 }
             }
         }
-        rollback["rollback_complete"] = json!(perform && failed.is_empty());
+        // The reverts' result only: completion of the WHOLE rollback is `rollback_done`, below.
+        rollback["reverts_ok"] = json!(perform && failed.is_empty());
         self.state = State::Aborted;
         self.journal.transition(State::Aborted, rollback)?;
-        if let Some(hook) = &self.cfg.hooks.on_abort {
-            let result = self.ops.run_hook(hook);
-            if let Err(e) = &result {
-                failed.push(format!("on_abort hook: {e}"));
+        if let Some(hook) = self.cfg.hooks.on_abort.clone() {
+            if !self.step_done("on_abort") {
+                let result = self.ops.run_hook(&hook);
+                self.journal.evidence(State::Aborted, json!({"on_abort_hook": format!("{result:?}")}))?;
+                match result {
+                    Ok(_) => self.mark_step("on_abort")?,
+                    Err(e) => failed.push(format!("on_abort hook: {e}")),
+                }
             }
-            self.journal.evidence(
-                State::Aborted,
-                json!({"on_abort_hook": format!("{result:?}")}),
-            )?;
         }
-        Ok(failed)
+        self.unstage(unstage_any, &mut failed, &mut notes)?;
+        if failed.is_empty() {
+            if perform {
+                self.journal.evidence(State::Aborted, json!({"rollback_done": true, "rollback_complete": true}))?;
+                self.aborted_rollback_complete = true;
+            }
+        } else {
+            self.journal.evidence(State::Aborted, json!({"rollback_incomplete": failed, "rollback_complete": false}))?;
+        }
+        Ok((failed, notes))
     }
 
     /// ARMED: watch head until H, then FREEZE WRITES (hook) — production

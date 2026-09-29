@@ -279,12 +279,15 @@ struct Acc {
     ignition_started: bool,
     /// The journal ends in an operator rollback forced after ignition (`--force-after-ignite`).
     forced_rollback: bool,
+    /// For an ABORTED journal: did the rollback provably finish (`rollback_done`)? None otherwise.
+    rollback_complete: Option<bool>,
 }
 
 static JOURNALS: Mutex<Option<HashMap<PathBuf, Acc>>> = Mutex::new(None);
 
-/// Preparation ("setup") checks: not health. Same split as the dashboard's CHECKS map
-/// (control/public/index.html); every other check is a HEALTH check.
+/// Preparation ("setup") checks: not health; every other check name (including unknown ones) is a
+/// HEALTH check. The shared list lives in control/check-kinds.json (also read by mission control and
+/// matched by the dashboard's CHECKS map); tests on both sides assert they are equal.
 pub const SETUP_CHECKS: &[&str] = &[
     "hook_on_freeze", "hook_post_ignite", "hook_on_live", "hook_on_abort",
     "validator_running", "metal_synced", "metal_reachable",
@@ -324,6 +327,12 @@ fn apply_line(acc: &mut Acc, v: &Value) {
     if matches!(d["side_effect"].as_str(), Some("ignite_started" | "ignite")) {
         acc.ignition_started = true;
     }
+    if d["rollback_done"].as_bool() == Some(true) {
+        acc.rollback_complete = Some(true);
+    }
+    if d.get("rollback_incomplete").is_some() {
+        acc.rollback_complete = Some(false);
+    }
     match v["kind"].as_str() {
         Some("transition") => {
             acc.state = v["state"].clone();
@@ -331,6 +340,8 @@ fn apply_line(acc: &mut Acc, v: &Value) {
                 acc.ignition_started = true;
             }
             acc.forced_rollback = v["state"].as_str() == Some("ABORTED") && d["force_after_ignite"].as_bool() == Some(true);
+            // An ABORTED is unfinished until its `rollback_done` record follows.
+            acc.rollback_complete = (v["state"].as_str() == Some("ABORTED")).then_some(false);
             acc.last_ts = v["ts"].clone();
             acc.transitions.push(json!({"state": v["state"], "ts": v["ts"]}));
             let ev = &mut acc.ev;
@@ -416,7 +427,8 @@ pub fn journal_summary(path: &Path) -> Value {
            "last_error_class": acc.last_error.as_deref().map(sanitize_short),
            "armed_ts_ms": acc.armed_ts_ms,
            "ignition_started": acc.ignition_started,
-           "forced_rollback": acc.forced_rollback})
+           "forced_rollback": acc.forced_rollback,
+           "rollback_complete": acc.rollback_complete})
 }
 
 /// Coordination status for the report, with free-text fields sanitized.

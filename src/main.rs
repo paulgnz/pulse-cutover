@@ -83,20 +83,25 @@ api mode: revert the flips, restart the source if the agent stopped it) ONLY whe
 positively shows ignition has not started.
 
 Exit codes:
-  0  rolled back (every step succeeded), or already rolled back (a repeat does nothing again)
+  0  rolled back (every step succeeded), or already rolled back: the journal proves every step
+     completed, on_abort and the unstage included, so a repeat does nothing again (it still stops
+     an orphaned hook and moves a late staged file aside)
   3  REFUSED, nothing changed: the config cannot be loaded; there is no journal (absence is not
      proof: pass --no-journal-i-know only on a box that never ran a ceremony); the journal is
      locked past --wait, corrupt or unreadable; or ignition may have started (ignite_started
      journaled, IGNITED or later, HALTED) and --force-after-ignite was not given
   4  INCOMPLETE: a rollback step failed (resume, flip revert, source restart, on_abort, unstage,
      or the target fence of a forced rollback); the failed steps are printed. The source may NOT
-     be producing: check by hand.
+     be producing: check by hand. Re-running redoes only the steps not yet journaled as done.
+  An orphaned hook that cannot be stopped is a refusal (3): nothing is rolled back.
 
 Before anything else it kills a hook left running by a killed agent. --force-after-ignite first
 FENCES this box's target (target.stop_cmd, default `systemctl stop <unit> && ! systemctl
 is-active --quiet <unit>`); if that fails the source is not resumed (exit 4). This is a local
 fence only: other producers' targets are not affected. A staged snapshot is moved aside
-(<staged>.rolled-back-<ms>). Every rollback is journaled (ABORTED, `operator_rollback`,
+(<staged>.rolled-back-<ms>) on every path (the agent's own abort moves the one it staged). Each step
+is journaled as it completes (`rollback_step`); the rollback counts as finished only when a final
+`rollback_done` record follows on_abort and the unstage. Every rollback is journaled (ABORTED, `operator_rollback`,
 `force_after_ignite`); with --no-journal-i-know the record goes to <journal>.rollback-<ms>.jsonl
 and the ceremony journal is not created.";
 
@@ -525,7 +530,13 @@ fn cmd_rollback(args: &[String]) -> Result<(), String> {
         cfg.source.snapshot_timeout_secs).with_hook_timeout(cfg.hooks.timeout_secs)
         .with_pgid_file_for(&cfg.journal_path);
     let mut machine = Machine::new(&cfg, &ops, journal, recovered);
-    match machine.operator_rollback(force) {
+    let result = machine.operator_rollback(force);
+    drop(machine); // releases the journal lock
+    if audit_only {
+        // The audit record's lock file is not needed once the record is written: leave no litter.
+        let _ = std::fs::remove_file(format!("{}.lock", journal_path.display()));
+    }
+    match result {
         Ok(out) => {
             for n in &out.notes {
                 println!("  {n}");

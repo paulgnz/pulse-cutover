@@ -87,10 +87,15 @@ pub struct Recovered {
     pub unhalted: bool,
     /// A trailing partial line (crash mid-write) was found and set aside on open.
     pub torn_tail: bool,
-    /// The journal ends in an ABORTED whose rollback actions all succeeded
-    /// (`rollback_complete: true` and no later `rollback_incomplete` evidence): a repeated
-    /// `rollback` is a no-op instead of a second resume.
+    /// The journal ends in an ABORTED whose rollback PROVABLY finished: a `rollback_done`
+    /// record, written only after every step (reverts, on_abort, unstage) succeeded, and no later
+    /// ABORTED or `rollback_incomplete`. A repeated `rollback` is then a no-op instead of a second
+    /// resume. (rc.7 put `rollback_complete: true` on the ABORTED transition BEFORE on_abort ran;
+    /// that key is no longer trusted, so an rc.7 journal repeats its rollback: the safe default.)
     pub aborted_rollback_complete: bool,
+    /// Rollback steps journaled as done (`rollback_step` records) in the current abort episode
+    /// (since the last non-ABORTED transition): a rollback that died part-way redoes only the rest.
+    pub rollback_steps_done: Vec<String>,
 }
 
 impl Journal {
@@ -334,8 +339,12 @@ impl Journal {
                     out.unhalted = false;
                     out.halted_from = entry.data.get("halted_from").and_then(|v| v.as_str()).and_then(|v| v.parse().ok());
                 }
-                out.aborted_rollback_complete = st == State::Aborted
-                    && entry.data.get("rollback_complete").and_then(|v| v.as_bool()) == Some(true);
+                // Every ABORTED transition (re)opens the rollback; only a later `rollback_done` closes
+                // it. Leaving ABORTED (a new ceremony on this journal) forgets the episode's steps.
+                out.aborted_rollback_complete = false;
+                if st != State::Aborted {
+                    out.rollback_steps_done.clear();
+                }
                 out.state = Some(st);
                 if entry.state == State::Frozen.as_str() {
                     out.frozen_ts_ms = Some(entry.ts_ms);
@@ -367,6 +376,18 @@ impl Journal {
             }
             if entry.data.get("rollback_incomplete").is_some() {
                 out.aborted_rollback_complete = false;
+            }
+            if let Some(step) = entry.data.get("rollback_step").and_then(|v| v.as_str()) {
+                if entry.data.get("ok").and_then(|v| v.as_bool()) == Some(true)
+                    && !out.rollback_steps_done.iter().any(|x| x == step)
+                {
+                    out.rollback_steps_done.push(step.to_string());
+                }
+            }
+            if entry.data.get("rollback_done").and_then(|v| v.as_bool()) == Some(true)
+                && out.state == Some(State::Aborted)
+            {
+                out.aborted_rollback_complete = true;
             }
             if entry.data.get("unhalted_by").is_some() {
                 out.unhalted = true;
