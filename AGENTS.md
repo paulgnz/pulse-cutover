@@ -5,7 +5,8 @@ cutover. Read this section in full before running any command.
 
 Human-oriented docs: **[docs/PROCESS.md](docs/PROCESS.md)** (the process, step by step, with diagrams),
 [ATOMICITY.md](ATOMICITY.md) (what "atomic" means, what the evidence shows so far, and what is still open),
-[README.md](README.md) (operator walkthrough and field notes), [TESTING.md](TESTING.md).
+[README.md](README.md) (operator walkthrough and field notes), [TESTING.md](TESTING.md),
+[docs/DESIGN.md](docs/DESIGN.md) (design, review findings, failure table) and [docs/EVIDENCE.md](docs/EVIDENCE.md) (every recorded run).
 
 ---
 
@@ -146,6 +147,9 @@ Always, LIVE or ABORTED:
 | `tools/state-diff.mjs` | byte-exact state comparison of two `/v1/chain` endpoints (atomicity A3) |
 | `tools/replay-canary.mjs` | exactly-once test across a same-chain_id cutover (atomicity A4) |
 | `docs/PROCESS.md` | the process, step by step, with diagrams |
+| `docs/DESIGN.md` | the design as of rc.11: review findings R1–R12, state machine, config format, failure/rollback table, v2 sketch |
+| `docs/EVIDENCE.md` | every recorded rehearsal run, what it proves and does not, findings R13–R23 |
+| `docs/DESIGN-authority-boundary.md` | fleet-wide commit-or-abort design (not implemented) |
 | `src/beacon.rs` + `control/` | `pulse-cutover beacon` (readiness + evidence reporter) and Cutover Mission Control (multi-network status board) |
 
 ## Command surface + contracts

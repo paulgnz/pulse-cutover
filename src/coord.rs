@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn arm_must_bind_the_exact_event_payload() {
-        // Astra verify2 #4: a correctly signed arm carrying the WRONG event_hash started the ceremony.
+        // Review #4: a correctly signed arm carrying the WRONG event_hash started the ceremony.
         let arm = |h: &str| json!({"type": "arm", "network": "testnet", "event_id": "e1", "event_hash": h});
         assert!(check_arm(&arm("aa"), "e1", "testnet", "aa").is_ok());
         assert!(check_arm(&arm("bb"), "e1", "testnet", "aa").unwrap_err().contains("event_hash"));

@@ -226,7 +226,7 @@ pub struct Ceremony {
     /// across nodes using the same value.
     #[serde(default = "default_cpu_scale")]
     pub import_cpu_scale: u64,
-    /// How writes stop at H (see Appendix A, review finding R1):
+    /// How writes stop at H (see docs/DESIGN.md, review finding R1):
     /// - "pause_at_h": poll head, pause the producer the moment head >= H.
     ///   Single-producer rehearsal mode; cut height may land a block or two
     ///   past H, and finality of the cut block is by quiescence, not DPoS LIB.
@@ -240,6 +240,13 @@ pub struct Ceremony {
     /// producer that did not actually stop, or late blocks arriving on p2p).
     #[serde(default = "default_quiescence_polls")]
     pub quiescence_polls: u32,
+    /// Upper bound on the quiescence wait. A producer that keeps producing after
+    /// the pause (pause ignored, another producer still on our schedule, a
+    /// replica still syncing) would otherwise hold the ceremony in FROZEN, with
+    /// writes closed, forever. On expiry the ceremony aborts (before ignition:
+    /// the on_abort hook reopens writes on the old chain). Must be > 0.
+    #[serde(default = "default_quiescence_timeout")]
+    pub quiescence_timeout_secs: u64,
     /// `schedule_at_h` only: freeze writes this many blocks BEFORE H. The
     /// cut stays exactly H; the lead lets transactions already accepted at
     /// an API edge or in flight on p2p land at or before H instead of in
@@ -619,13 +626,13 @@ pub struct Hooks {
     /// writes that would be silently discarded.
     #[serde(default)]
     pub on_freeze: Option<String>,
-    /// Runs once after IGNITED (e.g. repoint the traffic generator / warm the
-    /// gateway). Failures are journaled but non-fatal: the LIVE gate decides.
+    /// Runs once after IGNITED (e.g. send the first transactions: PulseVM builds
+    /// blocks on demand). Required: a failure halts the ceremony (ignition has started).
     #[serde(default)]
     pub post_ignite: Option<String>,
-    /// Runs once after LIVE (e.g. flip gateway upstreams / DNS). This is the
-    /// ONLY user-visible commitment in the ceremony (finding R5 ratchet
-    /// rule); everything before it is abortable.
+    /// Runs once the LIVE gate has passed, BEFORE LIVE is journaled (e.g. flip the
+    /// edge to PulseVM and reopen writes). In producer mode this is the user-visible
+    /// commitment (finding R5 ratchet rule). Required: a failure halts the ceremony.
     #[serde(default)]
     pub on_live: Option<String>,
     /// Runs on ABORT after auto-rollback (e.g. re-open writes at the
@@ -673,6 +680,9 @@ fn default_freeze_lead_blocks() -> u64 {
 fn default_quiescence_polls() -> u32 {
     6
 }
+fn default_quiescence_timeout() -> u64 {
+    120
+}
 fn default_snapshot_timeout() -> u64 {
     600
 }
@@ -695,6 +705,9 @@ impl Config {
             .map_err(|e| format!("read config {}: {e}", path.display()))?;
         let config: Config =
             toml::from_str(&text).map_err(|e| format!("parse config {}: {e}", path.display()))?;
+        if config.ceremony.quiescence_timeout_secs == 0 {
+            return Err("ceremony.quiescence_timeout_secs must be > 0 (0 would abort every ceremony at the pause)".into());
+        }
         if config.snapshot.golden_roots.is_some() && config.snapshot.capture_roots.is_some() {
             return Err("snapshot.golden_roots and snapshot.capture_roots are mutually exclusive: \
                         a node either verifies against published goldens or captures its own"

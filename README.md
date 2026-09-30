@@ -414,7 +414,7 @@ One agent, one manifest format, three operator roles — pick with
   public `/v2` call returning post-cut + 3,206 pre-cut rows minutes after the
   cut.
 
-(Recorded evidence: wiki/59 Appendices B + C in pulsevm-experimental.)
+(Recorded evidence for each mode, with what it does and does not prove: [docs/EVIDENCE.md](docs/EVIDENCE.md).)
 
 ---
 
@@ -466,8 +466,9 @@ Plain-English versions of every term this repo uses:
 - **Journal** — an append-only file (`journal.jsonl`) the agent writes every
   step to, with timestamps and evidence. Crash-safe: a restarted agent
   resumes from it. It's also the thing you share when something breaks.
-- **R-numbers (R1, R10, R12...)** — findings from the design review
-  (wiki/59). When a message cites one, it's pointing at the *reason* a rule
+- **R-numbers (R1, R10, R12...)** — findings from the design review and the
+  rehearsals ([docs/DESIGN.md](docs/DESIGN.md#2-adversarial-review-findings-that-shaped-the-design),
+  R13–R23 in [docs/EVIDENCE.md](docs/EVIDENCE.md#findings-r13r23)). When a message cites one, it's pointing at the *reason* a rule
   exists, e.g. R10 = "the producer API can pause your chain, keep it off the
   public internet"; R12 = "a stale staged snapshot must never pin a new chain
   to an old cut".
@@ -566,7 +567,8 @@ gantt
 | 6 | **LIVE on all 5, unattended, one public URL** | Every client used `api-rehearsal.protonnz.com` (DNS across all 5 BPs, real TLS). Write gap 101–114 s; local LIVE times spread over ~13 s. Watched on [Cutover Mission Control](control/README.md): all 7 evidence rows agreed 5/5, the state diff at H ran automatically (identical on the sampled state, every BP), replay canary passed. The post-LIVE stall (note 10) reproduced: 92 expired + 12 timeouts after the flip |
 
 Evidence (journals, fingerprints, snapshot hashes per BP) is kept with the
-rehearsal notes; the configs are reproducible from `examples/ceremony-bp.toml`.
+rehearsal notes and summarized per run in [docs/EVIDENCE.md](docs/EVIDENCE.md#multi-producer-rehearsal-5-bps-september-2026);
+the configs are reproducible from `examples/ceremony-bp.toml`.
 
 ## Field notes: what real-world rehearsals taught us
 
@@ -678,8 +680,10 @@ journal and re-runs its current step. Crash recovery is implemented but not yet
 certified on real boxes: an exclusive journal lock, torn-tail repair (only a fragment
 after the last newline; a complete corrupt record is fatal), journaled side-effect
 records (staged artifact, ignition start, flips), a durable HALTED, and hooks run in
-their own process group with a deadline (`hooks.timeout_secs`). None of it has been
-fault-injected on real hosts yet (ATOMICITY Known limits #6).
+their own process group with a deadline (`hooks.timeout_secs`). A Linux fault-injection
+run (real systemd, stubbed nodeos and metalgo) passed on rc.10
+([docs/EVIDENCE.md](docs/EVIDENCE.md#linux-fault-injection-rc9-and-rc10)); none of it has
+been exercised against real chain services or a fleet yet (ATOMICITY Known limits #6).
 
 ### Commands
 
@@ -746,7 +750,7 @@ and paginated across the boundary. See `federator/README.md`.
 
 ### bp mode (`mode = "producer"`)
 
-The producer-side ceremony from Appendix A: freeze writes at the API edge,
+The producer-side ceremony from [docs/DESIGN.md](docs/DESIGN.md): freeze writes at the API edge,
 **schedule the snapshot at exactly H** (`freeze_strategy = "schedule_at_h"` —
 nodeos writes `snapshot-<block_id(H)>.bin` when H finalizes and the agent picks
 it up by that exact name), pause after, quiescence-pin the cut, verify, ignite
@@ -993,8 +997,10 @@ than one: `"nginx"`, `"haproxy"`, or `"auto"` (default — auto-picks the one
 edge that routes /v1 to your nodeos, and refuses to guess if both do).
 Boxes with a single edge can omit it entirely.
 
-In a real multi-operator ceremony this file is generated from the on-chain
-msig declaration (freeze height, pinned versions, goldens) — see wiki/59 §A.3.
+In a real multi-operator ceremony every operator gets the same manifest from the
+coordinator, and H comes from the signed coordinator event (`pulse-cutover await`).
+The on-chain msig declaration in the original design was not built; see
+[docs/DESIGN.md](docs/DESIGN.md) (§4 and finding R6).
 
 ### `pulse-cutover scan-contracts` — stubbed-intrinsic preflight
 
@@ -1068,10 +1074,18 @@ cargo build --release && cargo test
 
 ### Design docs & trust model
 
-The reviewed design — trust model, failure/rollback table, R-findings, and
-the v2 shadow-mirror sketch — is Appendix A of `wiki/59-cutover-orchestration.md`
-(pulsevm-experimental). `examples/ceremony.toml` documents the full agent
-config format.
+- [docs/DESIGN.md](docs/DESIGN.md): the reviewed design as of rc.11 — review
+  findings R1–R12, state machine, config format, trust model, failure/rollback
+  table, and the v2 shadow-mirror sketch.
+- [docs/EVIDENCE.md](docs/EVIDENCE.md): every recorded rehearsal run (single
+  producer, API, hyperion and bp mode, the 5-BP rehearsal, Linux fault
+  injection), with what each proves and does not, and findings R13–R23.
+- [docs/DESIGN-authority-boundary.md](docs/DESIGN-authority-boundary.md): the
+  fleet-wide commit-or-abort design (not implemented).
+- [docs/PROCESS.md](docs/PROCESS.md) and [ATOMICITY.md](ATOMICITY.md): the
+  process step by step, and what "atomic" means and how far the evidence goes.
+
+`examples/ceremony.toml` documents the full agent config format.
 
 ---
 
@@ -1160,8 +1174,8 @@ on a single Ubuntu 24.04 box; the multi-producer numbers come from a
 disposable 5-BP Leap chain + private 5-validator Metal network (see
 [Multi-producer cutover](#multi-producer-cutover-5-bps-5-continents)). To reproduce: walk Steps 0–5 above, then
 `pulse-cutover loop --runs N` with `examples/ceremony-api.toml` (the
-`examples/loop/` scripts show the exact reset harness we used). Evidence
-journals for the recorded runs: wiki/59 Appendices B + C.
+`examples/loop/` scripts show the exact reset harness we used). The recorded
+runs, with what each proves and does not: [docs/EVIDENCE.md](docs/EVIDENCE.md).
 
 ## Testing program
 

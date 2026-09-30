@@ -1,5 +1,5 @@
 // node --test control/test/*.test.mjs
-// Round-2 fixes (Astra verification 2026-09-30): DNS-pinned outbound requests, rc.5 report schema, durable relay
+// Round-2 fixes (independent verification 2026-09-30): DNS-pinned outbound requests, rc.5 report schema, durable relay
 // (restart, write failure, corrupt store, single-use event ids), replay state across restarts, instance-id conflicts,
 // endpoint identity, no-roster agreement, freshness from the report's own timestamp.
 import { test, after } from 'node:test';

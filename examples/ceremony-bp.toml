@@ -53,6 +53,7 @@ freeze_lead_blocks = 24
 # After pausing, the chain's head must hold still for this many consecutive
 # polls before the cut is trusted (catches stragglers/late blocks).           [LEAVE]
 quiescence_polls = 8
+quiescence_timeout_secs = 120   # abort if the source never stops producing after the pause
 
 chain_id = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"  # XPR testnet  [CHANGE to your chain]
 import_cpu_scale = 143       # same number for every operator — coordinator sets it  [LEAVE]

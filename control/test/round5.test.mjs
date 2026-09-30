@@ -1,5 +1,5 @@
 // node --test control/test/*.test.mjs
-// Round 5 (Fable re-check of rc.7, N8/N9): mission control must judge health the way the agent's fleet gate
+// Round 5 (external re-check of rc.7, N8/N9): mission control must judge health the way the agent's fleet gate
 // does (one shared setup-check list), and an ABORTED must say what actually happened to the old chain.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';

@@ -1,6 +1,6 @@
 # Design: the authority boundary (commit-or-abort for the whole fleet)
 
-**Status: design, not implemented.** This closes Astra P0 #1 (authority boundary and source fencing) and most of
+**Status: design, not implemented.** This closes review item P0 #1 (authority boundary and source fencing) and most of
 P0 #3 (coordination model) once built. Parts need upstream PulseVM support (marked **upstream**).
 
 ## The problem
@@ -61,12 +61,12 @@ At COMMIT, "paused" is not enough (a restart un-pauses nodeos). The fence must s
 
 | Piece | Owner | Notes |
 |---|---|---|
-| Sealed start / activation gate: chain loads imported state but builds no blocks and admits no txs until a COMMIT certificate (file or Warp message) is presented | **upstream (Glenn)** | Smallest version: a chain-config flag `activation_certificate_path` + signer set; VM refuses `BuildBlock`/`IssueTx` until a valid certificate is present. |
-| Deterministic `state_commitment` at H (hash over all tables, not sampled) exposed by the importer and by the node | **upstream** | Replaces the 64-bit fingerprints and the sampled RPC state-diff as the gate (Astra P0 #5). |
-| `block_id@H` recorded in imported chain metadata, queryable after boot | **upstream** | Lets every agent check target lineage at H (Astra P0 #2). |
+| Sealed start / activation gate: chain loads imported state but builds no blocks and admits no txs until a COMMIT certificate (file or Warp message) is presented | **upstream** | Smallest version: a chain-config flag `activation_certificate_path` + signer set; VM refuses `BuildBlock`/`IssueTx` until a valid certificate is present. |
+| Deterministic `state_commitment` at H (hash over all tables, not sampled) exposed by the importer and by the node | **upstream** | Replaces the 64-bit fingerprints and the sampled RPC state-diff as the gate (review item P0 #5). |
+| `block_id@H` recorded in imported chain metadata, queryable after boot | **upstream** | Lets every agent check target lineage at H (review item P0 #2). |
 | Vote / certificate formats, signing, persistence, threshold verification | **us** | Extends `src/coord.rs`; per-BP keys (not coordinator keys) sign votes. |
 | Agent logic: act only on certificates; timeout = halt; COMMIT blocks any resume path (incl. `cutover.sh abort`) | **us** | Rewrites `abort()` semantics; journal records certificate before action. |
-| Roster: required validators + weights, required API/history providers (incl. non-producers such as Greymass) | **Metallicus + us** | Published per event, hash bound into every vote. |
+| Roster: required validators + weights, required API/history providers (incl. non-producers such as wallet default endpoints) | **Metallicus + us** | Published per event, hash bound into every vote. |
 | Coordinator key holders and threshold; who can sign ABORT | **Metallicus governance** | Not one key on one laptop. |
 | Durable, replicated relay (certificates must survive mission control restarts; agents also accept certificates from a second channel) | **us** | Mission control is a convenience relay, never the authority. |
 

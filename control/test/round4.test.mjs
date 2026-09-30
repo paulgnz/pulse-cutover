@@ -1,4 +1,4 @@
-// Round 4 (Fable review of rc.7): the beacon now reports whether ignition started on the box and
+// Round 4 (external review of rc.7): the beacon now reports whether ignition started on the box and
 // whether its last ABORTED was a forced rollback after ignition. An ABORTED with ignition_started
 // must stay distinguishable from a pre-ceremony box on the public dashboard.
 import { test } from 'node:test';

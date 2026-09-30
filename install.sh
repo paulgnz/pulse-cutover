@@ -6,7 +6,7 @@
 #   ./install.sh --mode hyperion --manifest ceremony.json  # API provider + /v2 history continuity
 #                                                          # (api mode + hyperion-rs + federating router)
 #
-# Discipline (modeled on the proven BP installer, wiki/36):
+# Discipline:
 #   - everything determinism-critical is PINNED in the manifest + sha256-verified, fail-closed;
 #   - tarballs are extracted SAFELY (--no-same-owner into a staging dir — a upstream release
 #     tarball once chown'd /root to uid 1001; never again);

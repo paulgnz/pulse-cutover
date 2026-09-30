@@ -59,6 +59,9 @@ struct MockOps {
     /// If true, produce one extra block on the SECOND poll after pause (a
     /// late block arriving over p2p — quiescence must absorb + journal it).
     late_block: Cell<bool>,
+    /// If true, the source keeps producing after the pause (a producer that
+    /// ignored it): quiescence never passes and must time out.
+    never_quiesce: Cell<bool>,
     paused_polls: Cell<u32>,
     /// Fault injection for the burn-off audit: transactions in each
     /// post-cut block, or an unreadable post-cut block.
@@ -136,6 +139,7 @@ impl MockOps {
             target_polls: Cell::new(0),
             target_head: Cell::new(0),
             late_block: Cell::new(false),
+            never_quiesce: Cell::new(false),
             paused_polls: Cell::new(0),
             burnoff_tx_per_block: Cell::new(0),
             burnoff_read_fails: Cell::new(false),
@@ -197,6 +201,9 @@ impl ChainOps for MockOps {
         } else {
             let polls = self.paused_polls.get() + 1;
             self.paused_polls.set(polls);
+            if self.never_quiesce.get() {
+                self.head.set(self.head.get() + 1);
+            }
             if polls == 2 && self.late_block.replace(false) {
                 self.head.set(self.head.get() + 1);
             }
@@ -607,6 +614,35 @@ fn happy_path_reaches_live_with_full_evidence() {
         .unwrap();
     assert!(live["data"]["cut_height"].as_u64().unwrap() >= 120);
     assert!(live["data"]["write_gap_ms_wallclock"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn producer_that_ignores_the_pause_aborts_at_the_quiescence_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path(), 120);
+    cfg.ceremony.quiescence_timeout_secs = 2;
+    let ops = MockOps::new(dir.path(), 110);
+    ops.never_quiesce.set(true);
+
+    let terminal = run_machine(&cfg, &ops);
+    assert_eq!(terminal, State::Aborted, "must not wait forever or ignite on an un-quiesced head");
+    assert!(!ops.ignited.get());
+
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("quiescence_timeout_secs"));
+    // Late blocks are journaled, but capped (a runaway producer must not flood the journal).
+    assert_eq!(text.matches("late_block_after_pause").count(), 10);
+}
+
+#[test]
+fn zero_quiescence_timeout_is_rejected_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    test_config(dir.path(), 120);
+    let base = std::fs::read_to_string(dir.path().join("ceremony.toml")).unwrap();
+    let bad = base.replace("quiescence_polls = 3", "quiescence_polls = 3\nquiescence_timeout_secs = 0");
+    assert_ne!(bad, base);
+    let err = load_toml(dir.path(), "bad.toml", &bad).unwrap_err();
+    assert!(err.contains("quiescence_timeout_secs"), "{err}");
 }
 
 #[test]
@@ -1564,7 +1600,7 @@ fn fleet_gate_times_out_and_rolls_back() {
 }
 
 
-// ---- Astra review fixes (2026-09-29) ---------------------------------------------------------------
+// ---- Independent review fixes (2026-09-29) ---------------------------------------------------------------
 
 #[test]
 fn readiness_profile_refuses_to_run_before_any_side_effect() {
@@ -1621,7 +1657,7 @@ fn beacon_url_must_be_https_unless_local() {
     assert!(check_beacon_url("http://[::1]:8787/api/report").is_ok());
     assert!(check_beacon_url("http://mc.example/api/report").is_err());
     assert!(check_beacon_url("").is_ok(), "empty = print-only --once");
-    // Astra 2026-09-30 #5: authority tricks that hand-parsing accepted.
+    // Review 2026-09-30 #5: authority tricks that hand-parsing accepted.
     assert!(check_beacon_url("http://localhost:80@example.org/api/report").is_err(), "userinfo: real host is example.org");
     assert!(check_beacon_url("http://localhost.example.org/api/report").is_err());
     assert!(check_beacon_url("http://127.0.0.1.nip.io/api/report").is_err());
@@ -1742,7 +1778,7 @@ fn api_mode_without_simulate_cuts_exactly_h_via_scheduler() {
 
 #[test]
 fn wrong_lineage_after_ignite_started_halts_without_resuming_source() {
-    // Astra 2026-09-30 #1: the lineage check runs AFTER the ignite command; the target may be
+    // Review 2026-09-30 #1: the lineage check runs AFTER the ignite command; the target may be
     // running, so a mismatch must seal, never resume the source.
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(dir.path(), 120);
@@ -1980,7 +2016,7 @@ fn crash_after_ignite_started_before_ignited_resumes_into_halt() {
 
 #[test]
 fn crash_mid_staging_resumes_and_accepts_its_own_staged_snapshot() {
-    // Astra 2026-09-30 #2: a crash after staging but before VERIFIED left the staged file; the
+    // Review 2026-09-30 #2: a crash after staging but before VERIFIED left the staged file; the
     // resumed preflight used to call it stale and abort.
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(dir.path(), 120);
@@ -2020,7 +2056,7 @@ fn side_effects_started_before_a_crash_are_recovered() {
 
 #[test]
 fn hook_completion_is_bounded_when_a_descendant_holds_the_pipe() {
-    // Astra 2026-09-30 #4: the shell exits but a background child keeps stdout open.
+    // Review 2026-09-30 #4: the shell exits but a background child keeps stdout open.
     let t0 = std::time::Instant::now();
     let out = pulse_cutover::ops::run_shell_timeout("sleep 30 & echo hi", std::time::Duration::from_secs(20)).unwrap();
     let took = t0.elapsed();
@@ -2126,7 +2162,7 @@ fn event_quorum_is_never_inherited_and_release_pin_needs_a_plugin() {
 
 #[test]
 fn beacon_preview_writes_nothing() {
-    // Astra 2026-09-30 #8: `beacon --once` with no url (installer dry-run) created the journal
+    // Review 2026-09-30 #8: `beacon --once` with no url (installer dry-run) created the journal
     // dir and beacon.instance.
     let dir = tempfile::tempdir().unwrap();
     let jdir = dir.path().join("not-created");
@@ -2157,8 +2193,8 @@ network = "testnet"
     assert!(!jdir.exists(), "a preview must not create the journal dir or beacon.instance");
 }
 
-// ---- Astra second verification (2026-09-30): round 3 regressions ------------------------------------
-// Each test below reproduces a failing case from ~/dev/pulse-migration/study/ASTRA-verify2-2026-09-30.md.
+// ---- second independent verification (2026-09-30): round 3 regressions ------------------------------------
+// Each test below reproduces a failing case from an independent review of rc.6.
 
 fn fail_live_config(dir: &std::path::Path) -> Config {
     let base = std::fs::read_to_string({ test_config(dir, 120); dir.join("ceremony.toml") }).unwrap();
@@ -2167,7 +2203,7 @@ fn fail_live_config(dir: &std::path::Path) -> Config {
 
 #[test]
 fn r3_rc6_halt_error_without_its_transition_is_still_halted() {
-    // Astra #2: rc.6 wrote the HALTED error, then the HALTED transition. A crash between the two
+    // Review #2: rc.6 wrote the HALTED error, then the HALTED transition. A crash between the two
     // left a journal whose replayed state was still IGNITED, and a restart ran on to LIVE.
     let dir = tempfile::tempdir().unwrap();
     let cfg = fail_live_config(dir.path());
@@ -2206,7 +2242,7 @@ fn r3_halt_is_one_durable_record_carrying_the_reason() {
 
 #[test]
 fn r3_unhalt_keeps_the_verified_snapshot_evidence() {
-    // Astra #3: unhalt wrote a VERIFIED transition without `sha256`; the beacon summary then
+    // Review #3: unhalt wrote a VERIFIED transition without `sha256`; the beacon summary then
     // reported snapshot_sha256 = null and any fleet-gated retry could never agree.
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(dir.path(), 120);
@@ -2254,7 +2290,7 @@ fn r3_unhalted_fleet_gated_retry_can_still_agree_and_reach_live() {
 
 #[test]
 fn r3_roster_with_zero_quorum_is_a_config_error() {
-    // Astra (#9 table): roster configured, fleet_quorum left at 0 and no event id → the gate was
+    // Review (#9 table): roster configured, fleet_quorum left at 0 and no event id → the gate was
     // skipped entirely and the ceremony reached LIVE with no fleet check.
     let dir = tempfile::tempdir().unwrap();
     let base = std::fs::read_to_string({ coord_config(dir.path(), 120, 0, 5); dir.path().join("ceremony-coord.toml") }).unwrap();
@@ -2267,7 +2303,7 @@ fn r3_roster_with_zero_quorum_is_a_config_error() {
 
 #[test]
 fn r3_conflicted_reports_never_count_toward_the_fleet_gate() {
-    // Astra #5: every roster report carried conflict=true (one token on two machines) and the
+    // Review #5: every roster report carried conflict=true (one token on two machines) and the
     // machine still reached LIVE.
     let probe = tempfile::tempdir().unwrap();
     let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
@@ -2293,7 +2329,7 @@ fn r3_conflicted_reports_never_count_toward_the_fleet_gate() {
 
 #[test]
 fn r3_completed_corrupt_record_before_a_cr_only_tail_is_fatal() {
-    // Astra #7: `valid\ncorrupt\n\r` — the tail after the last LF is whitespace, so the corrupt
+    // Review #7: `valid\ncorrupt\n\r` — the tail after the last LF is whitespace, so the corrupt
     // record is COMPLETE; it used to be treated as torn and silently dropped.
     let dir = tempfile::tempdir().unwrap();
     let good = serde_json::json!({"seq": 0, "ts_ms": 1, "ts": "t", "kind": "transition", "state": "ARMED",
@@ -2318,7 +2354,7 @@ fn run_bin(args: &[&str], cfg: &std::path::Path) -> std::process::Output {
 
 #[test]
 fn r3_rollback_refuses_without_affirmative_evidence() {
-    // Astra #1: `cutover.sh abort` treated a MISSING journal as safe and resumed the source.
+    // Review #1: `cutover.sh abort` treated a MISSING journal as safe and resumed the source.
     let dir = tempfile::tempdir().unwrap();
     let _ = test_config(dir.path(), 120);
     let cfgp = dir.path().join("ceremony.toml");
@@ -2434,7 +2470,7 @@ fn r3_crash_mid_copy_restages_a_truncated_staged_snapshot() {
 
 
 // ---------------------------------------------------------------------------------------------
-// Round 4 (Fable review of rc.7): rollback must never claim success it did not achieve.
+// Round 4 (external review of rc.7): rollback must never claim success it did not achieve.
 // ---------------------------------------------------------------------------------------------
 
 /// Minimal HTTP stub on 127.0.0.1: `handler(method, path) -> (status, body)`. Returns the base
@@ -2500,7 +2536,7 @@ fn pre_ignite_journal(dir: &std::path::Path) -> Config {
 
 #[test]
 fn r4_rollback_with_a_failed_resume_exits_4_and_names_the_step() {
-    // Fable §2.1: `rollback` printed "rolled back" and exited 0 when the producer resume FAILED.
+    // Review §2.1: `rollback` printed "rolled back" and exited 0 when the producer resume FAILED.
     let dir = tempfile::tempdir().unwrap();
     let cfg = pre_ignite_journal(dir.path());
     point_producer_at(dir.path(), "http://127.0.0.1:1"); // closed port
@@ -2515,7 +2551,7 @@ fn r4_rollback_with_a_failed_resume_exits_4_and_names_the_step() {
 
 #[test]
 fn r4_a_second_rollback_after_a_complete_one_does_nothing() {
-    // Fable §2.7: repeat rollbacks re-resumed and re-ran on_abort.
+    // Review §2.7: repeat rollbacks re-resumed and re-ran on_abort.
     let dir = tempfile::tempdir().unwrap();
     let _cfg = pre_ignite_journal(dir.path());
     let (url, hits) = stub_http(|_m, _p| (200, "{}".into()));
@@ -2533,7 +2569,7 @@ fn r4_a_second_rollback_after_a_complete_one_does_nothing() {
 
 #[test]
 fn r4_forced_rollback_fences_the_target_before_resuming_the_source() {
-    // Fable §2.2: --force-after-ignite resumed the source while this box's target kept running.
+    // Review §2.2: --force-after-ignite resumed the source while this box's target kept running.
     let dir = tempfile::tempdir().unwrap();
     let base = test_config(dir.path(), 120);
     let ops = MockOps::new(dir.path(), 110);
@@ -2570,7 +2606,7 @@ fn r4_forced_rollback_fences_the_target_before_resuming_the_source() {
 
 #[test]
 fn r4_every_rollback_refusal_exits_3() {
-    // Fable §2.3: lock timeout and corrupt journal exited 1, so cutover.sh skipped its guidance.
+    // Review §2.3: lock timeout and corrupt journal exited 1, so cutover.sh skipped its guidance.
     let dir = tempfile::tempdir().unwrap();
     let cfg = pre_ignite_journal(dir.path());
     let cfgp = dir.path().join("ceremony.toml");
@@ -2587,7 +2623,7 @@ fn r4_every_rollback_refusal_exits_3() {
 
 #[test]
 fn r4_rollback_moves_the_staged_snapshot_aside() {
-    // Fable §2.4: the staged snapshot stayed; the next preflight refused and a metalgo restart
+    // Review §2.4: the staged snapshot stayed; the next preflight refused and a metalgo restart
     // would have imported the abandoned cut.
     let dir = tempfile::tempdir().unwrap();
     let cfg = pre_ignite_journal(dir.path());
@@ -2607,7 +2643,7 @@ fn r4_rollback_moves_the_staged_snapshot_aside() {
 
 #[test]
 fn r4_no_journal_rollback_leaves_no_ceremony_journal_behind() {
-    // Fable §2.5: --no-journal-i-know created a terminal ABORTED journal, so the next `run` on
+    // Review §2.5: --no-journal-i-know created a terminal ABORTED journal, so the next `run` on
     // that box did nothing.
     let dir = tempfile::tempdir().unwrap();
     let _ = test_config(dir.path(), 120);
@@ -2626,7 +2662,7 @@ fn r4_no_journal_rollback_leaves_no_ceremony_journal_behind() {
 
 #[test]
 fn r4_rollback_stops_an_orphaned_hook_before_anything_else() {
-    // Fable §2.6: an on_freeze left running by a killed agent could close writes again after
+    // Review §2.6: an on_freeze left running by a killed agent could close writes again after
     // on_abort reopened them.
     let dir = tempfile::tempdir().unwrap();
     let _ = pre_ignite_journal(dir.path());
@@ -2653,7 +2689,7 @@ fn r4_rollback_stops_an_orphaned_hook_before_anything_else() {
     let ops2 = MockOps::new(dir2.path(), 200);
     *ops2.orphan.borrow_mut() = Some(Err("survived SIGKILL".into()));
     let (j, rec) = Journal::open(&cfg2.journal_path).unwrap();
-    // Round 5 (Fable N5): nothing changed, so this is a refusal (exit 3), not an incomplete rollback.
+    // Round 5 (Review N5): nothing changed, so this is a refusal (exit 3), not an incomplete rollback.
     let err = Machine::new(&cfg2, &ops2, j, rec).operator_rollback(false).expect_err("refused");
     assert!(err.starts_with("refusing"), "{err}");
     assert_eq!(ops2.resumes.get(), 0, "nothing rolled back while an orphaned hook still runs");
@@ -2683,7 +2719,7 @@ fn r4_recorded_hook_group_is_killed_for_real() {
 
 #[test]
 fn r4_fleet_gate_ignores_reports_with_failing_health_but_not_setup_checks() {
-    // Fable #5 residual: the gate counted reports whose health checks were failing.
+    // Review #5 residual: the gate counted reports whose health checks were failing.
     let probe = tempfile::tempdir().unwrap();
     let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
     let ours = pulse_cutover::beacon::journal_summary(&probe.path().join("journal.jsonl"))["evidence"].clone();
@@ -2710,7 +2746,7 @@ fn r4_fleet_gate_ignores_reports_with_failing_health_but_not_setup_checks() {
 
 #[test]
 fn r4_await_never_launches_the_ceremony_for_an_arm_with_the_wrong_event_hash() {
-    // Fable #4 residual: the arm-hash check was only unit-tested through check_arm.
+    // Review #4 residual: the arm-hash check was only unit-tested through check_arm.
     fn run_await_against(dir: &std::path::Path, wrong_hash: bool) -> String {
         let _ = coord_config(dir, 120, 0, 60);
         let ev = signed(serde_json::json!({"type": "event", "event_id": "e1", "network": "rehearsal", "h": 5000u64}));
@@ -2747,7 +2783,7 @@ fn r4_await_never_launches_the_ceremony_for_an_arm_with_the_wrong_event_hash() {
 
 #[test]
 fn r4_beacon_summary_marks_a_forced_rollback_after_ignition() {
-    // Fable §2.9: after a forced rollback the beacon judged the box as pre-ceremony.
+    // Review §2.9: after a forced rollback the beacon judged the box as pre-ceremony.
     let dir = tempfile::tempdir().unwrap();
     let base = test_config(dir.path(), 120);
     let ops = MockOps::new(dir.path(), 110);
@@ -2764,7 +2800,7 @@ fn r4_beacon_summary_marks_a_forced_rollback_after_ignition() {
 
 
 // ---------------------------------------------------------------------------------------------
-// Round 5 (Fable re-check of rc.7, N1–N10): rollback completion, orphans on every path.
+// Round 5 (external re-check of rc.7, N1–N10): rollback completion, orphans on every path.
 // ---------------------------------------------------------------------------------------------
 
 /// pre_ignite_journal + an on_abort hook.
@@ -2783,7 +2819,7 @@ fn rollback_with(cfg: &Config, ops: &MockOps, force: bool) -> Result<pulse_cutov
 
 #[test]
 fn r5_rollback_killed_inside_on_abort_reruns_only_the_missing_steps() {
-    // Fable N1 (P9): rollback_complete was journaled BEFORE on_abort; a rollback killed inside
+    // Review N1 (P9): rollback_complete was journaled BEFORE on_abort; a rollback killed inside
     // on_abort replayed as complete and every later rollback was a no-op with writes still closed.
     let dir = tempfile::tempdir().unwrap();
     let cfg = pre_ignite_with_on_abort(dir.path());
@@ -2811,7 +2847,7 @@ fn r5_rollback_killed_inside_on_abort_reruns_only_the_missing_steps() {
 
 #[test]
 fn r5_already_rolled_back_still_unstages_and_kills_orphans() {
-    // Fable N2 (P4, P8d): the "already rolled back" no-op returned before the orphan kill and the
+    // Review N2 (P4, P8d): the "already rolled back" no-op returned before the orphan kill and the
     // unstage, so a late staged file and an orphaned hook both survived.
     let dir = tempfile::tempdir().unwrap();
     let cfg = pre_ignite_journal(dir.path());
@@ -2830,7 +2866,7 @@ fn r5_already_rolled_back_still_unstages_and_kills_orphans() {
 
 #[test]
 fn r5_automatic_abort_after_staging_moves_its_own_snapshot_aside() {
-    // Fable N2 (P4): the agent's own abort (here: fleet gate short of quorum, after staging)
+    // Review N2 (P4): the agent's own abort (here: fleet gate short of quorum, after staging)
     // left staged.bin; the next preflight refused and a metalgo restart would import it.
     let probe = tempfile::tempdir().unwrap();
     let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
@@ -2851,7 +2887,7 @@ fn r5_automatic_abort_after_staging_moves_its_own_snapshot_aside() {
 
 #[test]
 fn r5_orphan_that_cannot_be_stopped_is_a_refusal() {
-    // Fable N5: an orphan that could not be killed exited 4 ("incomplete") although nothing changed.
+    // Review N5: an orphan that could not be killed exited 4 ("incomplete") although nothing changed.
     let dir = tempfile::tempdir().unwrap();
     let cfg = pre_ignite_journal(dir.path());
     let ops = MockOps::new(dir.path(), 200);
@@ -2893,7 +2929,7 @@ fn alive(pid: u32) -> bool {
 #[test]
 #[cfg(unix)]
 fn r5_run_resume_kills_a_recorded_orphan_before_anything_else() {
-    // Fable N3 (P10): a resumed `run` neither killed the orphan left by a crashed agent nor kept
+    // Review N3 (P10): a resumed `run` neither killed the orphan left by a crashed agent nor kept
     // its record (the next hook overwrote it and deleted it on completion).
     let dir = tempfile::tempdir().unwrap();
     let cfg = pre_ignite_journal(dir.path());
@@ -2910,7 +2946,7 @@ fn r5_run_resume_kills_a_recorded_orphan_before_anything_else() {
 #[test]
 #[cfg(unix)]
 fn r5_run_long_pipeline_steps_are_tracked_and_killable() {
-    // Fable N4: run_long (upstream export/import) ran untracked, outside its own process group:
+    // Review N4: run_long (upstream export/import) ran untracked, outside its own process group:
     // it survived `pkill` and could re-create the staged artifact after "rolled back".
     use pulse_cutover::ops::ChainOps;
     let dir = tempfile::tempdir().unwrap();
@@ -2936,7 +2972,7 @@ fn r5_run_long_pipeline_steps_are_tracked_and_killable() {
 #[test]
 #[cfg(unix)]
 fn r5_recycled_pid_guard_compares_the_process_start_time() {
-    // Fable N10: the guard accepted any `sh -c …` leader, so a compound hook's record could kill an
+    // Review N10: the guard accepted any `sh -c …` leader, so a compound hook's record could kill an
     // unrelated `sh -c` group that inherited the pid. The record now carries the start time.
     let dir = tempfile::tempdir().unwrap();
     let pg = dir.path().join("journal.jsonl.hook.pgid");
@@ -2955,7 +2991,7 @@ fn r5_recycled_pid_guard_compares_the_process_start_time() {
 
 #[test]
 fn r5_no_journal_rollback_leaves_no_lock_file_litter() {
-    // Fable N7: --no-journal-i-know left <journal>.rollback-<ms>.jsonl.lock behind.
+    // Review N7: --no-journal-i-know left <journal>.rollback-<ms>.jsonl.lock behind.
     let dir = tempfile::tempdir().unwrap();
     let _ = test_config(dir.path(), 120);
     let (url, _hits) = stub_http(|_m, _p| (200, "{}".into()));
@@ -2969,7 +3005,7 @@ fn r5_no_journal_rollback_leaves_no_lock_file_litter() {
 
 #[test]
 fn r5_fleet_gate_journals_why_each_report_was_excluded() {
-    // Fable N9: excluded reports left no per-producer reason in the journal.
+    // Review N9: excluded reports left no per-producer reason in the journal.
     let probe = tempfile::tempdir().unwrap();
     let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
     let ours = pulse_cutover::beacon::journal_summary(&probe.path().join("journal.jsonl"))["evidence"].clone();
@@ -2988,7 +3024,7 @@ fn r5_fleet_gate_journals_why_each_report_was_excluded() {
 
 #[test]
 fn r5_setup_check_names_are_shared_with_mission_control() {
-    // Fable N9: the agent's health/setup split must be the dashboard's, from one shared list.
+    // Review N9: the agent's health/setup split must be the dashboard's, from one shared list.
     let v: serde_json::Value = serde_json::from_str(include_str!("../control/check-kinds.json")).unwrap();
     let mut shared: Vec<String> = v["setup"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
     let mut ours: Vec<String> = pulse_cutover::beacon::SETUP_CHECKS.iter().map(|s| s.to_string()).collect();
@@ -3033,7 +3069,7 @@ fn r5b_operator_rollback_records_its_intent_before_any_step() {
 
 #[test]
 fn r6_steady_stale_report_is_journaled_once_and_non_roster_producers_are_not_named() {
-    // Fable final N-1: the exclusion reason embedded the relay's changing age_ms, so a steadily
+    // Final review N-1: the exclusion reason embedded the relay's changing age_ms, so a steadily
     // stale report wrote a fleet_gate line on EVERY 2 s poll, and non-roster producers were named.
     let probe = tempfile::tempdir().unwrap();
     let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
@@ -3059,7 +3095,7 @@ fn r6_steady_stale_report_is_journaled_once_and_non_roster_producers_are_not_nam
 
 #[test]
 fn r6_forced_rollback_fences_on_every_attempt() {
-    // Fable final N-2 (P7e): after a forced attempt whose fence succeeded and whose resume failed, the
+    // Final review N-2 (P7e): after a forced attempt whose fence succeeded and whose resume failed, the
     // re-run skipped the fence and resumed on the strength of the earlier "target stopped" proof.
     let dir = tempfile::tempdir().unwrap();
     let base = test_config(dir.path(), 120);
@@ -3084,7 +3120,7 @@ fn r6_forced_rollback_fences_on_every_attempt() {
 
 #[test]
 fn r6_status_shows_a_pending_rollback_and_cancel_intent_works_only_before_any_step() {
-    // Fable final N-3: a recorded intent was invisible in `status`/the beacon and could not be withdrawn.
+    // Final review N-3: a recorded intent was invisible in `status`/the beacon and could not be withdrawn.
     let dir = tempfile::tempdir().unwrap();
     let cfg = pre_ignite_journal(dir.path());
     {
@@ -3120,7 +3156,7 @@ fn r6_status_shows_a_pending_rollback_and_cancel_intent_works_only_before_any_st
 
 #[test]
 fn r6_run_on_an_aborted_journal_with_an_unfinished_rollback_says_so_and_exits_4() {
-    // Fable final N-4: `run` said "it stopped safely and rolled back" for an ABORTED whose rollback
+    // Final review N-4: `run` said "it stopped safely and rolled back" for an ABORTED whose rollback
     // never finished (writes still closed).
     let dir = tempfile::tempdir().unwrap();
     let cfg = pre_ignite_journal(dir.path());
@@ -3135,7 +3171,7 @@ fn r6_run_on_an_aborted_journal_with_an_unfinished_rollback_says_so_and_exits_4(
 
 #[test]
 fn r6_pre_rc8_aborted_reads_as_unknown_not_incomplete() {
-    // Fable final N-8: every rc.7-written ABORTED (no step records) read as an incomplete rollback.
+    // Final review N-8: every rc.7-written ABORTED (no step records) read as an incomplete rollback.
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("journal.jsonl");
     {
@@ -3157,7 +3193,7 @@ fn r6_pre_rc8_aborted_reads_as_unknown_not_incomplete() {
 #[cfg(unix)]
 #[test]
 fn r6_legacy_record_of_an_execd_script_hook_is_recognised() {
-    // Fable final N-6: an rc.7 record (no start time) of a script hook, which `sh -c` execs in place
+    // Final review N-6: an rc.7 record (no start time) of a script hook, which `sh -c` execs in place
     // so the leader shows `<interpreter> <script>`, was refused as "pid reused?" and left running.
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("myhook.sh");

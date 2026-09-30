@@ -1284,6 +1284,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         let mut stable = 0u32;
         let mut head = 0u64;
+        let mut late = 0u64;
+        let quiesce_from = self.ops.now_ms();
+        let quiesce_deadline = quiesce_from.saturating_add(self.cfg.ceremony.quiescence_timeout_secs.saturating_mul(1000));
         let at_pause = loop {
             self.ops.sleep_ms(self.cfg.poll_ms);
             let i = self.ops.source_info()?;
@@ -1294,13 +1297,27 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 }
             } else {
                 if head != 0 {
-                    self.journal.evidence(
-                        State::Frozen,
-                        json!({"late_block_after_pause": i.head_block_num}),
-                    )?;
+                    late += 1;
+                    // Journal the first few; a producer that never stops would
+                    // otherwise write one line per poll until the deadline.
+                    if late <= 10 {
+                        self.journal.evidence(
+                            State::Frozen,
+                            json!({"late_block_after_pause": i.head_block_num}),
+                        )?;
+                    }
                 }
                 stable = 0;
                 head = i.head_block_num;
+            }
+            if self.ops.now_ms() > quiesce_deadline {
+                self.abort(
+                    "source did not stop producing after the pause (quiescence_timeout_secs)",
+                    json!({"head": i.head_block_num, "late_blocks": late,
+                           "waited_ms": self.ops.now_ms().saturating_sub(quiesce_from),
+                           "quiescence_timeout_secs": self.cfg.ceremony.quiescence_timeout_secs}),
+                )?;
+                return Ok(());
             }
         };
 

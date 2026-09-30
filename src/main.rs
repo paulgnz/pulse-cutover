@@ -9,7 +9,7 @@
 //!   pulse-cutover scan-contracts snap.bin [--served f] [--json]
 //!   pulse-cutover report [--config f] [--out f.tar.gz] [--paranoid]
 //!
-//! See Appendix A of wiki/59-cutover-orchestration.md for the reviewed design.
+//! The reviewed design is in docs/DESIGN.md; recorded rehearsal evidence in docs/EVIDENCE.md.
 
 use std::path::PathBuf;
 

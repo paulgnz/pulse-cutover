@@ -84,7 +84,8 @@ IGNITED 23:57:45 · LIVE 00:05:59.5. All five BPs hit each transition within 1.5
 > crossed the boundary twice.
 
 The full per-BP evidence (journals, snapshot hashes, `state-diff` reports, canary transcript,
-bot ledgers) is archived with the rehearsal notes.
+bot ledgers) is archived with the rehearsal notes; a per-run summary with what each run does and does not prove is in
+[docs/EVIDENCE.md](docs/EVIDENCE.md).
 
 ### Earlier runs of the same rehearsal
 
@@ -109,7 +110,7 @@ is safe. Open items, most severe first:
 | 3 | **Coordination is single-key with unsigned fleet evidence.** One coordinator signature arms; the relay is now durable (fails with 503 rather than accept what it can't persist) and events can bind a roster and quorum, but producer reports are not signed and validator weight is not modelled. | Needs a signed immutable manifest, threshold authorization, a durable event log, and a complete roster before arming. |
 | 4 | **Shared producer identity.** The fork plugin requires every validator to run the same producer name and key. | Unacceptable for mainnet custody; needs per-validator authoring identity. |
 | 5 | **State evidence is narrower than "every account"**: `state-diff` covers the accounts and tables it discovers; fingerprints are 64-bit; both imports use the same importer. | Needs a complete, cryptographic whole-state commitment checked by an independent implementation. |
-| 6 | **Crash recovery is implemented, not certified.** Exclusive journal lock, torn-tail repair, staged-artifact and ignition-start records, durable HALTED and process-group hook timeouts exist (rc.6) and have unit tests; no fault-injection run on real boxes yet. | A crash mid-ceremony must never produce a later-H snapshot or an accidental resume. |
+| 6 | **Crash recovery is implemented, not certified.** Exclusive journal lock, torn-tail repair, staged-artifact and ignition-start records, durable HALTED and process-group hook timeouts exist (rc.6) and have unit tests. A Linux fault-injection run with stubbed nodeos/metalgo passed on rc.10 after finding and fixing a critical process-group kill bug ([docs/EVIDENCE.md](docs/EVIDENCE.md#linux-fault-injection-rc9-and-rc10)); not yet exercised with real chain services or a fleet. | A crash mid-ceremony must never produce a later-H snapshot or an accidental resume. |
 | 7 | **Validator registration and METAL funding** are not automated or certified. | Every producer needs an accepted, funded validator before H can be scheduled. |
 | 8 | **The ~50 s post-LIVE stall** is unexplained. | Clients see timeouts right after the cut. |
 

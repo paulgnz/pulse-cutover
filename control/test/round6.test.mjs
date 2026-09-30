@@ -1,5 +1,5 @@
 // node --test control/test/*.test.mjs
-// Round 6 (Fable final check of rc.8, N-3): an unfinished operator rollback must be visible centrally.
+// Round 6 (final external check of rc.8, N-3): an unfinished operator rollback must be visible centrally.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

@@ -39,6 +39,7 @@ freeze_strategy = "pause_at_h"
 # After pausing: the head must hold still for this many consecutive polls
 # before the cut is trusted (late blocks are detected and absorbed).
 quiescence_polls = 6
+quiescence_timeout_secs = 120   # abort if the source never stops producing after the pause
 
 [source]
 rpc_url = "http://127.0.0.1:8888"            # your nodeos chain API

@@ -1,5 +1,5 @@
 // node --test control/test/*.test.mjs
-// Round-3 fixes (Astra second verification 2026-09-30). Every test reproduces the failing case Astra reported:
+// Round-3 fixes (second independent verification 2026-09-30). Every test reproduces the failing case that review reported:
 // rc.5-store event-id reuse, invalid nested store accepted, crash right after a 200 losing replay/conflict state,
 // conflicted evidence counted in agreement, clearing one conflict un-flagging the rest, colliding display labels
 // and label-based navigation, first-wins endpoint health, DNS outliving the request deadline, event-hash contract.
