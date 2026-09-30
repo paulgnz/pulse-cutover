@@ -38,7 +38,7 @@ bin_version() {
 }
 # Pre-rc.16 binaries have no --version: ask mission control what this beacon last reported.
 reported_version() {
-  [ -n "$URL" ] && [ -n "$NETWORK" ] && [ -n "$PRODUCER" ] && [ -n "$NODE" ] || return 0
+  [ -n "${URL:-}" ] && [ -n "${NETWORK:-}" ] && [ -n "${PRODUCER:-}" ] && [ -n "${NODE:-}" ] || return 0
   local v; v=$(curl -fsS -m 5 "${URL%/}/api/node/$NETWORK/$PRODUCER/$NODE" 2>/dev/null | jstdin report.agent_version)
   [ -z "$v" ] || printf 'v%s' "${v#v}"
 }
