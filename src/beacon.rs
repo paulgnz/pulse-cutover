@@ -135,6 +135,45 @@ fn staking_reachable(cfg: &Config, b: &Budget) -> Option<bool> {
     Some(ok)
 }
 
+/// Last producer-API exposure verdict from mission control: it probes this server's IP (:8888, :80 and the
+/// producer's bp.json endpoints that resolve to it) with the read-only /v1/producer/paused. Asked at most
+/// every 10 minutes; `None` until the first answer. (open endpoints, endpoints checked)
+static EXPOSURE: Mutex<Option<(Instant, Option<(Vec<String>, u64)>)>> = Mutex::new(None);
+
+fn producer_api_exposure(cfg: &Config, b: &Budget) -> Option<(Vec<String>, u64)> {
+    let bc = cfg.beacon.as_ref()?;
+    let base = bc.url.trim_end_matches("/api/report");
+    if base.is_empty() || base == bc.url {
+        return None;
+    }
+    let mut g = EXPOSURE.lock().ok()?;
+    // Asked at most once per 10 minutes, or per minute until the first answer (mission control allows one probe per 30 s per IP); a failed ask
+    // keeps the last verdict rather than flipping to "not tested".
+    if let Some((t, last)) = g.as_ref() {
+        if t.elapsed() < Duration::from_secs(if last.is_some() { 600 } else { 60 }) {
+            return last.clone();
+        }
+    }
+    let last = g.as_ref().and_then(|(_, l)| l.clone());
+    let fresh = (|| {
+        let a = b.agent(Duration::from_secs(6))?;
+        let v = a.get(&format!("{base}/api/exposure")).query("net", &bc.network).query("producer", &bc.producer)
+            .call().ok()?.into_json::<Value>().ok()?;
+        let r = &v["producer_api"];
+        let open: Vec<String> = r["open"].as_array()?.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        Some((open, r["checked"].as_u64().unwrap_or(0)))
+    })();
+    if let Some((open, _)) = &fresh {
+        if !open.is_empty() {
+            // Local log only: the public report carries the count, never the URLs.
+            eprintln!("beacon: producer API answers from the internet at: {}", open.join(", "));
+        }
+    }
+    let out = fresh.or(last);
+    *g = Some((Instant::now(), out.clone()));
+    out
+}
+
 /// metalgo answers /ext/health with 200 when healthy and 503 (same JSON shape) when not.
 fn metal_healthy(b: &Budget, base: &str) -> Option<bool> {
     let a = b.agent(Duration::from_secs(2))?;
@@ -292,7 +331,7 @@ static JOURNALS: Mutex<Option<HashMap<PathBuf, Acc>>> = Mutex::new(None);
 /// matched by the dashboard's CHECKS map); tests on both sides assert they are equal.
 pub const SETUP_CHECKS: &[&str] = &[
     "hook_on_freeze", "hook_post_ignite", "hook_on_live", "hook_on_abort",
-    "validator_running", "metal_synced", "metal_reachable",
+    "validator_running", "metal_synced", "metal_reachable", "producer_api_private",
 ];
 
 /// A report with any failing HEALTH check (a failing setup check does not count).
@@ -490,6 +529,16 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
             None => Err(skipped()),
         };
         checks.push(check("producer_api", p.is_ok(), match &p { Ok(_) => "reachable locally".to_string(), Err(_) => "not reachable locally".into() }));
+    }
+    // Anyone who can reach /v1/producer can `resume` a producer the ceremony paused at H. Visible even when
+    // unknown: an untested exposure is not a private one.
+    match producer_api_exposure(cfg, &budget) {
+        Some((open, _)) if !open.is_empty() => checks.push(check("producer_api_private", false, format!(
+            "/v1/producer answers from the internet on {} endpoint{}: block /v1/producer in your proxy or bind nodeos http to 127.0.0.1",
+            open.len(), if open.len() == 1 { "" } else { "s" }))),
+        Some((_, n)) => checks.push(check("producer_api_private", true, format!("not reachable from the internet ({n} endpoint{} checked)", if n == 1 { "" } else { "s" }))),
+        None if cfg.beacon.as_ref().map(|b| !b.url.is_empty()).unwrap_or(false) => checks.push(check("producer_api_private", false, "not tested yet")),
+        None => {}
     }
 
     // Declared H (only meaningful for a ceremony config; readiness configs have none).

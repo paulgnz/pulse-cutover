@@ -17,7 +17,7 @@ import { createHash, createPublicKey, verify as edVerify } from 'node:crypto';
 import { readFileSync, existsSync, watchFile, renameSync, mkdirSync, openSync, writeSync, fsyncSync, closeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isPublicIp, normIp, resolvePublic, limiter, safeRequest, safeJson, safeDecode, RE, UA, endpointId, endpointRef, reservedKey,
+import { isPublicIp, normIp, resolvePublic, limiter, safeRequest, probeProducerApi, safeJson, safeDecode, RE, UA, endpointId, endpointRef, reservedKey,
   isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth } from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -263,8 +263,9 @@ async function surveyInfra(n) {
       const types = [].concat(nd?.node_type || []).map((x) => clip(x, 24)).slice(0, 6);
       const features = [].concat(nd?.features || []).map((x) => clip(x, 32)).slice(0, 12);
       const url = safeUrl(nd?.ssl_endpoint || nd?.api_endpoint || '');
+      const urls = [...new Set([nd?.ssl_endpoint, nd?.api_endpoint].map((x) => safeUrl(x || '')).filter(Boolean))];
       const p2p = typeof nd?.p2p_endpoint === 'string' ? nd.p2p_endpoint.slice(0, 120) : null;
-      const e = { producer: p.owner, rank: p.rank, types, features, url, id: url ? endpointId(url) : null, ref: url ? endpointRef(url) : null, p2p, location: clip(nd?.location?.name || nd?.location?.country || null, 60) };
+      const e = { producer: p.owner, rank: p.rank, types, features, url, urls, id: url ? endpointId(url) : null, ref: url ? endpointRef(url) : null, p2p, location: clip(nd?.location?.name || nd?.location?.country || null, 60) };
       const jobs = [];
       // bp.json "query" nodes whose only feature is a non-chain service (e.g. atomic-assets-api) are not chain APIs:
       // probing /v1/chain on them just reports a false 404.
@@ -594,6 +595,13 @@ function allow(tok) {
 }
 
 const reachSeen = new Map(); let reachInflight = 0;
+const exposureSeen = new Map(); let exposureInflight = 0;
+/** The requesting server's address: X-Real-IP only from the local reverse proxy (which overwrites it). */
+function callerIp(req) {
+  const sock = normIp(req.socket.remoteAddress);
+  const local = sock === '127.0.0.1' || sock === '::1';
+  return normIp(local && req.headers['x-real-ip'] ? String(req.headers['x-real-ip']).trim() : sock);
+}
 
 async function handle(req, res) {
   let url; try { url = new URL(req.url, 'http://x'); } catch { return send(res, 400, { error: 'bad url' }); }
@@ -629,9 +637,7 @@ async function handle(req, res) {
     // Can the internet reach the CALLER's Metal staking port? Only ever dials the requesting IP (X-Real-IP is
     // trusted only from the local reverse proxy, which overwrites it), only a public IP literal, only port 9651,
     // at most once per 5 s per IP and 20 probes in flight overall.
-    const sock = normIp(req.socket.remoteAddress);
-    const local = sock === '127.0.0.1' || sock === '::1';
-    const ip = normIp(local && req.headers['x-real-ip'] ? String(req.headers['x-real-ip']).trim() : sock);
+    const ip = callerIp(req);
     if (!isPublicIp(ip)) return send(res, 400, { error: 'caller address is not a public IP', ip: net.isIP(ip) ? ip : null });
     const now = Date.now();
     if (reachSeen.size > 10000) reachSeen.clear();
@@ -645,6 +651,26 @@ async function handle(req, res) {
         sk.once('connect', () => { sk.destroy(); done(true); }); sk.once('timeout', () => { sk.destroy(); done(false); }); sk.once('error', () => done(false)); });
       return send(res, 200, { ip, port: 9651, reachable: ok, ms: Date.now() - t0 });
     } finally { reachInflight--; }
+  }
+  if (req.method === 'GET' && path === '/api/exposure') {
+    // Does the CALLER's producer API (/v1/producer/*) answer from the internet? Dials only the requesting IP:
+    // its :8888 and :80, plus that producer's bp.json endpoints whose hostname resolves to the same IP
+    // (connection pinned, no redirects). Read-only probe (/v1/producer/paused). Once per 30 s per IP.
+    const ip = callerIp(req);
+    if (!isPublicIp(ip)) return send(res, 400, { error: 'caller address is not a public IP', ip: net.isIP(ip) ? ip : null });
+    const netId = url.searchParams.get('net') || ''; const prod = url.searchParams.get('producer') || '';
+    if ((netId && !RE.net.test(netId)) || (prod && !RE.producer.test(prod))) return send(res, 400, { error: 'bad net or producer' });
+    const now = Date.now();
+    if (exposureSeen.size > 10000) exposureSeen.clear();
+    exposureSeen.forEach((t, k) => { if (now - t > 120000) exposureSeen.delete(k); });
+    if (now - (exposureSeen.get(ip) || 0) < 30000) return send(res, 429, { error: 'slow down' });
+    if (exposureInflight >= 10) return send(res, 503, { error: 'busy, retry shortly' });
+    exposureSeen.set(ip, now); exposureInflight++;
+    try {
+      const urls = netId && prod ? (infra[netId]?.nodes || []).filter((n) => n.producer === prod).flatMap((n) => n.urls || [n.url]).filter(Boolean) : [];
+      const r = await probeProducerApi(ip, urls.slice(0, 12));
+      return send(res, 200, { ip, producer_api: r });
+    } finally { exposureInflight--; }
   }
   const nm = path.match(/^\/api\/node\/([^/]+)\/([^/]+)\/([^/]+)$/);
   if (nm && req.method === 'GET') {

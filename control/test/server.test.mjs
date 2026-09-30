@@ -88,6 +88,13 @@ test('/api/reach refuses a private X-Real-IP', async () => {
   assert.equal((await get('/api/reach')).status, 400);
 });
 
+test('/api/exposure refuses a private caller and bad parameters', async () => {
+  assert.equal((await get('/api/exposure', { 'x-real-ip': '10.0.0.5' })).status, 400);
+  assert.equal((await get('/api/exposure')).status, 400);
+  assert.equal((await get('/api/exposure?net=../x&producer=protonnz', { 'x-real-ip': '203.0.113.9' })).status, 400);
+  assert.equal((await get('/api/exposure?net=testnet&producer=NOT_VALID', { 'x-real-ip': '203.0.113.9' })).status, 400);
+});
+
 test('two tokens with the same label are both kept and disambiguated', async () => {
   assert.equal((await post(T1, report())).status, 200);
   const r2 = await post(T2, report());

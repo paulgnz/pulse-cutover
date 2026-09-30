@@ -166,6 +166,34 @@ export async function safeRequest(url, { method = 'GET', headers = {}, body = nu
     return r;
   }
 }
+/**
+ * Does the producer API (/v1/producer/*) of the server at `ip` answer from the internet? Probes that address on
+ * :8888 and :80, plus `urls` (the producer's own bp.json endpoints) only where the hostname resolves to `ip`:
+ * every connection is pinned to `ip` and redirects are not followed, so this can never be pointed elsewhere.
+ * The probe is the read-only POST /v1/producer/paused; "open" = a 2xx whose body is a JSON boolean.
+ */
+export async function probeProducerApi(ip, urls = [], { request = safeRequest, lookup = dns.lookup, timeoutMs = 4000 } = {}) {
+  const host = net.isIPv6(ip) ? `[${ip}]` : ip;
+  const cands = new Set([`http://${host}:8888`, `http://${host}`]);
+  for (const u of urls) { const id = endpointId(u); if (id) cands.add(id); }
+  const onlyIp = async (h, o) => {
+    const a = await lookup(h, o);
+    if (!a.some((x) => normIp(x.address) === ip)) throw Object.assign(new Error('not this server'), { code: 'EBLOCKED' });
+    return [{ address: ip, family: net.isIP(ip) }];
+  };
+  const open = []; let checked = 0;
+  await Promise.all([...cands].slice(0, 8).map(async (base) => {
+    let h; try { h = new URL(base).hostname.replace(/^\[|\]$/g, ''); } catch { return; }
+    if (net.isIP(h) && normIp(h) !== ip) return;
+    try {
+      const r = await request(`${base}/v1/producer/paused`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+        timeoutMs, maxBytes: 4096, maxRedirects: 0, lookup: onlyIp });
+      checked++;
+      if (r.status >= 200 && r.status < 300) { try { if (typeof JSON.parse(r.body.toString('utf8')) === 'boolean') open.push(base); } catch {} }
+    } catch (e) { if (e?.code !== 'EBLOCKED') checked++; }
+  }));
+  return { exposed: open.length > 0, open: open.sort(), checked };
+}
 export async function safeJson(url, opts = {}, maxBytes = 1024 * 1024) {
   const r = await safeRequest(url, { ...opts, maxBytes });
   if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status}`);

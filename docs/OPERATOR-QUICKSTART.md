@@ -105,5 +105,16 @@ label you choose (default: its role; use `--node` to tell several servers of the
 node's public identity (NodeID, BLS public key, version, peers), and the pulse-cutover version. Not sent: private
 keys, hostnames, file paths or config contents. If a ceremony step fails, only a short error class is sent (paths,
 URLs and IP addresses stripped, and mission control redacts again); the full error stays in your local journal.
-Mission control does see the IP address your reports come from; it uses it only for the 9651 reachability check.
+Mission control does see the IP address your reports come from; it uses it only for two reachability checks
+against that address: port 9651, and whether your producer API answers from the internet (below).
 </details>
+
+**Producer API must not be public.** Anyone who can reach `/v1/producer/*` can `resume` a producer the ceremony
+paused at H (and pause, greylist, take snapshots). Mission control checks this for you: it sends the read-only
+`POST /v1/producer/paused` to your server's own IP on :8888 and :80 and to your bp.json endpoints that resolve to
+that IP (never anywhere else, no redirects followed), at most every 10 minutes. The result is the
+**Producer API private** setup check; the dashboard shows only pass/fail and a count, and the beacon logs the open
+URLs locally. Fix, with producer and API on the same box: in your nginx server blocks add
+`location ^~ /v1/producer { return 403; }`, and if nodeos also listens publicly on :8888, bind it to
+`http-server-address = 127.0.0.1:8889` and let nginx serve :8888 with the same rule (then point the beacon's
+`rpc_url` and `producer_api_url` at `http://127.0.0.1:8889`).
