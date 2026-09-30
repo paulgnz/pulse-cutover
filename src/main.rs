@@ -363,6 +363,7 @@ fn load_config(args: &[String]) -> Result<Config, String> {
 fn cmd_run(args: &[String]) -> Result<(), String> {
     let cfg = load_config(args)?;
     cfg.ensure_ceremony_profile()?;
+    cfg.ensure_h_known()?;
     let ignite_cmd = cfg
         .target
         .ignite_cmd
@@ -423,6 +424,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
 fn cmd_loop(args: &[String]) -> Result<(), String> {
     let cfg = load_config(args)?;
     cfg.ensure_ceremony_profile()?;
+    cfg.ensure_h_known()?;
     let runs: u32 = arg(args, "--runs")
         .ok_or("missing --runs")?
         .parse()

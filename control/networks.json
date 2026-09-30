@@ -47,7 +47,9 @@
         "https://test.proton.eosusa.io"
       ],
       "event": null,
-      "coordinators": [],
+      "coordinators": [
+        "55539e3a424fcf4648108540fa8c855806bf56e4a192e3a1cd5529ab6027ef23"
+      ],
       "metal": {
         "network": "tahoe",
         "network_id": 5,

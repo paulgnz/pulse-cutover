@@ -741,7 +741,12 @@ impl Config {
             // mutating command refuses this file (see `ensure_ceremony_profile`).
             return Ok(config);
         }
-        if config.ceremony.freeze_height == 0 {
+        // An `await` config legitimately has no H yet: the signed coordinator event supplies it
+        // (await writes the derived config with that H). `run`/`loop` refuse it via ensure_h_known.
+        let awaiting_event = config.ceremony.freeze_height == 0
+            && config.ceremony.freeze_margin.is_none()
+            && config.coordination.is_some();
+        if config.ceremony.freeze_height == 0 && !awaiting_event {
             if config.ceremony.freeze_margin.is_none() {
                 return Err("ceremony.freeze_height is 0: set the event's H (or use `await`, which \
                             takes H from the signed coordinator event)"
@@ -803,6 +808,16 @@ impl Config {
 
     /// Mutating commands (`run`, `loop`, `await`) call this first: a readiness-only config
     /// can never drive a ceremony, whatever else it contains.
+    /// `run`/`loop`: the cut height must be known (explicit H, or the rehearsal derive opt-in).
+    /// A coordination config with freeze_height = 0 is for `await` only.
+    pub fn ensure_h_known(&self) -> Result<(), String> {
+        if self.ceremony.freeze_height == 0 && !(self.ceremony.derive_h_at_arm && self.ceremony.freeze_margin.is_some()) {
+            return Err("ceremony.freeze_height is 0: this config waits for a coordinator event. Run `pulse-cutover await` with it (H comes from the signed event), or set freeze_height"
+                .into());
+        }
+        Ok(())
+    }
+
     pub fn ensure_ceremony_profile(&self) -> Result<(), String> {
         if self.ceremony.profile == Profile::Readiness {
             return Err("this config is a READINESS-ONLY profile ([ceremony] profile = \"readiness\", \

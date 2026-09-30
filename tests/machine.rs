@@ -3208,3 +3208,18 @@ fn r6_legacy_record_of_an_execd_script_hook_is_recognised() {
     assert!(res.as_ref().map(|r| r.as_deref().unwrap_or("").contains("killed")).unwrap_or(false), "{res:?}");
     assert!(wait_exited(&exited, pid));
 }
+
+#[test]
+fn await_config_without_h_loads_but_run_refuses_it() {
+    // A production await config: freeze_height = 0, no rehearsal derive flags, a [coordination] section.
+    let dir = tempfile::tempdir().unwrap();
+    test_config(dir.path(), 120);
+    let base = std::fs::read_to_string(dir.path().join("ceremony.toml")).unwrap();
+    let text = base.replace("freeze_height = 120", "freeze_height = 0")
+        + "\n[coordination]\nurl = \"https://mc.example\"\nnetwork = \"testnet\"\ncoordinator_keys = [\"00\"]\n";
+    let cfg = load_toml(dir.path(), "await.toml", &text).expect("an await config needs no H");
+    assert!(cfg.ensure_h_known().unwrap_err().contains("await"));
+    // Without [coordination] the old rule stands: H is required.
+    let plain = base.replace("freeze_height = 120", "freeze_height = 0");
+    assert!(load_toml(dir.path(), "plain.toml", &plain).unwrap_err().contains("freeze_height is 0"));
+}
