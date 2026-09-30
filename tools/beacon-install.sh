@@ -24,7 +24,7 @@
 #
 # Options: --network <mainnet|testnet> --producer <account> --node <label> --role <producer|api|history>
 #          [--url https://control-rehearsal.protonnz.com] [--version vX.Y.Z] [--api http://127.0.0.1:8888]
-#          [--producer-api <url>] [--snapshots-dir <dir>] [--interval 10] [--force] [--dry-run] [--uninstall]
+#          [--producer-api <url>] [--snapshots-dir <dir>] [--interval 10] [--force] [--dry-run] [--yes] [--uninstall]
 set -euo pipefail
 
 VERSION_DEFAULT="v0.5.0-rc.16"
@@ -34,21 +34,22 @@ ETC=/etc/pulse-cutover; VAR=/var/lib/pulse-cutover; STATE=/var/lib/pulse-beacon;
 bin_version() {
   [ -x "$1" ] || return 0
   local v; v=$("$1" --version 2>/dev/null | sed -n 's/^pulse-cutover \([0-9][0-9A-Za-z.+-]*\)$/\1/p' | head -1)
-  [ -n "$v" ] && printf 'v%s' "$v"
+  [ -z "$v" ] || printf 'v%s' "$v"
 }
 # Pre-rc.16 binaries have no --version: ask mission control what this beacon last reported.
 reported_version() {
   [ -n "$URL" ] && [ -n "$NETWORK" ] && [ -n "$PRODUCER" ] && [ -n "$NODE" ] || return 0
   local v; v=$(curl -fsS -m 5 "${URL%/}/api/node/$NETWORK/$PRODUCER/$NODE" 2>/dev/null | jstdin report.agent_version)
-  [ -n "$v" ] && printf 'v%s' "${v#v}"
+  [ -z "$v" ] || printf 'v%s' "${v#v}"
 }
 # Other pulse-cutover services on this box (e.g. `await`) keep running the binary they started with.
 # Never restarted here: an await may be driving a ceremony. Listed so the operator can restart them.
 other_units() {
   systemctl list-units --type=service --state=active --no-legend --plain 2>/dev/null | awk '{print $1}' | while read -r u; do
     [ "$u" = pulse-beacon.service ] && continue
-    systemctl show -p ExecStart --value "$u" 2>/dev/null | grep -q "$BIN" && echo "$u"
+    if systemctl show -p ExecStart --value "$u" 2>/dev/null | grep -q "$BIN"; then echo "$u"; fi
   done
+  return 0
 }
 UNIT=/etc/systemd/system/pulse-beacon.service; SVC_USER=pulse-beacon
 MAINNET_CHAIN=384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0
@@ -115,13 +116,13 @@ token_hash() { [ -s "$1" ] && tr -d '\n' < "$1" | sha256sum | cut -d' ' -f1 || t
 
 parse_args() {
   NETWORK=""; PRODUCER=""; NODE=""; ROLE=""; URL=""; VERSION=""; API=""; PAPI=""; SNAPDIR=""; INTERVAL=""
-  DRY=0; UNINSTALL=0; FORCE=0
+  DRY=0; UNINSTALL=0; FORCE=0; YES=0
   while [ $# -gt 0 ]; do case "$1" in
     --network) NETWORK=${2:-}; shift 2;; --producer) PRODUCER=${2:-}; shift 2;; --node) NODE=${2:-}; shift 2;;
     --role) ROLE=${2:-}; shift 2;; --url) URL=${2:-}; shift 2;; --version) VERSION=${2:-}; shift 2;;
     --api) API=${2:-}; shift 2;; --producer-api) PAPI=${2:-}; shift 2;; --snapshots-dir) SNAPDIR=${2:-}; shift 2;;
     --interval) INTERVAL=${2:-}; shift 2;; --force) FORCE=1; shift;;
-    --dry-run) DRY=1; shift;; --uninstall) UNINSTALL=1; shift;;
+    --dry-run) DRY=1; shift;; --uninstall) UNINSTALL=1; shift;; --yes|-y) YES=1; shift;;
     *) die "unknown option $1";; esac; done
   case "$ROLE" in ""|producer|api|history) ;; *) die "--role must be producer, api or history";; esac
   case "$NETWORK" in ""|mainnet|testnet) ;; *) die "--network must be mainnet or testnet";; esac
@@ -378,7 +379,38 @@ try: r=json.load(open(sys.argv[1]))
 except Exception: sys.exit(0)
 for c in r.get("checks",[]): print("   ", "ok " if c.get("ok") else "-- ", c.get("name"), "·", c.get("detail"))' "$TMP/once.out" || true
 
+  # ---- the plan: everything detected, every change, everything left alone. Shown before anything changes. --
+  local MG_STATE PAPI_NOTE OTHERS_NOW
+  MG_STATE=$(systemctl is-active "$MG_UNIT" 2>/dev/null || true); MG_STATE=${MG_STATE:-not found}
+  case "$PAPI" in http://127.0.0.1*|http://localhost*|http://\[::1\]*) PAPI_NOTE="local ✓";; *) PAPI_NOTE="NOT local: keep /v1/producer off the internet";; esac
+  OTHERS_NOW=$(other_units | tr '\n' ' ')
+  echo
+  echo "  pulse-cutover beacon installer   ${CURRENT:-(not installed)} → $VERSION"
+  echo
+  echo "  Found"
+  printf '    %-11s %s\n' chain "XPR $NETWORK (${CHAIN_ID:0:8}…) · head $HEAD" \
+    nodeos "API $API · producer API $PAPI ($PAPI_NOTE)" \
+    producer "$PRODUCER$( [ -n "$CFG_PRODUCER" ] && echo ' (from the nodeos config)')" \
+    server "label '$NODE' · role $ROLE · ceremony mode $MODE" \
+    snapshots "$SNAPDIR" \
+    metal "service $MG_UNIT: $MG_STATE"
+  if [ "$OLD_FOUND" = 1 ]; then printf '    %-11s %s\n' existing "beacon ${CURRENT:-?} · token and settings kept"; fi
+  [ -n "$OTHERS_NOW" ] && printf '    %-11s %s\n' also "$OTHERS_NOW(left running)"
+  echo
+  echo "  Plan"
+  echo "    1. install /usr/local/bin/pulse-cutover $VERSION   (downloaded and sha256-checked already)"
+  echo "    2. write $ETC/beacon.toml   (readiness-only: it cannot run a ceremony)"
+  [ "$OLD_FOUND" = 1 ] || echo "    3. create the beacon's token and the 'pulse-beacon' service user"
+  echo "    $( [ "$OLD_FOUND" = 1 ] && echo 3 || echo 4 ). (re)start the pulse-beacon service   (reports readiness every ${INTERVAL}s to ${URL%/})"
+  echo "    If any step fails, the previous binary, config and service are restored."
+  echo
+  echo "  Won't touch: nodeos or its config, keys, metalgo, nginx, firewall."
+  echo
   if [ "$DRY" = 1 ]; then say "dry run: nothing installed or written outside a temp dir"; exit 0; fi
+  if [ "$YES" != 1 ] && [ -t 1 ] && { : </dev/tty; } 2>/dev/null; then
+    local ANS; read -r -p "  Proceed? [Y/n] " ANS </dev/tty || ANS=n
+    case "$ANS" in n*|N*) die "cancelled: nothing was changed";; esac
+  fi
 
   # ---- apply: transactional. From the first change until the new beacon is confirmed running, ANY failure
   # (install, chown, systemctl, restart, or the beacon not staying up) restores the previous binary, config,

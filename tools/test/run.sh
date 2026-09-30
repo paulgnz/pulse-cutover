@@ -235,6 +235,9 @@ printf '#!/bin/sh\necho "usage: pulse-cutover <command>"\n' > "$T/oldbin"; chmod
 [ "$(bin_version "$T/newbin")" = "v0.5.0-rc.16" ] && ok "beacon: current version read from --version" || bad "beacon: bin_version new ($(bin_version "$T/newbin"))"
 [ -z "$(bin_version "$T/oldbin")" ] && ok "beacon: a binary without --version reports no version (falls back to mission control)" || bad "beacon: bin_version old"
 [ -z "$(bin_version "$T/absent")" ] && ok "beacon: no installed binary = fresh install" || bad "beacon: bin_version absent"
+if bash -c 'set -euo pipefail; BEACON_INSTALL_SOURCED=1 source "$1"; set -euo pipefail; a=$(bin_version /nonexistent); b=$(reported_version); c=$(other_units | tr "\n" " "); echo survived' _ "$HERE/beacon-install.sh" 2>/dev/null | grep -q survived; then
+  ok "beacon: version/unit helpers are set -e safe when they find nothing (an rc.15 box died silently here)"
+else bad "beacon: helpers abort under set -e"; fi
 expect_ok  "beacon: http://[::1]:8787 accepted"                             check_url 'http://[::1]:8787'
 expect_die "beacon: ftp refused"                                            check_url ftp://control.example.org
 
