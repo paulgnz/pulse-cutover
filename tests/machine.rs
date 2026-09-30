@@ -543,12 +543,27 @@ on_live = "announce-live"
     Config::load(&path).unwrap()
 }
 
+/// Journal::open for tests. Other tests in this binary spawn real child processes; a fork taken
+/// while this test holds its journal lock briefly shares the lock until the child execs (the fd is
+/// close-on-exec), so a reopen right after a simulated crash can see "lock busy" for a moment.
+/// Retry briefly on exactly that error; anything else fails the test.
+fn open_journal(path: &std::path::Path) -> (Journal, pulse_cutover::journal::Recovered) {
+    for _ in 0..100 {
+        match Journal::open(path) {
+            Ok(x) => return x,
+            Err(e) if e.contains("another pulse-cutover process holds") => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("journal lock still busy after 2 s: {}", path.display())
+}
+
 fn run_machine(cfg: &Config, ops: &MockOps) -> State {
     run_machine_result(cfg, ops).unwrap()
 }
 
 fn run_machine_result(cfg: &Config, ops: &MockOps) -> Result<State, String> {
-    let (journal, recovered) = Journal::open(&cfg.journal_path).unwrap();
+    let (journal, recovered) = open_journal(&cfg.journal_path);
     let mut machine = Machine::new(cfg, ops, journal, recovered);
     machine.run()
 }
@@ -1948,7 +1963,7 @@ fn failing_required_hooks_abort_before_ignition_and_halt_after() {
 fn second_process_on_the_same_journal_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(dir.path(), 120);
-    let (held, _) = Journal::open(&cfg.journal_path).unwrap();
+    let (held, _) = open_journal(&cfg.journal_path);
     // A genuinely separate process (the real binary) must be refused while this one holds it.
     let bin = env!("CARGO_BIN_EXE_pulse-cutover");
     let out = std::process::Command::new(bin).args(["run", "--config"]).arg(dir.path().join("ceremony.toml")).output().unwrap();
@@ -1956,7 +1971,7 @@ fn second_process_on_the_same_journal_is_refused() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("already running"), "{stderr}");
     drop(held);
-    assert!(Journal::open(&cfg.journal_path).is_ok(), "lock released on drop");
+    let _ = open_journal(&cfg.journal_path); // lock released on drop (retrying past a sibling test's fork)
 }
 
 #[test]
@@ -1966,7 +1981,7 @@ fn torn_last_line_is_set_aside_but_a_corrupt_middle_line_is_fatal() {
     let good = serde_json::json!({"seq": 0, "ts_ms": 1, "ts": "t", "kind": "transition", "state": "ARMED",
         "data": {"chain_id": "ab", "resolved_h": 120}}).to_string();
     std::fs::write(&path, format!("{good}\n{{\"seq\":1,\"ts_ms\":2,\"kin")).unwrap();
-    let (mut j, rec) = Journal::open(&path).unwrap();
+    let (mut j, rec) = open_journal(&path);
     assert!(rec.torn_tail);
     assert_eq!(rec.state, Some(State::Armed));
     assert_eq!(rec.resolved_h, Some(120));
@@ -2343,7 +2358,7 @@ fn r3_completed_corrupt_record_before_a_cr_only_tail_is_fatal() {
     // A genuinely torn tail (no LF after it) is still set aside.
     let torn = dir.path().join("torn.jsonl");
     std::fs::write(&torn, format!("{good}\n\r\n{{\"seq\":1,\"ts_ms\":2,\"kin")).unwrap();
-    let (_j, rec) = Journal::open(&torn).unwrap();
+    let (_j, rec) = open_journal(&torn);
     assert!(rec.torn_tail);
     assert_eq!(rec.state, Some(State::Armed));
 }
@@ -2398,7 +2413,7 @@ fn r3_rollback_before_ignition_is_journaled_and_waits_for_the_lock() {
     std::fs::write(&cfg.journal_path, keep.join("\n") + "\n").unwrap();
     let cfgp = dir.path().join("ceremony.toml");
     // Another process (a still-running agent) holds the journal: rollback must not decide.
-    let held = Journal::open(&cfg.journal_path).unwrap();
+    let held = open_journal(&cfg.journal_path);
     let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
     assert_eq!(out.status.code(), Some(3), "a lock still held after --wait is a refusal (exit 3)");
     assert!(String::from_utf8_lossy(&out.stderr).contains("holds"), "{}", String::from_utf8_lossy(&out.stderr));
@@ -2439,7 +2454,7 @@ fn r3_recovered_flip_side_effect_is_reverted_by_a_forced_rollback() {
     let at = lines.iter().position(|l| l.contains(r#""side_effect":"flip_cmd""#)).expect("flip side effect journaled");
     std::fs::write(&cfg.journal_path, lines[..=at].join("\n") + "\n").unwrap();
     let ops = MockOps::new(dir.path(), 200);
-    let (journal, rec) = Journal::open(&cfg.journal_path).unwrap();
+    let (journal, rec) = open_journal(&cfg.journal_path);
     let mut m = Machine::new(&cfg, &ops, journal, rec);
     assert!(m.operator_rollback(false).is_err(), "ignition started: refused without force");
     assert!(!ops.hooks.borrow().iter().any(|h| h == "revert-nginx"));
@@ -2579,7 +2594,7 @@ fn r4_forced_rollback_fences_the_target_before_resuming_the_source() {
     set_target_line(dir.path(), "stop_cmd = \"fail-stop-target\"");
     let cfg = Config::load(&dir.path().join("ceremony.toml")).unwrap();
     let ops = MockOps::new(dir.path(), 200);
-    let (j, rec) = Journal::open(&cfg.journal_path).unwrap();
+    let (j, rec) = open_journal(&cfg.journal_path);
     let mut m = Machine::new(&cfg, &ops, j, rec);
     let out = m.operator_rollback(true).unwrap();
     assert!(!out.failed.is_empty() && out.failed[0].contains("target fence failed"), "{out:?}");
@@ -2593,7 +2608,7 @@ fn r4_forced_rollback_fences_the_target_before_resuming_the_source() {
     std::fs::write(dir.path().join("ceremony.toml"), t).unwrap();
     let cfg = Config::load(&dir.path().join("ceremony.toml")).unwrap();
     let ops = MockOps::new(dir.path(), 200);
-    let (j, rec) = Journal::open(&cfg.journal_path).unwrap();
+    let (j, rec) = open_journal(&cfg.journal_path);
     let mut m = Machine::new(&cfg, &ops, j, rec);
     let out = m.operator_rollback(true).unwrap();
     assert!(out.failed.is_empty(), "{out:?}");
@@ -2610,7 +2625,7 @@ fn r4_every_rollback_refusal_exits_3() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = pre_ignite_journal(dir.path());
     let cfgp = dir.path().join("ceremony.toml");
-    let held = Journal::open(&cfg.journal_path).unwrap();
+    let held = open_journal(&cfg.journal_path);
     assert_eq!(run_bin(&["rollback", "--wait", "1"], &cfgp).status.code(), Some(3), "lock held past --wait");
     drop(held);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
@@ -2629,7 +2644,7 @@ fn r4_rollback_moves_the_staged_snapshot_aside() {
     let cfg = pre_ignite_journal(dir.path());
     assert!(cfg.snapshot.staged_path.exists(), "fixture: staged file present");
     let ops = MockOps::new(dir.path(), 200);
-    let (j, rec) = Journal::open(&cfg.journal_path).unwrap();
+    let (j, rec) = open_journal(&cfg.journal_path);
     let mut m = Machine::new(&cfg, &ops, j, rec);
     let out = m.operator_rollback(false).unwrap();
     assert!(out.failed.is_empty(), "{out:?}");
@@ -2672,7 +2687,7 @@ fn r4_rollback_stops_an_orphaned_hook_before_anything_else() {
     let cfg = Config::load(&dir.path().join("ceremony.toml")).unwrap();
     let ops = MockOps::new(dir.path(), 200);
     *ops.orphan.borrow_mut() = Some(Ok(Some("killed orphaned hook process group 4242 (SIGTERM): `freeze-writes`".into())));
-    let (j, rec) = Journal::open(&cfg.journal_path).unwrap();
+    let (j, rec) = open_journal(&cfg.journal_path);
     let mut m = Machine::new(&cfg, &ops, j, rec);
     let out = m.operator_rollback(false).unwrap();
     assert!(out.failed.is_empty(), "{out:?}");
@@ -2688,7 +2703,7 @@ fn r4_rollback_stops_an_orphaned_hook_before_anything_else() {
     let cfg2 = pre_ignite_journal(dir2.path());
     let ops2 = MockOps::new(dir2.path(), 200);
     *ops2.orphan.borrow_mut() = Some(Err("survived SIGKILL".into()));
-    let (j, rec) = Journal::open(&cfg2.journal_path).unwrap();
+    let (j, rec) = open_journal(&cfg2.journal_path);
     // Round 5 (Review N5): nothing changed, so this is a refusal (exit 3), not an incomplete rollback.
     let err = Machine::new(&cfg2, &ops2, j, rec).operator_rollback(false).expect_err("refused");
     assert!(err.starts_with("refusing"), "{err}");
@@ -2790,7 +2805,7 @@ fn r4_beacon_summary_marks_a_forced_rollback_after_ignition() {
     ops.target_fork.set(true);
     assert!(run_machine_result(&base, &ops).unwrap_err().starts_with("HALTED"));
     let ops = MockOps::new(dir.path(), 200);
-    let (j, rec) = Journal::open(&base.journal_path).unwrap();
+    let (j, rec) = open_journal(&base.journal_path);
     Machine::new(&base, &ops, j, rec).operator_rollback(true).unwrap();
     let s = pulse_cutover::beacon::journal_summary(&base.journal_path);
     assert_eq!(s["state"], "ABORTED");
@@ -2813,7 +2828,7 @@ fn pre_ignite_with_on_abort(dir: &std::path::Path) -> Config {
 }
 
 fn rollback_with(cfg: &Config, ops: &MockOps, force: bool) -> Result<pulse_cutover::machine::RollbackOutcome, String> {
-    let (j, rec) = Journal::open(&cfg.journal_path).unwrap();
+    let (j, rec) = open_journal(&cfg.journal_path);
     Machine::new(cfg, ops, j, rec).operator_rollback(force)
 }
 
@@ -3040,7 +3055,7 @@ fn r5b_run_refuses_a_journal_whose_operator_rollback_died_before_aborted() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = pre_ignite_journal(dir.path());
     {
-        let (mut j, rec) = Journal::open(&cfg.journal_path).unwrap();
+        let (mut j, rec) = open_journal(&cfg.journal_path);
         let st = rec.state.unwrap();
         j.evidence(st, serde_json::json!({"rollback_requested": true, "force_after_ignite": false})).unwrap();
     }
@@ -3051,7 +3066,7 @@ fn r5b_run_refuses_a_journal_whose_operator_rollback_died_before_aborted() {
     // Re-running rollback finishes it; after that the journal is a normal ABORTED.
     let out = rollback_with(&cfg, &MockOps::new(dir.path(), 200), false).unwrap();
     assert!(out.failed.is_empty() && !out.already, "{out:?}");
-    let (_, rec) = Journal::open(&cfg.journal_path).unwrap();
+    let (_, rec) = open_journal(&cfg.journal_path);
     assert!(!rec.rollback_pending && rec.state == Some(State::Aborted), "{rec:?}");
 }
 
@@ -3124,7 +3139,7 @@ fn r6_status_shows_a_pending_rollback_and_cancel_intent_works_only_before_any_st
     let dir = tempfile::tempdir().unwrap();
     let cfg = pre_ignite_journal(dir.path());
     {
-        let (mut j, rec) = Journal::open(&cfg.journal_path).unwrap();
+        let (mut j, rec) = open_journal(&cfg.journal_path);
         j.evidence(rec.state.unwrap(), serde_json::json!({"rollback_requested": true, "force_after_ignite": false})).unwrap();
     }
     let toml = dir.path().join("ceremony.toml");
@@ -3143,7 +3158,7 @@ fn r6_status_shows_a_pending_rollback_and_cancel_intent_works_only_before_any_st
     assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["rollback_pending"], serde_json::json!(false));
     // Once a step has completed, the rollback can only be finished, not cancelled.
     {
-        let (mut j, rec) = Journal::open(&cfg.journal_path).unwrap();
+        let (mut j, rec) = open_journal(&cfg.journal_path);
         let s = rec.state.unwrap();
         j.evidence(s, serde_json::json!({"rollback_requested": true})).unwrap();
         j.evidence(s, serde_json::json!({"rollback_step": "resume", "ok": true})).unwrap();
@@ -3175,7 +3190,7 @@ fn r6_pre_rc8_aborted_reads_as_unknown_not_incomplete() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("journal.jsonl");
     {
-        let (mut j, _) = Journal::open(&p).unwrap();
+        let (mut j, _) = open_journal(&p);
         j.transition(State::Armed, serde_json::json!({})).unwrap();
         j.transition(State::Aborted, serde_json::json!({"reason": "rc.7 style", "rollback_complete": true})).unwrap();
     }
@@ -3183,7 +3198,7 @@ fn r6_pre_rc8_aborted_reads_as_unknown_not_incomplete() {
     let d2 = tempfile::tempdir().unwrap();
     let p2 = d2.path().join("journal.jsonl");
     {
-        let (mut j, _) = Journal::open(&p2).unwrap();
+        let (mut j, _) = open_journal(&p2);
         j.transition(State::Armed, serde_json::json!({})).unwrap();
         j.transition(State::Aborted, serde_json::json!({"reason": "rc.8", "reverts_ok": true})).unwrap();
     }

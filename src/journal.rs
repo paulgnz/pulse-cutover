@@ -117,7 +117,16 @@ impl Journal {
             .write(true)
             .open(&lock_path)
             .map_err(|e| format!("open journal lock {}: {e}", lock_path.display()))?;
-        match lock.try_lock() {
+        // A lock that is busy for a moment is not a second agent: a process that forked while this
+        // lock's previous holder had it open shares the lock until it execs (the fd is close-on-exec).
+        // Wait up to 2 s; a real concurrent agent holds the lock for the whole ceremony.
+        let mut busy = lock.try_lock();
+        for _ in 0..100 {
+            if !matches!(busy, Err(std::fs::TryLockError::WouldBlock)) { break; }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            busy = lock.try_lock();
+        }
+        match busy {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(format!(
