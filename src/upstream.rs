@@ -110,6 +110,62 @@ fn fresh_dir(path: &Path) -> Result<(), String> {
     std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))
 }
 
+#[derive(serde::Deserialize)]
+struct SidecarSeq {
+    #[serde(default)]
+    source_chain_id: Option<String>,
+    source_block_id: String,
+    global_action_sequence: u64,
+    #[serde(default)]
+    account_metadata: Vec<SidecarAccountSeq>,
+}
+
+#[derive(serde::Deserialize)]
+struct SidecarAccountSeq {
+    recv_sequence: u64,
+}
+
+/// Gate the sidecar's sequence counters before anything is imported. Hard failures: no
+/// `source_chain_id` (upstream then skips its exact-coverage check), a chain id or block id
+/// that is not the cut's, no per-account rows, a zero global sequence. Evidence (advisory until
+/// proven on a real export): every action receipt bumps the global sequence once and exactly one
+/// receiver's recv_sequence once, so on a chain that started at genesis the recv_sequences sum
+/// to global_action_sequence.
+pub fn check_sidecar(path: &Path, chain_id: &str, cut_block_id: &str) -> Result<Value, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("open sidecar {}: {e}", path.display()))?;
+    let sc: SidecarSeq = serde_json::from_reader(std::io::BufReader::new(f))
+        .map_err(|e| format!("sidecar {} is not valid JSON of the expected shape: {e}", path.display()))?;
+    let src = sc.source_chain_id.as_deref().ok_or(
+        "sidecar has no source_chain_id: it predates full-state export, so per-account action \
+         sequence counters would be missing or unchecked (history paging would reset at the cut). \
+         Re-export with the current deferred-sidecar plugin",
+    )?;
+    if !chain_id.is_empty() && !src.eq_ignore_ascii_case(chain_id) {
+        return Err(format!("sidecar source_chain_id {src} is not this chain ({chain_id})"));
+    }
+    if !sc.source_block_id.eq_ignore_ascii_case(cut_block_id) {
+        return Err(format!(
+            "sidecar source_block_id {} is not the cut block {cut_block_id}",
+            sc.source_block_id
+        ));
+    }
+    if sc.account_metadata.is_empty() {
+        return Err("sidecar has no account_metadata rows: every account's recv/auth/code/abi \
+                    sequence would restart at 0"
+            .into());
+    }
+    if sc.global_action_sequence == 0 {
+        return Err("sidecar global_action_sequence is 0: the global action sequence would restart".into());
+    }
+    let sum_recv: u128 = sc.account_metadata.iter().map(|a| a.recv_sequence as u128).sum();
+    Ok(json!({
+        "accounts": sc.account_metadata.len(),
+        "global_action_sequence": sc.global_action_sequence,
+        "sum_recv_sequence": sum_recv.to_string(),
+        "recv_sum_matches_global": sum_recv == sc.global_action_sequence as u128,
+    }))
+}
+
 /// Drive the whole #61 pipeline over the cut snapshot. `progress` receives
 /// journal-ready evidence blobs between steps; Err is a verification failure
 /// (the machine aborts with it). Idempotent on resume: a completed export
@@ -176,6 +232,11 @@ pub fn run_pipeline<O: ChainOps>(
          set (post-cut replay protection) and deferred transactions are lost",
     )?;
     progress(json!({"upstream_sidecar": sidecar.display().to_string()}));
+    // Action sequence counters (global_action_sequence, per-account recv/auth/code/abi) come ONLY
+    // from the sidecar: SHiP carries none of them. A missing or partial sidecar silently restarts
+    // them, which breaks every client that pages history by sequence (upstream issue #101).
+    let seq = check_sidecar(&sidecar, chain_id, cut_block_id)?;
+    progress(json!({"upstream_sidecar_sequences": seq}));
     let manifest_env = parse_manifest_env(
         &std::fs::read_to_string(&manifest_path)
             .map_err(|e| format!("read {}: {e}", manifest_path.display()))?,

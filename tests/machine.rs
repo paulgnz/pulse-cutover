@@ -260,7 +260,7 @@ impl ChainOps for MockOps {
         // these from the SHiP log; the fakes read them from here).
         let _ = std::fs::write(
             self.dir.join("cut-facts.env"),
-            format!("CUT_HEIGHT={cut}\nCUT_BLOCK_ID={}\n", hex::encode(m.head_id())),
+            format!("CUT_HEIGHT={cut}\nCUT_BLOCK_ID={}\nCHAIN_ID={}\n", hex::encode(m.head_id()), hex::encode(CHAIN_ID)),
         );
         // Production continues; the block that finalized the cut arrives.
         self.head.set(cut + 1);
@@ -1357,6 +1357,24 @@ fn write_script(path: &std::path::Path, body: &str) {
     }
 }
 
+/// The fake export's sidecar (printf template: %s = chain id, %s = cut block id). recv
+/// sequences 3 + 2 = global 5, as on a chain that started at genesis.
+const SIDECAR: &str = r#"{"version":1,"source_chain_id":"%s","source_block_id":"%s","account_metadata":[{"name":1,"recv_sequence":3,"auth_sequence":1,"code_sequence":0,"abi_sequence":0},{"name":2,"recv_sequence":2,"auth_sequence":0,"code_sequence":0,"abi_sequence":0}],"global_action_sequence":5,"input_transactions":[]}"#;
+
+/// Rewrite the fake export so it writes `sidecar_printf` (same %s %s arguments) instead.
+fn fake_export_with_sidecar(dir: &std::path::Path, sidecar_printf: &str) {
+    let export = dir.join("fake-export.sh");
+    let body = std::fs::read_to_string(&export).unwrap().replace(SIDECAR, sidecar_printf);
+    write_script(&export, &body);
+}
+
+fn upstream_journal_has_verified(text: &str) -> bool {
+    text.lines().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["state"] == "VERIFIED" && v["kind"] == "transition"
+    })
+}
+
 fn stage_fake_upstream_tools(dir: &std::path::Path, compare_exit: i32) {
     let d = dir.display();
     // export.sh stand-in: nests its own work dir (the docker-mount shape),
@@ -1369,7 +1387,8 @@ fn stage_fake_upstream_tools(dir: &std::path::Path, compare_exit: i32) {
              sha() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi | awk '{{print $1}}'; }}\n\
              mkdir -p \"$out/work/state-history\"\n\
              printf SHIPLOG > \"$out/work/state-history/chain_state_history.log\"\n\
-             if [ -z \"$NO_SIDECAR\" ]; then printf '{{}}' > \"$out/work/deferred-transactions.json\"; fi\n\
+             . {d}/cut-facts.env\n\
+             if [ -z \"$NO_SIDECAR\" ]; then printf '{SIDECAR}' \"$CHAIN_ID\" \"$CUT_BLOCK_ID\" > \"$out/work/deferred-transactions.json\"; fi\n\
              {{ echo \"XPR_CORE_REVISION=d133c641\"; echo \"INPUT_SNAPSHOT_SHA256=$(sha \"$snap\")\"; \
                 echo \"CHAIN_STATE_HISTORY_SHA256=$(sha \"$out/work/state-history/chain_state_history.log\")\"; }} > \"$out/work/manifest.env\"\n\
              echo \"exported full XPR chain-state history to $out/work\"\n"
@@ -1504,6 +1523,66 @@ fn upstream_export_without_sidecar_fails_verification() {
         let v: serde_json::Value = serde_json::from_str(l).unwrap();
         v["state"] == "VERIFIED" && v["kind"] == "transition"
     }));
+}
+
+#[test]
+fn upstream_sidecar_sequences_are_journaled() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    run_machine_result(&cfg, &ops).ok();
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let ev = text.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|v| !v["data"]["upstream_sidecar_sequences"].is_null()).expect("sequence evidence journaled");
+    let seq = &ev["data"]["upstream_sidecar_sequences"];
+    assert_eq!(seq["accounts"], 2);
+    assert_eq!(seq["global_action_sequence"], 5);
+    assert_eq!(seq["recv_sum_matches_global"], true);
+    assert!(upstream_journal_has_verified(&text));
+}
+
+#[test]
+fn upstream_sidecar_without_source_chain_id_fails_verification() {
+    // A pre-full-state sidecar: upstream would restore the global sequence but leave every
+    // per-account counter at 0 (issue #101 case 2).
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    fake_export_with_sidecar(dir.path(), r#"{"version":1,"x":"%s","source_block_id":"%s","global_action_sequence":5,"input_transactions":[]}"#);
+    let cfg = upstream_test_config(dir.path(), 120);
+    assert_eq!(run_machine(&cfg, &MockOps::new(dir.path(), 110)), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("no source_chain_id"), "{text}");
+    assert!(!upstream_journal_has_verified(&text));
+}
+
+#[test]
+fn upstream_sidecar_from_another_block_or_without_accounts_fails_verification() {
+    for (sidecar, want) in [
+        (r#"{"version":1,"source_chain_id":"%s","source_block_id":"%s00","account_metadata":[{"name":1,"recv_sequence":5}],"global_action_sequence":5,"input_transactions":[]}"#, "is not the cut block"),
+        (r#"{"version":1,"source_chain_id":"%s","source_block_id":"%s","account_metadata":[],"global_action_sequence":5,"input_transactions":[]}"#, "no account_metadata rows"),
+        (r#"{"version":1,"source_chain_id":"%s","source_block_id":"%s","account_metadata":[{"name":1,"recv_sequence":0}],"global_action_sequence":0,"input_transactions":[]}"#, "global_action_sequence is 0"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        stage_fake_upstream_tools(dir.path(), 0);
+        fake_export_with_sidecar(dir.path(), sidecar);
+        let cfg = upstream_test_config(dir.path(), 120);
+        assert_eq!(run_machine(&cfg, &MockOps::new(dir.path(), 110)), State::Aborted, "{want}");
+        let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+        assert!(text.contains(want), "{want}: {text}");
+    }
+}
+
+#[test]
+fn upstream_sidecar_recv_sum_mismatch_is_evidence_not_a_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    fake_export_with_sidecar(dir.path(), &SIDECAR.replace("\"global_action_sequence\":5", "\"global_action_sequence\":9"));
+    let cfg = upstream_test_config(dir.path(), 120);
+    run_machine_result(&cfg, &MockOps::new(dir.path(), 110)).ok();
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("\"recv_sum_matches_global\":false"), "{text}");
+    assert!(upstream_journal_has_verified(&text), "advisory only until proven on a real export");
 }
 
 #[test]
