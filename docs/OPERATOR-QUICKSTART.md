@@ -56,6 +56,22 @@ admission, funding and routing are checked separately.
 One more command installs metalgo and prints your NodeID, BLS key and proof of possession:
 [METAL-QUICKSTART.md](METAL-QUICKSTART.md).
 
+## 5. API and Hyperion operators: serve /v1 through the edge
+
+If your node serves a public `/v1` (install mode `api`) or `/v1` + `/v2` history (mode `hyperion`), set
+`"gateway": {"mode": "edge"}` in the ceremony manifest with PulseVM v1.0.0+ (the coordinator pins
+`artifacts.edge`). After the cut your `/v1` URL keeps answering the Leap 5 endpoints dapps call: the node's own
+API where it has one, translations for the rest, and a clear 501 where PulseVM cannot answer yet. In `hyperion`
+mode `/v1/history` and `/v2` go through the federator, which reads balances and permissions from the new chain
+and uses the old and new Hyperion indexes only to find accounts. What each endpoint does:
+[V1-COVERAGE.md](V1-COVERAGE.md).
+
+Before your source nodeos stops, capture two facts the edge serves from the old chain:
+
+```bash
+node tools/capture-static.mjs http://127.0.0.1:8888 /etc/pulse-cutover/static
+```
+
 ---
 
 ## If something goes wrong

@@ -25,6 +25,18 @@ semantics client-side on the 1:1 chain.)
   old local Hyperion, e.g. `LEGACY=http://127.0.0.1:<old-hyperion-port>` —
   same code path, pre-cut queries never leave the box.
 
+## State comes from the chain
+
+An index only knows what it has seen. The local hyperion-rs is filled from
+post-cut deltas, so an account untouched since the cut has no rows there (its
+token list would come back empty, with HTTP 200); the legacy archive is frozen
+at the cut. So for **state**, the indexes are used only to *discover* which
+contracts or accounts to look at, and the values are read from the chain's
+`/v1/chain` (`CHAIN_URL`, default `http://127.0.0.1:8899`, the /v1 edge; the
+node's native base `http://127.0.0.1:9650/ext/bc/<BID>` works too). A chain
+failure is a 502, never an index answer. Full per-endpoint table:
+[docs/V1-COVERAGE.md](../docs/V1-COVERAGE.md).
+
 ## Federated surface
 
 | endpoint | behavior |
@@ -32,9 +44,19 @@ semantics client-side on the 1:1 chain.)
 | `/v2/health` | local health + `federation` block (boundary, local ok + last_indexed, legacy ok) |
 | `/v2/history/get_actions` | per-account merge + cross-boundary pagination (desc); no-account = local feed |
 | `/v2/history/get_transaction` | new-then-legacy; legacy hits tagged `_premigration` |
-| `/v2/state/get_key_accounts` | union (keys are 1:1 across the cut) |
+| `/v2/state/get_tokens` | contracts: union of legacy + local (discovery); amounts: chain `get_currency_balance` per contract; no balance row = omitted |
+| `/v2/state/get_account` | permissions from chain `get_account`; tokens as above; actions = federated `get_actions` (limit 20); hyperion-rs shape |
+| `/v2/state/get_key_accounts` | discovery legacy + local in every key spelling, kept only if the key is in the account's permissions **now** |
+| other `/v2/state/*` | local first, legacy fallback, tagged `x-pulse-federation: index-only` (not chain-verified) |
 | other `/v2/*` | local first, legacy fallback (`get_creator` etc. live pre-cut) |
-| `/v1/history/*` | local hyperion-rs shim only — v1 pos/offset pagination is NOT federated (per-source seq positions differ; /v2 is the federated surface) |
+| `/v1/history/get_actions` | from the federated timeline, v1 shape: `pos=-1` exact order; `pos>=0` mapped onto the combined timeline, flagged `federation.positional: "approximate"` (sequence numbers are per-index, see V1-COVERAGE) |
+| `/v1/history/get_transaction` | new-then-legacy |
+| `/v1/history/get_key_accounts` | as `/v2/state/get_key_accounts` |
+| `/v1/history/get_controlled_accounts` | discovery legacy + local, kept only if the account's permissions name the controller now |
+
+Before the boundary file exists every state and `/v1/history` endpoint is
+served legacy-only (the pre-ceremony behaviour). A partially failed discovery
+(one index unreachable) is answered with `partial: true` + `source_errors`.
 
 ## Boundary — how the router knows where "old" ends and "new" begins
 
@@ -50,4 +72,6 @@ legacy-only: never a wrong answer, just no new rows yet.
 - `PASSTHROUGH_PORT` (7019): pure legacy proxy, standing in for "the /v2 you
   already had" as the pre-flip nginx upstream.
 
-Run: `LOCAL=http://127.0.0.1:7000 LEGACY=https://test.proton.eosusa.io node server.js`
+Run: `LOCAL=http://127.0.0.1:7000 LEGACY=https://test.proton.eosusa.io CHAIN_URL=http://127.0.0.1:8899 node server.js`
+
+Tests: `node --test federator/test/*.test.mjs` (mock legacy, local and chain; no network).

@@ -111,6 +111,43 @@ ensure_node(){
   exit 1
 }
 
+# ---------- /v1 gateway modes (pure: tools/test/run.sh extracts and tests these) ----------
+# manifest .gateway.mode:
+#   "legacy" (default) — the /v1/chain -> pulsevm.* translating gateway (artifacts.gateway),
+#            for PulseVM builds without the in-node API.
+#   "native" — dependency-free pass-through to the node's own nodeos-style /v1/chain
+#            (PulseVM v1.0.0+: 14 endpoints, no translation).
+#   "edge"   — recommended with PulseVM v1.0.0+: the pinned /v1 edge (artifacts.edge,
+#            gateway/server.js in this repo) — native pass-through for the 14 plus
+#            polyfills for the rest of the Leap 5 /v1 surface and /v1/history via the
+#            federator (docs/V1-COVERAGE.md).
+gw_mode_check(){ # mode -> prints the mode, or fails with the reason
+  case "${1:-legacy}" in
+    legacy|native|edge) echo "${1:-legacy}";;
+    *) echo "ABORT: manifest gateway.mode must be \"legacy\", \"native\" or \"edge\" (got \"$1\")" >&2; return 1;;
+  esac
+}
+gw_unit(){ # mode bid node_bin description -> the pulse-gateway systemd unit
+  local mode="$1" bid="$2" node="$3" desc="$4"
+  echo "[Unit]"
+  echo "Description=$desc"
+  echo "After=network.target"
+  echo "[Service]"
+  echo "Environment=UPSTREAM=http://127.0.0.1:9650/ext/bc/$bid/rpc"
+  echo "Environment=NATIVE_BASE=http://127.0.0.1:9650/ext/bc/$bid"
+  if [ "$mode" = "edge" ]; then
+    echo "Environment=RPC_URL=http://127.0.0.1:9650/ext/bc/$bid/rpc"
+    echo "Environment=FEDERATOR_URL=http://127.0.0.1:7010"
+    echo "Environment=STATIC_DIR=/etc/pulse-cutover/static"
+  fi
+  echo "Environment=PORT=8899"
+  echo "ExecStart=$node /opt/pulse-gateway/server.js"
+  echo "Restart=always"
+  echo "RestartSec=3"
+  echo "[Install]"
+  echo "WantedBy=multi-user.target"
+}
+
 # ---------- haproxy flip helpers (used when the detected edge is haproxy) ----------
 # Both use the globals resolved in the edge section below:
 #   HAP_CFG (config path), HAP_VALIDATE / HAP_RELOAD (per-runtime commands),
@@ -538,14 +575,11 @@ systemctl enable --now metalgo-pulse >/dev/null 2>&1
 if $API_LIKE; then
   ensure_node
   mkdir -p /opt/pulse-gateway
-  # manifest .gateway.mode:
-  #   "legacy" (default) — the /v1/chain -> pulsevm.* translating gateway
-  #            (artifacts.gateway), for PulseVM builds without the in-node API.
-  #   "native" — PulseVM builds that serve nodeos-style /v1/chain themselves
-  #            (MetalBlockchain/pulsevm #98) at /ext/bc/<BID>/v1/chain/. A
-  #            dependency-free pass-through on the same port forwards to it,
-  #            so the flip/revert machinery below is unchanged.
-  GW_MODE=$(mget_opt '.gateway.mode'); GW_MODE=${GW_MODE:-legacy}
+  # manifest .gateway.mode (see gw_mode_check): legacy | native | edge. Every
+  # mode listens on 127.0.0.1:8899, so the flip/revert machinery below is
+  # unchanged. "native" = PulseVM builds that serve nodeos-style /v1/chain
+  # themselves (MetalBlockchain/pulsevm #98) at /ext/bc/<BID>/v1/chain/.
+  GW_MODE=$(gw_mode_check "$(mget_opt '.gateway.mode')") || exit 1
   case "$GW_MODE" in
     legacy)
       fetch_verify "$(mget '.artifacts.gateway.url')" "$(mget '.artifacts.gateway.sha256')" /opt/pulse-gateway/server.js
@@ -569,23 +603,20 @@ http.createServer((req, res) => {
 }).listen(port, '127.0.0.1');
 JS
       GW_DESC="PulseVM /v1/chain native pass-through";;
-    *) echo "ABORT: manifest gateway.mode must be \"legacy\" or \"native\" (got \"$GW_MODE\")"; exit 1;;
+    edge)
+      fetch_verify "$(mget '.artifacts.edge.url')" "$(mget '.artifacts.edge.sha256')" /opt/pulse-gateway/server.js
+      GW_DESC="PulseVM /v1 edge (native pass-through + Leap 5 polyfills)"
+      # The edge serves get_activated_protocol_features / get_consensus_parameters
+      # from files captured on the SOURCE chain. Capture now (best effort); the
+      # capture must be refreshed at the cut, before nodeos stops (README).
+      mkdir -p /etc/pulse-cutover/static
+      if [ -f "$(dirname "$0")/tools/capture-static.mjs" ]; then
+        node "$(dirname "$0")/tools/capture-static.mjs" "$SRC_RPC" /etc/pulse-cutover/static \
+          || echo "  warn: static capture from $SRC_RPC failed; those two endpoints answer 501 until it is captured"
+      fi;;
   esac
   echo "gateway mode: $GW_MODE"
-  cat > /etc/systemd/system/pulse-gateway.service <<UNIT
-[Unit]
-Description=$GW_DESC
-After=network.target
-[Service]
-Environment=UPSTREAM=http://127.0.0.1:9650/ext/bc/$BID/rpc
-Environment=NATIVE_BASE=http://127.0.0.1:9650/ext/bc/$BID
-Environment=PORT=8899
-ExecStart=$(command -v node) /opt/pulse-gateway/server.js
-Restart=always
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
-UNIT
+  gw_unit "$GW_MODE" "$BID" "$(command -v node)" "$GW_DESC" > /etc/systemd/system/pulse-gateway.service
   systemctl daemon-reload
   # restart (not just enable --now): a re-run may have changed the unit's
   # UPSTREAM (new target chain) and a running service would keep the old env.
@@ -887,6 +918,7 @@ After=network.target
 [Service]
 Environment=LOCAL=http://127.0.0.1:7000
 Environment=LEGACY=$LEGACY_URL
+Environment=CHAIN_URL=http://127.0.0.1:8899
 Environment=BOUNDARY_FILE=/etc/pulse-cutover/boundary.json
 Environment=PORT=7010
 Environment=PASSTHROUGH_PORT=7019

@@ -271,4 +271,37 @@ printf '[ceremony]\nmode = "api"\n[source]\nrpc_url = "http://127.0.0.1:8889"\np
 if ( eval "$(toml_read "$T/b.toml")"; [ "$OLD_beacon_node" = hyperion-testnet ] && [ "$OLD_beacon_interval_secs" = 15 ] && [ "$OLD_source_rpc_url" = http://127.0.0.1:8889 ] && [ "$OLD_source_producer_api_url" = http://127.0.0.1:8890 ] && [ "$OLD_snapshot_dir" = /data/snap ] && [ "$OLD_ceremony_mode" = api ] && [ "$OLD_beacon_url" = https://x.example/api/report ] ); then ok "beacon: existing config values read back"; else bad "beacon: existing config values read back"; fi
 if [ "$(mode_for_role producer)" = producer ] && [ "$(mode_for_role history)" = api ] && [ "$(mode_for_role api)" = api ]; then ok "beacon: ceremony mode follows role"; else bad "beacon: ceremony mode follows role"; fi
 
+echo "install.sh (/v1 gateway modes)"
+ROOT=$(cd "$HERE/.." && pwd)
+# install.sh is not sourceable (it runs as root, top to bottom): extract its pure gateway helpers.
+eval "$(sed -n '/^gw_mode_check(){/,/^}/p;/^gw_unit(){/,/^}/p' "$ROOT/install.sh")"
+if ( bash -n "$ROOT/install.sh" ); then ok "install.sh: syntax"; else bad "install.sh: syntax"; fi
+for m in legacy native edge; do
+  if [ "$(gw_mode_check "$m" 2>/dev/null)" = "$m" ]; then ok "gateway mode: $m accepted"; else bad "gateway mode: $m accepted"; fi
+done
+if [ "$(gw_mode_check "" 2>/dev/null)" = legacy ]; then ok "gateway mode: absent defaults to legacy (unchanged)"; else bad "gateway mode: default"; fi
+expect_die "gateway mode: unknown mode refused"            gw_mode_check translating
+expect_die "gateway mode: injection-looking mode refused"  gw_mode_check 'edge; rm -rf /'
+U=$(gw_unit edge TESTBID /usr/bin/node "PulseVM /v1 edge")
+for want in "Environment=NATIVE_BASE=http://127.0.0.1:9650/ext/bc/TESTBID" "Environment=RPC_URL=http://127.0.0.1:9650/ext/bc/TESTBID/rpc" \
+            "Environment=FEDERATOR_URL=http://127.0.0.1:7010" "Environment=STATIC_DIR=/etc/pulse-cutover/static" "Environment=PORT=8899" \
+            "ExecStart=/usr/bin/node /opt/pulse-gateway/server.js"; do
+  printf '%s\n' "$U" | grep -qxF "$want" || bad "edge unit: missing $want"
+done
+printf '%s\n' "$U" | grep -qxF "Environment=PORT=8899" && ok "edge unit: native base, rpc, federator, static dir, port 8899"
+# legacy/native units are byte-identical to the pre-edge installer's unit
+for m in legacy native; do
+  WANT=$(printf '%s\n' "[Unit]" "Description=D" "After=network.target" "[Service]" "Environment=UPSTREAM=http://127.0.0.1:9650/ext/bc/B/rpc" \
+    "Environment=NATIVE_BASE=http://127.0.0.1:9650/ext/bc/B" "Environment=PORT=8899" "ExecStart=/n /opt/pulse-gateway/server.js" "Restart=always" "RestartSec=3" "[Install]" "WantedBy=multi-user.target")
+  if [ "$(gw_unit "$m" B /n D)" = "$WANT" ]; then ok "$m unit: unchanged"; else bad "$m unit: unchanged"; fi
+done
+# the native pass-through heredoc is still extractable (CI runs it)
+awk "/cat > \/opt\/pulse-gateway\/server.js <<'JS'/{f=1;next} /^JS$/{f=0} f" "$ROOT/install.sh" > "$T/native.js"
+if command -v node >/dev/null && node --check "$T/native.js" 2>/dev/null && [ -s "$T/native.js" ]; then ok "native pass-through heredoc extracts and parses"; else bad "native pass-through heredoc"; fi
+if command -v node >/dev/null; then
+  for f in gateway/server.js federator/server.js tools/capture-static.mjs; do
+    if node --check "$ROOT/$f" 2>/dev/null; then ok "node --check $f"; else bad "node --check $f"; fi
+  done
+fi
+
 echo; echo "$PASS passed, $FAIL failed"; [ "$FAIL" = 0 ]

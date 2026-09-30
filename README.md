@@ -915,14 +915,19 @@ VERDICTS
             ceremony flips the edge your users actually reach
 ```
 
-### `/v1/chain`: legacy gateway or native
+### `/v1`: edge, native or legacy gateway
 
 API mode puts something on `127.0.0.1:8899` for the public `/v1` route to flip to. Which one is set by `gateway.mode` in the manifest:
 
-- **`legacy`** (default): the translating gateway from `artifacts.gateway`, which turns nodeos-style `/v1/chain/*` calls into `pulsevm.*` JSON-RPC. Needed for PulseVM builds without the in-node API, including v0.7.1.
-- **`native`**: for PulseVM builds that serve nodeos-style `/v1/chain` themselves (MetalBlockchain/pulsevm #98, at `/ext/bc/<BID>/v1/chain/`). The installer writes a dependency-free pass-through to port 8899 that forwards `/v1/chain/*` to the node with `Host: localhost` for metalgo's host check. No translation happens; `artifacts.gateway` is not needed.
+- **`edge`** (recommended with PulseVM v1.0.0+): the /v1 edge from `artifacts.edge` (`gateway/server.js` in this repo, dependency-free Node). It forwards the 14 `/v1/chain` endpoints the node serves natively (normalizing requests nodeos accepts but the node's parser rejects), polyfills the rest of the Leap 5 `/v1/chain` surface (`send_transaction2`, `push_transactions`, `get_raw_block`, `get_block_header(_state)`, `get_producers`, `get_accounts_by_authorizers`, `get_transaction_id`, …), serves `get_activated_protocol_features` / `get_consensus_parameters` from a capture of the source chain, and proxies `/v1/history/*` to the federator. What cannot be served yet is a nodeos-shaped 501. Values always come from the new chain; history indexes are used only to discover accounts. Full table and upstream asks: [docs/V1-COVERAGE.md](docs/V1-COVERAGE.md).
+- **`native`**: a dependency-free pass-through of `/v1/chain/*` to the node's own nodeos-style API (MetalBlockchain/pulsevm #98, at `/ext/bc/<BID>/v1/chain/`) with `Host: localhost` for metalgo's host check. Only the 14 native endpoints answer. `artifacts.gateway` is not needed.
+- **`legacy`** (default, unchanged): the translating gateway from `artifacts.gateway`, which turns nodeos-style `/v1/chain/*` calls into `pulsevm.*` JSON-RPC. Needed for PulseVM builds without the in-node API, including v0.7.1.
 
-The flip and revert are identical in both modes: the public route swaps its backend to `127.0.0.1:8899`.
+The flip and revert are identical in all modes: the public route swaps its backend to `127.0.0.1:8899`.
+
+**Edge: capture the at-cut facts.** Run `node tools/capture-static.mjs <source-rpc> /etc/pulse-cutover/static` while
+the source nodeos still answers (the installer does it once at install time; run it again during the freeze, before
+nodeos stops). Without the capture those two endpoints answer 501.
 
 ### `install.sh` internals
 
@@ -986,8 +991,9 @@ state of nodeos, metalgo and the edge before assuming the source is authoritativ
   "artifacts": { "agent":   {"url": "…", "sha256": "…"},
                  "plugin":  {"url": "…", "sha256": "…"},
                  "metalgo": {"url": "…", "sha256": "…"},
-                 "gateway": {"url": "…", "sha256": "…"} },
-  "gateway": { "mode": "legacy" },
+                 "gateway": {"url": "…", "sha256": "…"},
+                 "edge":    {"url": "…", "sha256": "…"} },
+  "gateway": { "mode": "edge" },
   "paths": { "work_dir": "/root/api-cutover" }
 }
 ```
