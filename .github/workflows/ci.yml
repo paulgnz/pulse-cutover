@@ -32,10 +32,10 @@ jobs:
           bash -n install.sh
           bash -n cutover.sh
           for f in $(git ls-files '*.sh'); do bash -n "$f"; done
-      - name: Node syntax (edge, federator, tools)
-        run: for f in $(git ls-files 'gateway/*.js' 'federator/*.js' 'examples/*.mjs' 'tools/*.mjs'); do node --check "$f"; done
-      - name: Edge + federator + mission control tests (node:test, mock upstreams, no network)
-        run: node --test control/test/*.test.mjs gateway/test/*.test.mjs federator/test/*.test.mjs
+      - name: Node syntax (edge, federator, tools, conformance harness)
+        run: for f in $(git ls-files 'gateway/*.js' 'federator/*.js' 'examples/*.mjs' 'tools/*.mjs' 'tools/conformance/*.mjs' 'tools/conformance/clients/*.mjs'); do node --check "$f"; done
+      - name: Edge + federator + mission control + conformance tests (node:test, mock upstreams, no network)
+        run: node --test control/test/*.test.mjs gateway/test/*.test.mjs federator/test/*.test.mjs tools/conformance/test/*.test.mjs
       - name: Installer unit tests
         run: bash tools/test/run.sh
       - name: Native /v1/chain pass-through (extracted from install.sh)

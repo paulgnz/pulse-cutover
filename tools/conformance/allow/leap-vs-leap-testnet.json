@@ -1,0 +1,10 @@
+[
+  { "endpoint": "get_supported_apis", "reason": "node configuration: the two nodes enable different API plugins (producer API listed on one, transaction-status on the other)" },
+  { "endpoint": "get_transaction_status", "reason": "node configuration: the transaction-finality-status plugin is enabled on one node only (Leap 5 serves it when configured)" },
+  { "endpoint": "send_read_only_transaction", "reason": "node configuration: read-only-threads > 0 on one node only" },
+  { "id_prefix": "get_block#", "tag": "early-block-2", "reason": "node configuration: one node keeps a partial block log (earliest_available_block_num > 2)" },
+  { "endpoint": "push_transactions", "tag": "empty-array", "class": "error-shape-diff", "reason": "build difference: the empty-array error text is the C++ standard library's range-check message, which differs between nodeos builds" },
+  { "group": "history", "class": "error-shape-diff", "reason": "Hyperion version difference: request-validation error wording (should/must) and an added FST_ERR_VALIDATION code between Hyperion releases" },
+  { "endpoint": "get_actions", "class": "DIFF", "reason": "history index range: the two Hyperion instances retain different spans of history (pos 0 is the first action each index holds)" },
+  { "endpoint": "get_key_accounts", "class": "DIFF", "reason": "history index completeness: one Hyperion instance returns no accounts for keys the chain holds (permission index not populated)" }
+]
