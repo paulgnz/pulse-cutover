@@ -19,10 +19,11 @@ const edge = require('../server.js');
 const BID = 'TESTBID';
 const DEV_EOS = 'EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV';
 const DEV_PUB = 'PUB_K1_6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5BoDq63';
+const THIRD = edge.pubSpelling({ type: 'K1', data: Buffer.concat([Buffer.from([3]), randomBytes(32)]) });
 const OTHER = edge.pubSpelling({ type: 'K1', data: Buffer.concat([Buffer.from([2]), randomBytes(32)]) });
 const BLOCK_ID = '00000064' + 'a1b2c3d4' + 'e5f6'.repeat(12);
 const blockJson = (n) => ({ timestamp: '2026-09-30T12:00:00.500', producer: 'eosio', confirmed: 0, previous: '00000063' + '0'.repeat(56),
-  transaction_mroot: '0'.repeat(64), action_mroot: '1'.repeat(64), transactions: [], id: BLOCK_ID, block_num: n });
+  transaction_mroot: '0'.repeat(64), action_mroot: '1'.repeat(64), transactions: [], id: BLOCK_ID, block_num: n, block_extensions: [] });
 
 const seen = [];   // every request the mock node received: {path, host, body}
 let nativeInfo = { head_block_num: 100, last_irreversible_block_num: 100, head_block_time: '2026-01-01T00:00:00.500', chain_id: 'c'.repeat(64) };
@@ -37,11 +38,16 @@ const accounts = {
   alice: { account_name: 'alice', permissions: [
     { perm_name: 'owner', parent: '', required_auth: { threshold: 1, keys: [{ key: DEV_PUB, weight: 1 }], accounts: [], waits: [] } },
     { perm_name: 'active', parent: 'owner', required_auth: { threshold: 2, keys: [{ key: DEV_PUB, weight: 1 }], accounts: [{ permission: { actor: 'bob', permission: 'active' }, weight: 1 }], waits: [] } }] },
+  amy: { account_name: 'amy', created: '2021-01-01T00:00:00.000', permissions: [
+    { perm_name: 'active', parent: 'owner', required_auth: { threshold: 1, keys: [{ key: THIRD, weight: 1 }], accounts: [], waits: [] } }] },
+  zed: { account_name: 'zed', created: '2019-01-01T00:00:00.000', permissions: [
+    { perm_name: 'active', parent: 'owner', required_auth: { threshold: 1, keys: [{ key: THIRD, weight: 1 }], accounts: [], waits: [] } }] },
   carol: { account_name: 'carol', permissions: [   // key rotated away after the cut
     { perm_name: 'active', parent: 'owner', required_auth: { threshold: 1, keys: [{ key: OTHER, weight: 1 }], accounts: [], waits: [] } }] },
 };
 
 function json(res, status, body) { res.writeHead(status, { 'content-type': 'application/json', 'x-mock': 'native' }); res.end(typeof body === 'string' ? body : JSON.stringify(body)); }
+const leapTxErr = (code, name, what, message, file, line_number, method) => ({ code: 500, message: 'Internal Service Error', error: { code, name, what, details: [{ message, file, line_number, method }] } });
 const nodeosErr = (what) => ({ code: 500, message: what, error: { code: 0, name: 'internal_error', what, details: [{ message: what, file: '', line_number: 0, method: '' }] } });
 
 function mockNode(req, res, body) {
@@ -71,7 +77,9 @@ function mockNode(req, res, body) {
         producer: 'eosio', confirmed: 0, previous: '00000063' + '0'.repeat(56), schedule_version: 0, producer_signature: 'SIG_K1_', header_extensions: [], new_producers: null, ref_block_prefix: 1 });
     case 'get_account':
       return accounts[p.account_name] ? json(res, 200, accounts[p.account_name]) : json(res, 500, nodeosErr(`unknown account ${p.account_name}`));
-    case 'get_raw_abi': return json(res, 200, { account_name: p.account_name, code_hash: 'a'.repeat(64), abi_hash: 'b'.repeat(64), abi: 'DmVvc2lvOjphYmkvMS4yAA==' });
+    case 'get_raw_abi':
+      if (p.account_name === 'nobody') return json(res, 500, nodeosErr('unknown account nobody'));
+      return json(res, 200, { account_name: p.account_name, code_hash: 'a'.repeat(64), abi_hash: 'b'.repeat(64), abi: 'DmVvc2lvOjphYmkvMS4yAA==' });
     case 'get_table_rows': {
       if (p.index_position !== undefined && typeof p.index_position !== 'number') return json(res, 400, nodeosErr('Invalid JSON'));
       if (p.limit !== undefined && typeof p.limit !== 'number') return json(res, 400, nodeosErr('Invalid JSON'));
@@ -87,6 +95,8 @@ function mockNode(req, res, body) {
       return json(res, 200, { required_keys: (p.available_keys || []).filter((k) => k === DEV_PUB) });
     case 'push_transaction': case 'send_transaction':
       if (p.packed_trx === 'bad') return json(res, 500, nodeosErr('transaction declares authority that was not provided'));
+      if (p.packed_trx === 'auth') return json(res, 500, leapTxErr(3090003, 'unsatisfied_authorization', 'Provided keys, permissions, and delays do not satisfy declared authorizations', "transaction declares authority '{\"actor\":\"alice\",\"permission\":\"active\"}', but does not have signatures for it", 'authorization_manager.cpp', 558, 'check_authorization'));
+      if (p.packed_trx === 'expired') return json(res, 500, leapTxErr(3040005, 'expired_tx_exception', 'Expired Transaction', 'expired transaction abc', 'producer_plugin.cpp', 877, 'process_incoming_transaction_async'));
       return json(res, 200, { transaction_id: createHash('sha256').update(Buffer.from(p.packed_trx, 'hex')).digest('hex') });
     case 'get_currency_balance': return json(res, 202, '["1.0000 XPR"]'); // odd status on purpose: pass-through must keep it
     default: return json(res, 404, nodeosErr('Not found'));
@@ -99,6 +109,7 @@ function mockFederator(req, res, body) {
   const p = JSON.parse(body || '{}');
   if (url.pathname === '/v1/history/get_key_accounts') {
     // Discovery deliberately includes a stale candidate (carol no longer holds the key) and a missing account.
+    if (edge.keyCanon(p.public_key) === edge.keyCanon(THIRD)) return json(res, 200, { account_names: ['amy', 'zed'] });
     return json(res, 200, { account_names: ['alice', 'carol', 'ghost'] });
   }
   if (url.pathname === '/v1/history/get_controlled_accounts') return json(res, 200, { controlled_accounts: p.controlling_account === 'bob' ? ['alice', 'carol'] : [] });
@@ -188,8 +199,11 @@ test('pass-through preserves status and body byte-for-byte, and sets Host: local
   const e = await call('get_account', { account_name: 'nobody' });
   assert.equal(e.status, 500);
   assert.equal(e.json.error.what, 'unknown account nobody');
+  const n = seen.length;
   const bad = await call('get_account', '{not json');
-  assert.equal(bad.status, 400, 'invalid JSON forwarded as-is so the node answers');
+  assert.equal(bad.status, 400);
+  assert.equal(bad.json.error.details[0].message, 'Unable to parse valid input from POST body', 'refused like nodeos, before reaching the node');
+  assert.equal(seen.length, n);
 });
 test('get_block: numeric block_num_or_id is sent as a string; get_block_info: string block_num as a number, timestamp repaired', async () => {
   const b = await call('get_block', { block_num_or_id: 100 });
@@ -208,11 +222,48 @@ test('get_table_rows: index names, numeric strings and numeric bounds are normal
   const sent = JSON.parse(lastSeen('/get_table_rows').body);
   assert.equal(sent.index_position, 2); assert.equal(sent.limit, 5); assert.equal(sent.lower_bound, '7');
 });
-test('get_required_keys: EOS… keys accepted and answered in the client spelling', async () => {
-  const r = await call('get_required_keys', { transaction: { actions: [] }, available_keys: [DEV_EOS, OTHER] });
-  assert.equal(r.status, 200);
-  assert.deepEqual(r.json.required_keys, [DEV_EOS]);
-  assert.ok(JSON.parse(lastSeen('/get_required_keys').body).available_keys.includes(DEV_PUB));
+test('get_required_keys: EOS… keys accepted; answer in the legacy EOS… form whatever the client sent (like nodeos 5)', async () => {
+  for (const keys of [[DEV_EOS, OTHER], [DEV_PUB, OTHER]]) {
+    const r = await call('get_required_keys', { transaction: { actions: [] }, available_keys: keys });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json.required_keys, [DEV_EOS]);
+    assert.ok(JSON.parse(lastSeen('/get_required_keys').body).available_keys.includes(DEV_PUB));
+  }
+  const bad = await call('get_required_keys', { transaction: { actions: [] }, available_keys: ['EOSnotakey'] });
+  isNodeosError(bad, 400);
+  assert.equal(bad.json.error.details[1].message, 'bin.size() == sizeof(data_type) + sizeof(uint32_t): ');
+});
+test('request bodies are validated exactly like nodeos 5 parse_params, before anything reaches the node', async () => {
+  const n = seen.length;
+  const msgs = async (name, body, method) => { const r = await call(name, body, method); return [r.status, ...(r.json.error ? r.json.error.details.map((d) => d.message) : ['OK'])]; };
+  // params required: empty body, {} and whitespace-only {} are "A Request body is required"
+  for (const b of ['', '{}', ' { } ']) assert.deepEqual(await msgs('get_account', b), [400, 'A Request body is required']);
+  assert.deepEqual(await msgs('get_producers', '{}'), [400, 'A Request body is required']);
+  assert.deepEqual(await msgs('push_transaction', '{}'), [400, 'A Request body is required']);
+  assert.deepEqual(await msgs('get_code', ''), [400, 'A Request body is required'], 'validated before the 501');
+  assert.deepEqual(await msgs('get_account', undefined, 'GET'), [400, 'A Request body is required']);
+  // malformed JSON and wrong top-level types: fc's texts
+  const eof = await msgs('get_account', '{"account_name": ');
+  assert.deepEqual(eof.slice(0, 2), [400, 'Unable to parse valid input from POST body']);
+  assert.match(eof[2], /^Unexpected EOF: 11 eof_exception: End Of File/);
+  assert.deepEqual(await msgs('get_account', '[1,2,3]'), [400, 'Unable to parse valid input from POST body', "Invalid cast from type 'array_type' to Object"]);
+  assert.deepEqual(await msgs('get_account', '"abc"'), [400, 'Unable to parse valid input from POST body', "Invalid cast from type 'string_type' to Object"]);
+  assert.deepEqual(await msgs('get_account', '{x}').then((m) => m.slice(0, 3)), [400, 'Unable to parse valid input from POST body', "Expected '\"' but read 'x'"]);
+  assert.equal(seen.length, n, 'none of these reached the node');
+  // no-params endpoints: only empty or {}
+  assert.deepEqual(await msgs('get_info', '{"zz":1}'), [400, 'Unable to parse valid input from POST body', 'no parameter should be given']);
+  assert.deepEqual(await msgs('get_producer_schedule', ''), [200, 'OK']);
+  // nodeos reads the first JSON value and ignores trailing bytes
+  assert.equal((await call('get_currency_balance', '{"code":"eosio.token","account":"alice"} trailing')).status, 202);
+});
+test('get_raw_code_and_abi and get_raw_block: nodeos error texts', async () => {
+  const r = await call('get_raw_code_and_abi', { account_name: 'nobody' });
+  isNodeosError(r, 400);
+  assert.equal(r.json.message, 'Account lookup');
+  assert.equal(r.json.error.details[0].message, 'unable to retrieve account code/abi (unknown key (eosio::chain::name): nobody)');
+  const b = await call('get_raw_block', { block_num_or_id: 999 });
+  assert.equal(b.json.error.details[0].message, 'Could not find block: 999');
+  isNodeosError(await call('get_raw_block', { block_num_or_id: 'zz' }), 500);
 });
 test('get_info: stale head time on an idle chain is refreshed, true value kept', async () => {
   const r = await call('get_info', undefined, 'GET');
@@ -229,17 +280,48 @@ test('send_transaction2 unwraps the Leap 5 envelope into send_transaction', asyn
   assert.equal(r.json.transaction_id, createHash('sha256').update(Buffer.from('abcd', 'hex')).digest('hex'));
   const sent = JSON.parse(lastSeen('/send_transaction').body);
   assert.equal(sent.packed_trx, 'abcd'); assert.equal(sent.packed_context_free_data, '');
-  isNodeosError(await call('send_transaction2', { retry_trx: false }), 400);
+  // no transaction: nodeos 5.0.3 answers 500 packed_transaction_type_exception
+  const e = await call('send_transaction2', { retry_trx: false });
+  isNodeosError(e, 500);
+  assert.equal(e.json.error.name, 'packed_transaction_type_exception');
+  assert.deepEqual(e.json.error.details.map((d) => d.message), ['Invalid packed transaction', "Invalid cast from type 'null_type' to Object", 'Failed to deserialize variant']);
 });
-test('push_transactions: sequential, one result per transaction, failures in nodeos shape', async () => {
-  const r = await call('push_transactions', [{ signatures: [], compression: 0, packed_trx: '01' }, { signatures: [], compression: 0, packed_trx: 'bad' }, { signatures: [], compression: 0, packed_trx: '02' }]);
-  assert.equal(r.status, 200);
+test('send_transaction2: a failure while executing is 202 + failure trace (default), 500 with return_failure_trace:false', async () => {
+  const tx = { signatures: [], compression: 0, packed_context_free_data: '', packed_trx: 'auth' };
+  for (const body of [{ transaction: tx }, { return_failure_trace: true, retry_trx: false, transaction: tx }]) {
+    const r = await call('send_transaction2', body);
+    assert.equal(r.status, 202, 'nodeos: return_failure_trace defaults to true');
+    const pr = r.json.processed;
+    assert.equal(r.json.transaction_id, pr.id);
+    assert.equal(pr.block_num, 101);
+    assert.equal(pr.receipt, null); assert.equal(pr.producer_block_id, null); assert.deepEqual(pr.action_traces, []); assert.equal(pr.scheduled, false);
+    assert.equal(pr.except.code, 3090003); assert.equal(pr.except.name, 'unsatisfied_authorization');
+    assert.equal(pr.except.message, 'Provided keys, permissions, and delays do not satisfy declared authorizations');
+    assert.equal(pr.except.stack[0].context.file, 'authorization_manager.cpp');
+    assert.equal(pr.error_code, '10000000000000000000');
+  }
+  const f = await call('send_transaction2', { return_failure_trace: false, retry_trx: false, transaction: tx });
+  isNodeosError(f, 500);
+  assert.equal(f.json.error.name, 'unsatisfied_authorization');
+  // raised before execution (expiry): a 500 even with return_failure_trace, like nodeos
+  const x = await call('send_transaction2', { return_failure_trace: true, transaction: { ...tx, packed_trx: 'expired' } });
+  isNodeosError(x, 500);
+  assert.equal(x.json.error.name, 'expired_tx_exception');
+});
+test('push_transactions: 202, one result per transaction in order, failures as nodeos detail strings', async () => {
+  const r = await call('push_transactions', [{ signatures: [], compression: 0, packed_trx: '01' }, { signatures: [], compression: 0, packed_trx: 'auth' }, { signatures: [], compression: 0, packed_trx: '02' }]);
+  assert.equal(r.status, 202, 'nodeos answers push_transactions with 202');
   assert.equal(r.json.length, 3);
   assert.match(r.json[0].transaction_id, /^[0-9a-f]{64}$/);
   assert.equal(r.json[1].transaction_id, '0'.repeat(64));
-  assert.match(r.json[1].processed.error, /not provided/);
+  assert.equal(r.json[1].processed.error, "3090003 unsatisfied_authorization: Provided keys, permissions, and delays do not satisfy declared authorizations\ntransaction declares authority '{\"actor\":\"alice\",\"permission\":\"active\"}', but does not have signatures for it\n    nodeos  authorization_manager.cpp:558 check_authorization\n");
   assert.match(r.json[2].transaction_id, /^[0-9a-f]{64}$/);
-  isNodeosError(await call('push_transactions', { not: 'an array' }), 400);
+  const obj = await call('push_transactions', { not: 'an array' });
+  isNodeosError(obj, 400);
+  assert.equal(obj.json.error.details[1].message, 'Invalid cast from object_type to Array');
+  const empty = await call('push_transactions', []);
+  isNodeosError(empty, 500);
+  assert.equal(empty.json.error.name, 'St12out_of_range');
 });
 test('get_raw_block via pulsevm.getRawBlock; unknown block is a nodeos-shaped 400', async () => {
   const r = await call('get_raw_block', { block_num_or_id: 100 });
@@ -258,15 +340,36 @@ test('get_block_header / get_block_header_state carry what eosjs TAPOS reads', a
   assert.equal(h.json.signed_block_header.previous, '00000063' + '0'.repeat(56));
   assert.equal(h.json.signed_block_header.producer, 'eosio');
   assert.equal('new_producers' in h.json.signed_block_header, false, 'omitted when null, like nodeos');
-  const s = await call('get_block_header_state', { block_num_or_id: 100 });
-  assert.equal(s.status, 200);
-  // eosjs transactionHeader(refBlock): refBlock.header.timestamp, refBlock.id, refBlock.block_num
-  assert.equal(s.json.block_num, 100);
-  assert.equal(s.json.id, BLOCK_ID);
-  assert.ok(Number.isFinite(Date.parse(s.json.header.timestamp + 'Z')));
-  assert.equal(s.json.dpos_irreversible_blocknum, 100);
-  assert.equal(s.json.ref_block_prefix, Buffer.from(BLOCK_ID.slice(16, 24), 'hex').readUInt32LE(0));
-  isNodeosError(await call('get_block_header', { block_num_or_id: 999 }), 500);
+  assert.equal('block_extensions' in h.json, false);
+  const hx = await call('get_block_header', { block_num_or_id: 100, include_extensions: true });
+  assert.deepEqual(hx.json.block_extensions, [], 'include_extensions adds block_extensions like nodeos');
+  const saved = nativeInfo;
+  nativeInfo = { ...saved, head_block_num: 120, last_irreversible_block_num: 90 };
+  try {
+    const s = await call('get_block_header_state', { block_num_or_id: 100 });
+    assert.equal(s.status, 200);
+    // eosjs transactionHeader(refBlock): refBlock.header.timestamp, refBlock.id, refBlock.block_num
+    assert.equal(s.json.block_num, 100);
+    assert.equal(s.json.id, BLOCK_ID);
+    assert.ok(Number.isFinite(Date.parse(s.json.header.timestamp + 'Z')));
+    assert.equal(s.json.dpos_irreversible_blocknum, 90);
+    assert.equal(s.json.ref_block_prefix, Buffer.from(BLOCK_ID.slice(16, 24), 'hex').readUInt32LE(0));
+    // at or below LIB: not in the fork database, exactly nodeos' answer
+    const gone = await call('get_block_header_state', { block_num_or_id: 90 });
+    isNodeosError(gone, 400);
+    assert.equal(gone.json.message, 'Unknown Block');
+    assert.equal(gone.json.error.details[0].message, 'Could not find reversible block: 90');
+  } finally { nativeInfo = saved; }
+  // PulseVM: LIB == head, so every block is irreversible
+  isNodeosError(await call('get_block_header_state', { block_num_or_id: 100 }), 400);
+  const nf = await call('get_block_header', { block_num_or_id: 999 });
+  isNodeosError(nf, 400);
+  assert.equal(nf.json.error.details[0].message, 'Could not find block header: 999');
+  const bad = await call('get_block_header', { block_num_or_id: 'abc' });
+  isNodeosError(bad, 500);
+  assert.equal(bad.json.error.name, 'block_id_type_exception');
+  assert.equal(bad.json.error.details[0].message, 'Invalid block ID: abc');
+  isNodeosError(await call('get_block_header', { zz: 1 }), 500);
 });
 test('get_producers: Leap shape, vote order, limit/lower_bound/more, json=false rows', async () => {
   const r = await call('get_producers', { json: true, limit: 2, lower_bound: '' });
@@ -296,16 +399,16 @@ test('get_raw_code_and_abi: abi from get_raw_abi, empty wasm + header', async ()
   assert.equal(r.json.abi, 'DmVvc2lvOjphYmkvMS4yAA==');
   assert.equal(r.headers.get('x-pulse-edge'), 'wasm-unavailable');
 });
-test('get_activated_protocol_features: static-at-cut, paged like Leap', async () => {
+test('get_activated_protocol_features: static-at-cut, like Leap 5.0 (limit ignored, never `more`)', async () => {
   const r = await call('get_activated_protocol_features', { limit: 5 });
   assert.equal(r.status, 200);
-  assert.equal(r.json.activated_protocol_features.length, 5);
-  assert.equal(r.json.more, 5);
+  assert.equal(r.json.activated_protocol_features.length, 13);
+  assert.deepEqual(Object.keys(r.json), ['activated_protocol_features']);
   const r2 = await call('get_activated_protocol_features', { lower_bound: 10, limit: 10 });
   assert.deepEqual(r2.json.activated_protocol_features.map((f) => f.activation_ordinal), [10, 11, 12]);
-  assert.equal(r2.json.more, undefined);
   const r3 = await call('get_activated_protocol_features', { search_by_block_num: true, lower_bound: 30, reverse: true, limit: 2 });
-  assert.deepEqual(r3.json.activated_protocol_features.map((f) => f.activation_block_num), [34, 32]);
+  assert.deepEqual(r3.json.activated_protocol_features.map((f) => f.activation_block_num), [34, 32, 30]);
+  assert.equal((await call('get_activated_protocol_features', '')).status, 200, 'params optional');
   assert.equal(r.headers.get('x-pulse-edge'), 'static-at-cut');
   const c = await call('get_consensus_parameters', {});
   assert.equal(c.json.chain_config.max_block_cpu_usage, 200000);
@@ -320,17 +423,18 @@ test('static endpoints without a capture answer a nodeos-shaped 501', async () =
       assert.match(r.json.error.what, /capture-static/);
     }
     // No capture -> cannot know deferred transactions are disabled -> 501, never a fabricated empty list
-    isNodeosError(await call('get_scheduled_transactions', {}, 'POST', url), 501);
+    isNodeosError(await call('get_scheduled_transactions', { json: true }, 'POST', url), 501);
   } finally { p.kill(); }
 });
 test('get_scheduled_transactions: 501 while deferred transactions exist; [] once DISABLE_DEFERRED_TRXS_STAGE_1 is active', async () => {
-  isNodeosError(await call('get_scheduled_transactions', {}), 501);
+  isNodeosError(await call('get_scheduled_transactions', { json: true }), 501);
+  isNodeosError(await call('get_scheduled_transactions', {}), 400);
   const d = mkdtempSync(join(tmpdir(), 'edge-stage1-'));
   writeFileSync(join(d, 'activated_protocol_features.json'), JSON.stringify({ activated_protocol_features: [
     { feature_digest: 'fce57d2331667353a0eac6b4209b67b843a7262a848af0a49a6e2fa9f6584eb4', activation_ordinal: 0, activation_block_num: 1 }] }));
   const { p, url } = await startEdge({ NATIVE_BASE: `http://127.0.0.1:${node.address().port}/ext/bc/${BID}`, STATIC_DIR: d });
   try {
-    const r = await call('get_scheduled_transactions', {}, 'POST', url);
+    const r = await call('get_scheduled_transactions', { json: true }, 'POST', url);
     assert.equal(r.status, 200);
     assert.deepEqual(r.json, { transactions: [], more: '' });
   } finally { p.kill(); }
@@ -339,9 +443,26 @@ test('get_accounts_by_authorizers (keys): discovery from the federator, truth fr
   const r = await call('get_accounts_by_authorizers', { keys: [DEV_EOS] });
   assert.equal(r.status, 200);
   // carol was a discovery candidate but no longer holds the key; ghost does not exist
-  assert.deepEqual(r.json.accounts.map((a) => `${a.account_name}@${a.permission_name}`), ['alice@active', 'alice@owner']);
+  // Leap order: owner before active (permission creation order); keys printed in the legacy EOS… form
+  assert.deepEqual(r.json.accounts.map((a) => `${a.account_name}@${a.permission_name}`), ['alice@owner', 'alice@active']);
   const active = r.json.accounts.find((a) => a.permission_name === 'active');
   assert.deepEqual(active, { account_name: 'alice', permission_name: 'active', authorizing_key: DEV_EOS, weight: 1, threshold: 2 });
+  const viaPub = await call('get_accounts_by_authorizers', { keys: [DEV_PUB] });
+  assert.equal(viaPub.json.accounts[0].authorizing_key, DEV_EOS, 'EOS… even when asked with PUB_K1_…, like nodeos');
+  const both = await call('get_accounts_by_authorizers', { keys: [DEV_PUB], accounts: ['bob'] });
+  assert.deepEqual(both.json.accounts.map((a) => (a.authorizing_account ? 'acct' : 'key')), ['acct', 'key', 'key'], 'account rows first');
+  // permission-creation order (account creation time), not name order
+  const third = await call('get_accounts_by_authorizers', { keys: [THIRD] });
+  assert.deepEqual(third.json.accounts.map((a) => a.account_name), ['zed', 'amy']);
+  // nodeos' parser errors
+  isNodeosError(await call('get_accounts_by_authorizers', {}), 400);
+  const bk = await call('get_accounts_by_authorizers', { keys: ['EOSnotakey'] });
+  isNodeosError(bk, 400);
+  assert.equal(bk.json.error.details[1].message, 'bin.size() == sizeof(data_type) + sizeof(uint32_t): ');
+  assert.equal((await call('get_accounts_by_authorizers', { keys: ['garbage'] })).json.error.details[1].message, 'pivot != std::string::npos: No delimiter in string, cannot determine data type: garbage');
+  const bn = await call('get_accounts_by_authorizers', { accounts: ['Bad.Name!'] });
+  assert.equal(bn.json.error.details[1].message, 'Name not properly normalized (name: Bad.Name!, normalized: .ad..ame) ');
+  assert.equal((await call('get_accounts_by_authorizers', { accounts: ['abcdefghijklmnop'] })).json.error.details[1].message, 'Name is longer than 13 characters (abcdefghijklmnop) ');
 });
 test('get_accounts_by_authorizers (accounts): wildcard and exact permission', async () => {
   const r = await call('get_accounts_by_authorizers', { accounts: ['bob'] });
@@ -354,17 +475,22 @@ test('get_accounts_by_authorizers: discovery down is a 502, never an empty answe
   const { p, url } = await startEdge({ NATIVE_BASE: `http://127.0.0.1:${node.address().port}/ext/bc/${BID}`, FEDERATOR_URL: 'http://127.0.0.1:1' });
   try { isNodeosError(await call('get_accounts_by_authorizers', { keys: [DEV_EOS] }, 'POST', url), 502); } finally { p.kill(); }
 });
-test('get_transaction_id: from packed_trx and from hex action data; JSON data is a 501', async () => {
+test('get_transaction_id: from hex action data; JSON data is a 501; wrappers and packed input refused like nodeos 5.0', async () => {
   const tx = { expiration: '2026-09-30T12:34:56', ref_block_num: 1, ref_block_prefix: 2, max_net_usage_words: 0, max_cpu_usage_ms: 0, delay_sec: 0,
     context_free_actions: [], actions: [{ account: 'eosio.token', name: 'transfer', authorization: [{ actor: 'alice', permission: 'active' }], data: 'ff00' }], transaction_extensions: [] };
   const packed = edge.packTransaction(tx).toString('hex');
   const want = createHash('sha256').update(Buffer.from(packed, 'hex')).digest('hex');
   const a = await call('get_transaction_id', tx);
   assert.equal(a.status, 200); assert.equal(a.json, want);
-  const b = await call('get_transaction_id', { signatures: [], compression: 'none', packed_trx: packed });
-  assert.equal(b.json, want);
   const j = await call('get_transaction_id', { ...tx, actions: [{ ...tx.actions[0], data: { from: 'alice' } }] });
   isNodeosError(j, 501);
+  const detail = async (body) => (await call('get_transaction_id', body)).json.error.details.map((d) => d.message);
+  assert.deepEqual(await detail({ signatures: [], compression: 'none', packed_trx: packed }), ['Transaction actions are missing or invalid', 'Invalid transaction']);
+  assert.deepEqual(await detail({ transaction: tx }), ['Transaction actions are missing or invalid', 'Invalid transaction']);
+  assert.deepEqual(await detail({}), ['Transaction actions are missing or invalid', 'Invalid transaction']);
+  assert.deepEqual(await detail('[1]'), ['Transaction object is missing or invalid', 'Invalid transaction']);
+  assert.deepEqual(await detail(''), ['A Request body is required']);
+  assert.equal((await detail('{"a":'))[0], 'Invalid transaction');
 });
 test('upstream-only endpoints: nodeos-shaped 501 naming upstream', async () => {
   for (const n of ['get_code', 'compute_transaction', 'send_read_only_transaction']) {
@@ -374,7 +500,15 @@ test('upstream-only endpoints: nodeos-shaped 501 naming upstream', async () => {
   }
 });
 test('push_block and unknown endpoints: nodeos-style 404', async () => {
-  for (const n of ['push_block', 'get_transaction_status', 'abi_json_to_bin', 'nope']) isNodeosError(await call(n, {}), 404);
+  for (const n of ['push_block', 'get_transaction_status', 'abi_json_to_bin', 'nope']) {
+    const r = await call(n, {});
+    isNodeosError(r, 404);
+    assert.deepEqual([r.json.message, r.json.error.what, r.json.error.details[0].message], ['Not Found', 'unspecified', 'Unknown Endpoint']);
+  }
+  // no trailing-slash leniency: nodeos treats /get_info/ as an unknown endpoint
+  const n = seen.length;
+  isNodeosError(await call('get_info/', {}), 404);
+  assert.equal(seen.length, n);
   const r = await fetch(`${base}/v2/health`);
   assert.equal(r.status, 404);
 });

@@ -14,6 +14,8 @@
 //                              on the SOURCE chain at the cut (tools/capture-static.mjs); 501 if absent.
 //   /v1/history/*           -> FEDERATOR_URL (pre-cut legacy + post-cut local, chain-verified state).
 //   everything else         -> 501 (known Leap endpoint PulseVM cannot serve yet) or nodeos-style 404.
+// Request bodies, paths and error bodies follow Leap 5.0.3 exactly (parse_params rules, exact paths, nodeos error
+// texts), checked differentially by tools/conformance against a live nodeos.
 // docs/V1-COVERAGE.md is the full table.
 //
 // Env: NATIVE_BASE (http://127.0.0.1:9650/ext/bc/<BID>), RPC_URL (NATIVE_BASE/rpc),
@@ -169,7 +171,119 @@ function nodeosError(status, name, what, message) {
 }
 const reply = (status, body, headers) => ({ status, body, headers });
 const err = (status, name, what, message, headers) => reply(status, nodeosError(status, name, what, message), headers);
-const notFound = () => err(404, 'exception', 'unspecified', 'Not Found');
+// Exact Leap 5.0.3 error bodies (captured from nodeos): {code, message, error:{code, name, what, details:[{message,
+// file, line_number, method}]}}. Clients match on the HTTP status, error.code/name/what and the detail messages.
+const D = (message, file, line_number, method) => ({ message, file, line_number, method });
+const leapErr = (status, code, name, what, message, details, headers) => reply(status, { code: status, message, error: { code, name, what, details } }, headers);
+const notFound = () => leapErr(404, 0, 'exception', 'unspecified', 'Not Found', [D('Unknown Endpoint', 'beast_http_session.hpp', 186, 'handle_request')]);
+const invalidRequest = (details) => leapErr(400, 3200006, 'invalid_http_request', 'invalid http request', 'Invalid Request', details);
+const bodyRequired = (file = 'http_plugin.hpp', line = 249) => invalidRequest([D('A Request body is required', file, line, 'parse_params')]);
+const unparsable = (...more) => invalidRequest([D('Unable to parse valid input from POST body', 'http_plugin.hpp', 270, 'parse_params'), ...more]);
+const unknownBlock = (msg, line, method) => leapErr(400, 3100002, 'unknown_block_exception', 'Unknown block', 'Unknown Block', [D(msg, 'chain_plugin.cpp', line, method)]);
+
+// ---- request parsing exactly like Leap 5's http_plugin parse_params ---------------------------------------------------
+// no_params endpoints accept only an empty body or {}; params_optional accept empty; params_required answer 400
+// "A Request body is required" for an empty body or {} (whitespace allowed). Only the first JSON value is read
+// (nodeos ignores trailing bytes). Malformed JSON and wrong top-level types get fc's messages.
+const NO_PARAMS = new Set(['get_info', 'get_producer_schedule', 'get_consensus_parameters']);
+const OPTIONAL_PARAMS = new Set(['get_activated_protocol_features']);
+const fcType = (v) => (v === null ? 'null_type' : Array.isArray(v) ? 'array_type' : typeof v === 'boolean' ? 'bool_type' : typeof v === 'string' ? 'string_type'
+  : typeof v === 'number' ? (Number.isInteger(v) ? (v < 0 ? 'int64_type' : 'uint64_type') : 'double_type') : 'object_type');
+const castToObject = (v) => D(`Invalid cast from type '${fcType(v)}' to Object`, 'variant.cpp', 630, 'get_object');
+const JSON_TAIL = D('', 'json.cpp', 461, 'from_string');
+// The first complete JSON value of `text` (nodeos stops there), or {error: fc-style details}.
+function firstJson(text) {
+  try { return { value: JSON.parse(text) }; } catch { /* maybe trailing bytes, maybe malformed */ }
+  let depth = 0, inStr = false, esc = false, end = -1;
+  const c0 = text[0];
+  if (c0 === '{' || c0 === '[') {
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue; }
+      if (c === '"') inStr = true; else if (c === '{' || c === '[') depth++; else if (c === '}' || c === ']') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end > 0) { try { return { value: JSON.parse(text.slice(0, end + 1)) }; } catch { /* malformed inside */ } }
+    if (end < 0) return { error: [D('Unexpected EOF: 11 eof_exception: End Of File\nunexpected end of file\n    {}\n    nodeos  json.cpp:435 variant_from_stream\n', 'json.cpp', 213, 'objectFromStream'), JSON_TAIL] };
+    const m = text.match(/^\{\s*([^"\s}])/);
+    if (m) return { error: [D(`Expected '"' but read '${m[1]}'`, 'json.cpp', 100, 'stringFromStream'), D("while parsing token ''", 'json.cpp', 123, 'stringFromStream'), D('Error parsing object', 'json.cpp', 218, 'objectFromStream'), JSON_TAIL] };
+    return { error: [D('Error parsing object', 'json.cpp', 218, 'objectFromStream'), JSON_TAIL] };
+  }
+  const first = text.match(/^[^\s,:\]}]+/);
+  try { if (first) return { value: JSON.parse(first[0]) }; } catch { /* not a scalar */ }
+  return { error: [D(`Unexpected char '${text.charCodeAt(0)}' in "${text.slice(0, 32)}"`, 'json.cpp', 438, 'variant_from_stream'), JSON_TAIL] };
+}
+// -> {params} or {fail: reply}
+function leapParse(name, raw) {
+  const text = String(raw || '').trim();
+  const parsed = text ? firstJson(text) : { value: undefined };
+  const v = parsed.value;
+  const emptyObj = v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0;
+  if (name === 'get_transaction_id') { // chain_api_plugin's own parser
+    const inv = D('Invalid transaction', 'chain_api_plugin.cpp', 91, 'parse_params');
+    if (!text) return { fail: bodyRequired('chain_api_plugin.cpp', 50) };
+    if (parsed.error) return { fail: invalidRequest([inv, ...parsed.error]) };
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return { fail: invalidRequest([D('Transaction object is missing or invalid', 'chain_api_plugin.cpp', 84, 'parse_params'), inv]) };
+    if (!Array.isArray(v.actions)) return { fail: invalidRequest([D('Transaction actions are missing or invalid', 'chain_api_plugin.cpp', 80, 'parse_params'), inv]) };
+    return { params: v };
+  }
+  if (NO_PARAMS.has(name)) {
+    if (!text || emptyObj) return { params: {} };
+    return { fail: unparsable(D('no parameter should be given', 'http_plugin.hpp', 263, 'parse_params')) };
+  }
+  if (parsed.error) return { fail: unparsable(...parsed.error) };
+  if (!text || emptyObj) return OPTIONAL_PARAMS.has(name) ? { params: {} } : { fail: bodyRequired() };
+  if (name === 'push_transactions') {
+    if (!Array.isArray(v)) return { fail: unparsable(D(`Invalid cast from ${fcType(v)} to Array`, 'variant.cpp', 561, 'get_array')) };
+    const bad = v.find((t) => !t || typeof t !== 'object' || Array.isArray(t));
+    if (bad !== undefined) return { fail: unparsable(castToObject(bad)) };
+    return { params: v };
+  }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return { fail: unparsable(castToObject(v)) };
+  return { params: v };
+}
+
+// Leap's name parser (fc name.cpp): over-long names and names that do not round-trip are refused with these texts.
+function leapNameError(s) {
+  s = String(s);
+  if (s.length > 13) return D(`Name is longer than 13 characters (${s}) `, 'name.cpp', 11, 'set');
+  const sym = (c) => (c >= 'a' && c <= 'z' ? c.charCodeAt(0) - 91 : c >= '1' && c <= '5' ? c.charCodeAt(0) - 48 : 0);
+  const chars = '.12345abcdefghijklmnopqrstuvwxyz';
+  let norm = '';
+  for (let i = 0; i < s.length; i++) norm += chars[i < 12 ? sym(s[i]) & 0x1f : sym(s[i]) & 0x0f];
+  norm = norm.replace(/\.+$/, '');
+  return norm === s ? null : D(`Name not properly normalized (name: ${s}, normalized: ${norm}) `, 'name.cpp', 15, 'set');
+}
+// Leap's public key parser (fc public_key.cpp): the texts for the malformed keys clients actually send.
+function leapKeyError(k) {
+  const s = String(k);
+  if (keyInfo(s)) return null;
+  if (s.startsWith('EOS')) {
+    const raw = b58decode(s.slice(3));
+    if (!raw || raw.length !== 37) return D('bin.size() == sizeof(data_type) + sizeof(uint32_t): ', 'public_key.cpp', 40, 'parse_base58');
+    return D('wrapper::calculate_checksum(wrapped.data) == wrapped.check: ', 'public_key.cpp', 42, 'parse_base58');
+  }
+  const m = s.match(/^PUB_([A-Z0-9]+)_(.*)$/);
+  if (!m) return D(`pivot != std::string::npos: No delimiter in string, cannot determine data type: ${s}`, 'public_key.cpp', 48, 'parse_base58');
+  const raw = b58decode(m[2]);
+  if (raw && raw.length >= 37) return D('checksum == wrapped.check: ', 'common.hpp', 50, 'apply');
+  const n = raw ? raw.length : 0;
+  return [D(`read datastream of length ${n} over by ${n - 5}`, 'datastream.cpp', 6, 'throw_datastream_range_error'), D('fc::array<char,33>', 'raw.hpp', 173, 'unpack'),
+    D('Error unpacking field data', 'raw.hpp', 363, 'operator()'), D('error unpacking fc::crypto::checksummed_data<T>', 'raw.hpp', 668, 'unpack')];
+}
+// Leap prints K1 keys in the legacy EOS… form (get_required_keys, get_accounts_by_authorizers, get_account).
+const leapKey = (k) => { const i = keyInfo(k); return (i && legacySpelling(i)) || k; };
+
+// Leap's block_num_or_id parser (get_block_header, get_block_header_state, get_raw_block) -> {num} | {id} | {fail}
+function leapBlockRef(v, method, line) {
+  const s = v == null ? '' : String(v);
+  const invalid = (...d) => ({ fail: leapErr(500, 3010008, 'block_id_type_exception', 'Invalid block ID', 'Internal Service Error', d) });
+  if (!s || s.length > 64) return invalid(D('Invalid Block number or ID, must be greater than 0 and less than 65 characters', 'chain_plugin.cpp', line - 14, method));
+  if (/^\d+$/.test(s)) return { num: Number(s), text: s };
+  if (s.length % 2) return invalid(D(`Invalid block ID: ${s}`, 'chain_plugin.cpp', line - 2, method), D('str.size() % 2 == 0: the length of hex string should be even number', 'variant.cpp', 752, 'from_variant'));
+  const bad = s.match(/[^0-9a-fA-F]/);
+  if (bad) return invalid(D(`Invalid block ID: ${s}`, 'chain_plugin.cpp', line - 2, method), D(`Invalid hex character '${bad[0]}'`, 'hex.cpp', 13, 'from_hex'));
+  return { id: s.toLowerCase(), text: s };
+}
 const unavailable = (endpoint, why) => err(501, 'unsupported_feature', `${endpoint} is not available on PulseVM yet (upstream)${why ? ': ' + why : ''}`,
   `${endpoint} not available on PulseVM yet (upstream)`, { 'x-pulse-edge': 'unavailable' });
 
@@ -264,14 +378,12 @@ function repairTimestamp(ts) {
   return m ? isoMs(Number(BigInt(m[1]) / 1000n)) : ts;
 }
 
-async function passNative(name, raw) {
+// raw: the request body; params: leapParse()'s result (already validated like nodeos would).
+async function passNative(name, raw, params) {
   let body = raw && raw.trim() ? raw : '{}';
-  let parsed, keyMap;
-  try { parsed = JSON.parse(body); } catch { parsed = undefined; } // invalid JSON: let the node answer (400 parse_error)
+  const parsed = params;
+  try { JSON.parse(body); } catch { body = JSON.stringify(parsed); } // trailing bytes after the first value: nodeos ignores them
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && NORMALIZE[name]) {
-    if (name === 'get_required_keys' && Array.isArray(parsed.available_keys)) {
-      keyMap = new Map(parsed.available_keys.map((k) => [keyCanon(k), k])); // answer in the client's own spelling
-    }
     const norm = NORMALIZE[name](parsed);
     const s = JSON.stringify(norm);
     if (s !== JSON.stringify(parsed)) body = s;
@@ -292,8 +404,10 @@ async function passNative(name, raw) {
     if (name === 'get_block_info' && r.json.timestamp && repairTimestamp(r.json.timestamp) !== r.json.timestamp) {
       return reply(200, { ...r.json, timestamp: repairTimestamp(r.json.timestamp) }, { 'x-pulse-edge': 'timestamp-repaired' });
     }
-    if (keyMap && Array.isArray(r.json.required_keys)) {
-      return reply(200, { ...r.json, required_keys: r.json.required_keys.map((k) => keyMap.get(keyCanon(k)) || k) });
+    if (name === 'get_required_keys' && Array.isArray(r.json.required_keys)) {
+      // Leap 5 answers K1 keys in the legacy EOS… form whatever spelling the client sent.
+      const keys = r.json.required_keys.map(leapKey);
+      if (JSON.stringify(keys) !== JSON.stringify(r.json.required_keys)) return reply(200, { ...r.json, required_keys: keys });
     }
   }
   return { status: r.status, raw: r.text, contentType: (r.headers && r.headers['content-type']) || 'application/json' };
@@ -302,7 +416,7 @@ async function passNative(name, raw) {
 // ---- polyfills ---------------------------------------------------------------------------------------------------
 async function blockAndHeader(id) {
   const b = await native('get_block', { block_num_or_id: toStr(id) });
-  if (b.status !== 200 || !b.json) return { fail: upstreamFailure(b, 'get_block') };
+  if (b.status !== 200 || !b.json) return { fail: upstreamFailure(b, 'get_block'), notFound: b.status >= 400 && b.status < 600 };
   const blk = b.json;
   // Fields get_block omits come from the node's own get_block_info for the same height (never invented here).
   const bi = await native('get_block_info', { block_num: blk.block_num });
@@ -315,47 +429,92 @@ async function blockAndHeader(id) {
   if (info.new_producers != null) header.new_producers = info.new_producers; // nodeos omits it when absent
   return { blk, header, signature: info.producer_signature };
 }
+// Errors nodeos raises before a transaction executes: never turned into a failure trace by send_transaction2.
+// expired_tx_exception, tx_duplicate, packed_transaction_type_exception, invalid_http_request.
+const PRE_EXECUTION = new Set([3040005, 3040008, 3010010, 3200006]);
+// fc's to_detail_string, as push_transactions reports a failed transaction: "<code> <name>: <what>\n" then per stack
+// entry "<message>\n    nodeos  <file>:<line> <method>\n". The node's error JSON does not carry each entry's format
+// arguments, so the "    {…}" argument line nodeos prints between the two is left out.
+function detailString(body, status) {
+  const e = body && body.error;
+  if (!e) return (body && body.message) || `HTTP ${status}`;
+  return `${e.code} ${e.name}: ${e.what}\n` + (e.details || []).map((d) => `${d.message}\n    nodeos  ${d.file}:${d.line_number} ${d.method}\n`).join('');
+}
 const refBlockPrefix = (id) => Buffer.from(String(id).slice(16, 24), 'hex').readUInt32LE(0);
 
 const POLY = {
   async send_transaction2(p) {
-    // Leap 5: {return_failure_trace, retry_trx, retry_trx_num_blocks, transaction:{signatures, compression, …}}.
-    const t = p && p.transaction;
-    if (!t || typeof t !== 'object') return err(400, 'invalid_params', 'send_transaction2 requires a "transaction" object');
-    return passNative('send_transaction', JSON.stringify(t));
+    // Leap 5: {return_failure_trace = true, retry_trx, retry_trx_num_blocks, transaction:{signatures, compression, …}}.
+    const t = p.transaction;
+    if (!t || typeof t !== 'object' || Array.isArray(t)) {
+      return leapErr(500, 3010010, 'packed_transaction_type_exception', 'Invalid packed transaction', 'Internal Service Error', [
+        D('Invalid packed transaction', 'chain_plugin.cpp', 2201, 'send_transaction_gen'), castToObject(t === undefined ? null : t), D('Failed to deserialize variant', 'abi_serializer.hpp', 1003, 'from_variant')]);
+    }
+    const r = await passNative('send_transaction', JSON.stringify(t), t);
+    if (p.return_failure_trace === false || p.return_failure_trace === 'false') return r;
+    const body = r.body || (() => { try { return JSON.parse(r.raw); } catch { return null; } })();
+    const e = body && body.error;
+    // A transaction that fails while executing comes back as 202 + a failure trace (nodeos' default); errors raised
+    // before execution (parsing, expiry, duplicates) stay a 500 like on Leap.
+    if (r.status < 400 || !e || PRE_EXECUTION.has(Number(e.code)) || Number(e.code) < 3000000) return r;
+    let id = '0'.repeat(64);
+    try { id = transactionId({ packed_trx: t.packed_trx, compression: t.compression }); } catch { /* unparsable packed_trx never reaches here */ }
+    const info = await native('get_info', {});
+    const head = (info.json && info.json.head_block_num) || 0, now = Date.now();
+    const blockTime = isoMs(Math.max(now, Date.parse(((info.json && info.json.head_block_time) || '1970-01-01T00:00:00') + 'Z') + 500));
+    return reply(202, { transaction_id: id, processed: {
+      id, block_num: head + 1, block_time: blockTime, producer_block_id: null, receipt: null, elapsed: 0, net_usage: 0, scheduled: false,
+      action_traces: [], account_ram_delta: null,
+      except: { code: e.code, name: e.name, message: e.what, stack: (e.details || []).map((d) => ({
+        context: { level: 'error', file: d.file || '', line: d.line_number || 0, method: d.method || '', hostname: '', thread_name: 'nodeos', timestamp: isoMs(now) },
+        format: d.message, data: {} })) },
+      error_code: '10000000000000000000',
+    } }, { 'x-pulse-edge': 'failure-trace from the node error (elapsed/net_usage and stack data not available)' });
   },
   async push_transactions(p) {
-    if (!Array.isArray(p)) return err(400, 'invalid_params', 'push_transactions expects an array of packed transactions');
-    if (p.length > 1000) return err(400, 'too_many_tx_at_once', 'Attempt to push more than 1000 transactions at once');
+    if (p.length > 1000) return leapErr(500, 3100001, 'too_many_tx_at_once', 'Pushing too many transactions at once', 'Internal Service Error', [D('Attempt to push more than 1000 transactions at once', 'chain_plugin.cpp', 2185, 'push_transactions')]);
+    if (!p.length) return leapErr(500, 13, 'St12out_of_range', 'vector', 'Internal Service Error', [D('rethrow vector: ', 'chain_plugin.cpp', 2190, 'push_transactions')]);
     const out = [];
     for (const t of p) { // sequential, in order, one result per transaction (like nodeos)
-      const r = await passNative('push_transaction', JSON.stringify(t));
+      const r = await passNative('push_transaction', JSON.stringify(t), t);
       const body = r.body || (() => { try { return JSON.parse(r.raw); } catch { return null; } })();
-      if (r.status === 200 && body) out.push(body);
-      else {
-        const what = (body && body.error && (body.error.what || (body.error.details && body.error.details[0] && body.error.details[0].message))) || (body && body.message) || `HTTP ${r.status}`;
-        out.push({ transaction_id: '0'.repeat(64), processed: { error: what } });
-      }
+      if (r.status < 400 && body) out.push(body);
+      else out.push({ transaction_id: '0'.repeat(64), processed: { error: detailString(body, r.status) } });
     }
-    return reply(200, out);
+    return reply(202, out);
   },
   async get_raw_block(p) {
+    const ref = leapBlockRef(p.block_num_or_id, 'get_raw_block', 1934);
+    if (ref.fail) return ref.fail;
     const r = await rpc('pulsevm.getRawBlock', { block_num_or_id: toStr(p.block_num_or_id) });
+    if (r.error && r.error.code === 404) return unknownBlock(`Could not find block: ${ref.text}`, 1935, 'get_raw_block');
     return r.error ? rpcFailure(r.error, 'get_raw_block') : reply(200, r.result, { 'x-pulse-edge': 'polyfill' });
   },
   async get_block_header(p) {
+    const ref = leapBlockRef(p.block_num_or_id, 'get_block_header', 1973);
+    if (ref.fail) return ref.fail;
     const h = await blockAndHeader(p.block_num_or_id);
-    if (h.fail) return h.fail;
-    return reply(200, { id: h.blk.id, signed_block_header: { ...h.header, producer_signature: h.signature } }, { 'x-pulse-edge': 'polyfill' });
+    if (h.fail) return h.notFound ? unknownBlock(`Could not find block header: ${ref.text}`, 1975, 'get_block_header') : h.fail;
+    const out = { id: h.blk.id, signed_block_header: { ...h.header, producer_signature: h.signature } };
+    if (p.include_extensions === true || p.include_extensions === 'true') out.block_extensions = h.blk.block_extensions || [];
+    return reply(200, out, { 'x-pulse-edge': 'polyfill' });
   },
   async get_block_header_state(p) {
     // Only the fields TAPOS clients read are meaningful here (eosjs: header.timestamp, id, block_num).
     // PulseVM finalizes every accepted block, so irreversible == head: eosjs never actually asks for this
     // (it uses get_block_info at or below LIB), but it must not fail if it does.
-    const h = await blockAndHeader(p.block_num_or_id);
-    if (h.fail) return h.fail;
+    // Leap serves header state only for REVERSIBLE blocks (in the fork database); anything at or below LIB is
+    // "Could not find reversible block". On PulseVM LIB == head, so this is always that error, as on a Leap node
+    // with no reversible blocks. eosjs/@proton/js only ask for blocks above LIB and fall back to get_block_info.
+    const ref = leapBlockRef(p.block_num_or_id, 'get_block_header_state', 2052);
+    if (ref.fail) return ref.fail;
+    const gone = () => unknownBlock(`Could not find reversible block: ${ref.text}`, 2054, 'get_block_header_state');
     const info = await native('get_info', {});
     const lib = info.json && info.json.last_irreversible_block_num;
+    if (ref.num != null && lib != null && ref.num <= lib) return gone();
+    const h = await blockAndHeader(p.block_num_or_id);
+    if (h.fail) return h.notFound ? gone() : h.fail;
+    if (lib != null && h.blk.block_num <= lib) return gone();
     return reply(200, {
       block_num: h.blk.block_num, id: h.blk.id,
       dpos_proposed_irreversible_blocknum: lib, dpos_irreversible_blocknum: lib,
@@ -408,7 +567,11 @@ const POLY = {
       { 'x-pulse-edge': 'partial: active names only' });
   },
   async get_raw_code_and_abi(p) {
+    const ne = leapNameError(p.account_name == null ? '' : p.account_name);
+    if (ne) return unparsable(ne);
     const r = await native('get_raw_abi', { account_name: p.account_name });
+    if (r.status >= 400 && r.status < 600) return leapErr(400, 3060002, 'account_query_exception', 'Account Query Exception', 'Account lookup',
+      [D(`unable to retrieve account code/abi (unknown key (eosio::chain::name): ${p.account_name})`, 'chain_plugin.cpp', 2357, 'get_raw_code_and_abi')]);
     if (r.status !== 200 || !r.json) return upstreamFailure(r, 'get_raw_code_and_abi');
     return reply(200, { account_name: r.json.account_name || p.account_name, wasm: '', abi: r.json.abi || '' }, { 'x-pulse-edge': 'wasm-unavailable' });
   },
@@ -421,10 +584,8 @@ const POLY = {
     if (p.lower_bound != null && p.lower_bound !== '') list = list.filter((f) => f[key] >= Number(p.lower_bound));
     if (p.upper_bound != null && p.upper_bound !== '') list = list.filter((f) => f[key] <= Number(p.upper_bound));
     if (p.reverse === true || p.reverse === 'true') list.reverse();
-    const limit = Math.max(1, Math.min(Number(p.limit) || 10, 1000));
-    const body = { activated_protocol_features: list.slice(0, limit) };
-    if (list.length > limit) body.more = list[limit][key];
-    return reply(200, body, { 'x-pulse-edge': 'static-at-cut' });
+    // Leap 5.0 ignores `limit` here: every matching feature, never a `more` (checked against nodeos 5.0.0 and 5.0.3).
+    return reply(200, { activated_protocol_features: list }, { 'x-pulse-edge': 'static-at-cut' });
   },
   async get_consensus_parameters() {
     const s = loadStatic('consensus_parameters.json');
@@ -441,8 +602,14 @@ const POLY = {
     return unavailable('get_scheduled_transactions', 'the chain keeps deferred transactions but PulseVM has no endpoint that lists them');
   },
   async get_accounts_by_authorizers(p) {
+    // Validate like nodeos' parser (names and keys), before any discovery.
+    const rawAccts = Array.isArray(p.accounts) ? p.accounts : [];
     const keys = Array.isArray(p.keys) ? p.keys : [];
-    const accts = (Array.isArray(p.accounts) ? p.accounts : []).map((a) => (typeof a === 'string' ? { actor: a, permission: '' } : { actor: a && a.actor, permission: (a && a.permission) || '' }));
+    for (const a of rawAccts) {
+      for (const n of typeof a === 'string' ? [a] : [a && a.actor, ...(a && a.permission ? [a.permission] : [])]) { const e = leapNameError(n == null ? '' : n); if (e) return unparsable(e); }
+    }
+    for (const k of keys) { const e = leapKeyError(k); if (e) return unparsable(...[].concat(e)); }
+    const accts = rawAccts.map((a) => (typeof a === 'string' ? { actor: a, permission: '' } : { actor: a.actor, permission: a.permission || '' }));
     if (!keys.length && !accts.length) return reply(200, { accounts: [] });
     // Discovery: the federator's verified key -> accounts and controlling -> controlled lookups (legacy
     // pre-cut index + local post-cut index). Truth: this node's get_account for every candidate.
@@ -457,36 +624,44 @@ const POLY = {
       if (r.status !== 200 || !r.json || !Array.isArray(r.json.controlled_accounts)) return discoveryDown(r);
       r.json.controlled_accounts.forEach((n) => candidates.add(n));
     }
-    const keyCanons = keys.map((k) => [keyCanon(k), k]);
-    const rows = [];
-    const results = await pool([...candidates].sort(), VERIFY_CONCURRENCY, (name) => native('get_account', { account_name: name }));
+    const keyCanons = [...new Set(keys.map(keyCanon))];
+    const acctRows = [], keyRows = [];
+    const results = await pool([...candidates], VERIFY_CONCURRENCY, (name) => native('get_account', { account_name: name }));
     for (const r of results) {
       if (r.status !== 200 || !r.json) continue; // no such account on the chain now: nothing to report
-      for (const perm of r.json.permissions || []) {
+      const perms = r.json.permissions || [];
+      for (const perm of perms) {
         const ra = perm.required_auth || {};
+        // Leap walks its permission index in permission-creation order. Approximated from what get_account exposes:
+        // account creation time, then name (same-block ties), then owner, active, the rest in get_account order.
+        const created = String(r.json.created || '');
+        const rank = perm.perm_name === 'owner' ? 0 : perm.perm_name === 'active' ? 1 : 2 + perms.indexOf(perm);
         for (const kw of ra.keys || []) {
           const c = keyCanon(kw.key);
-          for (const [kc, spelled] of keyCanons) if (kc === c) rows.push({ account_name: r.json.account_name, permission_name: perm.perm_name, authorizing_key: spelled, weight: kw.weight, threshold: ra.threshold });
+          if (keyCanons.includes(c)) keyRows.push({ sort: [c, created, nameToU64(r.json.account_name), rank], row: { account_name: r.json.account_name, permission_name: perm.perm_name, authorizing_key: leapKey(kw.key), weight: kw.weight, threshold: ra.threshold } });
         }
         for (const aw of ra.accounts || []) {
           const pl = aw.permission || {};
-          for (const a of accts) {
-            if (pl.actor === a.actor && (!a.permission || pl.permission === a.permission)) {
-              rows.push({ account_name: r.json.account_name, permission_name: perm.perm_name, authorizing_account: { actor: pl.actor, permission: pl.permission }, weight: aw.weight, threshold: ra.threshold });
-            }
+          if (accts.some((a) => pl.actor === a.actor && (!a.permission || pl.permission === a.permission))) {
+            acctRows.push({ sort: [`${pl.actor}@${pl.permission}`, created, nameToU64(r.json.account_name), rank], row: { account_name: r.json.account_name, permission_name: perm.perm_name, authorizing_account: { actor: pl.actor, permission: pl.permission }, weight: aw.weight, threshold: ra.threshold } });
           }
         }
       }
     }
-    const auth = (x) => x.authorizing_key || `${x.authorizing_account.actor}@${x.authorizing_account.permission}`;
-    rows.sort((a, b) => (auth(a) < auth(b) ? -1 : auth(a) > auth(b) ? 1 : a.account_name < b.account_name ? -1 : a.account_name > b.account_name ? 1 : a.permission_name < b.permission_name ? -1 : a.permission_name > b.permission_name ? 1 : 0));
+    // Leap order: account-authorized rows first, then key rows; each by authorizer, then permission-creation order.
+    const cmp = (x, y) => { for (let i = 0; i < 4; i++) { if (x.sort[i] < y.sort[i]) return -1; if (x.sort[i] > y.sort[i]) return 1; } return 0; };
     const seen = new Set();
-    return reply(200, { accounts: rows.filter((x) => { const k = `${auth(x)}|${x.account_name}|${x.permission_name}`; if (seen.has(k)) return false; seen.add(k); return true; }) },
-      { 'x-pulse-edge': 'polyfill; chain-verified' });
+    const rows = [...acctRows.sort(cmp), ...keyRows.sort(cmp)].map((x) => x.row).filter((x) => {
+      const k = `${x.authorizing_key || `${x.authorizing_account.actor}@${x.authorizing_account.permission}`}|${x.account_name}|${x.permission_name}`;
+      if (seen.has(k)) return false; seen.add(k); return true;
+    });
+    return reply(200, { accounts: rows }, { 'x-pulse-edge': 'polyfill; chain-verified' });
   },
   async get_transaction_id(p) {
     // sha256 of the packed transaction. Sound without an ABI when the caller sends packed_trx or hex action
     // data (what eosjs/wharfkit serialize anyway); JSON action data needs the contract ABI: 501 for that case.
+    // leapParse already required a transaction object with an actions array (nodeos 5.0 rejects {transaction}
+    // wrappers and {packed_trx} here), so only plain transactions reach this point.
     try { return reply(200, transactionId(p), { 'x-pulse-edge': 'polyfill' }); } catch (e) {
       if (e instanceof AbiNeeded) return unavailable('get_transaction_id', `action ${e.message} has JSON data; send packed_trx or hex-serialized action data`);
       return err(400, 'invalid_params', `get_transaction_id: ${e.message}`);
@@ -513,7 +688,7 @@ const SUPPORTED = [...NATIVE, 'send_transaction2', 'push_transactions', 'get_raw
 
 async function route(req, raw) {
   const url = new URL(req.url, 'http://x');
-  const p = url.pathname.replace(/\/+$/, '');
+  const p = url.pathname; // exact, like nodeos: a trailing slash is a different (unknown) endpoint
   if (p.startsWith('/v1/history/')) {
     const r = await request(FEDERATOR_URL + p + url.search, { method: req.method === 'GET' ? 'GET' : 'POST', body: req.method === 'GET' ? undefined : (raw || '{}') });
     if (!r.status) return err(502, 'upstream_unavailable', `history (federator ${FEDERATOR_URL}) unreachable: ${r.error}`);
@@ -523,14 +698,17 @@ async function route(req, raw) {
   const m = p.match(/^\/v1\/chain\/([a-z0-9_]+)$/);
   if (!m) return notFound();
   const name = m[1];
-  if (NATIVE.has(name)) return passNative(name, raw);
   if (name === 'push_block') return notFound(); // not a producer node
-  const fn = POLY[name];
-  if (!fn) return notFound();
-  let params = {};
-  if (raw && raw.trim()) { try { params = JSON.parse(raw); } catch { return err(400, 'parse_error', 'Invalid JSON'); } }
-  if (params === null || typeof params !== 'object') params = {};
-  return fn(params);
+  if (!NATIVE.has(name) && !POLY[name]) return notFound();
+  const parsed = leapParse(name, raw); // nodeos validates the body before any handler runs
+  if (parsed.fail) return parsed.fail;
+  if (NATIVE.has(name)) {
+    if (name === 'get_required_keys' && Array.isArray(parsed.params.available_keys)) {
+      for (const k of parsed.params.available_keys) { const e = leapKeyError(k); if (e) return unparsable(...[].concat(e)); }
+    }
+    return passNative(name, raw, parsed.params);
+  }
+  return POLY[name](parsed.params);
 }
 
 function createEdge() {

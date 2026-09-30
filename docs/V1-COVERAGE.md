@@ -20,6 +20,10 @@ Legend for "served by":
 - **501 upstream**: a known Leap endpoint PulseVM cannot serve yet; nodeos-shaped JSON error
   `{code:501, message:"… not available on PulseVM yet (upstream)", error:{name,what,details}}`.
 
+[tools/conformance](../tools/conformance/README.md) checks this table differentially: the same requests go to a Leap 5 node and to the edge, and the answers are compared (documented 501s are expected, anything else must match).
+
+Request bodies are validated like Leap 5's `parse_params` before anything reaches the node: an empty body or `{}` on an endpoint that needs parameters is `400 A Request body is required`, malformed JSON and wrong top-level types get fc's messages, and `get_info`/`get_producer_schedule`/`get_consensus_parameters` accept only an empty body or `{}`. Paths match exactly (a trailing slash is an unknown endpoint), and unknown endpoints get nodeos' `404 Unknown Endpoint`.
+
 Responses that are not a plain pass-through carry an `x-pulse-edge` header saying what was done
 (`polyfill`, `static-at-cut`, `wasm-unavailable`, `fresh-head-time`, `timestamp-repaired`, `partial: …`).
 
@@ -38,22 +42,22 @@ Responses that are not a plain pass-through carry an `x-pulse-edge` header sayin
 | `get_currency_balance` | native | |
 | `get_currency_stats` | native | |
 | `get_code_hash` | native | |
-| `get_required_keys` | native (+normalization) | `EOS…` keys converted to `PUB_K1_…` (the node rejects `EOS…`); the answer uses the client's own spelling |
+| `get_required_keys` | native (+normalization) | `EOS…` keys converted to `PUB_K1_…` (the node rejects `EOS…`); K1 keys in the answer are printed `EOS…` whatever the client sent, like Leap 5 |
 | `push_transaction` | native | the node returns `{transaction_id}` on **admission**; confirm inclusion before treating a write as final |
 | `send_transaction` | native | as `push_transaction` |
-| `send_transaction2` | polyfill | Leap 5 envelope `{return_failure_trace, retry_trx, …, transaction}` unwrapped into native `send_transaction`; the response is the node's |
-| `push_transactions` | polyfill | sequential native `push_transaction`, one result per transaction in order; a failure is `{transaction_id: "000…0", processed: {error}}` like nodeos; max 1000 |
+| `send_transaction2` | polyfill | Leap 5 envelope `{return_failure_trace, retry_trx, …, transaction}` unwrapped into native `send_transaction`. A transaction that fails while executing is a **202** with a failure trace (`return_failure_trace` defaults to true, as on Leap), built from the node's error: `except` code/name/message/stack as the node reports them; `elapsed`, `net_usage` and the stack entries' `data` are not available (header `x-pulse-edge: failure-trace …`). Errors raised before execution (parse, expiry, duplicate) stay a 500. `return_failure_trace: false` gives the node's 500. Success: the node's answer |
+| `push_transactions` | polyfill | sequential native `push_transaction`, one result per transaction in order; answered **202** like nodeos; a failure is `{transaction_id: "000…0", processed: {error}}` with nodeos' detail string (`<code> <name>: <what>` + each detail and its source line; the per-entry argument line nodeos prints is not in the node's error JSON). `[]` is the same 500 `St12out_of_range` nodeos 5.0.3 gives; max 1000 |
 | `get_raw_block` | polyfill | `pulsevm.getRawBlock`; an unknown block is a 400 `unknown_block_exception` |
 | `get_block_header` | polyfill | `{id, signed_block_header}` from native `get_block` (timestamp, producer, previous, roots) + native `get_block_info` (fields `get_block` omits); `block_extensions` not available. Byte-identical to Leap when pointed at a Leap node. On PulseVM `producer_signature` and `schedule_version` are whatever the node's `get_block_info` reports (currently placeholders) |
-| `get_block_header_state` | polyfill (partial) | `block_num`, `id`, `header` (what eosjs TAPOS reads), `dpos_irreversible_blocknum`; other header-state fields (schedules, merkle, signing authority) are not exposed by PulseVM. eosjs never asks for it in practice: PulseVM's LIB equals head, so eosjs uses `get_block_info` |
+| `get_block_header_state` | polyfill (partial) | `block_num`, `id`, `header` (what eosjs TAPOS reads), `dpos_irreversible_blocknum`; other header-state fields (schedules, merkle, signing authority) are not exposed by PulseVM. Like Leap, only **reversible** blocks (above LIB) are served; at or below LIB it is Leap's 400 `Could not find reversible block`. On PulseVM LIB equals head, so that is every block: eosjs and @proton/js only ask for blocks above LIB (otherwise they use `get_block_info`) and fall back to `get_block_info` on error |
 | `get_producers` | polyfill | `eosio` `producers` table in eosio.system's `by_votes` order (active by votes desc, then inactive by votes asc; ties by owner) + `global.total_producer_vote_weight`; honours `json`, `limit` (default 50), `lower_bound` (a producer name), `more` = next owner. PulseVM's table reader has no float64 secondary index, so the whole table is read and sorted. Checked against a live XPR mainnet Leap node with the edge pointed at it: identical rows, `more` and vote weight for `json` true/false, limits 3–100 and `lower_bound` |
 | `get_producer_schedule` | polyfill (partial) | `pulsevm.getProducers`: `active.version` + producer names only; signing keys and the pending/proposed schedules are not exposed (and never invented). Header `x-pulse-edge: partial: active names only` |
 | `get_raw_code_and_abi` | polyfill (partial) | `abi` from `get_raw_abi`; `wasm: ""` because code bytes cannot be read; header `x-pulse-edge: wasm-unavailable` |
-| `get_activated_protocol_features` | static-at-cut | captured list, paged like Leap (`lower_bound`, `upper_bound`, `limit`, `search_by_block_num`, `reverse`, `more`). Features activated on PulseVM after the cut are not reflected. 501 if no capture |
+| `get_activated_protocol_features` | static-at-cut | captured list, filtered like Leap 5.0 (`lower_bound`, `upper_bound`, `search_by_block_num`, `reverse`); like nodeos 5.0.0/5.0.3, `limit` is ignored and there is never a `more`. Features activated on PulseVM after the cut are not reflected. 501 if no capture |
 | `get_consensus_parameters` | static-at-cut | captured `{chain_config, wasm_config}`. Parameter changes after the cut are not reflected. 501 if no capture |
 | `get_scheduled_transactions` | 501 upstream, or polyfill | PulseVM v1.0.0 **does** keep deferred transactions (migrated from the snapshot and executed or retired per block) but has no way to list them, so this is a 501. It answers `{transactions:[], more:""}` only when the at-cut feature list shows `DISABLE_DEFERRED_TRXS_STAGE_1` active (then no deferred transaction can exist after the next block). XPR mainnet has **not** activated it |
-| `get_accounts_by_authorizers` | polyfill | `keys`: discovery = the federator's `get_key_accounts` per key; `accounts` (name = any permission, or `{actor, permission}`): discovery = the federator's `get_controlled_accounts`. Truth = the chain's `get_account` for every candidate: a row `{account_name, permission_name, authorizing_key \| authorizing_account, weight, threshold}` is emitted only where the key or account is in that permission **now**. Federator unreachable: 502, never an empty answer. Completeness depends on the indexes having seen every permission change (see limits) |
-| `get_transaction_id` | polyfill | sha256 of the packed transaction. Sound without an ABI: accepts `packed_trx` (+`compression`) or a transaction whose action data is hex (what eosjs and wharfkit send); JSON action data needs the contract ABI and is a 501 |
+| `get_accounts_by_authorizers` | polyfill | `keys`: discovery = the federator's `get_key_accounts` per key; `accounts` (name = any permission, or `{actor, permission}`): discovery = the federator's `get_controlled_accounts`. Truth = the chain's `get_account` for every candidate: a row `{account_name, permission_name, authorizing_key \| authorizing_account, weight, threshold}` is emitted only where the key or account is in that permission **now**. Federator unreachable: 502, never an empty answer. Keys are printed `EOS…`; rows come account-authorized first, then by key, in permission-creation order as far as `get_account` shows it (account creation time, then name). Malformed keys and names get nodeos' parser errors. Completeness depends on the indexes having seen every permission change (see limits) |
+| `get_transaction_id` | polyfill | sha256 of the packed transaction. Sound without an ABI for a transaction whose action data is hex (what eosjs and wharfkit send); JSON action data needs the contract ABI and is a 501. Like nodeos 5.0, `{transaction: …}` wrappers and `{packed_trx}` are refused with `Transaction actions are missing or invalid` |
 | `get_code` | 501 upstream | the node exposes no way to read contract code bytes; `get_code_hash`, `get_abi`, `get_raw_abi` work |
 | `compute_transaction` | 501 upstream | no dry-run execution endpoint |
 | `send_read_only_transaction` | 501 upstream | no read-only execution endpoint |
@@ -113,8 +117,9 @@ chain failure is a 502: amounts and permissions are never taken from an index.
 6. **Deferred transactions**: a `get_scheduled_transactions` listing of the generated-transaction table PulseVM already keeps.
 7. **Protocol features and consensus parameters** served by the node (`get_activated_protocol_features`,
    `get_consensus_parameters`), so they follow post-cut changes.
-8. **`get_block_info` timestamp**: print the block time as `YYYY-MM-DDTHH:MM:SS.mmm` (it currently uses Rust's debug format).
-9. **Request parsing like nodeos**: accept numeric `block_num_or_id`, `index_position` names, numeric strings, and
+8. **Failure traces and error details**: `send_transaction2` failure traces (`elapsed`, `net_usage`, stack `data`) and the full fc detail string (with each entry's arguments) in error JSON, so the edge does not have to rebuild them from the error body.
+9. **`get_block_info` timestamp**: print the block time as `YYYY-MM-DDTHH:MM:SS.mmm` (it currently uses Rust's debug format).
+10. **Request parsing like nodeos**: accept numeric `block_num_or_id`, `index_position` names, numeric strings, and
    `EOS…` key spellings in `get_required_keys`, so the edge's normalization can go away.
-10. **Action-sequence continuity for history**: expose per-account action sequence numbers in a form history APIs
+11. **Action-sequence continuity for history**: expose per-account action sequence numbers in a form history APIs
     can continue across the import, so v1 positional paging can be exact.
