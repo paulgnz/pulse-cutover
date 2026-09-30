@@ -30,6 +30,26 @@ set -euo pipefail
 VERSION_DEFAULT="v0.5.0-rc.15"
 URL_DEFAULT="https://control-rehearsal.protonnz.com"
 ETC=/etc/pulse-cutover; VAR=/var/lib/pulse-cutover; STATE=/var/lib/pulse-beacon; BIN=/usr/local/bin/pulse-cutover
+# Version of an installed pulse-cutover binary: rc.16+ prints it; older builds only embed the string.
+bin_version() {
+  [ -x "$1" ] || return 0
+  local v; v=$("$1" --version 2>/dev/null | sed -n 's/^pulse-cutover \([0-9][0-9A-Za-z.+-]*\)$/\1/p' | head -1)
+  [ -n "$v" ] && printf 'v%s' "$v"
+}
+# Pre-rc.16 binaries have no --version: ask mission control what this beacon last reported.
+reported_version() {
+  [ -n "$URL" ] && [ -n "$NETWORK" ] && [ -n "$PRODUCER" ] && [ -n "$NODE" ] || return 0
+  local v; v=$(curl -fsS -m 5 "${URL%/}/api/node/$NETWORK/$PRODUCER/$NODE" 2>/dev/null | jstdin report.agent_version)
+  [ -n "$v" ] && printf 'v%s' "${v#v}"
+}
+# Other pulse-cutover services on this box (e.g. `await`) keep running the binary they started with.
+# Never restarted here: an await may be driving a ceremony. Listed so the operator can restart them.
+other_units() {
+  systemctl list-units --type=service --state=active --no-legend --plain 2>/dev/null | awk '{print $1}' | while read -r u; do
+    [ "$u" = pulse-beacon.service ] && continue
+    systemctl show -p ExecStart --value "$u" 2>/dev/null | grep -q "$BIN" && echo "$u"
+  done
+}
 UNIT=/etc/systemd/system/pulse-beacon.service; SVC_USER=pulse-beacon
 MAINNET_CHAIN=384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0
 TESTNET_CHAIN=71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd
@@ -221,10 +241,14 @@ main() {
   check_url "$URL"
 
   # ---- download + verify + survey, all in a temp dir (nothing on the box changes yet) --------------------
-  local ARCH T REL TMP B
+  local ARCH T REL TMP B CURRENT
   ARCH=$(uname -m); case "$ARCH" in x86_64) T=x86_64-unknown-linux-musl;; aarch64|arm64) T=aarch64-unknown-linux-musl;; *) die "unsupported arch $ARCH";; esac
   REL="https://github.com/paulgnz/pulse-cutover/releases/download/$VERSION"
   TMP=$(mktemp -d); trap on_exit EXIT
+  CURRENT=$(bin_version "$BIN"); [ -n "$CURRENT" ] || CURRENT=$(reported_version)
+  if [ -z "$CURRENT" ]; then say "installing pulse-cutover $VERSION ($T)"
+  elif [ "$CURRENT" = "$VERSION" ]; then say "current: $CURRENT → already the target version; reinstalling $VERSION"
+  else say "current: $CURRENT → upgrading to: $VERSION"; fi
   say "downloading pulse-cutover $VERSION ($T)"
   curl -fsSL -o "$TMP/pulse-cutover-$T" "$REL/pulse-cutover-$T" || die "download failed: $REL/pulse-cutover-$T"
   curl -fsSL -o "$TMP/sha256sums.txt" "$REL/sha256sums.txt" || die "download failed: $REL/sha256sums.txt"
@@ -412,8 +436,18 @@ for c in r.get("checks",[]): print("   ", "ok " if c.get("ok") else "-- ", c.get
   local HASH; HASH=$(token_hash "$ETC/beacon.token")
   echo
   if [ -n "$HASH_BEFORE" ] && [ "$HASH_BEFORE" = "$HASH" ]; then
-    echo "  ✓ Upgraded to $VERSION. Same token as before, so there is nothing to send: your page updates within 10 seconds."
+    if [ -n "$CURRENT" ] && [ "$CURRENT" != "$VERSION" ]; then
+      echo "  ✓ Upgraded from $CURRENT to $VERSION. Same token as before, so there is nothing to send: your page updates within 10 seconds."
+    else
+      echo "  ✓ On $VERSION. Same token as before, so there is nothing to send: your page updates within 10 seconds."
+    fi
     echo "      ${URL%/}/$NETWORK/$PRODUCER/$NODE"
+    local OTHERS; OTHERS=$(other_units | tr '\n' ' ')
+    if [ -n "$OTHERS" ]; then
+      echo
+      echo "  ! Still running the previous binary: $OTHERS"
+      echo "    Restart when no ceremony is in progress on this box: sudo systemctl restart $OTHERS"
+    fi
     exit 0
   fi
   echo "  ✓ Done. Last step: send this ONE line to the mission-control operator (it is only a hash of your token):"

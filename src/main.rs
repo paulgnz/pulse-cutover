@@ -255,6 +255,10 @@ fn flag(args: &[String], name: &str) -> bool {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("");
+    if command == "--version" || command == "-V" || command == "version" {
+        println!("pulse-cutover {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     // `pulse-cutover help [command]` and `pulse-cutover <command> --help|-h`.
     if command == "help" || command == "--help" || command == "-h" {
         match args.get(1).and_then(|c| help_for(c)) {

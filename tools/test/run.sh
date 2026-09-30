@@ -230,6 +230,11 @@ expect_die "beacon: http://localhost.example.org refused (not localhost)"   chec
 expect_die "beacon: http://localhost:80@example.org refused (userinfo)"     check_url http://localhost:80@example.org
 expect_die "beacon: https with userinfo refused"                            check_url https://user:pw@control.example.org
 expect_ok  "beacon: http://localhost:8787 accepted"                         check_url http://localhost:8787
+printf '#!/bin/sh\n[ "$1" = --version ] && echo "pulse-cutover 0.5.0-rc.16"\n' > "$T/newbin"; chmod +x "$T/newbin"
+printf '#!/bin/sh\necho "usage: pulse-cutover <command>"\n' > "$T/oldbin"; chmod +x "$T/oldbin"
+[ "$(bin_version "$T/newbin")" = "v0.5.0-rc.16" ] && ok "beacon: current version read from --version" || bad "beacon: bin_version new ($(bin_version "$T/newbin"))"
+[ -z "$(bin_version "$T/oldbin")" ] && ok "beacon: a binary without --version reports no version (falls back to mission control)" || bad "beacon: bin_version old"
+[ -z "$(bin_version "$T/absent")" ] && ok "beacon: no installed binary = fresh install" || bad "beacon: bin_version absent"
 expect_ok  "beacon: http://[::1]:8787 accepted"                             check_url 'http://[::1]:8787'
 expect_die "beacon: ftp refused"                                            check_url ftp://control.example.org
 
