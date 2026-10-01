@@ -94,7 +94,7 @@ export_cmd = """docker run --rm --network none -v {export_dir}:/out -v {snapshot
 -v /root/pulsevm/tools/xpr-chainbase-export:/xce:ro --entrypoint bash leap-sidecar:5.0.3 \
 -c '/xce/export.sh --nodeos /usr/local/bin/nodeos --xpr-core /src/leap --snapshot /in/cut.bin \
 --work-dir /out/export --chain-state-db-size-mb 8192 --timeout-seconds 1800 \
---deferred-sidecar /out/export-sidecar/deferred-transactions.json'"""
+--deferred-sidecar /out/deferred-transactions.json'"""
 import_bin      = "/root/pulsevm/target/release/examples/xpr_import_check"
 compare_bin     = "/root/pulsevm/target/release/examples/xpr_19_table_compare"
 fingerprint_bin = "/root/pulsevm/target/release/examples/xpr_state_fingerprint"

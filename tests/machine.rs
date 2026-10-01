@@ -2954,6 +2954,42 @@ fn r4_await_never_launches_the_ceremony_for_an_arm_with_the_wrong_event_hash() {
 }
 
 #[test]
+fn stage2_await_never_accepts_an_event_the_coordinator_aborted() {
+    // Stage-2 rig, 2026-10-01: after a signed ABORT the await loop dropped the event, re-accepted it on
+    // the next poll, dropped it again, … (accepted/aborted flip every 3 s), and a fresh `await` started
+    // after the abort accepted the aborted event. A signed abort is final for its event id.
+    let dir = tempfile::tempdir().unwrap();
+    let _ = coord_config(dir.path(), 120, 0, 60);
+    let ev = signed(serde_json::json!({"type": "event", "event_id": "e1", "network": "rehearsal", "h": 5000u64}));
+    let hash = pulse_cutover::coord::payload_hash(&ev).unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let arm = signed(serde_json::json!({"type": "arm", "event_id": "e1", "network": "rehearsal", "event_hash": hash, "issued_at_ms": now}));
+    let abort = signed(serde_json::json!({"type": "abort", "event_id": "e1", "network": "rehearsal", "event_hash": hash, "issued_at_ms": now}));
+    let doc = serde_json::json!({"event": ev, "arm": arm, "abort": abort}).to_string();
+    let (url, _hits) = stub_http(move |_m, p| {
+        if p.starts_with("/api/coord/") { (200, doc.clone()) } else { (200, r#"{"head_block_num": 100}"#.into()) }
+    });
+    let t = std::fs::read_to_string(dir.path().join("ceremony-coord.toml")).unwrap()
+        .replace("url = \"http://mc\"", &format!("url = \"{url}\"\nauto_arm = true"))
+        .replace("rpc_url = \"http://mock\"\nproducer_api_url", &format!("rpc_url = \"{url}\"\nproducer_api_url"));
+    std::fs::write(dir.path().join("ceremony-coord.toml"), t).unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pulse-cutover"))
+        .args(["await", "--config"]).arg(dir.path().join("ceremony-coord.toml"))
+        .stderr(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(8));
+    let _ = child.kill();
+    let err = String::from_utf8_lossy(&child.wait_with_output().unwrap().stderr).to_string();
+    assert!(err.contains("event e1 is aborted by the coordinator"), "{err}");
+    assert!(!err.contains("accepted event e1"), "an aborted event must never be accepted: {err}");
+    assert!(!err.contains("ARMED by signed"), "{err}");
+    assert_eq!(err.matches("aborted by the coordinator").count(), 1, "no accepted/aborted oscillation: {err}");
+    assert!(!dir.path().join("ceremony-e1.toml").exists(), "no derived ceremony config was written");
+    // The beacon reports the abort (written once by this fresh await, never "accepted").
+    let st: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("coord-state.json")).unwrap()).unwrap();
+    assert_eq!((st["event_id"].as_str(), st["aborted"].as_bool(), st["accepted"].as_bool()), (Some("e1"), Some(true), Some(false)), "{st}");
+}
+
+#[test]
 fn r4_beacon_summary_marks_a_forced_rollback_after_ignition() {
     // Review §2.9: after a forced rollback the beacon judged the box as pre-ceremony.
     let dir = tempfile::tempdir().unwrap();

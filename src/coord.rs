@@ -134,13 +134,38 @@ pub fn read_state(cfg: &Config) -> Value {
     std::fs::read_to_string(state_file(cfg)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null)
 }
 
-fn write_state(cfg: &Config, v: &Value) {
+/// Write the coordination status the beacon reports. Err names the file and the OS error.
+pub fn try_write_state(cfg: &Config, v: &Value) -> Result<(), String> {
     let mut v = v.clone();
     if let Some(r) = v.get("reason").and_then(|r| r.as_str()).map(crate::beacon::sanitize_short) {
         v["reason"] = json!(r);
     }
-    let v = &v;
-    let _ = std::fs::write(state_file(cfg), serde_json::to_string_pretty(v).unwrap_or_default());
+    let path = state_file(cfg);
+    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default())
+        .map_err(|e| format!("cannot write coordination state {}: {e}", path.display()))
+}
+
+/// `try_write_state`, logging a failure on stderr (once per distinct error) instead of dropping
+/// it: a journal directory the service cannot write (e.g. created by root) otherwise left mission
+/// control without this node's acceptance/abort status and nobody knew why. Never fatal: the
+/// ceremony itself does not depend on this file.
+fn write_state(cfg: &Config, v: &Value) {
+    static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    match try_write_state(cfg, v) {
+        Ok(()) => {
+            if let Ok(mut l) = LAST.lock() {
+                l.clear();
+            }
+        }
+        Err(e) => {
+            let mut l = LAST.lock().unwrap_or_else(|p| p.into_inner());
+            if *l != e {
+                eprintln!("await: ERROR: {e}; mission control will not see this node's coordination status \
+                           (fix the directory's ownership/permissions)");
+                *l = e;
+            }
+        }
+    }
 }
 
 /// Derived ceremony config for one event: H, event_id and the event's bindings (roster, quorum,
@@ -181,6 +206,8 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
     // body; a changed body under the same id is a different event and is validated again.
     let mut accepted: Option<(String, u64, String)> = None;
     let mut accepted_ev: Value = Value::Null;
+    // The event id whose signed abort was last recorded in the state file (written once, not every poll).
+    let mut aborted_seen: Option<String> = None;
     let mut last_note = String::new();
     let note = |s: &str, last: &mut String| { if s != last { eprintln!("await: {s}"); *last = s.to_string(); } };
     loop {
@@ -195,7 +222,21 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
             Some(Ok(ev)) => {
                 let id = ev["event_id"].as_str().unwrap_or("").to_string();
                 let hash = doc["event"].get("payload").and_then(|_| payload_hash(&doc["event"])).unwrap_or_default();
-                if accepted.as_ref().map(|(x, _, hx)| x != &id || hx != &hash).unwrap_or(true) {
+                if aborted(&doc, &co.coordinator_keys, &co.network, &id) {
+                    // A signed abort is final for its event id, whatever the event body (a new
+                    // attempt is a new event id): never (re-)accept it. Without this the loop
+                    // dropped the event, re-accepted it on the next poll, dropped it again
+                    // (accepted/aborted flipping every 3 s), and an `await` started after the
+                    // abort accepted the aborted event.
+                    if aborted_seen.as_deref() != Some(id.as_str()) {
+                        let was_accepted = accepted.as_ref().is_some_and(|(x, _, _)| x == &id);
+                        write_state(cfg, &json!({"event_id": id, "accepted": was_accepted, "armed": false, "aborted": true,
+                            "at": chrono::Utc::now().to_rfc3339()}));
+                        aborted_seen = Some(id.clone());
+                    }
+                    accepted = None;
+                    note(&format!("event {id} is aborted by the coordinator (signed); waiting for a new event"), &mut last_note);
+                } else if accepted.as_ref().map(|(x, _, hx)| x != &id || hx != &hash).unwrap_or(true) {
                     accepted = None;
                     match validate_event(&ev, cfg, &co.network, head, co.min_lead_blocks) {
                         Ok(h) => {
@@ -214,15 +255,7 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
             Some(Err(e)) => note(&format!("ignoring event: {e}"), &mut last_note),
             None => note("no event published; waiting", &mut last_note),
         }
-        // 2. abort before arming
-        if let Some((id, _, _)) = &accepted {
-            if aborted(&doc, &co.coordinator_keys, &co.network, id) {
-                write_state(cfg, &json!({"event_id": id, "accepted": true, "armed": false, "aborted": true}));
-                note(&format!("event {id} aborted by the coordinator (signed) before arming"), &mut last_note);
-                accepted = None;
-            }
-        }
-        // 3. arm
+        // 2. arm (an aborted event never reaches here: step 1 dropped it)
         if let (Some((id, h, ev_hash)), Some(Ok(arm))) = (&accepted, doc.get("arm").filter(|m| !m.is_null()).map(|m| verify(m, &co.coordinator_keys))) {
             let bound = check_arm(&arm, id, &co.network, ev_hash);
             if let Err(e) = &bound {
@@ -319,6 +352,23 @@ mod tests {
         let ev = signed(&sk, &json!({"type": "event", "event_id": "e1"}));
         use sha2::{Digest, Sha256};
         assert_eq!(payload_hash(&ev).unwrap(), hex::encode(Sha256::digest(ev["payload"].as_str().unwrap().as_bytes())));
+    }
+
+    #[test]
+    fn state_write_failure_is_an_error_not_silence() {
+        // Stage-2 rig: a root-owned journal dir made every write fail silently.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("c.toml");
+        std::fs::write(&cfg_path, format!(
+            "journal_path = \"{}/missing-dir/journal.jsonl\"\n[ceremony]\nprofile = \"readiness\"\n[source]\nrpc_url = \"http://m\"\nproducer_api_url = \"http://m\"\n\
+             [snapshot]\nstaged_path = \"/s\"\n[target]\nmetalgo_unit = \"m\"\nrpc_url = \"http://m\"\n", dir.path().display())).unwrap();
+        let cfg = Config::load(&cfg_path).unwrap();
+        let err = try_write_state(&cfg, &json!({"event_id": "e1"})).unwrap_err();
+        assert!(err.contains("cannot write coordination state") && err.contains("coord-state.json"), "{err}");
+        write_state(&cfg, &json!({"event_id": "e1"})); // logs, never panics
+        std::fs::create_dir_all(dir.path().join("missing-dir")).unwrap();
+        try_write_state(&cfg, &json!({"event_id": "e1"})).unwrap();
+        assert_eq!(read_state(&cfg)["event_id"], "e1");
     }
 
     #[test]
