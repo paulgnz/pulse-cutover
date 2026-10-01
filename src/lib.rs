@@ -7,6 +7,7 @@ pub mod config;
 pub mod coord;
 pub mod doctor;
 pub mod journal;
+pub mod keys;
 pub mod looper;
 pub mod machine;
 pub mod ops;

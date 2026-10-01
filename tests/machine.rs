@@ -143,6 +143,22 @@ struct MockOps {
     /// GET /api/coord/<net> answers this doc once `<dir>/abort-now` exists (a fake pipeline tool
     /// creates it: the coordinator's abort lands while that tool runs).
     coord_doc_when_abort_file: RefCell<Option<serde_json::Value>>,
+    /// Scripted eosio/producers answers, one per read (then the default: bp1, active, the test
+    /// producer key).
+    producer_rows: RefCell<std::collections::VecDeque<Option<serde_json::Value>>>,
+    producer_reads: Cell<u32>,
+}
+
+/// An eosio/producers row as nodeos prints it (legacy EOS key format).
+fn producer_row(owner: &str, key: &[u8; 33]) -> serde_json::Value {
+    serde_json::json!({"owner": owner, "is_active": 1, "total_votes": "1.0",
+        "producer_key": pulse_cutover::keys::format_legacy_public(key), "url": "", "location": 0})
+}
+
+/// The test producer's secret (fixture only) and its public key.
+const TEST_PRODUCER_SECRET: [u8; 32] = [5u8; 32];
+fn test_producer_pub() -> [u8; 33] {
+    pulse_cutover::keys::public_of_private_k1(&pulse_cutover::keys::format_private_k1(&TEST_PRODUCER_SECRET)).unwrap()
 }
 
 /// The stage-2 fixture block (XPR testnet 408461570, 6 receipts) re-numbered to `h`: its id is
@@ -208,6 +224,8 @@ impl MockOps {
             bound: RefCell::new(Vec::new()),
             ignite_vars: RefCell::new(Vec::new()),
             coord_doc_when_abort_file: RefCell::new(None),
+            producer_rows: RefCell::new(std::collections::VecDeque::new()),
+            producer_reads: Cell::new(0),
         }
     }
 
@@ -438,6 +456,14 @@ impl ChainOps for MockOps {
             self.flipped_v2.set(false);
         }
         Ok(format!("ran: {cmd}"))
+    }
+
+    fn source_producer(&self, producer: &str) -> Result<Option<serde_json::Value>, String> {
+        self.producer_reads.set(self.producer_reads.get() + 1);
+        if let Some(row) = self.producer_rows.borrow_mut().pop_front() {
+            return Ok(row);
+        }
+        Ok((producer == "bp1").then(|| producer_row("bp1", &test_producer_pub())))
     }
 
     fn run_long_cancellable(&self, cmd: &str, cancel: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
@@ -3541,8 +3567,11 @@ fn fake_compare_failing(dir: &std::path::Path, failing: &[&str]) {
 /// upstream_test_config + ignition: genesis/chain-config bases, create_chain hook, chain config
 /// dir, traffic hooks. `extra_ceremony` / `extra_upstream` are appended to those sections.
 fn upstream_ignite_config(dir: &std::path::Path, extra_ceremony: &str, extra_upstream: &str) -> Result<Config, String> {
-    std::fs::write(dir.join("genesis-base.json"), r#"{"initial_timestamp":"2020-04-22T17:00:00","initial_key":"PUB_K1_test","initial_configuration":{"max_block_cpu_usage":200000}}"#).unwrap();
-    std::fs::write(dir.join("chain-config-base.json"), r#"{"system_account":"eosio","native_system_contract":false,"producer_name":"bp1"}"#).unwrap();
+    std::fs::write(dir.join("genesis-base.json"), serde_json::json!({"initial_timestamp": "2020-04-22T17:00:00",
+        "initial_key": pulse_cutover::keys::format_public_k1(&test_producer_pub()),
+        "initial_configuration": {"max_block_cpu_usage": 200000}}).to_string()).unwrap();
+    std::fs::write(dir.join("chain-config-base.json"), serde_json::json!({"system_account": "eosio", "native_system_contract": false,
+        "producer_name": "bp1", "producer_key": pulse_cutover::keys::format_private_k1(&TEST_PRODUCER_SECRET)}).to_string()).unwrap();
     let toml_text = format!(
         r#"
 journal_path = "{d}/journal.jsonl"
@@ -3625,7 +3654,7 @@ fn upstream_ignites_from_the_checkpoint_and_reaches_live() {
     // Genesis commits the verified checkpoint; the chain config points at checkpoint + manifest.
     let genesis: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(verified["boot"]["genesis"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(genesis["migration_checkpoint_sha256"], verified["checkpoint_sha256"]);
-    assert_eq!(genesis["initial_key"], "PUB_K1_test");
+    assert_eq!(genesis["initial_key"], pulse_cutover::keys::format_public_k1(&test_producer_pub()));
     let cc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(verified["boot"]["chain_config"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(cc["migration_checkpoint"], verified["checkpoint"]);
     assert_eq!(cc["migration_manifest"], verified["boot"]["manifest"]);
@@ -3646,6 +3675,88 @@ fn upstream_ignites_from_the_checkpoint_and_reaches_live() {
     assert_eq!(live["rehearsal_overrides"], serde_json::json!([]));
     assert_eq!(transition(&e, "IGNITED").unwrap()["data"]["lineage_at_cut"], "verified");
     assert_eq!(ops.resumes.get(), 0);
+}
+
+fn other_key() -> [u8; 33] {
+    pulse_cutover::keys::public_of_private_k1(&pulse_cutover::keys::format_private_k1(&[6u8; 32])).unwrap()
+}
+
+#[test]
+fn stage2_producer_key_is_checked_against_eosio_producers_at_arm_and_before_ignition() {
+    // Happy path: the check passes at ARM and again before ignition, both journaled (public key only).
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let e = journal_entries(&cfg);
+    let checks: Vec<_> = e.iter().filter(|v| !v["data"]["producer_key_check"].is_null()).collect();
+    assert_eq!(checks.iter().map(|v| v["state"].as_str().unwrap()).collect::<Vec<_>>(), vec!["ARMED", "VERIFIED"]);
+    assert_eq!(checks[0]["data"]["producer_key_check"]["signing_key"], pulse_cutover::keys::format_public_k1(&test_producer_pub()));
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(!text.contains(&pulse_cutover::keys::format_private_k1(&TEST_PRODUCER_SECRET)), "the private key is never journaled");
+    assert_eq!(ops.producer_reads.get(), 2);
+}
+
+#[test]
+fn stage2_producer_key_mismatch_aborts_at_arm_before_anything_freezes() {
+    // Stage-2 run 1: the node signed with a key eosio/producers did not register for it; the first
+    // onblock re-election put the registered key on the schedule and the chain halted at H+4.
+    for (row, want) in [
+        (Some(producer_row("bp1", &other_key())), "producer signing key mismatch"),
+        (None, "not registered in eosio/producers"),
+        (Some({ let mut r = producer_row("bp1", &test_producer_pub()); r["is_active"] = serde_json::json!(0); r }), "NOT active"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        stage_fake_upstream_tools(dir.path(), 0);
+        let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+        let ops = upstream_ops(dir.path());
+        ops.producer_rows.borrow_mut().push_back(row);
+        let err = run_machine_result(&cfg, &ops).unwrap_err();
+        assert!(err.contains(want), "{want}: {err}");
+        let e = journal_entries(&cfg);
+        assert_eq!(e.last().unwrap()["state"], "ABORTED", "{want}");
+        assert!(transition(&e, "FROZEN").is_none(), "{want}: nothing froze");
+        assert!(!ops.hooks.borrow().iter().any(|h| h == "freeze-writes"), "{want}");
+    }
+}
+
+#[test]
+fn stage2_producer_key_changed_by_the_cut_aborts_before_create_chain() {
+    // Registered key changes between ARM and the cut (a regproducer in the window): the check at
+    // VERIFIED reads the state the target will inherit and aborts pre-ignition (source resumed).
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    ops.producer_rows.borrow_mut().extend([Some(producer_row("bp1", &test_producer_pub())), Some(producer_row("bp1", &other_key()))]);
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let e = journal_entries(&cfg);
+    assert!(transition(&e, "VERIFIED").is_some());
+    let err = e.iter().find(|v| v["kind"] == "error").unwrap();
+    assert_eq!(err["data"]["message"], "producer signing key check failed (pre-ignition)");
+    assert!(err["data"]["detail"]["problem"].as_str().unwrap().contains(&pulse_cutover::keys::format_public_k1(&other_key())));
+    assert!(!dir.path().join("create-chain.calls").exists(), "no chain created");
+    assert!(!std::fs::read_to_string(&cfg.journal_path).unwrap().contains("ignite_started"));
+    assert_eq!(ops.resumes.get(), 1);
+}
+
+#[test]
+fn stage2_chain_config_producer_key_must_be_the_genesis_initial_key() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    std::fs::write(dir.path().join("chain-config-base.json"), serde_json::json!({"producer_name": "bp1",
+        "producer_key": pulse_cutover::keys::format_private_k1(&[6u8; 32])}).to_string()).unwrap();
+    let err = run_machine_result(&cfg, &upstream_ops(dir.path())).unwrap_err();
+    assert!(err.contains("is not the genesis initial_key"), "{err}");
+    assert!(!err.contains(&pulse_cutover::keys::format_private_k1(&[6u8; 32])), "{err}");
+    // No producer_name: cannot tell which producer to check.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    std::fs::write(dir.path().join("chain-config-base.json"), r#"{"system_account":"eosio"}"#).unwrap();
+    assert!(run_machine_result(&cfg, &upstream_ops(dir.path())).unwrap_err().contains("no producer_name"));
 }
 
 #[test]
@@ -3875,7 +3986,7 @@ fn upstream_boot_artifact_changed_after_verified_aborts_before_ignition() {
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_machine_result(&cfg, &ops))).is_err());
     assert!(upstream_journal_has_verified(&std::fs::read_to_string(&cfg.journal_path).unwrap()));
     let genesis = dir.path().join("upstream-work/migration-genesis-120.json");
-    let tampered = std::fs::read_to_string(&genesis).unwrap().replace("PUB_K1_test", "PUB_K1_other");
+    let tampered = std::fs::read_to_string(&genesis).unwrap().replace("2020-04-22T17:00:00", "2020-04-22T17:00:01");
     std::fs::write(&genesis, tampered).unwrap();
     let ops2 = upstream_ops(dir.path());
     ops2.head.set(130);

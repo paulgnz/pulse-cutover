@@ -106,8 +106,11 @@ rehearsal_allow_compare_mismatch = ["contract_index_double", "global_property"]
 # adds migration_checkpoint_sha256 and writes migration-genesis-<cut>.json.
 genesis_base = "/root/stage2/genesis-base.json"
 # Base chain config (e.g. {"system_account":"eosio","native_system_contract":false,
-# "producer_name":"<the genesis producer>"}); the agent adds migration_checkpoint and
-# migration_manifest and writes chain-config-<cut>.json.
+# "producer_name":"<the genesis producer>","producer_key":"PVT_K1_…"}); the agent adds
+# migration_checkpoint and migration_manifest and writes chain-config-<cut>.json.
+# Producer mode: producer_key must pair with genesis_base's initial_key AND be the key
+# eosio/producers registers for producer_name on the source (checked at ARM and before
+# ignition): the migrated system contract re-elects the schedule at the first onblock.
 chain_config_base = "/root/stage2/chain-config-base.json"
 # The full cut block comes from side A by default (it synced past the cut). If the local
 # source cannot serve get_block at the cut, point this at any testnet /v1 endpoint: the

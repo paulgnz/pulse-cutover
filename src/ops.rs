@@ -60,6 +60,11 @@ pub trait ChainOps {
     fn source_block(&self, block_num: u64, _rpc_url: Option<&str>) -> Result<Value, String> {
         Err(format!("source_block({block_num}) is not supported by this ChainOps"))
     }
+    /// The source chain's `eosio/producers` row for `producer` (nodeos get_table_rows, JSON);
+    /// Ok(None) when no such producer is registered.
+    fn source_producer(&self, producer: &str) -> Result<Option<Value>, String> {
+        Err(format!("source_producer({producer}) is not supported by this ChainOps"))
+    }
     /// Bind values for `{name}` placeholders in the target RPC URL and the ignite command (the
     /// upstream backend learns `blockchain_id` only when it creates the chain). Default: no-op.
     fn bind_target(&self, _vars: &[(String, String)]) {}
@@ -678,6 +683,17 @@ impl ChainOps for HttpOps {
     fn source_block(&self, block_num: u64, rpc_url: Option<&str>) -> Result<Value, String> {
         let base = rpc_url.map(|u| u.trim_end_matches('/').to_string()).unwrap_or_else(|| self.source_rpc.clone());
         self.post(&format!("{base}/v1/chain/get_block"), Some(json!({"block_num_or_id": block_num})), None)
+    }
+
+    fn source_producer(&self, producer: &str) -> Result<Option<Value>, String> {
+        let v = self.post(
+            &format!("{}/v1/chain/get_table_rows", self.source_rpc),
+            Some(json!({"json": true, "code": "eosio", "scope": "eosio", "table": "producers",
+                        "lower_bound": producer, "upper_bound": producer, "limit": 1})),
+            None,
+        )?;
+        let rows = v.get("rows").and_then(|r| r.as_array()).ok_or_else(|| format!("get_table_rows eosio/producers: no rows in {v}"))?;
+        Ok(rows.iter().find(|r| r["owner"].as_str() == Some(producer)).cloned())
     }
 
     fn bind_target(&self, vars: &[(String, String)]) {

@@ -390,6 +390,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 )),
             }
         }
+        // Producer signing key vs the key the source registers (stage-2 run 1 halt). Checked
+        // again before ignition, against the state at the cut.
+        let mut producer_key_ok = None;
+        if !(resumed && self.reached_ignited) {
+            match self.producer_key_check() {
+                Some(Ok(ev)) => producer_key_ok = Some(ev),
+                Some(Err(problem)) => problems.push(problem),
+                None => {}
+            }
+        }
         if let Some(dir) = self.cfg.snapshot.staged_path.parent() {
             if !dir.exists() {
                 problems.push(format!("staged_path dir {} missing", dir.display()));
@@ -426,6 +436,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             if !g.exists() {
                 problems.push(format!("golden_roots {} missing", g.display()));
             }
+        }
+        if let (true, Some(ev)) = (problems.is_empty(), producer_key_ok) {
+            self.journal.evidence(self.state, json!({"producer_key_check": ev}))?;
         }
         if problems.is_empty() && resumed {
             self.journal.evidence(self.state, json!({"resume_preflight": "ok"}))?;
@@ -1795,6 +1808,53 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         ]);
     }
 
+    /// Producer mode, upstream ignition: can the key the target will sign with actually produce
+    /// once the migrated system contract re-elects the schedule from `eosio/producers`? The
+    /// signing key is the chain config base's `producer_key` (its public key; the private key is
+    /// never journaled), which must also be the genesis `initial_key` (schedule v0); the producer
+    /// is the chain config's `producer_name`. Ok(Ok(evidence)) / Ok(Err(problem)); None = not
+    /// applicable (api mode, fork backend, verify-only).
+    fn producer_key_check(&self) -> Option<Result<serde_json::Value, String>> {
+        let up = self.cfg.upstream.as_ref()?;
+        if self.cfg.ceremony.mode != Mode::Producer
+            || self.cfg.ceremony.import_backend != ImportBackend::Upstream
+            || !up.ignite_configured(&self.cfg.target)
+        {
+            return None;
+        }
+        let read = |p: &std::path::Path, what: &str| -> Result<serde_json::Value, String> {
+            let t = std::fs::read_to_string(p).map_err(|e| format!("read {what} {}: {e}", p.display()))?;
+            serde_json::from_str(&t).map_err(|e| format!("{what} {} is not JSON: {e}", p.display()))
+        };
+        Some((|| {
+            let genesis = read(up.genesis_base.as_ref().expect("ignite configured"), "upstream.genesis_base")?;
+            let initial = genesis["initial_key"].as_str().ok_or("upstream.genesis_base has no initial_key")?;
+            let initial = crate::keys::parse_public_k1(initial).map_err(|e| format!("upstream.genesis_base initial_key: {e}"))?;
+            let cc = match &up.chain_config_base {
+                Some(p) => read(p, "upstream.chain_config_base")?,
+                None => json!({}),
+            };
+            let producer = cc["producer_name"].as_str().ok_or(
+                "upstream.chain_config_base has no producer_name: cannot tell which producer this node signs as                  (the migrated chain re-elects producers from eosio/producers at the first onblock)")?;
+            let signing = match cc["producer_key"].as_str() {
+                Some(k) => {
+                    let p = crate::keys::public_of_private_k1(k).map_err(|e| format!("upstream.chain_config_base producer_key: {e}"))?;
+                    if p != initial {
+                        return Err(format!(
+                            "the chain config producer_key (public {}) is not the genesis initial_key {}: PulseVM seeds                              schedule v0 with initial_key and signs with producer_key, so it could not produce at all",
+                            crate::keys::format_public_k1(&p), crate::keys::format_public_k1(&initial)));
+                    }
+                    p
+                }
+                // No producer_key in the base (installed another way): the node signs for
+                // schedule v0 with the genesis initial key, so that is what must be registered.
+                None => initial,
+            };
+            let row = self.ops.source_producer(producer).map_err(|e| format!("cannot read eosio/producers for {producer} on the source: {e}"))?;
+            crate::keys::check_registered_producer_key(row.as_ref(), producer, &signing)
+        })())
+    }
+
     /// Upstream backend, before the fleet gate: refuse what cannot be ignited safely, journal what
     /// stays unsolved for mainnet, and re-check the boot artifacts against their VERIFIED hashes.
     /// Ok(false) after aborting (pre-ignition: the source is resumed).
@@ -1817,6 +1877,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 json!({"verify_only": true, "remaining_for_mainnet": pending}),
             )?;
             return Ok(false);
+        }
+        match self.producer_key_check() {
+            Some(Ok(ev)) => self.journal.evidence(State::Verified, json!({"producer_key_check": ev}))?,
+            Some(Err(problem)) => {
+                self.abort("producer signing key check failed (pre-ignition)", json!({"problem": problem}))?;
+                return Ok(false);
+            }
+            None => {}
         }
         self.journal.evidence(State::Verified, json!({
             "upstream_ignite_warnings": pending,

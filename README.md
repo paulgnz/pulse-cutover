@@ -1148,6 +1148,16 @@ selected by `[ceremony] import_backend = "fork" | "upstream"`:
      manifest + `source_block`), `migration-genesis-<cut>.json` (`genesis_base` +
      `migration_checkpoint_sha256`) and `chain-config-<cut>.json` (`chain_config_base` +
      `migration_checkpoint` + `migration_manifest`), and journals their hashes.
+  1b. *Producer mode: the signing key must be the registered one.* At ARM and again right
+     before ignition, the agent reads the producer's row from the source's `eosio/producers`
+     (`get_table_rows`) and requires the key the target will sign with (the public key of
+     `chain_config_base`'s `producer_key`, which must also be `genesis_base`'s `initial_key`;
+     without a `producer_key` there, the `initial_key`) to be its `producer_authority` (or
+     `producer_key`), and the producer (`chain_config_base`'s `producer_name`) to be registered
+     and active. Otherwise it aborts before anything freezes (ARM) or before the chain is created
+     (VERIFIED). The migrated system contract re-elects the schedule from that table at the first
+     `onblock`; on the stage-2 rig a node signing with a different key stopped building blocks
+     four blocks after the cut, without any error. The private key is never journaled.
   2. *After the fleet gate, before `ignite_started`*, the hashes are re-checked and
      `create_chain_cmd` runs (`{genesis}`, `{chain_config}`, `{manifest}`, `{checkpoint}`,
      `{genesis_sha256}`, `{cut_height}`). It creates the subnet + blockchain on Metal (the
