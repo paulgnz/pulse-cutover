@@ -1574,15 +1574,16 @@ fn upstream_sidecar_from_another_block_or_without_accounts_fails_verification() 
 }
 
 #[test]
-fn upstream_sidecar_recv_sum_mismatch_is_evidence_not_a_gate() {
+fn upstream_sidecar_recv_sum_mismatch_fails_verification() {
+    // Exact on a real XPR testnet export, so a mismatch means lost or altered counters.
     let dir = tempfile::tempdir().unwrap();
     stage_fake_upstream_tools(dir.path(), 0);
     fake_export_with_sidecar(dir.path(), &SIDECAR.replace("\"global_action_sequence\":5", "\"global_action_sequence\":9"));
     let cfg = upstream_test_config(dir.path(), 120);
-    run_machine_result(&cfg, &MockOps::new(dir.path(), 110)).ok();
+    assert_eq!(run_machine(&cfg, &MockOps::new(dir.path(), 110)), State::Aborted);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
-    assert!(text.contains("\"recv_sum_matches_global\":false"), "{text}");
-    assert!(upstream_journal_has_verified(&text), "advisory only until proven on a real export");
+    assert!(text.contains("sequence counters are inconsistent"), "{text}");
+    assert!(!upstream_journal_has_verified(&text));
 }
 
 #[test]

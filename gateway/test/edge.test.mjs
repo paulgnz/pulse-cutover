@@ -52,7 +52,7 @@ const nodeosErr = (what) => ({ code: 500, message: what, error: { code: 0, name:
 
 function mockNode(req, res, body) {
   const url = new URL(req.url, 'http://x');
-  seen.push({ path: url.pathname, host: req.headers.host, body });
+  seen.push({ path: url.pathname + url.search, host: req.headers.host, body });
   if (url.pathname === `/ext/bc/${BID}/rpc`) {
     const { id, method, params } = JSON.parse(body);
     if (method === 'pulsevm.getRawBlock') {
@@ -62,7 +62,10 @@ function mockNode(req, res, body) {
     if (method === 'pulsevm.getProducers') return json(res, 200, { jsonrpc: '2.0', id, result: { schedule_version: 3, active_producers: ['alpha', 'bravo'] } });
     return json(res, 200, { jsonrpc: '2.0', id, error: { code: -32601, message: 'method not found' } });
   }
-  const m = url.pathname.match(new RegExp(`^/ext/bc/${BID}/v1/chain/(\\w+)$`));
+  // Like metalgo 1.14: the VM's "/v1/chain" handler is an EXACT route, so /v1/chain/<name> is a 404 and the
+  // node reads the method from the full URL (query included), as PulseVM v1.0.0's extract_method does.
+  if (url.pathname !== `/ext/bc/${BID}/v1/chain`) return json(res, 404, nodeosErr('Not found'));
+  const m = (url.pathname + url.search).split('/v1/chain/')[1]?.split(/[?&]/)[0]?.match(/^(\w+)$/);
   if (!m) return json(res, 404, nodeosErr('Not found'));
   let p; try { p = JSON.parse(body || '{}'); } catch { return json(res, 400, nodeosErr('Invalid JSON')); }
   switch (m[1]) {

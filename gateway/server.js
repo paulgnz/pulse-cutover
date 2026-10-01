@@ -312,7 +312,11 @@ function request(url, { method = 'POST', body, headers = {} } = {}) {
     req.end();
   });
 }
-const native = (name, params) => request(`${NATIVE_BASE}/v1/chain/${name}`, { body: typeof params === 'string' ? params : JSON.stringify(params || {}) });
+// metalgo 1.14 matches VM routes exactly, so /ext/bc/<BID>/v1/chain/<name> is a metalgo 404. The node picks
+// the method out of the full URL (split on "/v1/chain/"), query string included, so the method rides in the
+// query; this form also works on metalgo 1.13's prefix routes.
+const nativeUrl = (name) => `${NATIVE_BASE}/v1/chain?route=/v1/chain/${encodeURIComponent(name)}`;
+const native = (name, params) => request(nativeUrl(name), { body: typeof params === 'string' ? params : JSON.stringify(params || {}) });
 let _rpcId = 0;
 async function rpc(method, params) {
   const r = await request(RPC_URL, { body: JSON.stringify({ jsonrpc: '2.0', id: ++_rpcId, method, params: params || {} }) });

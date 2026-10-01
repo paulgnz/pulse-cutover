@@ -127,10 +127,8 @@ struct SidecarAccountSeq {
 
 /// Gate the sidecar's sequence counters before anything is imported. Hard failures: no
 /// `source_chain_id` (upstream then skips its exact-coverage check), a chain id or block id
-/// that is not the cut's, no per-account rows, a zero global sequence. Evidence (advisory until
-/// proven on a real export): every action receipt bumps the global sequence once and exactly one
-/// receiver's recv_sequence once, so on a chain that started at genesis the recv_sequences sum
-/// to global_action_sequence.
+/// that is not the cut's, no per-account rows, a zero global sequence, and recv_sequences that do
+/// not sum to global_action_sequence (every receipt bumps both once).
 pub fn check_sidecar(path: &Path, chain_id: &str, cut_block_id: &str) -> Result<Value, String> {
     let f = std::fs::File::open(path).map_err(|e| format!("open sidecar {}: {e}", path.display()))?;
     let sc: SidecarSeq = serde_json::from_reader(std::io::BufReader::new(f))
@@ -158,6 +156,16 @@ pub fn check_sidecar(path: &Path, chain_id: &str, cut_block_id: &str) -> Result<
         return Err("sidecar global_action_sequence is 0: the global action sequence would restart".into());
     }
     let sum_recv: u128 = sc.account_metadata.iter().map(|a| a.recv_sequence as u128).sum();
+    // Every receipt bumps the global sequence once and exactly one receiver's recv_sequence once, so on a
+    // chain that started at genesis these are equal. Proven exact on a real XPR testnet export (2026-10-01:
+    // 1,983,236,481 both): a mismatch means counters were lost or altered, and history paging would break.
+    if sum_recv != sc.global_action_sequence as u128 {
+        return Err(format!(
+            "sidecar sequence counters are inconsistent: sum of recv_sequence {sum_recv} != global_action_sequence {} \
+             (counters lost or altered in export; history paging would break at the cut)",
+            sc.global_action_sequence
+        ));
+    }
     Ok(json!({
         "accounts": sc.account_metadata.len(),
         "global_action_sequence": sc.global_action_sequence,
