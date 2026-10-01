@@ -9,6 +9,15 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+/// XPR Network MAINNET chain_id. Rehearsal-only overrides are refused for it, at config load and
+/// again at ARM (when the chain_id is discovered rather than configured).
+pub const XPR_MAINNET_CHAIN_ID: &str = "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0";
+
+/// True when `chain_id` is XPR mainnet (case-insensitive).
+pub fn is_xpr_mainnet(chain_id: &str) -> bool {
+    chain_id.trim().eq_ignore_ascii_case(XPR_MAINNET_CHAIN_ID)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -271,6 +280,15 @@ pub struct Ceremony {
     ///   explanation of what remains).
     #[serde(default)]
     pub import_backend: ImportBackend,
+    /// REHEARSAL ONLY (default false). With the upstream backend the target signs with metalgo's
+    /// blockchain id, not the source chain_id (PulseVM v1.0.0 does not pin it). When true, the
+    /// post-ignition chain_id check accepts a target chain_id that differs from the source's and
+    /// journals both; when false (the default) a different target chain_id HALTS the ceremony.
+    /// Refused at config load for XPR mainnet, and at ARM if the source turns out to be mainnet.
+    /// Shown by `status`, failed as the `rehearsal_overrides` beacon setup check, and on
+    /// mission control.
+    #[serde(default)]
+    pub rehearsal_allow_chain_id_change: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -499,6 +517,41 @@ pub struct Upstream {
     /// official tools above.
     #[serde(default)]
     pub fork_audit: bool,
+    /// REHEARSAL ONLY (default empty). Table names that `xpr_19_table_compare` may report as
+    /// differing without failing verification — for known upstream regressions such as v1.0.0's
+    /// `contract_index_double` / `global_property` (crates/pulsevm_chaindb/src/history.rs).
+    /// The compare still runs and its full output is journaled; it passes only if EVERY failing
+    /// table it names is listed here (exact names parsed from its output), and any other failing
+    /// table (or a failure that names no table) still aborts. Refused for XPR mainnet.
+    #[serde(default)]
+    pub rehearsal_allow_compare_mismatch: Vec<String>,
+    /// Ignition from the checkpoint: the operator's base migration genesis (JSON object with
+    /// `initial_timestamp`, `initial_key`, `initial_configuration`; the coordinator's file, the
+    /// same on every validator). The agent writes `migration-genesis-<h>.json` = this +
+    /// `migration_checkpoint_sha256` of the verified checkpoint. Unset = verify-only: the
+    /// ceremony stops (ABORTED, source resumed) after VERIFIED.
+    #[serde(default)]
+    pub genesis_base: Option<PathBuf>,
+    /// Ignition: the operator's base PulseVM chain config (JSON object, e.g. `system_account`,
+    /// `native_system_contract`, `producer_name`). The agent writes `chain-config-<h>.json` =
+    /// this + `migration_checkpoint` (the checkpoint path) + `migration_manifest` (the boot
+    /// manifest it built). Default: an empty object.
+    #[serde(default)]
+    pub chain_config_base: Option<PathBuf>,
+    /// Where to fetch the FULL cut block (all transaction receipts) for the boot manifest's
+    /// anchor: a nodeos `/v1` base URL of the SOURCE chain. Default: `source.rpc_url`. Any
+    /// endpoint is safe to use — the agent packs the block itself and requires its computed id
+    /// to equal the pinned cut block id. Useful when the local source nodeos started from a
+    /// snapshot and has no blocks at or before the cut.
+    #[serde(default)]
+    pub source_block_rpc_url: Option<String>,
+}
+
+impl Upstream {
+    /// Both halves of the upstream ignition are configured (else the ceremony is verify-only).
+    pub fn ignite_configured(&self, target: &Target) -> bool {
+        self.genesis_base.is_some() && target.create_chain_cmd.is_some()
+    }
 }
 
 /// hyperion mode (api mode + `[hyperion]`): /v2 history continuity across
@@ -594,6 +647,21 @@ pub struct Target {
     /// A local fence only: other producers' targets are not affected.
     #[serde(default)]
     pub stop_cmd: Option<String>,
+    /// Upstream backend: creates the target subnet + blockchain on Metal from the migration
+    /// genesis the agent wrote (in production this is the coordinator's / validators' job; on a
+    /// rehearsal rig a helper with the local network's key). Runs once, after VERIFIED and the
+    /// fleet gate, BEFORE `ignite_started` (a failure aborts and resumes the source). It must
+    /// print `BLOCKCHAIN_ID=<id>` (optionally `SUBNET_ID=<id>`); the id is journaled at once,
+    /// so a resumed agent never creates a second chain. It must NOT start the chain with its
+    /// migration config on any validator: ignition does that. Placeholders: `{genesis}`,
+    /// `{genesis_sha256}`, `{chain_config}`, `{manifest}`, `{checkpoint}`, `{cut_height}`.
+    #[serde(default)]
+    pub create_chain_cmd: Option<String>,
+    /// Upstream backend, optional: metalgo's `--chain-config-dir`. When set, the agent installs
+    /// the chain config it built as `<dir>/<blockchain_id>/config.json` right before ignition
+    /// (otherwise `ignite_cmd` must do it; it receives `{blockchain_id}` and `{chain_config}`).
+    #[serde(default)]
+    pub chain_config_dir: Option<PathBuf>,
 }
 
 impl Target {
@@ -716,6 +784,7 @@ impl Config {
         if config.snapshot.path_map_from.is_some() != config.snapshot.path_map_to.is_some() {
             return Err("snapshot.path_map_from and path_map_to must be set together".into());
         }
+        config.check_rehearsal_overrides()?;
         if let Some(b) = &config.beacon {
             check_beacon_url(&b.url)?;
         }
@@ -795,6 +864,13 @@ impl Config {
                         pipeline the ceremony drives)"
                 .into());
         }
+        if let Some(up) = &config.upstream {
+            if up.genesis_base.is_some() != config.target.create_chain_cmd.is_some() {
+                return Err("upstream ignition needs BOTH upstream.genesis_base and target.create_chain_cmd \
+                            (leave both unset for a verify-only run)"
+                    .into());
+            }
+        }
         if config.ceremony.freeze_strategy == FreezeStrategy::ScheduleAtH
             && config.ceremony.mode == Mode::Producer
             && config.snapshot.dir.is_none()
@@ -804,6 +880,51 @@ impl Config {
                 .into());
         }
         Ok(config)
+    }
+
+    /// The REHEARSAL-ONLY overrides this config turns on, one human-readable line each (empty for
+    /// a config fit for a real cut). Shown by `status`, the beacon and the journal.
+    pub fn rehearsal_overrides(&self) -> Vec<String> {
+        let mut out = vec![];
+        if self.ceremony.rehearsal_allow_chain_id_change {
+            out.push("ceremony.rehearsal_allow_chain_id_change (target may sign with a different chain_id)".to_string());
+        }
+        if let Some(up) = &self.upstream {
+            if !up.rehearsal_allow_compare_mismatch.is_empty() {
+                out.push(format!(
+                    "upstream.rehearsal_allow_compare_mismatch = [{}] (xpr_19_table_compare may fail on these tables)",
+                    up.rehearsal_allow_compare_mismatch.join(", ")
+                ));
+            }
+        }
+        out
+    }
+
+    /// Rehearsal overrides are refused outright for XPR mainnet, and the allowlist must name real
+    /// table names (no wildcards, nothing empty).
+    pub fn check_rehearsal_overrides(&self) -> Result<(), String> {
+        if let Some(up) = &self.upstream {
+            for t in &up.rehearsal_allow_compare_mismatch {
+                if t.is_empty() || !t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+                    return Err(format!(
+                        "upstream.rehearsal_allow_compare_mismatch entry {t:?} is not a table name \
+                         (exact names as xpr_19_table_compare prints them, e.g. \"global_property\")"
+                    ));
+                }
+            }
+        }
+        let overrides = self.rehearsal_overrides();
+        if overrides.is_empty() {
+            return Ok(());
+        }
+        if self.ceremony.chain_id.as_deref().is_some_and(is_xpr_mainnet) {
+            return Err(format!(
+                "rehearsal overrides are refused for XPR MAINNET (ceremony.chain_id {XPR_MAINNET_CHAIN_ID}): {}. \
+                 They relax gates a real cut depends on; remove them.",
+                overrides.join("; ")
+            ));
+        }
+        Ok(())
     }
 
     /// Mutating commands (`run`, `loop`, `await`) call this first: a readiness-only config

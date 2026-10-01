@@ -17,6 +17,9 @@ url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex = "1"
 wasmparser = "0.245"
+# Packing the source cut block for the upstream boot manifest (signature base58 + checksum).
+bs58 = "0.5"
+ripemd = "0.1"
 
 # Linked PulseVM crates: only the snapshot reader (scan-contracts) and the
 # interim fork importer (import_backend = "fork") use them. Pinned to an exact

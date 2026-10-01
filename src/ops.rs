@@ -54,6 +54,15 @@ pub trait ChainOps {
     fn target_block_id(&self, _height: u64) -> Result<Option<String>, String> {
         Ok(None)
     }
+    /// The FULL source block at `block_num` as nodeos `get_block` JSON (all receipts), from
+    /// `rpc_url` (a nodeos /v1 base) or, when None, the source RPC. Upstream ignition packs it
+    /// into the boot manifest's anchor.
+    fn source_block(&self, block_num: u64, _rpc_url: Option<&str>) -> Result<Value, String> {
+        Err(format!("source_block({block_num}) is not supported by this ChainOps"))
+    }
+    /// Bind values for `{name}` placeholders in the target RPC URL and the ignite command (the
+    /// upstream backend learns `blockchain_id` only when it creates the chain). Default: no-op.
+    fn bind_target(&self, _vars: &[(String, String)]) {}
     fn ignite(&self) -> Result<String, String>;
     /// Hooks and operator commands: killed after the configured hook timeout.
     fn run_hook(&self, cmd: &str) -> Result<String, String>;
@@ -386,7 +395,14 @@ pub fn run_shell(cmd: &str) -> Result<String, String> {
     }
 }
 
+/// Expand `{name}` placeholders from `vars` (unknown placeholders are left as they are).
+pub fn expand_placeholders(template: &str, vars: &[(String, String)]) -> String {
+    vars.iter().fold(template.to_string(), |acc, (k, v)| acc.replace(&format!("{{{k}}}"), v))
+}
+
 pub struct HttpOps {
+    /// Values for `{name}` placeholders in `target_rpc` / `ignite_cmd` (see `bind_target`).
+    pub target_vars: std::sync::Mutex<Vec<(String, String)>>,
     pub source_rpc: String,
     pub producer_api: String,
     pub target_rpc: String,
@@ -408,6 +424,7 @@ impl HttpOps {
         snapshot_timeout_secs: u64,
     ) -> Self {
         HttpOps {
+            target_vars: std::sync::Mutex::new(vec![]),
             source_rpc: source_rpc.trim_end_matches('/').to_string(),
             producer_api: producer_api.trim_end_matches('/').to_string(),
             target_rpc: target_rpc.to_string(),
@@ -451,6 +468,14 @@ impl HttpOps {
             }
             Err(e) => Err(format!("{url}: {e}")),
         }
+    }
+
+    /// The target RPC URL with bound placeholders expanded; None while it still holds an
+    /// unbound `{blockchain_id}` (the chain does not exist yet: "unreachable").
+    pub fn target_url(&self) -> Option<String> {
+        let vars = self.target_vars.lock().map(|v| v.clone()).unwrap_or_default();
+        let url = expand_placeholders(&self.target_rpc, &vars);
+        (!url.contains("{blockchain_id}")).then_some(url)
     }
 
     fn parse_info(v: &Value) -> Result<ChainInfo, String> {
@@ -565,7 +590,8 @@ impl ChainOps for HttpOps {
 
     fn target_info(&self) -> Result<Option<ChainInfo>, String> {
         let body = json!({"jsonrpc": "2.0", "method": "pulsevm.getInfo", "params": {}, "id": 1});
-        match self.post(&self.target_rpc, Some(body), None) {
+        let Some(url) = self.target_url() else { return Ok(None) };
+        match self.post(&url, Some(body), None) {
             Ok(v) => {
                 let result = v.get("result").cloned().unwrap_or(v);
                 match Self::parse_info(&result) {
@@ -591,7 +617,8 @@ impl ChainOps for HttpOps {
         // PulseVM's getBlock takes block_num_or_id as a STRING.
         let body = json!({"jsonrpc": "2.0", "method": "pulsevm.getBlock",
                           "params": {"block_num_or_id": height.to_string()}, "id": 1});
-        match self.post(&self.target_rpc, Some(body), None) {
+        let Some(url) = self.target_url() else { return Ok(None) };
+        match self.post(&url, Some(body), None) {
             Ok(v) => {
                 let r = v.get("result").cloned().unwrap_or(v);
                 Ok(["id", "block_id"].iter().find_map(|k| r.get(*k).and_then(|x| x.as_str()).map(str::to_string)))
@@ -600,8 +627,27 @@ impl ChainOps for HttpOps {
         }
     }
 
+    fn source_block(&self, block_num: u64, rpc_url: Option<&str>) -> Result<Value, String> {
+        let base = rpc_url.map(|u| u.trim_end_matches('/').to_string()).unwrap_or_else(|| self.source_rpc.clone());
+        self.post(&format!("{base}/v1/chain/get_block"), Some(json!({"block_num_or_id": block_num})), None)
+    }
+
+    fn bind_target(&self, vars: &[(String, String)]) {
+        if let Ok(mut v) = self.target_vars.lock() {
+            for (k, val) in vars {
+                v.retain(|(k2, _)| k2 != k);
+                v.push((k.clone(), val.clone()));
+            }
+        }
+    }
+
     fn ignite(&self) -> Result<String, String> {
-        self.run_hook(&self.ignite_cmd)
+        let vars = self.target_vars.lock().map(|v| v.clone()).unwrap_or_default();
+        let cmd = expand_placeholders(&self.ignite_cmd, &vars);
+        if cmd.contains("{blockchain_id}") {
+            return Err(format!("ignite command still has an unbound {{blockchain_id}}: `{cmd}`"));
+        }
+        self.run_hook(&cmd)
     }
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
@@ -639,6 +685,25 @@ impl ChainOps for HttpOps {
 
     fn sleep_ms(&self, ms: u64) {
         std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::*;
+
+    #[test]
+    fn target_url_and_ignite_cmd_expand_bound_placeholders() {
+        let ops = HttpOps::new("http://s", "http://p", "http://127.0.0.1:9650/ext/bc/{blockchain_id}/rpc",
+            "install {chain_config} {blockchain_id} && systemctl restart metalgo", 5);
+        assert_eq!(ops.target_url(), None, "unbound blockchain id = target not reachable yet");
+        ops.bind_target(&[("blockchain_id".into(), "2YXV".into()), ("chain_config".into(), "/w/cc.json".into())]);
+        assert_eq!(ops.target_url().unwrap(), "http://127.0.0.1:9650/ext/bc/2YXV/rpc");
+        let vars = ops.target_vars.lock().unwrap().clone();
+        assert_eq!(expand_placeholders(&ops.ignite_cmd, &vars), "install /w/cc.json 2YXV && systemctl restart metalgo");
+        // Re-binding replaces, never duplicates.
+        ops.bind_target(&[("blockchain_id".into(), "3ABC".into())]);
+        assert_eq!(ops.target_url().unwrap(), "http://127.0.0.1:9650/ext/bc/3ABC/rpc");
     }
 }
 

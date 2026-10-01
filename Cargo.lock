@@ -1933,6 +1933,7 @@ dependencies = [
 name = "pulse-cutover"
 version = "0.5.0-rc.18"
 dependencies = [
+ "bs58",
  "chrono",
  "ed25519-dalek",
  "hex",
@@ -1941,6 +1942,7 @@ dependencies = [
  "pulsevm_snapshot",
  "pulsevm_snapshot_import",
  "regex",
+ "ripemd",
  "serde",
  "serde_json",
  "sha2 0.10.9",

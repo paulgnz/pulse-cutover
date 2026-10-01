@@ -100,6 +100,18 @@ pub struct Recovered {
     /// followed: it died before finishing. `run` must refuse (the operator asked to go back, not to
     /// carry on); re-running `rollback` finishes it.
     pub rollback_pending: bool,
+    /// Upstream backend: the Metal blockchain id `create_chain_cmd` created (evidence
+    /// `target_blockchain_id`, journaled the moment it is known): a resumed agent reuses it and
+    /// never creates a second chain.
+    pub target_blockchain_id: Option<String>,
+    /// REHEARSAL ONLY: a target chain_id different from the source's that
+    /// `rehearsal_allow_chain_id_change` accepted at IGNITED (evidence `accepted_target_chain_id`).
+    pub accepted_target_chain_id: Option<String>,
+    /// Upstream backend: hashes of the boot artifacts as journaled at VERIFIED (re-checked
+    /// before ignition: a file changed since verification aborts).
+    pub boot_manifest_sha256: Option<String>,
+    pub boot_genesis_sha256: Option<String>,
+    pub boot_chain_config_sha256: Option<String>,
 }
 
 impl Journal {
@@ -419,6 +431,11 @@ impl Journal {
                 out.staged_cut_height = a.get("cut_height").and_then(|v| v.as_u64());
             }
             for (key, slot) in [
+                ("target_blockchain_id", &mut out.target_blockchain_id),
+                ("accepted_target_chain_id", &mut out.accepted_target_chain_id),
+                ("boot_manifest_sha256", &mut out.boot_manifest_sha256),
+                ("boot_genesis_sha256", &mut out.boot_genesis_sha256),
+                ("boot_chain_config_sha256", &mut out.boot_chain_config_sha256),
                 ("chain_id", &mut out.chain_id),
                 ("cut_block_id", &mut out.cut_block_id),
                 ("snapshot_file", &mut out.snapshot_file),

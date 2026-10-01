@@ -617,6 +617,12 @@ fn cancel_rollback_intent(cfg: &Config, understood: bool) -> Result<(), String> 
 
 fn cmd_status(args: &[String]) -> Result<(), String> {
     let cfg = load_config(args)?;
+    let overrides = cfg.rehearsal_overrides();
+    if overrides.is_empty() {
+        println!("rehearsal_overrides: none");
+    } else {
+        println!("rehearsal_overrides: ACTIVE (REHEARSAL ONLY, never a real cut): {}", overrides.join("; "));
+    }
     if !cfg.journal_path.exists() {
         println!("no journal at {} — ceremony not started", cfg.journal_path.display());
         return Ok(());
@@ -642,6 +648,12 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     }
     if let Some(h) = recovered.cut_height {
         println!("cut_height: {h}");
+    }
+    if let Some(b) = &recovered.target_blockchain_id {
+        println!("target_blockchain_id: {b}");
+    }
+    if let Some(c) = &recovered.accepted_target_chain_id {
+        println!("target_chain_id: {c} (differs from the source: accepted by rehearsal_allow_chain_id_change)");
     }
     // cutover.sh reads this: once ignition may have started, a local rollback is refused.
     println!("ignition_started: {}", if recovered.reached_ignited { "yes" } else { "no" });

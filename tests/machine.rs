@@ -126,6 +126,33 @@ struct MockOps {
     orphan: RefCell<Option<Result<Option<String>, String>>>,
     /// A hook command that makes the mock panic (simulates the agent dying mid-hook).
     panic_on_hook: RefCell<Option<String>>,
+    // --- upstream ignition world ---
+    /// Source chain_id (default hex(CHAIN_ID)).
+    chain_id: RefCell<String>,
+    /// The ignited target presents this chain_id instead of the source's (PulseVM v1.0.0 signs
+    /// with metalgo's blockchain id).
+    target_chain_id: RefCell<Option<String>>,
+    /// Block ids are REAL Antelope ids of packable blocks (built from the stage-2 fixture block
+    /// re-numbered to each height), so the upstream full-block anchor can be checked end to end.
+    real_blocks: Cell<bool>,
+    /// source_block (full get_block) calls fail.
+    source_block_fails: Cell<bool>,
+    /// Placeholder values bound via bind_target, and the ones in force when ignite ran.
+    bound: RefCell<Vec<(String, String)>>,
+    ignite_vars: RefCell<Vec<(String, String)>>,
+}
+
+/// The stage-2 fixture block (XPR testnet 408461570, 6 receipts) re-numbered to `h`: its id is
+/// computed by the real packer, so it is a consistent, packable anchor at any height.
+fn fixture_block(h: u64) -> serde_json::Value {
+    let mut b: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/xpr-testnet-block-408461570.json")).unwrap();
+    let prev = b["previous"].as_str().unwrap().to_string();
+    b["previous"] = serde_json::json!(format!("{:08x}{}", h - 1, &prev[8..]));
+    let id = pulse_cutover::upstream::pack_signed_block(&b).unwrap().id;
+    b["id"] = serde_json::json!(id);
+    b["block_num"] = serde_json::json!(h);
+    b
 }
 
 impl MockOps {
@@ -171,6 +198,20 @@ impl MockOps {
             events: RefCell::new(Vec::new()),
             orphan: RefCell::new(None),
             panic_on_hook: RefCell::new(None),
+            chain_id: RefCell::new(hex::encode(CHAIN_ID)),
+            target_chain_id: RefCell::new(None),
+            real_blocks: Cell::new(false),
+            source_block_fails: Cell::new(false),
+            bound: RefCell::new(Vec::new()),
+            ignite_vars: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn block_id(&self, h: u64) -> String {
+        if self.real_blocks.get() {
+            fixture_block(h)["id"].as_str().unwrap().to_string()
+        } else {
+            hex::encode(mini(h as u32).head_id())
         }
     }
 
@@ -179,11 +220,10 @@ impl MockOps {
     }
 
     fn info(&self, head: u64) -> ChainInfo {
-        let m = mini(head as u32);
         ChainInfo {
-            chain_id: hex::encode(CHAIN_ID),
+            chain_id: self.chain_id.borrow().clone(),
             head_block_num: head,
-            head_block_id: hex::encode(m.head_id()),
+            head_block_id: self.block_id(head),
             head_block_time: "2024-01-01T00:00:00.000".into(),
             last_irreversible_block_num: head.saturating_sub(1),
         }
@@ -212,8 +252,22 @@ impl ChainOps for MockOps {
     }
 
     fn source_block_id(&self, block_num: u64) -> Result<(String, String), String> {
-        let m = mini(block_num as u32);
-        Ok((hex::encode(m.head_id()), "2024-01-01T00:00:00.000".into()))
+        Ok((self.block_id(block_num), "2024-01-01T00:00:00.000".into()))
+    }
+
+    fn source_block(&self, block_num: u64, _rpc_url: Option<&str>) -> Result<serde_json::Value, String> {
+        if self.source_block_fails.get() {
+            return Err("get_block: unknown block (snapshot-started nodeos)".into());
+        }
+        Ok(fixture_block(block_num))
+    }
+
+    fn bind_target(&self, vars: &[(String, String)]) {
+        let mut b = self.bound.borrow_mut();
+        for (k, v) in vars {
+            b.retain(|(k2, _)| k2 != k);
+            b.push((k.clone(), v.clone()));
+        }
     }
 
     fn source_block_tx_count(&self, _block_num: u64) -> Result<u64, String> {
@@ -260,7 +314,7 @@ impl ChainOps for MockOps {
         // these from the SHiP log; the fakes read them from here).
         let _ = std::fs::write(
             self.dir.join("cut-facts.env"),
-            format!("CUT_HEIGHT={cut}\nCUT_BLOCK_ID={}\nCHAIN_ID={}\n", hex::encode(m.head_id()), hex::encode(CHAIN_ID)),
+            format!("CUT_HEIGHT={cut}\nCUT_BLOCK_ID={}\nCHAIN_ID={}\n", self.block_id(cut), self.chain_id.borrow()),
         );
         // Production continues; the block that finalized the cut arrives.
         self.head.set(cut + 1);
@@ -268,7 +322,7 @@ impl ChainOps for MockOps {
         Ok(SnapshotResult {
             snapshot_name: self.snapshot_path().display().to_string(),
             head_block_num: cut,
-            head_block_id: hex::encode(m.head_id()),
+            head_block_id: self.block_id(cut),
         })
     }
 
@@ -309,6 +363,9 @@ impl ChainOps for MockOps {
             self.target_head.get()
         };
         let mut info = self.info(head);
+        if let Some(c) = self.target_chain_id.borrow().clone() {
+            info.chain_id = c;
+        }
         if self.target_fork.get() {
             info.head_block_id = format!("ff{}", &info.head_block_id[2..]);
         }
@@ -332,6 +389,7 @@ impl ChainOps for MockOps {
     }
 
     fn ignite(&self) -> Result<String, String> {
+        *self.ignite_vars.borrow_mut() = self.bound.borrow().clone();
         self.ignited.set(true);
         if self.ignite_fails.get() {
             return Err("systemctl restart exited 1 (partial start)".into());
@@ -1403,8 +1461,8 @@ fn stage_fake_upstream_tools(dir: &std::path::Path, compare_exit: i32) {
              sha() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi | awk '{{print $1}}'; }}\n\
              [ -f \"$4\" ] || {{ echo 'usage: sidecar (4th arg) missing' >&2; exit 2; }}\n\
              printf CKPT > \"$3\"\n\
-             printf '{{\"checkpoint_sha256\":\"%s\",\"checkpoint_revision\":%s,\"source_block_id\":\"%s\"}}' \
-               \"$(sha \"$3\")\" \"$CUT_HEIGHT\" \"$CUT_BLOCK_ID\" > \"$3.manifest.json\"\n\
+             printf '{{\"version\":1,\"checkpoint_sha256\":\"%s\",\"checkpoint_revision\":%s,\"source_block_id\":\"%s\",\"source_chain_id\":\"%s\"}}' \
+               \"$(sha \"$3\")\" \"$CUT_HEIGHT\" \"$CUT_BLOCK_ID\" \"$CHAIN_ID\" > \"$3.manifest.json\"\n\
              echo 'XPR state imported successfully: ImportSummary {{ accounts: 1 }}'\n"
         ),
     );
@@ -1415,6 +1473,21 @@ fn stage_fake_upstream_tools(dir: &std::path::Path, compare_exit: i32) {
              [ -f \"$5\" ] || {{ echo 'usage: sidecar (5th arg) missing' >&2; exit 2; }}\n\
              if [ {compare_exit} -ne 0 ]; then echo 'table permission: nodeos=1 arena=2' >&2; exit {compare_exit}; fi\n\
              echo 'table account: rows=1 sha256=aa55'\necho 'table permission: rows=2 sha256=bb66'\nexit 0\n"
+        ),
+    );
+    // create_chain stand-in (the rig's Go helper): checks it was handed the migration genesis
+    // and a chain config pointing at a boot manifest that carries the source block, counts its
+    // invocations, and prints the ids.
+    write_script(
+        &dir.join("fake-create-chain.sh"),
+        &format!(
+            "#!/bin/sh\nset -e\necho run >> {d}/create-chain.calls\n\
+             grep -q migration_checkpoint_sha256 \"$1\" || {{ echo 'genesis without migration_checkpoint_sha256' >&2; exit 3; }}\n\
+             grep -q migration_manifest \"$2\" || {{ echo 'chain config without migration_manifest' >&2; exit 3; }}\n\
+             grep -q source_block \"$3\" || {{ echo 'boot manifest without source_block' >&2; exit 3; }}\n\
+             echo 'issuing CreateSubnetTx + CreateChainTx'\n\
+             echo SUBNET_ID=2qFyanyVDk2LKrUsUdh3JjtYJYZGqUg9y9QAvMaWdQZZGaLiXY\n\
+             echo BLOCKCHAIN_ID=2YXVy2NWHZJphNuvWry8So8TpQodhSb7ZVJPxhwhtKS6Z6JjpV\n"
         ),
     );
     write_script(
@@ -1461,7 +1534,7 @@ compare_bin = "{dir}/fake-compare.sh"
 }
 
 #[test]
-fn upstream_backend_verifies_with_official_tools_and_stubs_ignite() {
+fn upstream_backend_verifies_with_official_tools_and_stops_when_ignite_is_not_configured() {
     let dir = tempfile::tempdir().unwrap();
     stage_fake_upstream_tools(dir.path(), 0);
     let cfg = upstream_test_config(dir.path(), 120);
@@ -1493,15 +1566,19 @@ fn upstream_backend_verifies_with_official_tools_and_stubs_ignite() {
     assert_eq!(compare["data"]["upstream_19_table_compare"]["result"], "MATCH");
     // No fork-importer artifacts: staged .bin never written, no captured roots.
     assert!(!dir.path().join("staged.bin").exists());
-    // The stop is the documented #61 stub, with the remaining work listed.
+    // Verify-only (no genesis_base / create_chain_cmd): a clean stop after VERIFIED, with what
+    // still stands between an upstream ignite and a mainnet cut listed.
     let abort_err = entries
         .iter()
         .find(|v| v["kind"] == "error")
         .expect("journaled abort reason");
-    assert!(abort_err["data"]["message"].as_str().unwrap().contains("#61"));
-    let remaining = abort_err["data"]["detail"]["remaining"].to_string();
+    let msg = abort_err["data"]["message"].as_str().unwrap();
+    assert!(msg.contains("#61") && msg.contains("not configured"), "{msg}");
+    let remaining = abort_err["data"]["detail"]["remaining_for_mainnet"].to_string();
     assert!(remaining.contains("TAPOS") && remaining.contains("chain_id"));
-    assert!(abort_err["data"]["detail"]["remaining"].is_array());
+    assert!(abort_err["data"]["detail"]["remaining_for_mainnet"].is_array());
+    assert_eq!(ops.resumes.get(), 1, "verify-only stop resumes the source");
+    assert!(!text.contains("ignite_started"));
 }
 
 #[test]
@@ -3317,4 +3394,480 @@ fn await_config_without_h_loads_but_run_refuses_it() {
     // Without [coordination] the old rule stands: H is required.
     let plain = base.replace("freeze_height = 120", "freeze_height = 0");
     assert!(load_toml(dir.path(), "plain.toml", &plain).unwrap_err().contains("freeze_height is 0"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Upstream ignition from the #61 checkpoint (PulseVM v1.0.0 boot: migration genesis + chain
+// config + boot manifest anchored on the FULL source cut block; chain created on Metal by a hook).
+// ---------------------------------------------------------------------------------------------
+
+const BLOCKCHAIN_ID: &str = "2YXVy2NWHZJphNuvWry8So8TpQodhSb7ZVJPxhwhtKS6Z6JjpV";
+const TARGET_CHAIN_ID: &str = "cb4786adfd7ddff2c1ae87db4e406a13d208fd3015e56ccddaf105ac9ba85c01";
+const MAINNET: &str = "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0";
+
+/// Make the fake compare fail the way v1.0.0 does: real-format lines, the named tables failing.
+fn fake_compare_failing(dir: &std::path::Path, failing: &[&str]) {
+    let mut body = String::from("#!/bin/sh\necho 'table account: rows=1 sha256=aa55'\n");
+    for t in failing {
+        body.push_str(&format!("echo 'table {t}: nodeos=Some(TableReport {{ rows: 1, sha256: \"aa\" }}) arena=None'\n"));
+        body.push_str(&format!("echo 'table {t}: first differing row index 0'\n"));
+    }
+    body.push_str("echo 'table permission: rows=2 sha256=bb66'\necho '21-table nodeos/Arena comparison FAILED' >&2\nexit 1\n");
+    write_script(&dir.join("fake-compare.sh"), &body);
+}
+
+/// upstream_test_config + ignition: genesis/chain-config bases, create_chain hook, chain config
+/// dir, traffic hooks. `extra_ceremony` / `extra_upstream` are appended to those sections.
+fn upstream_ignite_config(dir: &std::path::Path, extra_ceremony: &str, extra_upstream: &str) -> Result<Config, String> {
+    std::fs::write(dir.join("genesis-base.json"), r#"{"initial_timestamp":"2020-04-22T17:00:00","initial_key":"PUB_K1_test","initial_configuration":{"max_block_cpu_usage":200000}}"#).unwrap();
+    std::fs::write(dir.join("chain-config-base.json"), r#"{"system_account":"eosio","native_system_contract":false,"producer_name":"bp1"}"#).unwrap();
+    let toml_text = format!(
+        r#"
+journal_path = "{d}/journal.jsonl"
+poll_ms = 1
+
+[ceremony]
+freeze_height = 120
+quiescence_polls = 3
+import_backend = "upstream"
+{extra_ceremony}
+
+[source]
+rpc_url = "http://mock"
+producer_api_url = "http://mock"
+
+[snapshot]
+staged_path = "{d}/staged.bin"
+
+[target]
+metalgo_unit = "mock.service"
+rpc_url = "http://127.0.0.1:9650/ext/bc/{{blockchain_id}}/rpc"
+quorum_timeout_secs = 60
+create_chain_cmd = "sh {d}/fake-create-chain.sh {{genesis}} {{chain_config}} {{manifest}}"
+chain_config_dir = "{d}/chain-configs"
+
+[upstream]
+work_dir = "{d}/upstream-work"
+export_cmd = "sh {d}/fake-export.sh {{snapshot}} {{export_dir}}"
+import_bin = "{d}/fake-import.sh"
+fingerprint_bin = "{d}/fake-fingerprint.sh"
+compare_bin = "{d}/fake-compare.sh"
+genesis_base = "{d}/genesis-base.json"
+chain_config_base = "{d}/chain-config-base.json"
+{extra_upstream}
+
+[hooks]
+on_freeze = "freeze-writes"
+post_ignite = "resume-traffic"
+on_live = "flip-gateway"
+on_abort = "reopen-writes"
+"#,
+        d = dir.display(),
+    );
+    load_toml(dir, "ceremony-upstream-ignite.toml", &toml_text)
+}
+
+fn upstream_ops(dir: &std::path::Path) -> MockOps {
+    let ops = MockOps::new(dir, 110);
+    ops.real_blocks.set(true);
+    ops
+}
+
+fn journal_entries(cfg: &Config) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(&cfg.journal_path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+fn transition<'a>(entries: &'a [serde_json::Value], state: &str) -> Option<&'a serde_json::Value> {
+    entries.iter().find(|v| v["kind"] == "transition" && v["state"] == state)
+}
+
+#[test]
+fn upstream_ignites_from_the_checkpoint_and_reaches_live() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let e = journal_entries(&cfg);
+    for st in ["ARMED", "FROZEN", "SNAPSHOTTED", "VERIFIED", "IGNITED", "LIVE"] {
+        assert!(transition(&e, st).is_some(), "{st} journaled");
+    }
+    let verified = &transition(&e, "VERIFIED").unwrap()["data"];
+    let cut = verified["cut_height"].as_u64().unwrap();
+    // Boot manifest = checkpoint manifest + the FULL packed source cut block.
+    let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(verified["boot"]["manifest"].as_str().unwrap()).unwrap()).unwrap();
+    let packed = pulse_cutover::upstream::pack_signed_block(&fixture_block(cut)).unwrap();
+    assert_eq!(manifest["source_block"].as_str().unwrap(), hex::encode(&packed.bytes));
+    assert_eq!(manifest["source_block_id"].as_str().unwrap(), packed.id);
+    assert_eq!(verified["boot"]["source_block_receipts"], 6);
+    // Genesis commits the verified checkpoint; the chain config points at checkpoint + manifest.
+    let genesis: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(verified["boot"]["genesis"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(genesis["migration_checkpoint_sha256"], verified["checkpoint_sha256"]);
+    assert_eq!(genesis["initial_key"], "PUB_K1_test");
+    let cc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(verified["boot"]["chain_config"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(cc["migration_checkpoint"], verified["checkpoint"]);
+    assert_eq!(cc["migration_manifest"], verified["boot"]["manifest"]);
+    assert_eq!(cc["producer_name"], "bp1");
+    // The chain was created once, its id journaled before ignite_started, the config installed
+    // under it, and the placeholders bound when the ignite command ran.
+    assert_eq!(std::fs::read_to_string(dir.path().join("create-chain.calls")).unwrap().lines().count(), 1);
+    let pos = |needle: &str| e.iter().position(|v| v.to_string().contains(needle)).unwrap_or_else(|| panic!("{needle} journaled"));
+    assert!(pos("\"target_blockchain_id\"") < pos("ignite_started"));
+    let installed = dir.path().join("chain-configs").join(BLOCKCHAIN_ID).join("config.json");
+    assert_eq!(std::fs::read_to_string(installed).unwrap(), std::fs::read_to_string(verified["boot"]["chain_config"].as_str().unwrap()).unwrap());
+    assert!(ops.ignite_vars.borrow().iter().any(|(k, v)| k == "blockchain_id" && v == BLOCKCHAIN_ID));
+    // Mainnet gaps journaled as warnings; no overrides; same chain_id end to end.
+    assert!(e.iter().any(|v| v["data"]["upstream_ignite_warnings"].to_string().contains("TAPOS")));
+    let live = &transition(&e, "LIVE").unwrap()["data"];
+    assert_eq!(live["source_chain_id_changed"], false);
+    assert_eq!(live["rehearsal_overrides"], serde_json::json!([]));
+    assert_eq!(transition(&e, "IGNITED").unwrap()["data"]["lineage_at_cut"], "verified");
+    assert_eq!(ops.resumes.get(), 0);
+}
+
+#[test]
+fn upstream_target_chain_id_change_halts_without_the_override_and_passes_with_it() {
+    // Without the override: the chain_id check runs after ignite_started, so it SEALS.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    *ops.target_chain_id.borrow_mut() = Some(TARGET_CHAIN_ID.into());
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.starts_with("HALTED") && err.contains("target chain_id != source chain_id"), "{err}");
+    assert_eq!(ops.resumes.get(), 0, "never resume the source after ignition started");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("rehearsal_allow_chain_id_change"), "the HALT names the rehearsal override");
+
+    // With it: LIVE, both ids journaled.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "rehearsal_allow_chain_id_change = true", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    *ops.target_chain_id.borrow_mut() = Some(TARGET_CHAIN_ID.into());
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let e = journal_entries(&cfg);
+    let change = e.iter().find(|v| !v["data"]["rehearsal_chain_id_change"].is_null()).expect("chain id change journaled");
+    assert_eq!(change["data"]["rehearsal_chain_id_change"]["source_chain_id"], hex::encode(CHAIN_ID));
+    assert_eq!(change["data"]["rehearsal_chain_id_change"]["target_chain_id"], TARGET_CHAIN_ID);
+    let live = &transition(&e, "LIVE").unwrap()["data"];
+    assert_eq!(live["target_chain_id"], TARGET_CHAIN_ID);
+    assert_eq!(live["source_chain_id_changed"], true);
+    assert!(live["rehearsal_overrides"].to_string().contains("rehearsal_allow_chain_id_change"));
+    assert!(transition(&e, "ARMED").unwrap()["data"]["rehearsal_overrides"].to_string().contains("chain_id"));
+    // Resume keeps the accepted id (not re-derived from the source).
+    let rec = Journal::replay(&cfg.journal_path).unwrap();
+    assert_eq!(rec.accepted_target_chain_id.as_deref(), Some(TARGET_CHAIN_ID));
+    assert_eq!(rec.chain_id.as_deref(), Some(hex::encode(CHAIN_ID).as_str()), "the source chain_id is not overwritten");
+    assert_eq!(rec.target_blockchain_id.as_deref(), Some(BLOCKCHAIN_ID));
+}
+
+#[test]
+fn upstream_compare_failure_on_allowed_tables_passes_only_with_the_override() {
+    let failing = ["contract_index_double", "global_property"];
+    // No override: the v1.0.0 compare failure aborts verification (source resumed).
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    fake_compare_failing(dir.path(), &failing);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("xpr_19_table_compare FAILED") && !upstream_journal_has_verified(&text));
+    assert_eq!(ops.resumes.get(), 1);
+
+    // Override listing exactly those tables: verification passes LOUDLY, full output journaled.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    fake_compare_failing(dir.path(), &failing);
+    let cfg = upstream_ignite_config(dir.path(), "", r#"rehearsal_allow_compare_mismatch = ["contract_index_double", "global_property"]"#).unwrap();
+    let ops = upstream_ops(dir.path());
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let e = journal_entries(&cfg);
+    let cmp = e.iter().find(|v| v["data"]["upstream_19_table_compare"]["result"].as_str().is_some_and(|r| r.contains("ALLOWED"))).expect("override journaled");
+    assert_eq!(cmp["data"]["upstream_19_table_compare"]["failing_tables"], serde_json::json!(failing));
+    assert!(cmp["data"]["upstream_19_table_compare"]["output"].as_str().unwrap().contains("first differing row"), "full output journaled");
+    assert!(cmp["data"]["upstream_19_table_compare"]["REHEARSAL_ONLY"].is_string());
+    let verified = &transition(&e, "VERIFIED").unwrap()["data"];
+    assert!(verified["table_compare"].as_str().unwrap().starts_with("MISMATCH ALLOWED BY REHEARSAL OVERRIDE"));
+    assert_eq!(verified["compare_allowed_mismatch"], serde_json::json!(failing));
+}
+
+#[test]
+fn upstream_compare_failure_on_a_table_not_allowed_still_aborts() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    fake_compare_failing(dir.path(), &["global_property", "permission_link"]);
+    let cfg = upstream_ignite_config(dir.path(), "", r#"rehearsal_allow_compare_mismatch = ["contract_index_double", "global_property"]"#).unwrap();
+    let ops = upstream_ops(dir.path());
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("not on the rehearsal allowlist: permission_link"), "{text}");
+    assert!(!upstream_journal_has_verified(&text));
+    assert!(!text.contains("ignite_started"));
+    // A failure that names no table cannot be allowlisted either.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    write_script(&dir.path().join("fake-compare.sh"), "#!/bin/sh\necho 'panicked: arena open failed' >&2\nexit 101\n");
+    let cfg = upstream_ignite_config(dir.path(), "", r#"rehearsal_allow_compare_mismatch = ["global_property"]"#).unwrap();
+    assert_eq!(run_machine(&cfg, &upstream_ops(dir.path())), State::Aborted);
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("names no table"));
+}
+
+#[test]
+fn rehearsal_overrides_are_refused_for_mainnet() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let chain = format!("chain_id = \"{MAINNET}\"");
+    for (c, u) in [
+        (format!("{chain}\nrehearsal_allow_chain_id_change = true"), String::new()),
+        (chain.clone(), r#"rehearsal_allow_compare_mismatch = ["global_property"]"#.to_string()),
+    ] {
+        let err = upstream_ignite_config(dir.path(), &c, &u).unwrap_err();
+        assert!(err.contains("MAINNET"), "{err}");
+    }
+    assert!(upstream_ignite_config(dir.path(), "", r#"rehearsal_allow_compare_mismatch = ["*"]"#).unwrap_err().contains("not a table name"));
+    // Mainnet discovered at ARM (no chain_id configured): refused before anything freezes.
+    let cfg = upstream_ignite_config(dir.path(), "rehearsal_allow_chain_id_change = true", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    *ops.chain_id.borrow_mut() = MAINNET.into();
+    assert!(run_machine_result(&cfg, &ops).is_err());
+    let e = journal_entries(&cfg);
+    assert!(transition(&e, "FROZEN").is_none());
+    assert!(e.iter().any(|v| v.to_string().contains("XPR MAINNET and rehearsal overrides are active")));
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "freeze-writes"));
+}
+
+#[test]
+fn upstream_ignite_is_refused_for_mainnet_while_gaps_remain() {
+    // No overrides, mainnet chain: verification runs, ignition is refused (pre-ignition abort).
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    *ops.chain_id.borrow_mut() = MAINNET.into();
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(upstream_journal_has_verified(&text));
+    assert!(text.contains("refused for XPR MAINNET") && text.contains("TAPOS"));
+    assert!(!dir.path().join("create-chain.calls").exists(), "no chain created");
+    assert_eq!(ops.resumes.get(), 1);
+}
+
+#[test]
+fn upstream_anchor_must_be_the_cut_block() {
+    // The source cannot serve the cut block: abort before VERIFIED.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    ops.source_block_fails.set(true);
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("cannot fetch the full source cut block") && !upstream_journal_has_verified(&text));
+    // A block that is not the cut (its computed id differs from the pinned cut id): abort.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let ops = MockOps::new(dir.path(), 110); // mini-snapshot ids: not the fixture block's id
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("is not the cut"), "{text}");
+    assert_eq!(ops.resumes.get(), 1);
+}
+
+#[test]
+fn upstream_create_chain_failure_aborts_pre_ignition_and_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    write_script(&dir.path().join("fake-create-chain.sh"), "#!/bin/sh\necho 'insufficient funds' >&2\nexit 1\n");
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("create_chain_cmd failed (pre-ignition)") && text.contains("insufficient funds"));
+    assert!(!text.contains("ignite_started"));
+    assert!(!ops.ignited.get());
+    assert_eq!(ops.resumes.get(), 1, "pre-ignition abort resumes the source");
+    assert!(ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "on_abort ran");
+    assert!(text.contains(r#""rollback_done":true"#));
+    // An operator rollback afterwards: nothing to redo.
+    let out = rollback_with(&cfg, &ops, false).unwrap();
+    assert!(out.already && out.failed.is_empty(), "{out:?}");
+    assert_eq!(ops.resumes.get(), 1);
+    // Output without a blockchain id is a failure too.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    write_script(&dir.path().join("fake-create-chain.sh"), "#!/bin/sh\necho created\n");
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    assert_eq!(run_machine(&cfg, &upstream_ops(dir.path())), State::Aborted);
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("no blockchain id"));
+}
+
+#[test]
+fn upstream_ignite_failure_halts_after_ignition_started() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    ops.ignite_fails.set(true);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.starts_with("HALTED") && err.contains("ignition command failed"), "{err}");
+    assert_eq!(ops.resumes.get(), 0);
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "on_abort must not run");
+    // A forced-less rollback is refused after ignition started.
+    assert!(rollback_with(&cfg, &ops, false).unwrap_err().starts_with("refusing"));
+}
+
+#[test]
+fn upstream_create_chain_started_without_a_journaled_id_is_never_repeated() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    let cmd = format!("sh {d}/fake-create-chain.sh {d}/upstream-work/migration-genesis-120.json {d}/upstream-work/chain-config-120.json {d}/upstream-work/boot-120.manifest.json", d = dir.path().display());
+    *ops.panic_on_hook.borrow_mut() = Some(cmd);
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_machine_result(&cfg, &ops)));
+    assert!(crashed.is_err(), "agent died inside create_chain");
+    let ops2 = upstream_ops(dir.path());
+    ops2.head.set(130);
+    assert_eq!(run_machine(&cfg, &ops2), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("Refusing to create a second one"), "{text}");
+    assert!(!dir.path().join("create-chain.calls").exists());
+    assert!(!text.contains("ignite_started"));
+}
+
+#[test]
+fn upstream_boot_artifact_changed_after_verified_aborts_before_ignition() {
+    // The agent dies after VERIFIED (inside create_chain); someone edits the migration genesis;
+    // the resumed run re-hashes the boot artifacts before anything else and aborts pre-ignition.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    let d = dir.path().display();
+    *ops.panic_on_hook.borrow_mut() = Some(format!(
+        "sh {d}/fake-create-chain.sh {d}/upstream-work/migration-genesis-120.json {d}/upstream-work/chain-config-120.json {d}/upstream-work/boot-120.manifest.json"));
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_machine_result(&cfg, &ops))).is_err());
+    assert!(upstream_journal_has_verified(&std::fs::read_to_string(&cfg.journal_path).unwrap()));
+    let genesis = dir.path().join("upstream-work/migration-genesis-120.json");
+    let tampered = std::fs::read_to_string(&genesis).unwrap().replace("PUB_K1_test", "PUB_K1_other");
+    std::fs::write(&genesis, tampered).unwrap();
+    let ops2 = upstream_ops(dir.path());
+    ops2.head.set(130);
+    assert_eq!(run_machine(&cfg, &ops2), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("missing or changed since VERIFIED") && text.contains("migration genesis"), "{text}");
+    assert!(!text.contains("ignite_started"));
+}
+
+#[test]
+fn upstream_api_mode_rehearsal_flips_to_a_target_with_a_different_chain_id() {
+    // api mode: the public /v1 health gate must accept the ACCEPTED target chain_id (it compared
+    // against the source id before, which a v1.0.0 target never presents).
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    std::fs::write(dir.path().join("genesis-base.json"), r#"{"initial_timestamp":"2020-04-22T17:00:00","initial_key":"PUB_K1_test","initial_configuration":{}}"#).unwrap();
+    let toml_text = format!(
+        r#"
+journal_path = "{d}/journal.jsonl"
+poll_ms = 1
+
+[ceremony]
+mode = "api"
+freeze_height = 120
+simulate_freeze = true
+import_backend = "upstream"
+rehearsal_allow_chain_id_change = true
+
+[source]
+rpc_url = "http://mock"
+producer_api_url = "http://mock"
+stop_cmd = "stop-nodeos"
+
+[snapshot]
+staged_path = "{d}/staged.bin"
+
+[target]
+metalgo_unit = "mock.service"
+rpc_url = "http://127.0.0.1:9650/ext/bc/{{blockchain_id}}/rpc"
+quorum_timeout_secs = 60
+create_chain_cmd = "sh {d}/fake-create-chain.sh {{genesis}} {{chain_config}} {{manifest}}"
+
+[upstream]
+work_dir = "{d}/upstream-work"
+export_cmd = "sh {d}/fake-export.sh {{snapshot}} {{export_dir}}"
+import_bin = "{d}/fake-import.sh"
+fingerprint_bin = "{d}/fake-fingerprint.sh"
+compare_bin = "{d}/fake-compare.sh"
+genesis_base = "{d}/genesis-base.json"
+
+[flip]
+cmd = "flip-nginx"
+public_url = "http://mock-public"
+revert_cmd = "revert-nginx"
+health_polls = 2
+head_tolerance = 2
+health_timeout_secs = 5
+
+[hooks]
+on_freeze = "freeze-writes"
+on_live = "announce-live"
+"#,
+        d = dir.path().display()
+    );
+    let cfg = load_toml(dir.path(), "api-upstream.toml", &toml_text).unwrap();
+    let ops = upstream_ops(dir.path());
+    *ops.target_chain_id.borrow_mut() = Some(TARGET_CHAIN_ID.into());
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let e = journal_entries(&cfg);
+    assert_eq!(transition(&e, "FLIPPED").unwrap()["data"]["health"]["public_chain_id"], TARGET_CHAIN_ID);
+    assert_eq!(transition(&e, "LIVE").unwrap()["data"]["source_chain_id_changed"], true);
+}
+
+#[test]
+fn rehearsal_overrides_show_in_status_and_fail_a_beacon_setup_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display();
+    let base = format!(r#"
+journal_path = "{d}/journal.jsonl"
+[ceremony]
+profile = "readiness"
+REHEARSAL
+[source]
+rpc_url = "http://127.0.0.1:9"
+producer_api_url = "http://127.0.0.1:9"
+[snapshot]
+staged_path = "{d}/staged.bin"
+[target]
+metalgo_unit = "metalgo-none"
+rpc_url = "http://127.0.0.1:9/ext/bc/X/rpc"
+[beacon]
+url = ""
+producer = "bp1"
+network = "rehearsal"
+"#);
+    let run = |cfg_text: &str, args: &[&str]| -> (bool, String) {
+        let p = dir.path().join("b.toml");
+        std::fs::write(&p, cfg_text).unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_pulse-cutover")).args(args).arg("--config").arg(&p).args(if args[0] == "beacon" { &["--once"][..] } else { &[][..] }).output().unwrap();
+        (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    };
+    let with = base.replace("REHEARSAL", "rehearsal_allow_chain_id_change = true");
+    let (ok, out) = run(&with, &["status"]);
+    assert!(ok && out.contains("rehearsal_overrides: ACTIVE"), "{out}");
+    let (ok, out) = run(&with, &["beacon"]);
+    assert!(ok, "{out}");
+    let report: serde_json::Value = serde_json::from_str(out.lines().find(|l| l.starts_with('{')).map(|_| &out[out.find('{').unwrap()..out.rfind('}').unwrap() + 1]).unwrap()).unwrap();
+    let c = report["checks"].as_array().unwrap().iter().find(|c| c["name"] == "rehearsal_overrides").expect("check present");
+    assert_eq!(c["ok"], false);
+    assert!(c["detail"].as_str().unwrap().contains("rehearsal overrides active"));
+    assert!(!pulse_cutover::beacon::has_failing_health(&serde_json::json!({"checks": [c]})), "a SETUP check, not health");
+    // Without overrides: no such check, and status says none.
+    let without = base.replace("REHEARSAL", "");
+    let (_, out) = run(&without, &["status"]);
+    assert!(out.contains("rehearsal_overrides: none"), "{out}");
+    let (_, out) = run(&without, &["beacon"]);
+    assert!(!out.contains("\"rehearsal_overrides\""), "{out}");
 }

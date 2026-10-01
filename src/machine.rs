@@ -67,6 +67,14 @@ pub struct Machine<'a, O: ChainOps> {
     /// Rollback steps already journaled as done in this abort episode (resumable rollback).
     rollback_steps_done: Vec<String>,
     rollback_pending: bool,
+    /// Upstream backend: the Metal blockchain id create_chain_cmd created (journaled at once).
+    target_blockchain_id: Option<String>,
+    /// Upstream backend: create_chain_cmd was started (journaled before it ran).
+    create_chain_started: bool,
+    /// REHEARSAL ONLY: the different target chain_id `rehearsal_allow_chain_id_change` accepted.
+    accepted_target_chain_id: Option<String>,
+    /// Upstream backend: boot artifact hashes journaled at VERIFIED (manifest, genesis, config).
+    boot_hashes: (Option<String>, Option<String>, Option<String>),
 }
 
 /// What `pulse-cutover rollback` did. `failed` lists every step that did not succeed; the
@@ -141,6 +149,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let aborted_rollback_complete = recovered.aborted_rollback_complete;
         let rollback_steps_done = recovered.rollback_steps_done.clone();
         let rollback_pending = recovered.rollback_pending;
+        let create_chain_started = recovered.side_effects.iter().any(|s| s == "create_chain");
         Machine {
             cfg,
             ops,
@@ -170,6 +179,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             aborted_rollback_complete,
             rollback_steps_done,
             rollback_pending,
+            target_blockchain_id: recovered.target_blockchain_id,
+            create_chain_started,
+            accepted_target_chain_id: recovered.accepted_target_chain_id,
+            boot_hashes: (recovered.boot_manifest_sha256, recovered.boot_genesis_sha256, recovered.boot_chain_config_sha256),
         }
     }
 
@@ -205,6 +218,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     crate::ops::hook_pgid_path(self.journal.path()).display()
                 ));
             }
+        }
+        if self.target_blockchain_id.is_some() {
+            // Resumed after create_chain: the target RPC / ignite placeholders need the id again.
+            self.bind_target_vars();
         }
         if self.state == State::Halted {
             return Err(format!(
@@ -266,8 +283,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     "lib_at_arm": info.last_irreversible_block_num,
                     "freeze_strategy": format!("{:?}", self.cfg.ceremony.freeze_strategy),
                     "import_cpu_scale": self.cfg.ceremony.import_cpu_scale,
+                    "import_backend": format!("{:?}", self.cfg.ceremony.import_backend),
+                    "rehearsal_overrides": self.cfg.rehearsal_overrides(),
                 }),
             )?;
+            if !self.cfg.rehearsal_overrides().is_empty() {
+                self.journal.evidence(State::Armed, json!({"REHEARSAL_OVERRIDES_ACTIVE": self.cfg.rehearsal_overrides(),
+                    "note": "REHEARSAL ONLY: gates a real cut depends on are relaxed; this ceremony is not a valid cutover"}))?;
+                eprintln!("WARNING: rehearsal overrides active: {}", self.cfg.rehearsal_overrides().join("; "));
+            }
             self.preflight(&info, false)?;
         }
         loop {
@@ -311,6 +335,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     info.chain_id
                 ));
             }
+        }
+        // Rehearsal overrides are refused at config load for a configured mainnet chain_id; a
+        // config that leaves chain_id to discovery is caught here, before anything freezes.
+        if crate::config::is_xpr_mainnet(&info.chain_id) && !self.cfg.rehearsal_overrides().is_empty() {
+            problems.push(format!(
+                "the source is XPR MAINNET and rehearsal overrides are active ({}): refused",
+                self.cfg.rehearsal_overrides().join("; ")
+            ));
         }
         match self.ops.producer_paused() {
             // api mode: this node does not produce; we only need producer_api
@@ -1490,11 +1522,64 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 )?,
             }
         }
+        // Boot artifacts for ignition from the checkpoint (only when ignition is configured; a
+        // verify-only run stops after VERIFIED). Built and bound to the cut BEFORE VERIFIED, while
+        // the source still serves the cut block: any failure here aborts and resumes the source.
+        let mut boot = serde_json::Value::Null;
+        let mut boot_hashes = (None, None, None);
+        if up.ignite_configured(&self.cfg.target) {
+            let rpc = up.source_block_rpc_url.as_deref();
+            let block = match self.ops.source_block(cut_height, rpc) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.abort(
+                        "cannot fetch the full source cut block for the boot manifest anchor",
+                        json!({"error": e, "cut_height": cut_height,
+                               "fix": "the source RPC (or upstream.source_block_rpc_url) must serve get_block at the cut"}),
+                    )?;
+                    return Ok(());
+                }
+            };
+            match upstream::build_boot_artifacts(&up, &outcome, &block, cut_height, &cut_block_id, &chain_id) {
+                Ok(a) => {
+                    boot = json!({
+                        "manifest": a.manifest.display().to_string(),
+                        "genesis": a.genesis.display().to_string(),
+                        "chain_config": a.chain_config.display().to_string(),
+                        "source_block_bytes": a.source_block_bytes,
+                        "source_block_receipts": a.source_block_receipts,
+                        "anchor": "full packed source cut block (all receipts); computed id == cut block id",
+                    });
+                    boot_hashes = (Some(a.manifest_sha256), Some(a.genesis_sha256), Some(a.chain_config_sha256));
+                }
+                Err(e) => {
+                    self.abort("cannot build the upstream boot artifacts", json!({"error": e}))?;
+                    return Ok(());
+                }
+            }
+        }
+        self.boot_hashes = boot_hashes.clone();
+        let table_compare = match (&outcome.compare_stdout, outcome.compare_allowed_mismatch.is_empty()) {
+            (None, _) => "not configured".to_string(),
+            (Some(_), true) => "MATCH".to_string(),
+            (Some(_), false) => format!(
+                "MISMATCH ALLOWED BY REHEARSAL OVERRIDE ({}) — not a valid verification for a real cut",
+                outcome.compare_allowed_mismatch.join(", ")
+            ),
+        };
         self.sha256 = Some(sha256.clone());
         self.state = State::Verified;
         self.journal.transition(
             State::Verified,
             json!({
+                "boot": boot,
+                "boot_manifest_sha256": boot_hashes.0,
+                "boot_genesis_sha256": boot_hashes.1,
+                "boot_chain_config_sha256": boot_hashes.2,
+                "compare_allowed_mismatch": outcome.compare_allowed_mismatch,
+                "rehearsal_overrides": self.cfg.rehearsal_overrides(),
+                // What the fleet gate compares across producers (beacon fingerprints_digest).
+                "fingerprints": outcome.state_root.as_ref().map(|r| json!({"upstream_state_root": r})),
                 "verify_backend": "upstream (#61: export.sh -> xpr_import_check; gates: \
                                    xpr_19_table_compare + manifest bindings)",
                 "sha256": sha256,
@@ -1508,11 +1593,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "checkpoint": outcome.checkpoint_path.display().to_string(),
                 "checkpoint_sha256": outcome.checkpoint_sha256,
                 "checkpoint_revision": outcome.checkpoint_revision,
-                "table_compare": outcome
-                    .compare_stdout
-                    .as_deref()
-                    .map(|_| "MATCH")
-                    .unwrap_or("not configured"),
+                "table_compare": table_compare,
                 "state_root": outcome.state_root,
                 "verify_wall_ms": self.ops.now_ms().saturating_sub(started),
             }),
@@ -1659,23 +1740,153 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Ok(())
     }
 
+    /// The `{name}` placeholders the upstream ignition binds once the chain exists.
+    fn bind_target_vars(&mut self) {
+        let (Some(bid), Some(up), Some(h)) = (self.target_blockchain_id.clone(), self.cfg.upstream.as_ref(), self.cut_height) else {
+            return;
+        };
+        let (manifest, genesis, chain_config) = upstream::boot_paths(up, h);
+        let checkpoint = up.work_dir.join(format!("checkpoint-{h}.bin"));
+        self.ops.bind_target(&[
+            ("blockchain_id".into(), bid),
+            ("chain_config".into(), chain_config.display().to_string()),
+            ("genesis".into(), genesis.display().to_string()),
+            ("manifest".into(), manifest.display().to_string()),
+            ("checkpoint".into(), checkpoint.display().to_string()),
+            ("cut_height".into(), h.to_string()),
+        ]);
+    }
+
+    /// Upstream backend, before the fleet gate: refuse what cannot be ignited safely, journal what
+    /// stays unsolved for mainnet, and re-check the boot artifacts against their VERIFIED hashes.
+    /// Ok(false) after aborting (pre-ignition: the source is resumed).
+    fn upstream_ignite_preflight(&mut self) -> Result<bool, String> {
+        let up = self.cfg.upstream.clone().expect("validated: upstream section");
+        let source_chain = self.chain_id.clone().unwrap_or_default();
+        let pending = upstream::ignite_pending_reasons();
+        if crate::config::is_xpr_mainnet(&source_chain) && !pending.is_empty() {
+            self.abort(
+                "upstream ignite refused for XPR MAINNET: a same-chain-id mainnet cutover still has unsolved \
+                 prerequisites (verification completed with the official #61 tools)",
+                json!({"remaining": pending}),
+            )?;
+            return Ok(false);
+        }
+        if !up.ignite_configured(&self.cfg.target) {
+            self.abort(
+                "upstream ignite not configured — verification completed with the official #61 tools; \
+                 set upstream.genesis_base and target.create_chain_cmd to boot the target from the checkpoint",
+                json!({"verify_only": true, "remaining_for_mainnet": pending}),
+            )?;
+            return Ok(false);
+        }
+        self.journal.evidence(State::Verified, json!({
+            "upstream_ignite_warnings": pending,
+            "note": "unsolved for a same-chain-id MAINNET cutover; acceptable only on a rehearsal/test chain",
+            "rehearsal_overrides": self.cfg.rehearsal_overrides(),
+        }))?;
+        eprintln!("WARNING (upstream ignite, not mainnet-ready): {}", pending.join(" | "));
+        // The artifacts the target boots from must be exactly the ones verification produced.
+        let h = self.cut_height.expect("cut pinned");
+        let (manifest, genesis, chain_config) = upstream::boot_paths(&up, h);
+        let mut changed = vec![];
+        for (what, path, want) in [
+            ("boot manifest", &manifest, &self.boot_hashes.0),
+            ("migration genesis", &genesis, &self.boot_hashes.1),
+            ("chain config", &chain_config, &self.boot_hashes.2),
+        ] {
+            let got = verify::sha256_file(path).map(|(h, _)| h).ok();
+            if want.is_none() || got.as_deref() != want.as_deref() {
+                changed.push(json!({"artifact": what, "path": path.display().to_string(), "verified": want, "now": got}));
+            }
+        }
+        if !changed.is_empty() {
+            self.abort("upstream boot artifacts missing or changed since VERIFIED", json!({"artifacts": changed}))?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Upstream backend, after the fleet gate and BEFORE `ignite_started`: create the target chain
+    /// on Metal (once: its id is journaled the moment it is known), bind the placeholders and
+    /// install the chain config. Ok(false) after aborting (pre-ignition).
+    fn upstream_create_chain(&mut self) -> Result<bool, String> {
+        let up = self.cfg.upstream.clone().expect("validated: upstream section");
+        let h = self.cut_height.expect("cut pinned");
+        let (manifest, genesis, chain_config) = upstream::boot_paths(&up, h);
+        if let Some(bid) = self.target_blockchain_id.clone() {
+            self.journal.evidence(State::Verified, json!({"create_chain": "reused (journaled by a previous run)", "blockchain_id": bid}))?;
+        } else if self.create_chain_started {
+            self.abort(
+                "create_chain_cmd was started by a previous run but no blockchain id was journaled: a chain may \
+                 exist on Metal. Refusing to create a second one",
+                json!({"fix": "find the chain on the P-Chain (by its genesis hash); retire it or journal its id by hand, then start a new ceremony"}),
+            )?;
+            return Ok(false);
+        } else {
+            let cmd = self.cfg.target.create_chain_cmd.clone().expect("validated: ignite configured");
+            let cmd = crate::ops::expand_placeholders(&cmd, &[
+                ("genesis".into(), genesis.display().to_string()),
+                ("genesis_sha256".into(), self.boot_hashes.1.clone().unwrap_or_default()),
+                ("chain_config".into(), chain_config.display().to_string()),
+                ("manifest".into(), manifest.display().to_string()),
+                ("checkpoint".into(), up.work_dir.join(format!("checkpoint-{h}.bin")).display().to_string()),
+                ("cut_height".into(), h.to_string()),
+            ]);
+            self.journal.evidence(State::Verified, json!({"side_effect": "create_chain", "cmd": cmd}))?;
+            self.create_chain_started = true;
+            let out = match self.ops.run_hook(&cmd) {
+                Ok(o) => o,
+                Err(e) => {
+                    self.abort("create_chain_cmd failed (pre-ignition)", json!({"error": e,
+                        "note": "if the chain was nevertheless created on Metal it was never ignited; retire it"}))?;
+                    return Ok(false);
+                }
+            };
+            let (bid, subnet) = match upstream::parse_create_chain_output(&out) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.abort("create_chain_cmd output has no blockchain id", json!({"error": e, "output": out}))?;
+                    return Ok(false);
+                }
+            };
+            self.journal.evidence(State::Verified, json!({"target_blockchain_id": bid, "target_subnet_id": subnet,
+                "create_chain_output": out}))?;
+            self.target_blockchain_id = Some(bid);
+        }
+        self.bind_target_vars();
+        let bid = self.target_blockchain_id.clone().expect("set above");
+        if let Some(dir) = self.cfg.target.chain_config_dir.clone() {
+            let dest = dir.join(&bid).join("config.json");
+            let installed = std::fs::create_dir_all(dest.parent().expect("has parent"))
+                .and_then(|_| std::fs::copy(&chain_config, &dest))
+                .map_err(|e| e.to_string())
+                .and_then(|_| verify::sha256_file(&dest).map(|(h, _)| h));
+            match installed {
+                Ok(h) if Some(&h) == self.boot_hashes.2.as_ref() => {
+                    self.journal.evidence(State::Verified, json!({"chain_config_installed": dest.display().to_string(), "sha256": h}))?;
+                }
+                other => {
+                    self.abort("could not install the chain config for the target", json!({
+                        "dest": dest.display().to_string(), "result": format!("{other:?}")}))?;
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// VERIFIED: ignite the target and wait for it to present the source
     /// chain at the cut height.
     fn step_verified(&mut self) -> Result<(), String> {
-        // Upstream backend: the #61 migration path is merged, but igniting
-        // FROM its checkpoint is not wired yet, and a same-chain-id mainnet
-        // cutover has hard prerequisites (see ignite_pending_reasons).
-        // Verification is done and journaled; stop here with the precise
-        // remaining list rather than booting anything unsafe.
-        if self.cfg.ceremony.import_backend == ImportBackend::Upstream {
-            self.abort(
-                "upstream ignite not yet available — verification completed with the \
-                 official #61 tools; booting from the checkpoint needs the remaining items",
-                json!({"remaining": upstream::ignite_pending_reasons()}),
-            )?;
-            return Ok(());
+        let upstream_backend = self.cfg.ceremony.import_backend == ImportBackend::Upstream;
+        if upstream_backend && !self.upstream_ignite_preflight()? {
+            return Ok(()); // aborted inside, with evidence
         }
         if !self.fleet_gate()? {
+            return Ok(()); // aborted inside, with evidence
+        }
+        if upstream_backend && !self.upstream_create_chain()? {
             return Ok(()); // aborted inside, with evidence
         }
         let started = self.ops.now_ms();
@@ -1716,13 +1927,28 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             self.ops.sleep_ms(self.cfg.poll_ms);
         };
-        if let Some(chain_id) = &self.chain_id {
-            if !info.chain_id.eq_ignore_ascii_case(chain_id) {
-                self.abort(
-                    "target chain_id != source chain_id",
-                    json!({"target": info.chain_id, "source": chain_id}),
-                )?;
-                return Ok(());
+        if let Some(chain_id) = self.chain_id.clone() {
+            if !info.chain_id.eq_ignore_ascii_case(&chain_id) {
+                if self.cfg.ceremony.rehearsal_allow_chain_id_change {
+                    // REHEARSAL ONLY (refused for mainnet at load and at ARM): PulseVM v1.0.0 signs
+                    // with metalgo's blockchain id. Both ids are journaled; LIVE carries them too.
+                    self.journal.evidence(State::Verified, json!({
+                        "accepted_target_chain_id": info.chain_id,
+                        "rehearsal_chain_id_change": {
+                            "source_chain_id": chain_id, "target_chain_id": info.chain_id,
+                            "allowed_by": "ceremony.rehearsal_allow_chain_id_change",
+                            "REHEARSAL_ONLY": "transactions must be signed for the TARGET chain_id; a real cut keeps the source chain_id",
+                        }}))?;
+                    eprintln!("WARNING (rehearsal override): target chain_id {} != source {chain_id}", info.chain_id);
+                    self.accepted_target_chain_id = Some(info.chain_id.clone());
+                } else {
+                    self.abort(
+                        "target chain_id != source chain_id",
+                        json!({"target": info.chain_id, "source": chain_id,
+                               "note": "a rehearsal on PulseVM v1.0.0 (signs with metalgo's blockchain id) needs ceremony.rehearsal_allow_chain_id_change = true"}),
+                    )?;
+                    return Ok(());
+                }
             }
         }
         // Lineage at H: the target's block AT the cut must be the source's block at the cut
@@ -1869,8 +2095,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let ok = match (&target, &public) {
                 (Some(t), Some(p)) => {
                     let chain_ok = self
-                        .chain_id
+                        .accepted_target_chain_id
                         .as_ref()
+                        .or(self.chain_id.as_ref())
                         .map(|c| p.chain_id.eq_ignore_ascii_case(c))
                         .unwrap_or(false);
                     let diff = t.head_block_num.abs_diff(p.head_block_num);
@@ -2146,6 +2373,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "last_source_block_time": self.last_source_block_time,
                 "ceremony_gap_ms_wallclock": write_gap_ms,
                 "on_live_hook": on_live,
+                "rehearsal_overrides": self.cfg.rehearsal_overrides(),
+                "target_chain_id": self.accepted_target_chain_id.clone().or(self.chain_id.clone()),
+                "source_chain_id_changed": self.accepted_target_chain_id.is_some(),
                 "note": "api-node cutover complete: same URL, same chain_id, PulseVM serving; nodeos stopped LAST; the gap includes the sustain window and on_live",
             }),
         )?;
@@ -2202,6 +2432,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "write_gap_ms_wallclock": write_gap_ms,
                 "first_progress_gap_ms_wallclock": first_progress_gap_ms,
                 "on_live_hook": on_live,
+                "rehearsal_overrides": self.cfg.rehearsal_overrides(),
+                "target_chain_id": self.accepted_target_chain_id.clone().or(self.chain_id.clone()),
+                "source_chain_id_changed": self.accepted_target_chain_id.is_some(),
             }),
         )?;
         Ok(())

@@ -672,6 +672,7 @@ const CHECKS = {
   metal_synced: ['setup', 'Metal node synced', 'the Metal P-Chain has finished bootstrapping'],
   metal_reachable: ['setup', 'Staking port open', 'peers can reach port 9651/tcp from the internet'],
   producer_api_private: ['setup', 'Producer API private', '/v1/producer/* (pause, resume, snapshots) does not answer from the internet'],
+  rehearsal_overrides: ['setup', 'REHEARSAL OVERRIDES ACTIVE', 'rehearsal only: this node relaxes cutover gates (table-compare allowlist / target chain_id change); never a real cut'],
 };
 const kind = (c) => (CHECKS[c.name] || ['health'])[0];
 const label = (c) => (CHECKS[c.name] || [0, c.name])[1];
@@ -948,7 +949,7 @@ const ICP = {
 const ic = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICP[n] || ICP.server}</svg>`;
 const CHECK_ICON = { source_api: 'globe', chain_id: 'key', producer_api: 'cpu', freeze_height: 'lock', freeze_lead_blocks: 'lock',
   staged_snapshot_absent: 'camera', disk_free: 'hdd', hook_on_freeze: 'lock', hook_post_ignite: 'zap', hook_on_live: 'arrow',
-  hook_on_abort: 'undo', validator_running: 'hex', metal_synced: 'hex', metal_reachable: 'radio', producer_api_private: 'lock' };
+  hook_on_abort: 'undo', validator_running: 'hex', metal_synced: 'hex', metal_reachable: 'radio', producer_api_private: 'lock', rehearsal_overrides: 'wrench' };
 const ROLE_ICON = { producer: 'cpu', history: 'db', api: 'globe', seed: 'link', query: 'db', full: 'globe' };
 const ROLE_NAME = { producer: 'Block producer node', history: 'History / Hyperion node', api: 'Public API node' };
 /* ---------------- full page: one server (beacon) or one public endpoint ---------------- */

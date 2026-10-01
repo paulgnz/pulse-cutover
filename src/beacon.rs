@@ -332,6 +332,7 @@ static JOURNALS: Mutex<Option<HashMap<PathBuf, Acc>>> = Mutex::new(None);
 pub const SETUP_CHECKS: &[&str] = &[
     "hook_on_freeze", "hook_post_ignite", "hook_on_live", "hook_on_abort",
     "validator_running", "metal_synced", "metal_reachable", "producer_api_private",
+    "rehearsal_overrides",
 ];
 
 /// A report with any failing HEALTH check (a failing setup check does not count).
@@ -553,6 +554,14 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         if cfg.ceremony.freeze_strategy == crate::config::FreezeStrategy::ScheduleAtH {
             checks.push(check("freeze_lead_blocks", cfg.ceremony.freeze_lead_blocks > 0, format!("writes close {} blocks before H", cfg.ceremony.freeze_lead_blocks)));
         }
+    }
+
+    // Rehearsal-only overrides: a failing SETUP check (never excludes the report from a rehearsal
+    // fleet gate) that stays red for as long as they are configured, so nobody mistakes the run
+    // for a real cut. Mission control labels it.
+    let overrides = cfg.rehearsal_overrides();
+    if !overrides.is_empty() {
+        checks.push(check("rehearsal_overrides", false, format!("rehearsal overrides active: {}", overrides.join("; "))));
     }
 
     // Hooks.
