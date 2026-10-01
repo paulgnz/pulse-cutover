@@ -664,6 +664,7 @@ const CHECKS = {
   producer_api: ['health', 'producer API reachable locally'], freeze_height: ['health', 'cut height configured'],
   freeze_lead_blocks: ['health', 'write-freeze lead set'], staged_snapshot_absent: ['health', 'no stale snapshot staged'],
   disk_free: ['health', 'enough free disk'],
+  target_live: ['health', 'new chain still producing after LIVE'],
   hook_on_freeze: ['setup', 'Write-freeze hook', 'closes writes at your public API just before the cut'],
   hook_post_ignite: ['setup', 'Post-ignite hook', 'gives the new chain its first blocks and checks state'],
   hook_on_live: ['setup', 'Go-live hook', 'switches your public API to PulseVM'],
@@ -949,7 +950,8 @@ const ICP = {
 const ic = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICP[n] || ICP.server}</svg>`;
 const CHECK_ICON = { source_api: 'globe', chain_id: 'key', producer_api: 'cpu', freeze_height: 'lock', freeze_lead_blocks: 'lock',
   staged_snapshot_absent: 'camera', disk_free: 'hdd', hook_on_freeze: 'lock', hook_post_ignite: 'zap', hook_on_live: 'arrow',
-  hook_on_abort: 'undo', validator_running: 'hex', metal_synced: 'hex', metal_reachable: 'radio', producer_api_private: 'lock', rehearsal_overrides: 'wrench' };
+  hook_on_abort: 'undo', validator_running: 'hex', metal_synced: 'hex', metal_reachable: 'radio', producer_api_private: 'lock', rehearsal_overrides: 'wrench',
+  target_live: 'activity' };
 const ROLE_ICON = { producer: 'cpu', history: 'db', api: 'globe', seed: 'link', query: 'db', full: 'globe' };
 const ROLE_NAME = { producer: 'Block producer node', history: 'History / Hyperion node', api: 'Public API node' };
 /* ---------------- full page: one server (beacon) or one public endpoint ---------------- */

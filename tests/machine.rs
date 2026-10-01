@@ -4141,6 +4141,93 @@ network = "rehearsal"
 }
 
 #[test]
+fn stage2_post_live_watch_reports_a_stalled_target_red_in_beacon_and_status() {
+    // Stage-2 run 2: LIVE at 18:20:19.8, last block two seconds later (CPU billing), every later
+    // transaction accepted over HTTP and never included, and everything kept saying LIVE.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display();
+    let now = chrono::Utc::now();
+    let ms = |t: chrono::DateTime<chrono::Utc>| t.timestamp_millis();
+    let live_at = now - chrono::Duration::seconds(90);
+    let block_time = std::sync::Arc::new(std::sync::Mutex::new(live_at + chrono::Duration::seconds(2)));
+    let bt = block_time.clone();
+    let (url, _) = stub_http(move |_m, p| {
+        if p.contains("/ext/bc/2YXVy2NWHZJphNuvWry8So8TpQodhSb7ZVJPxhwhtKS6Z6JjpV/rpc") {
+            let t = bt.lock().unwrap().format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
+            (200, serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"head_block_num": 408462226u64, "head_block_time": t}}).to_string())
+        } else {
+            (200, r#"{"head_block_num": 500, "last_irreversible_block_num": 400, "chain_id": "ab"}"#.into())
+        }
+    });
+    let line = |seq: u64, kind: &str, state: &str, ts: i64, data: serde_json::Value| {
+        format!("{}\n", serde_json::json!({"seq": seq, "ts_ms": ts, "ts": "t", "kind": kind, "state": state, "data": data}))
+    };
+    let t0 = ms(live_at) - 600_000;
+    let journal = [
+        line(0, "transition", "ARMED", t0, serde_json::json!({"resolved_h": 100})),
+        line(1, "evidence", "VERIFIED", t0 + 1000, serde_json::json!({"target_blockchain_id": BLOCKCHAIN_ID, "target_subnet_id": "2qFyanyVDk2LKrUsUdh3JjtYJYZGqUg9y9QAvMaWdQZZGaLiXY"})),
+        line(2, "transition", "IGNITED", t0 + 2000, serde_json::json!({})),
+        line(3, "transition", "LIVE", ms(live_at), serde_json::json!({"write_gap_ms_wallclock": 1000})),
+    ].concat();
+    std::fs::write(dir.path().join("journal.jsonl"), journal).unwrap();
+    let cfg_text = |probe: &str| format!(r#"
+journal_path = "{d}/journal.jsonl"
+[ceremony]
+profile = "readiness"
+[source]
+rpc_url = "{url}"
+producer_api_url = "{url}"
+[snapshot]
+staged_path = "{d}/staged.bin"
+[target]
+metalgo_unit = "metalgo-none"
+rpc_url = "{url}/ext/bc/{{blockchain_id}}/rpc"
+{probe}
+[beacon]
+url = ""
+producer = "bp1"
+network = "rehearsal"
+"#);
+    let run = |text: &str, cmd: &str| -> String {
+        let p = dir.path().join("b.toml");
+        std::fs::write(&p, text).unwrap();
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_pulse-cutover"));
+        c.arg(cmd).arg("--config").arg(&p);
+        if cmd == "beacon" {
+            c.arg("--once");
+        }
+        let out = c.output().unwrap();
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let report = |out: &str| -> serde_json::Value { serde_json::from_str(&out[out.find('{').unwrap()..out.rfind('}').unwrap() + 1]).unwrap() };
+    let target_live = |r: &serde_json::Value| r["checks"].as_array().unwrap().iter().find(|c| c["name"] == "target_live").cloned();
+
+    let r = report(&run(&cfg_text(""), "beacon"));
+    let c = target_live(&r).expect("target_live reported after LIVE");
+    assert_eq!(c["ok"], false, "{c}");
+    assert!(c["detail"].as_str().unwrap().starts_with("no new block for 8"), "{c}");
+    assert!(pulse_cutover::beacon::has_failing_health(&r), "a HEALTH check: mission control shows it red");
+    assert_eq!(r["ceremony"]["state"], "LIVE", "the journal state is reported as is (no auto-rollback)");
+    for k in ["live_ts_ms", "target_blockchain_id", "target_subnet_id"] {
+        assert!(r["ceremony"].get(k).is_none(), "{k} stays local");
+    }
+    let out = run(&cfg_text(""), "status");
+    assert!(out.contains("target_live: FAILING (no new block for 8") && out.contains("operator decision"), "{out}");
+    assert!(out.contains("state: LIVE"), "{out}");
+
+    // Producing again: green. A failing operator probe turns it red with its own reason.
+    *block_time.lock().unwrap() = chrono::Utc::now() - chrono::Duration::seconds(3);
+    let c = target_live(&report(&run(&cfg_text(""), "beacon"))).unwrap();
+    assert_eq!(c["ok"], true, "{c}");
+    assert!(run(&cfg_text(""), "status").contains("target_live: ok (producing"));
+    let c = target_live(&report(&run(&cfg_text("post_live_probe_cmd = \"echo no inclusion for {blockchain_id} >&2; exit 3\""), "beacon"))).unwrap();
+    assert_eq!(c["ok"], false, "{c}");
+    assert!(c["detail"].as_str().unwrap().contains("probe failed: no inclusion for"), "{c}");
+    // Disabled: no check.
+    assert!(target_live(&report(&run(&cfg_text("post_live_max_idle_secs = 0"), "beacon"))).is_none());
+}
+
+#[test]
 fn upstream_example_configs_load_and_the_rehearsal_one_refuses_mainnet() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["ceremony-upstream.toml", "ceremony-upstream-rehearsal.toml"] {

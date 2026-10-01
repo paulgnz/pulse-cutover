@@ -7,7 +7,8 @@
 //! control is down the beacon logs and retries; the ceremony never waits on it.
 //! Read-only on the box: it calls nodeos' chain API, reads files, and asks
 //! systemd whether a unit is active. The only thing it ever writes is its own
-//! `beacon.instance` id (once).
+//! `beacon.instance` id (once). After LIVE it also asks the target for its head and, if the
+//! operator configured one, runs `target.post_live_probe_cmd` (see live_watch.rs).
 //!
 //! Public by design: mission control's dashboard is public, so every string in a
 //! report is either a fixed verdict, a number, a public chain/Metal identifier, or
@@ -322,6 +323,10 @@ struct Acc {
     rollback_complete: Option<bool>,
     /// An operator rollback recorded its intent and has not reached ABORTED (see journal.rs).
     rollback_pending: bool,
+    /// When LIVE was journaled, and the target chain's Metal ids (post-LIVE watch).
+    live_ts_ms: Option<u64>,
+    target_blockchain_id: Option<String>,
+    target_subnet_id: Option<String>,
 }
 
 static JOURNALS: Mutex<Option<HashMap<PathBuf, Acc>>> = Mutex::new(None);
@@ -371,6 +376,12 @@ fn apply_line(acc: &mut Acc, v: &Value) {
     }
     if d["rollback_done"].as_bool() == Some(true) {
         acc.rollback_complete = Some(true);
+    }
+    if let Some(b) = d["target_blockchain_id"].as_str() {
+        acc.target_blockchain_id = Some(b.to_string());
+    }
+    if let Some(s) = d["target_subnet_id"].as_str() {
+        acc.target_subnet_id = Some(s.to_string());
     }
     if d["rollback_requested"].as_bool() == Some(true) {
         acc.rollback_pending = true;
@@ -423,7 +434,10 @@ fn apply_line(acc: &mut Acc, v: &Value) {
                     put(ev, "target_head_id", &d["target_head_id"]);
                     put(ev, "lineage_at_cut", &d["lineage_at_cut"]);
                 }
-                Some("LIVE") => put(ev, "write_gap_ms", &d["write_gap_ms_wallclock"]),
+                Some("LIVE") => {
+                    acc.live_ts_ms = v["ts_ms"].as_u64();
+                    put(ev, "write_gap_ms", &d["write_gap_ms_wallclock"]);
+                }
                 // rc.7: the HALTED transition itself carries the reason (one durable record).
                 Some("HALTED") => {
                     if let Some(m) = d["message"].as_str() {
@@ -483,7 +497,11 @@ pub fn journal_summary(path: &Path) -> Value {
            "ignition_started": acc.ignition_started,
            "forced_rollback": acc.forced_rollback,
            "rollback_complete": acc.rollback_complete,
-           "rollback_pending": acc.rollback_pending})
+           "rollback_pending": acc.rollback_pending,
+           // Local only (the post-LIVE watch); removed from the posted report.
+           "live_ts_ms": acc.live_ts_ms,
+           "target_blockchain_id": acc.target_blockchain_id,
+           "target_subnet_id": acc.target_subnet_id})
 }
 
 /// Coordination status for the report, with free-text fields sanitized.
@@ -616,6 +634,13 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
             }
         }
     }
+    // After LIVE: is the new chain still producing? (stage-2 run 2 stopped including transactions
+    // seconds after LIVE while everything kept saying LIVE). Health, never an action.
+    if state == "LIVE" {
+        if let Some(c) = crate::live_watch::check(cfg, &journal, budget.agent(Duration::from_secs(2)).as_ref(), true) {
+            checks.push(c);
+        }
+    }
     if let Some(dir) = cfg.snapshot.dir.as_ref().or(staged.parent().map(|p| p.to_path_buf()).as_ref()) {
         let gb = free_gb(dir);
         checks.push(check("disk_free", gb.map(|g| g >= 5.0).unwrap_or(false), gb.map(|g| format!("{:.0} GB free", g.floor())).unwrap_or_else(|| "unknown".into())));
@@ -643,7 +668,9 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         }
     }
     if let Some(o) = journal.as_object_mut() {
-        o.remove("armed_ts_ms");
+        for k in ["armed_ts_ms", "live_ts_ms", "target_blockchain_id", "target_subnet_id"] {
+            o.remove(k);
+        }
     }
 
     let ready = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(false));

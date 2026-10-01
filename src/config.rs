@@ -670,6 +670,18 @@ pub struct Target {
     /// make metalgo track `{subnet_id}`; a flip script repoints the edge at `/ext/bc/{blockchain_id}`).
     #[serde(default)]
     pub chain_config_dir: Option<PathBuf>,
+    /// Post-LIVE watch (reporting only): the beacon and `status` keep checking the target after
+    /// LIVE and report the HEALTH check `target_live` as failing once no new block has appeared
+    /// for this many seconds (PulseVM builds blocks only when there are transactions, so on a
+    /// chain with traffic a still head means admitted transactions are not being included).
+    /// Never rolls anything back. 0 disables.
+    #[serde(default = "default_post_live_max_idle")]
+    pub post_live_max_idle_secs: u64,
+    /// Optional, post-LIVE: an operator probe the beacon runs at most every 30 s (killed after
+    /// 5 s), e.g. a script that checks a recent transaction was included. Exit 0 = healthy;
+    /// anything else fails `target_live`. `{blockchain_id}` / `{subnet_id}` expand.
+    #[serde(default)]
+    pub post_live_probe_cmd: Option<String>,
 }
 
 impl Target {
@@ -689,6 +701,9 @@ fn default_live_sustain() -> u64 {
 }
 fn default_live_max_gap() -> u64 {
     20
+}
+fn default_post_live_max_idle() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Deserialize)]

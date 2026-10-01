@@ -158,7 +158,9 @@ pulse-cutover status --config ceremony.toml
 
 Read-only. Replays the journal and prints the current state plus the pinned
 facts (cut block, snapshot hash...). 'no journal' means the ceremony was
-never started on this config.
+never started on this config. After LIVE it also asks the target for its head
+and prints `target_live: ok|FAILING (...)` (failing after
+target.post_live_max_idle_secs without a new block; nothing is rolled back).
 
 EXAMPLES
   pulse-cutover status --config /etc/pulse-cutover/ceremony.toml";
@@ -661,6 +663,17 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     }
     if let Some(c) = &recovered.accepted_target_chain_id {
         println!("target_chain_id: {c} (differs from the source: accepted by rehearsal_allow_chain_id_change)");
+    }
+    // After LIVE: is the target still producing? (reporting only; never an action)
+    let summary = pulse_cutover::beacon::journal_summary(&cfg.journal_path);
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(5)).build();
+    if let Some(c) = pulse_cutover::live_watch::check(&cfg, &summary, Some(&agent), false) {
+        let detail = c["detail"].as_str().unwrap_or("");
+        if c["ok"].as_bool() == Some(true) {
+            println!("target_live: ok ({detail})");
+        } else {
+            println!("target_live: FAILING ({detail}). Not rolled back: after LIVE that is an operator decision");
+        }
     }
     // cutover.sh reads this: once ignition may have started, a local rollback is refused.
     println!("ignition_started: {}", if recovered.reached_ignited { "yes" } else { "no" });

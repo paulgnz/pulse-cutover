@@ -673,6 +673,15 @@ hyperion  ARMED → FROZEN → SNAPSHOTTED → VERIFIED → IGNITED* → FLIPPED
 - **LIVE** — local target head keeps advancing for `live_sustain_secs` (default 60) with no gap over
   `live_max_gap_secs` (20); in bp mode `on_live` flips the edge first and must succeed, in api mode the
   flip already happened at FLIPPED. It is still a local check, not all-validator health or inclusion.
+- **After LIVE** (reporting only) — the beacon and `pulse-cutover status` keep asking the target for
+  its head. Once no new block has appeared for `target.post_live_max_idle_secs` (default 60; 0 = off),
+  or the optional `target.post_live_probe_cmd` (run by the beacon at most every 30 s, 5 s timeout,
+  exit 0 = healthy) fails, the HEALTH check `target_live` fails ("no new block for N s since LIVE")
+  and mission control shows the node red; `status` prints `target_live: FAILING (...)`. PulseVM
+  builds blocks only when there are transactions, so on a chain with traffic a still head means
+  admitted transactions are not being included (stage-2 run 2: the chain stopped two seconds
+  after LIVE while everything still said LIVE). Nothing is rolled back after LIVE: that is an
+  operator decision.
 
 Every transition is an fsynced JSONL journal line with timestamps and evidence
 (hashes, block ids, fingerprints, durations). A restarted agent resumes from the

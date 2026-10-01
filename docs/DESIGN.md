@@ -227,6 +227,7 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 | Target block id at H ≠ cut block id, or not verifiable with `require_lineage_check` | lineage check | VERIFIED | halt |
 | `post_ignite` fails; head never passes H + `live_blocks`; a gap over `live_max_gap_secs` in the sustain window; `on_live` fails | LIVE gate | IGNITED / FLIPPED | halt |
 | Hyperion does not hydrate; flip command fails; public URL does not serve the target; `/v2` gate fails; source stop fails | api/hyperion stages | IGNITED / FLIPPED | halt |
+| No new target block for `post_live_max_idle_secs`, or `post_live_probe_cmd` fails | beacon / `status` after LIVE | LIVE | reported only: HEALTH check `target_live` fails (mission control red); never an automatic rollback |
 | Agent crash | journal replay | any | resume the current step; halt if `ignite_started` has no IGNITED |
 | Operator `rollback` after ignition | `past_point_of_no_return` | IGNITED+ | refused (exit 3) unless `--force-after-ignite`, which fences this box's target first |
 

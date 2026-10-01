@@ -75,6 +75,12 @@ quorum_timeout_secs = 300
 # for the testnet accounts there is no traffic, so the sustained-LIVE window is off.
 live_sustain_secs = 0
 auto_rollback = true
+# After LIVE (reporting only): the beacon/status flag `target_live` red once no new block has
+# appeared for this long. Without traffic the chain idles by design, so on a rig without test
+# traffic either raise it or set 0. Optional probe (exit 0 = healthy), e.g. a script that sends
+# a heartbeat transaction and checks it was included:
+post_live_max_idle_secs = 120
+# post_live_probe_cmd = "/root/stage2/probe-inclusion.sh {blockchain_id}"
 
 [flip]
 # A local nginx in front of side A plays "the public endpoint". The flip script
