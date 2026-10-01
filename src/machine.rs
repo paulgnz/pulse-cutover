@@ -69,6 +69,7 @@ pub struct Machine<'a, O: ChainOps> {
     rollback_pending: bool,
     /// Upstream backend: the Metal blockchain id create_chain_cmd created (journaled at once).
     target_blockchain_id: Option<String>,
+    target_subnet_id: Option<String>,
     /// Upstream backend: create_chain_cmd was started (journaled before it ran).
     create_chain_started: bool,
     /// REHEARSAL ONLY: the different target chain_id `rehearsal_allow_chain_id_change` accepted.
@@ -180,6 +181,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             rollback_steps_done,
             rollback_pending,
             target_blockchain_id: recovered.target_blockchain_id,
+            target_subnet_id: recovered.target_subnet_id,
             create_chain_started,
             accepted_target_chain_id: recovered.accepted_target_chain_id,
             boot_hashes: (recovered.boot_manifest_sha256, recovered.boot_genesis_sha256, recovered.boot_chain_config_sha256),
@@ -1747,6 +1749,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         };
         let (manifest, genesis, chain_config) = upstream::boot_paths(up, h);
         let checkpoint = up.work_dir.join(format!("checkpoint-{h}.bin"));
+        if let Some(sid) = self.target_subnet_id.clone() {
+            self.ops.bind_target(&[("subnet_id".into(), sid)]);
+        }
         self.ops.bind_target(&[
             ("blockchain_id".into(), bid),
             ("chain_config".into(), chain_config.display().to_string()),
@@ -1853,6 +1858,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.journal.evidence(State::Verified, json!({"target_blockchain_id": bid, "target_subnet_id": subnet,
                 "create_chain_output": out}))?;
             self.target_blockchain_id = Some(bid);
+            self.target_subnet_id = subnet;
         }
         self.bind_target_vars();
         let bid = self.target_blockchain_id.clone().expect("set above");

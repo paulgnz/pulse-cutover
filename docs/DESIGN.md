@@ -72,8 +72,8 @@ stateDiagram-v2
     [*] --> ARMED: preflight ok
     ARMED --> FROZEN: head ≥ H − lead (producer) · LIB ≥ H (api)
     FROZEN --> SNAPSHOTTED: snapshot of exactly H · pause · quiescence · burn-off = 0
-    SNAPSHOTTED --> VERIFIED: sha256 · dual import · goldens · staged
-    VERIFIED --> IGNITED: fleet gate · ignite_started · chain_id + block id at H
+    SNAPSHOTTED --> VERIFIED: fork: sha256 · dual import · goldens · staged / upstream: #61 tools · boot artifacts
+    VERIFIED --> IGNITED: fleet gate · (upstream: create_chain) · ignite_started · chain_id + block id at H
     IGNITED --> LIVE: producer: head > H, sustained · on_live
     IGNITED --> FLIPPED: api: /v1 (+ /v2) flipped and healthy
     FLIPPED --> LIVE: source stopped · still healthy · sustained · on_live
@@ -96,6 +96,17 @@ stateDiagram-v2
   adds FLIPPED, because the source nodeos keeps serving reads until after the public flip.
   Hyperion mode is API mode plus a hydration gate inside IGNITED and a `/v2` flip in the same
   stage. The README's "How it works" section has the per-state detail.
+- **Upstream backend.** SNAPSHOTTED → VERIFIED runs the #61 pipeline (export, import, 19-table
+  compare, state fingerprint) and, when ignition is configured, builds the boot artifacts:
+  the boot manifest anchored on the FULL packed cut block (its computed id must equal the cut
+  block id), the migration genesis and the chain config, all hashed into the journal. In
+  VERIFIED: refuse XPR mainnet while `ignite_pending_reasons()` is non-empty, journal those
+  reasons as warnings otherwise, re-hash the artifacts, run the fleet gate, then
+  `create_chain_cmd` (journaled as a side effect before it runs; its blockchain id journaled
+  the moment it is printed, reused on resume, never created twice), bind `{blockchain_id}` /
+  `{subnet_id}` / … into the target RPC, ignite command and hooks, install the chain config,
+  and only then `ignite_started`. Rehearsal-only overrides (compare allowlist, target chain_id
+  change) are refused for mainnet and journaled wherever they act.
 - **ABORTED** is reachable only before `ignite_started` is journaled. It resumes the source
   producer (producer mode, if `target.auto_rollback`), restarts the source and reverts flips
   (API mode, if they ran), runs `on_abort`, and moves the staged snapshot aside. The rollback
@@ -137,7 +148,7 @@ freeze_strategy = "schedule_at_h"  # R1; "pause_at_h" is single-producer rehears
 freeze_lead_blocks = 24            # writes close this many blocks before H
 quiescence_polls = 6               # R4
 quiescence_timeout_secs = 120      # R4: abort if head never stops after the pause
-import_backend = "fork"            # | "upstream" (stops after VERIFIED, see README)
+import_backend = "fork"            # | "upstream" (ignites from the #61 checkpoint when configured, see README)
 # allow_inexact_cut / simulate_freeze: rehearsal-only escapes from exact H, journaled loudly
 
 [source]
@@ -185,7 +196,7 @@ downloaded from anyone. What is still missing (signed per-producer votes, thresh
 coordinator keys, a durable certificate) is listed in ATOMICITY Known limits #1 and #3 and
 designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 
-## 5. Failure and rollback table (rc.11)
+## 5. Failure and rollback table (rc.11, upstream ignition rows added)
 
 "Abort" = ABORTED with rollback (§3). "Halt" = HALTED, sealed, nothing reverted.
 
@@ -203,10 +214,15 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 | Any transaction in H+1…pause, or an unreadable block | burn-off audit | FROZEN | abort |
 | sha256 ≠ manifest; imported head, chain_id or block id ≠ the pinned cut; fingerprints ≠ goldens; staged copy hash differs | verify | SNAPSHOTTED | abort |
 | Two imports disagree | dual import (R9) | SNAPSHOTTED | abort; a VM bug to report upstream |
-| Upstream backend reaches VERIFIED | by design | VERIFIED | abort with the list of remaining upstream prerequisites |
+| Upstream: export/import/fingerprint fails; sidecar missing or inconsistent; artifact not bound to the cut; `xpr_19_table_compare` fails (on a table not in `rehearsal_allow_compare_mismatch`, or naming no table) | upstream pipeline | SNAPSHOTTED | abort |
+| Upstream: the full cut block cannot be fetched, does not pack, or its computed id ≠ the cut block id; boot artifacts cannot be written | boot artifacts | SNAPSHOTTED | abort |
+| Rehearsal override configured for XPR mainnet | config load / preflight | — / ARMED | refused / abort |
+| Upstream, verify-only config (no `genesis_base` + `create_chain_cmd`); XPR mainnet while `ignite_pending_reasons()` is non-empty | upstream ignite preflight | VERIFIED | abort with the remaining list |
+| Upstream: a boot artifact missing or changed since VERIFIED | re-hash | VERIFIED | abort |
 | Fleet does not agree before `fleet_timeout_secs` | fleet gate | VERIFIED | abort |
+| Upstream: `create_chain_cmd` fails or prints no `BLOCKCHAIN_ID=`; a previous run started it without journaling an id; the chain config cannot be installed | create_chain | VERIFIED | abort (a chain created but never ignited must be retired) |
 | — `ignite_started` journaled — | | | |
-| Ignite command fails; target not up before `quorum_timeout_secs`; target chain_id ≠ source | ignition | VERIFIED | halt |
+| Ignite command fails; target not up before `quorum_timeout_secs`; target chain_id ≠ source (unless `rehearsal_allow_chain_id_change`: accepted, both ids journaled) | ignition | VERIFIED | halt |
 | Target block id at H ≠ cut block id, or not verifiable with `require_lineage_check` | lineage check | VERIFIED | halt |
 | `post_ignite` fails; head never passes H + `live_blocks`; a gap over `live_max_gap_secs` in the sustain window; `on_live` fails | LIVE gate | IGNITED / FLIPPED | halt |
 | Hyperion does not hydrate; flip command fails; public URL does not serve the target; `/v2` gate fails; source stop fails | api/hyperion stages | IGNITED / FLIPPED | halt |

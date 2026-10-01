@@ -15,6 +15,13 @@
 //!   manifest.json source_block_id       == the pinned cut block id
 //!   manifest.json checkpoint_revision   == the pinned cut height
 //!
+//! Ignition from the checkpoint (PulseVM v1.0.0): `build_boot_artifacts` writes the boot
+//! manifest (checkpoint manifest + the FULL packed source cut block, bound to the cut by its
+//! computed id), the migration genesis and the chain config; the machine then runs
+//! `target.create_chain_cmd` and ignites. Refused for XPR mainnet while
+//! `ignite_pending_reasons()` is non-empty; rehearsal-only overrides cover the known v1.0.0
+//! gaps (`rehearsal_allow_compare_mismatch`, `rehearsal_allow_chain_id_change`).
+//!
 //! The fork importer plays NO verification role here (its equivalence to #61
 //! was established once, by the published cross-check — see the README's
 //! "Import backends"); `[upstream] fork_audit = true` can journal its

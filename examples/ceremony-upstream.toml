@@ -5,10 +5,11 @@
 # the 2026-09 run: dockerized pinned Leap (nodeos:5.0.3 image) for export,
 # the #61 example binaries for import/verify.
 #
-# Status: verification-complete, ignition pending — an upstream-mode ceremony
-# runs export -> import -> 19-table compare -> state fingerprint, then stops
-# after VERIFIED with the precise remaining list in the journal (the
-# checkpoint-consuming node only exists on the unmerged #61 branch).
+# This file is VERIFY-ONLY: it runs export -> import -> 19-table compare ->
+# state fingerprint, then stops after VERIFIED (source resumed) with what still
+# blocks a mainnet ignite in the journal. To ignite from the checkpoint, set
+# [upstream] genesis_base + [target] create_chain_cmd — see
+# examples/ceremony-upstream-rehearsal.toml (PulseVM v1.0.0, rehearsal overrides).
 #
 # Prep on the box (once):
 #   git clone https://github.com/MetalBlockchain/pulsevm /root/pr61 \

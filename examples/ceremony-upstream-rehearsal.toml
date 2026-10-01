@@ -1,0 +1,121 @@
+# =============================================================================
+# REHEARSAL ONLY: a full upstream-backend ceremony (ARMED -> FROZEN -> SNAPSHOTTED
+# -> VERIFIED -> IGNITED -> FLIPPED -> LIVE) on PulseVM v1.0.0 + metalgo
+# v1.14.2-tahoe, booting the target from the official #61 checkpoint.
+#
+# The shape of the "stage 2" rig: one box, side A = Leap 5.0.3 nodeos in docker
+# synced to the XPR TESTNET (api mode: it does not produce, so the freeze is
+# simulated at LIB >= H), side B = metalgo on a local network with the PulseVM
+# v1.0.0 plugin, the /v1 edge (gateway/server.js) and the federator.
+#
+# This file turns on BOTH rehearsal overrides. They are refused for XPR mainnet,
+# shown by `status`, journaled at ARMED/VERIFIED/LIVE, and reported by the beacon
+# as the failing setup check `rehearsal_overrides` (mission control labels it
+# "REHEARSAL OVERRIDES ACTIVE"). A run with them is never a valid cutover.
+#
+# Prep on the box (once):
+#   - PulseVM v1.0.0 examples: cargo build --release --examples -p pulsevm_database
+#     (xpr_import_check, xpr_19_table_compare, xpr_state_fingerprint)
+#   - the export image: Leap 5.0.3 + upstream's deferred-sidecar plugin
+#     (tools/xpr-chainbase-export/install-deferred-sidecar-plugin.sh), tagged leap-sidecar:5.0.3
+#   - side A: nodeos with p2p peers on the testnet (it must keep syncing: the cut lands
+#     at its finality near H), producer_api on 127.0.0.1 only, snapshots dir mounted
+#   - a create-chain helper (e.g. built from metalgo's
+#     wallet/subnet/primary/examples/create-chain) that issues CreateSubnetTx +
+#     CreateChainTx for the PulseVM VM id with the genesis file it is given, and prints
+#     SUBNET_ID=<id> and BLOCKCHAIN_ID=<id>
+#   - the metalgo user must be able to read upstream.work_dir (checkpoint + boot manifest)
+# =============================================================================
+
+journal_path = "/root/stage2-run/journal.jsonl"
+poll_ms = 250
+
+[ceremony]
+mode = "api"
+# A few hundred blocks ahead of the testnet's LIB at the time you start.
+freeze_height = 0
+freeze_margin = 240
+derive_h_at_arm = true
+simulate_freeze = true
+chain_id = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"   # XPR testnet
+import_backend = "upstream"
+# REHEARSAL OVERRIDE: PulseVM v1.0.0 signs with metalgo's blockchain id, not the
+# source chain_id. Without this, the post-ignition chain_id check HALTS.
+rehearsal_allow_chain_id_change = true
+
+[source]
+rpc_url = "http://127.0.0.1:8888"
+producer_api_url = "http://127.0.0.1:8888"
+snapshot_timeout_secs = 900
+# Graceful stop/start of the side A container (never `docker rm -f`: it dirties the db).
+stop_cmd = "docker stop -t 120 sideA"
+start_cmd = "docker start sideA"
+
+[snapshot]
+# Not used to boot in upstream mode, but still checked to be absent (R12).
+staged_path = "/root/stage2-run/staged.bin"
+# nodeos reports its snapshot path inside the container: map it to the host.
+path_map_from = "/data/snapshots"
+path_map_to = "/root/sideA/data/snapshots"
+
+[target]
+metalgo_unit = "metalgo-stage2"
+# {blockchain_id} is bound when create_chain_cmd prints it.
+rpc_url = "http://127.0.0.1:9650/ext/bc/{blockchain_id}/rpc"
+# Runs after VERIFIED and the fleet gate, BEFORE ignite_started (failure = abort,
+# source untouched). Must print BLOCKCHAIN_ID=<id> (and SUBNET_ID=<id>).
+create_chain_cmd = "/root/stage2/create-chain --genesis {genesis}"
+# metalgo --chain-config-dir: the agent installs <dir>/<blockchain_id>/config.json.
+chain_config_dir = "/root/.metalgo/configs/chains"
+# Ignition: make metalgo track the new subnet and restart it (chain configs are read at
+# start). The default would be `systemctl restart metalgo-stage2`.
+ignite_cmd = "/root/stage2/ignite.sh {subnet_id}"
+quorum_timeout_secs = 300
+# The imported chain only builds blocks when transactions arrive; with no test keys
+# for the testnet accounts there is no traffic, so the sustained-LIVE window is off.
+live_sustain_secs = 0
+auto_rollback = true
+
+[flip]
+# A local nginx in front of side A plays "the public endpoint". The flip script
+# repoints the edge at /ext/bc/{blockchain_id} (restarts the edge unit) and swaps
+# nginx from :8888 to the edge on :8899; revert swaps it back.
+cmd = "/root/stage2/flip.sh {blockchain_id}"
+revert_cmd = "/root/stage2/revert.sh"
+public_url = "http://127.0.0.1:8080"
+health_polls = 4
+head_tolerance = 8
+health_timeout_secs = 120
+
+[upstream]
+work_dir = "/root/stage2-run/upstream"
+# export.sh as validated on the rig (Leap 5.0.3 + deferred-sidecar plugin image).
+export_cmd = """docker run --rm --network none -v {export_dir}:/out -v {snapshot}:/in/cut.bin:ro \
+-v /root/pulsevm/tools/xpr-chainbase-export:/xce:ro --entrypoint bash leap-sidecar:5.0.3 \
+-c '/xce/export.sh --nodeos /usr/local/bin/nodeos --xpr-core /src/leap --snapshot /in/cut.bin \
+--work-dir /out/export --chain-state-db-size-mb 8192 --timeout-seconds 1800 \
+--deferred-sidecar /out/export-sidecar/deferred-transactions.json'"""
+import_bin      = "/root/pulsevm/target/release/examples/xpr_import_check"
+compare_bin     = "/root/pulsevm/target/release/examples/xpr_19_table_compare"
+fingerprint_bin = "/root/pulsevm/target/release/examples/xpr_state_fingerprint"
+# REHEARSAL OVERRIDE: v1.0.0's compare fails on exactly these two tables (upstream
+# regression in crates/pulsevm_chaindb/src/history.rs). The compare still runs, its full
+# output is journaled, and any OTHER failing table still aborts.
+rehearsal_allow_compare_mismatch = ["contract_index_double", "global_property"]
+# Base migration genesis: initial_timestamp, initial_key, initial_configuration. The agent
+# adds migration_checkpoint_sha256 and writes migration-genesis-<cut>.json.
+genesis_base = "/root/stage2/genesis-base.json"
+# Base chain config (e.g. {"system_account":"eosio","native_system_contract":false,
+# "producer_name":"<the genesis producer>"}); the agent adds migration_checkpoint and
+# migration_manifest and writes chain-config-<cut>.json.
+chain_config_base = "/root/stage2/chain-config-base.json"
+# The full cut block comes from side A by default (it synced past the cut). If the local
+# source cannot serve get_block at the cut, point this at any testnet /v1 endpoint: the
+# agent packs the block itself and requires its id to equal the pinned cut block id.
+# source_block_rpc_url = "https://<a testnet API endpoint>"
+
+[hooks]
+on_freeze = "/root/stage2/freeze-writes.sh"
+on_abort = "/root/stage2/reopen-writes.sh"
+on_halt = "/root/stage2/page.sh"
+timeout_secs = 300

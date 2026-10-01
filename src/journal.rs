@@ -104,6 +104,8 @@ pub struct Recovered {
     /// `target_blockchain_id`, journaled the moment it is known): a resumed agent reuses it and
     /// never creates a second chain.
     pub target_blockchain_id: Option<String>,
+    /// Upstream backend: the subnet create_chain_cmd reported (`target_subnet_id`), if any.
+    pub target_subnet_id: Option<String>,
     /// REHEARSAL ONLY: a target chain_id different from the source's that
     /// `rehearsal_allow_chain_id_change` accepted at IGNITED (evidence `accepted_target_chain_id`).
     pub accepted_target_chain_id: Option<String>,
@@ -432,6 +434,7 @@ impl Journal {
             }
             for (key, slot) in [
                 ("target_blockchain_id", &mut out.target_blockchain_id),
+                ("target_subnet_id", &mut out.target_subnet_id),
                 ("accepted_target_chain_id", &mut out.accepted_target_chain_id),
                 ("boot_manifest_sha256", &mut out.boot_manifest_sha256),
                 ("boot_genesis_sha256", &mut out.boot_genesis_sha256),

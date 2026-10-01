@@ -1130,21 +1130,65 @@ selected by `[ceremony] import_backend = "fork" | "upstream"`:
   Every artifact is bound back to the ceremony's pinned cut: the export
   manifest's `INPUT_SNAPSHOT_SHA256` must equal the cut snapshot's hash, and
   the checkpoint manifest's `source_block_id`/`checkpoint_revision` must
-  equal the pinned cut block id/height. **Upstream verification is not
-  upstream ignition:** #61 is merged and PulseVM v1.0.0 is tagged, but this
-  agent's ignition from the upstream checkpoint is not wired yet, so an
-  upstream-mode ceremony deliberately stops after VERIFIED with the remaining
-  list in the journal. Config: `[upstream]` (work_dir, export_cmd, import_bin,
+  equal the pinned cut block id/height. Config: `[upstream]` (work_dir, export_cmd, import_bin,
   compare_bin, fingerprint_bin) — see `src/config.rs` for the documented
-  fields and `examples/ceremony-upstream.toml` for a working shape.
+  fields and `examples/ceremony-upstream.toml` for a verify-only shape.
+
+  **Ignition from the checkpoint** (PulseVM v1.0.0 + metalgo v1.14.2-tahoe) is on when
+  `[upstream] genesis_base` and `[target] create_chain_cmd` are both set (without them the
+  ceremony is verify-only and stops after VERIFIED, source resumed). It follows how the
+  node actually boots a migrated chain, as found on the stage-2 rig:
+  1. *Before VERIFIED* (abortable), the agent fetches the **full** cut block (every
+     transaction receipt) from the source with `get_block` (or `upstream.source_block_rpc_url`),
+     packs it into the wire `signed_block` itself and requires its computed id to equal the
+     pinned cut block id. Upstream's `xpr_attach_source_block` refuses a boundary block with
+     transactions and a block emptied of them fails the controller's `transaction_mroot`
+     check; the controller accepts the complete block (the Rust packer reproduces the rig's
+     accepted anchor byte for byte). It then writes `boot-<cut>.manifest.json` (checkpoint
+     manifest + `source_block`), `migration-genesis-<cut>.json` (`genesis_base` +
+     `migration_checkpoint_sha256`) and `chain-config-<cut>.json` (`chain_config_base` +
+     `migration_checkpoint` + `migration_manifest`), and journals their hashes.
+  2. *After the fleet gate, before `ignite_started`*, the hashes are re-checked and
+     `create_chain_cmd` runs (`{genesis}`, `{chain_config}`, `{manifest}`, `{checkpoint}`,
+     `{genesis_sha256}`, `{cut_height}`). It creates the subnet + blockchain on Metal (the
+     coordinator's / validators' job in production, a helper with the local network key on a
+     rig) and prints `BLOCKCHAIN_ID=<id>` (and `SUBNET_ID=<id>`); the id is journaled at once
+     and a resumed agent never creates a second chain. A failure aborts and resumes the source.
+  3. From then on `{blockchain_id}`, `{subnet_id}`, `{chain_config}`, … expand in
+     `target.rpc_url` (`…/ext/bc/{blockchain_id}/rpc`), `ignite_cmd` and every hook.
+     `target.chain_config_dir` (metalgo `--chain-config-dir`) gets `<id>/config.json`;
+     `ignite_cmd` makes metalgo track `{subnet_id}` and restarts it. `ignite_started` is
+     journaled before it runs, so any failure from here HALTS (sealed), as for the fork backend.
+  4. The target must come up at the cut height with the cut block id (lineage) and the source
+     chain_id. The edge reaches the node as `/ext/bc/<id>/v1/chain?route=/v1/chain/<m>`.
+
+  An upstream ignite is **refused for XPR mainnet** while `upstream::ignite_pending_reasons()`
+  is non-empty (the signing chain_id is not pinned to the source's, and TAPOS is not
+  enforced); on any other chain those reasons are journaled as warnings at every ignite.
+
+  **Rehearsal-only overrides** for the known v1.0.0 gaps (refused at config load for the XPR
+  mainnet chain_id and again at ARM if the source turns out to be mainnet; listed by
+  `status`, journaled at ARMED/VERIFIED/LIVE, reported by the beacon as the failing setup
+  check `rehearsal_overrides`, labeled on mission control):
+  - `[upstream] rehearsal_allow_compare_mismatch = ["contract_index_double", "global_property"]`:
+    v1.0.0's `xpr_19_table_compare` fails on those two tables (an upstream regression in
+    `crates/pulsevm_chaindb/src/history.rs`). The compare still runs and its full output is
+    journaled; it passes only if every failing table it names is listed, and any other
+    failing table (or a failure naming none) still aborts.
+  - `[ceremony] rehearsal_allow_chain_id_change = true`: the target signs with metalgo's
+    blockchain id, not the source chain_id; the post-ignition check accepts the different id
+    and journals both (without it, that check HALTS). Clients must sign for the target id.
+
+  `examples/ceremony-upstream-rehearsal.toml` is the full rehearsal shape (api mode against the
+  live testnet, both overrides).
 
 - **`fork` — the interim bridge (today's default).** Our
   `feat/arena-snapshot-import` branch reads the Leap `.bin` directly and the
   target chain boots via `snapshot_path`; verification is the dual
   fresh-arena import + 19-table fingerprints. It is the default **only
-  because it is the path that can actually IGNITE today**; once upstream
-  ignition is wired and qualified, the default flips to `upstream` and the
-  fork path is slated for retirement. Its correctness was established by a **one-time
+  until the upstream ignition above is rehearsed end to end and the mainnet
+  gaps close** (chain_id pinning, TAPOS, the v1.0.0 compare regression); then
+  the default flips to `upstream` and the fork path is slated for retirement. Its correctness was established by a **one-time
   published cross-check** against the #61 pipeline — byte-identical state,
   row order included, on every table both implementations carry, measured
   with upstream's own tools
@@ -1204,8 +1248,10 @@ what testers get out of it.
 - Default import backend is still the fork path (`paulgnz/pulsevm`,
   `feat/arena-snapshot-import`), an interim bridge: the official migration
   path (MetalBlockchain/pulsevm#61) is merged, and `import_backend = "upstream"`
-  drives it through VERIFIED; igniting from the upstream checkpoint waits for
-  a PulseVM release that boots from it (see "Import backends").
+  drives it through VERIFIED and can ignite from the checkpoint on PulseVM v1.0.0
+  (unit/integration-tested; a full ceremony on real services has not run yet). On
+  v1.0.0 that needs both rehearsal-only overrides, and it is refused for mainnet
+  (see "Import backends").
 - Multi-producer: proven LIVE across 5 BPs with a **shared** target producer
   identity (field note 6). Per-BP producer keys on the migrated chain need an
   upstream change.

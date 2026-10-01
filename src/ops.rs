@@ -651,7 +651,12 @@ impl ChainOps for HttpOps {
     }
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
-        run_shell_timeout_tracked(cmd, self.hook_timeout, self.pgid_file.as_deref())
+        // Once the upstream backend has created the target chain, `{blockchain_id}`,
+        // `{subnet_id}`, `{chain_config}`, … expand in every hook (e.g. a flip script that points
+        // the edge at /ext/bc/<id>). Before that they are left as written.
+        let vars = self.target_vars.lock().map(|v| v.clone()).unwrap_or_default();
+        let cmd = expand_placeholders(cmd, &vars);
+        run_shell_timeout_tracked(&cmd, self.hook_timeout, self.pgid_file.as_deref())
     }
 
     fn kill_orphan_hooks(&self) -> Result<Option<String>, String> {
@@ -701,6 +706,8 @@ mod placeholder_tests {
         assert_eq!(ops.target_url().unwrap(), "http://127.0.0.1:9650/ext/bc/2YXV/rpc");
         let vars = ops.target_vars.lock().unwrap().clone();
         assert_eq!(expand_placeholders(&ops.ignite_cmd, &vars), "install /w/cc.json 2YXV && systemctl restart metalgo");
+        // Every hook expands them too (a flip script repointing the edge at the new chain).
+        assert_eq!(ops.run_hook("echo /ext/bc/{blockchain_id}").unwrap(), "/ext/bc/2YXV");
         // Re-binding replaces, never duplicates.
         ops.bind_target(&[("blockchain_id".into(), "3ABC".into())]);
         assert_eq!(ops.target_url().unwrap(), "http://127.0.0.1:9650/ext/bc/3ABC/rpc");

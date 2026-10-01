@@ -652,6 +652,9 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     if let Some(b) = &recovered.target_blockchain_id {
         println!("target_blockchain_id: {b}");
     }
+    if let Some(s) = &recovered.target_subnet_id {
+        println!("target_subnet_id: {s}");
+    }
     if let Some(c) = &recovered.accepted_target_chain_id {
         println!("target_chain_id: {c} (differs from the source: accepted by rehearsal_allow_chain_id_change)");
     }

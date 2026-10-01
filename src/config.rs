@@ -275,9 +275,10 @@ pub struct Ceremony {
     ///   full-state log, `xpr_import_check` hydrates it into an Arena
     ///   checkpoint, and verification uses upstream's OWN tools
     ///   (`xpr_19_table_compare` + `xpr_state_fingerprint`). Requires the
-    ///   `[upstream]` section. IGNITED from the checkpoint is pending the
-    ///   #61 merge (the ceremony stops after VERIFIED with a precise
-    ///   explanation of what remains).
+    ///   `[upstream]` section. Ignition from the checkpoint needs
+    ///   `upstream.genesis_base` + `target.create_chain_cmd` (without them the
+    ///   ceremony is verify-only and stops after VERIFIED); it is refused for
+    ///   XPR mainnet while `upstream::ignite_pending_reasons()` is non-empty.
     #[serde(default)]
     pub import_backend: ImportBackend,
     /// REHEARSAL ONLY (default false). With the upstream backend the target signs with metalgo's
@@ -659,7 +660,10 @@ pub struct Target {
     pub create_chain_cmd: Option<String>,
     /// Upstream backend, optional: metalgo's `--chain-config-dir`. When set, the agent installs
     /// the chain config it built as `<dir>/<blockchain_id>/config.json` right before ignition
-    /// (otherwise `ignite_cmd` must do it; it receives `{blockchain_id}` and `{chain_config}`).
+    /// (otherwise `ignite_cmd` must do it). Once the chain exists, `{blockchain_id}`,
+    /// `{subnet_id}`, `{chain_config}`, `{genesis}`, `{manifest}`, `{checkpoint}` and
+    /// `{cut_height}` expand in `target.rpc_url`, `ignite_cmd` and every hook (e.g. ignite must
+    /// make metalgo track `{subnet_id}`; a flip script repoints the edge at `/ext/bc/{blockchain_id}`).
     #[serde(default)]
     pub chain_config_dir: Option<PathBuf>,
 }

@@ -3516,6 +3516,7 @@ fn upstream_ignites_from_the_checkpoint_and_reaches_live() {
     let installed = dir.path().join("chain-configs").join(BLOCKCHAIN_ID).join("config.json");
     assert_eq!(std::fs::read_to_string(installed).unwrap(), std::fs::read_to_string(verified["boot"]["chain_config"].as_str().unwrap()).unwrap());
     assert!(ops.ignite_vars.borrow().iter().any(|(k, v)| k == "blockchain_id" && v == BLOCKCHAIN_ID));
+    assert!(ops.ignite_vars.borrow().iter().any(|(k, v)| k == "subnet_id" && v == "2qFyanyVDk2LKrUsUdh3JjtYJYZGqUg9y9QAvMaWdQZZGaLiXY"));
     // Mainnet gaps journaled as warnings; no overrides; same chain_id end to end.
     assert!(e.iter().any(|v| v["data"]["upstream_ignite_warnings"].to_string().contains("TAPOS")));
     let live = &transition(&e, "LIVE").unwrap()["data"];
@@ -3870,4 +3871,20 @@ network = "rehearsal"
     assert!(out.contains("rehearsal_overrides: none"), "{out}");
     let (_, out) = run(&without, &["beacon"]);
     assert!(!out.contains("\"rehearsal_overrides\""), "{out}");
+}
+
+#[test]
+fn upstream_example_configs_load_and_the_rehearsal_one_refuses_mainnet() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["ceremony-upstream.toml", "ceremony-upstream-rehearsal.toml"] {
+        let text = std::fs::read_to_string(format!("{}/examples/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let cfg = load_toml(dir.path(), name, &text).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let rehearsal = name.contains("rehearsal");
+        assert_eq!(!cfg.rehearsal_overrides().is_empty(), rehearsal, "{name}");
+        if rehearsal {
+            assert!(cfg.upstream.as_ref().unwrap().ignite_configured(&cfg.target));
+            let mainnet = text.replace("71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd", MAINNET);
+            assert!(load_toml(dir.path(), "m.toml", &mainnet).unwrap_err().contains("MAINNET"));
+        }
+    }
 }
