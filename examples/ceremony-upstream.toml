@@ -24,8 +24,9 @@ poll_ms = 250
 
 [ceremony]
 freeze_height = 12345
-import_cpu_scale = 143
 import_backend = "upstream"
+# import_cpu_scale: not used by this backend (PulseVM v1.0.0 has no import CPU scale). Leave it
+# unset; a non-default value only warns, and must match a coordinator event that carries one.
 
 [source]
 rpc_url = "http://127.0.0.1:8888"

@@ -4,6 +4,7 @@
 //   node control/coord.mjs keygen --out coordinator.pem          # prints the public key (hex) for configs
 //   node control/coord.mjs event --url https://control… --net rehearsal --chain-id <hex> --h 9000 \
 //        --lead 24 --cpu-scale 143 --key coordinator.pem [--event-id ev-…]
+//        (--cpu-scale none omits import_cpu_scale: use it for import_backend = "upstream", where it does nothing)
 //   node control/coord.mjs arm   --url … --net rehearsal --event-id ev-… --key coordinator.pem --event-file ev-….event.json
 //   node control/coord.mjs abort --url … --net rehearsal --event-id ev-… --key coordinator.pem --event-file ev-….event.json
 //
@@ -47,7 +48,7 @@ if (cmd !== 'event') {
 }
 const payload = JSON.stringify(cmd === 'event'
   ? { v: 1, type: 'event', network: a.net, event_id: a['event-id'] || `ev-${Date.now().toString(36)}`, chain_id: a['chain-id'], h: +a.h,
-      freeze_lead_blocks: +(a.lead || 24), import_cpu_scale: +(a['cpu-scale'] || 143), issued_at_ms: Date.now() }
+      freeze_lead_blocks: +(a.lead || 24), ...(a['cpu-scale'] === 'none' ? {} : { import_cpu_scale: +(a['cpu-scale'] || 143) }), issued_at_ms: Date.now() }
   : { v: 1, type: cmd, network: a.net, event_id: a['event-id'], event_hash: eventHash, issued_at_ms: Date.now() });
 const msg = { payload, sig: sign(null, Buffer.from(payload), key).toString('hex'), key: rawPub(key) };
 if (cmd === 'event') { const f = `${JSON.parse(payload).event_id}.event.json`; writeFileSync(f, JSON.stringify(msg, null, 1)); console.error(`saved the signed event to ${f} (arm/abort need it)`); }

@@ -67,6 +67,8 @@ pub fn validate_event(ev: &Value, cfg: &Config, network: &str, head: Option<u64>
     if let Some(v) = ev["freeze_lead_blocks"].as_u64() {
         if v != cfg.ceremony.freeze_lead_blocks { return Err(format!("event freeze_lead_blocks {v} ≠ local {}", cfg.ceremony.freeze_lead_blocks)); }
     }
+    // Compared whatever the backend: the field is part of the signed payload and producers must
+    // agree on it (on the upstream backend it is inert; Config::warnings says so).
     if let Some(v) = ev["import_cpu_scale"].as_u64() {
         if v != cfg.ceremony.import_cpu_scale { return Err(format!("event import_cpu_scale {v} ≠ local {}", cfg.ceremony.import_cpu_scale)); }
     }

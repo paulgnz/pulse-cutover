@@ -1794,6 +1794,40 @@ fn stage2_signed_abort_between_upstream_steps_stops_before_the_next_one() {
 }
 
 #[test]
+fn stage2_import_cpu_scale_is_reported_as_inert_on_the_upstream_backend() {
+    // Stage-2 runs 2/2b/2c: import_cpu_scale = 143 was set (and signed into the event) believing it
+    // fixed CPU billing on the target; on the upstream backend PulseVM v1.0.0 has no such setting.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let _ = upstream_test_config(dir.path(), 120);
+    let path = dir.path().join("ceremony-upstream.toml");
+    let text = std::fs::read_to_string(&path).unwrap().replace("import_backend = \"upstream\"", "import_backend = \"upstream\"\nimport_cpu_scale = 143");
+    std::fs::write(&path, text).unwrap();
+    let cfg = Config::load(&path).unwrap();
+    let w = cfg.warnings();
+    assert_eq!(w.len(), 1);
+    assert!(w[0].contains("import_cpu_scale = 143 is IGNORED"), "{w:?}");
+    // Still part of the agreement with a signed event (payload unchanged, hash-compatible).
+    let ev = |scale: u64| serde_json::json!({"type": "event", "network": "rehearsal", "h": 5000, "import_cpu_scale": scale});
+    assert!(pulse_cutover::coord::validate_event(&ev(143), &cfg, "rehearsal", None, 0).is_ok());
+    assert!(pulse_cutover::coord::validate_event(&ev(1), &cfg, "rehearsal", None, 0).unwrap_err().contains("import_cpu_scale"));
+    // Journaled at ARM as not effective, with the warning.
+    let ops = MockOps::new(dir.path(), 110);
+    let _ = run_machine_result(&cfg, &ops);
+    let e = journal_entries(&cfg);
+    let armed = &transition(&e, "ARMED").unwrap()["data"];
+    assert_eq!((armed["import_cpu_scale"].as_u64(), armed["import_cpu_scale_effective"].as_bool()), (Some(143), Some(false)));
+    assert!(e.iter().any(|v| v["state"] == "ARMED" && v["data"]["config_warning"].as_str().is_some_and(|x| x.contains("IGNORED"))));
+    // Default value on upstream, or any value on the fork backend: no warning.
+    let _ = test_config(dir.path(), 120);
+    let fork_text = std::fs::read_to_string(dir.path().join("ceremony.toml")).unwrap().replacen("[ceremony]\n", "[ceremony]\nimport_cpu_scale = 143\n", 1);
+    let fork = load_toml(dir.path(), "fork-143.toml", &fork_text).unwrap();
+    assert_eq!(fork.ceremony.import_cpu_scale, 143);
+    assert!(fork.warnings().is_empty());
+    assert!(upstream_test_config(dir.path(), 120).warnings().is_empty());
+}
+
+#[test]
 fn upstream_backend_requires_upstream_section() {
     let dir = tempfile::tempdir().unwrap();
     let toml_text = format!(

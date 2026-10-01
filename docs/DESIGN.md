@@ -143,7 +143,7 @@ poll_ms = 250
 mode = "producer"                  # | "api"
 freeze_height = 12345              # H; 0 only with derive_h_at_arm = true (rehearsals)
 chain_id = "…"                     # pinned source chain id
-import_cpu_scale = 143             # chain identity: must equal the staged PulseVM chain config
+import_cpu_scale = 143             # fork backend: chain identity, must equal the staged PulseVM chain config; upstream: ignored (warns)
 freeze_strategy = "schedule_at_h"  # R1; "pause_at_h" is single-producer rehearsal only
 freeze_lead_blocks = 24            # writes close this many blocks before H
 quiescence_polls = 6               # R4

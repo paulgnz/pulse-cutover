@@ -229,10 +229,14 @@ pub struct Ceremony {
     /// time (it is then journaled and enforced from there on).
     #[serde(default)]
     pub chain_id: Option<String>,
-    /// Import-time CPU unit conversion (metering points per source µs).
-    /// Part of the migrated chain's identity: the staged PulseVM chain config
-    /// MUST carry the same value, and fingerprint goldens are only comparable
-    /// across nodes using the same value.
+    /// Import-time CPU unit conversion (metering points per source µs). FORK BACKEND ONLY:
+    /// part of the migrated chain's identity there (the staged PulseVM chain config MUST carry
+    /// the same value, and fingerprint goldens are only comparable across nodes using the same
+    /// value). With `import_backend = "upstream"` it changes nothing on the target (PulseVM
+    /// v1.0.0 has no such setting; the #61 checkpoint carries the source's CPU limits as they
+    /// are): a non-default value only warns (at load and at ARM). It is still compared with a
+    /// coordinator event that carries `import_cpu_scale` (that field is part of the signed
+    /// payload), and it scales the fork_audit fingerprints.
     #[serde(default = "default_cpu_scale")]
     pub import_cpu_scale: u64,
     /// How writes stop at H (see docs/DESIGN.md, review finding R1):
@@ -884,6 +888,25 @@ impl Config {
                 .into());
         }
         Ok(config)
+    }
+
+    /// Settings that are accepted but do nothing in this configuration, one line each (printed at
+    /// load by the CLI and journaled at ARM). Not errors: see each case.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = vec![];
+        // Not rejected: a coordinator event may carry import_cpu_scale and every producer must
+        // hold the same value to accept it (signed payload, agreement check), so refusing a
+        // non-default here would make an inert field block the event. Warned loudly instead.
+        if self.ceremony.import_backend == ImportBackend::Upstream && self.ceremony.import_cpu_scale != default_cpu_scale() {
+            out.push(format!(
+                "ceremony.import_cpu_scale = {} is IGNORED with import_backend = \"upstream\": PulseVM v1.0.0 has no \
+                 import CPU scale (the #61 checkpoint carries the source's CPU limits unchanged). It only has to match \
+                 a coordinator event that carries it, and scales fork_audit fingerprints. It does not change CPU billing \
+                 on the target",
+                self.ceremony.import_cpu_scale
+            ));
+        }
+        out
     }
 
     /// The REHEARSAL-ONLY overrides this config turns on, one human-readable line each (empty for

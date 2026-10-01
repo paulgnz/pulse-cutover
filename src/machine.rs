@@ -302,10 +302,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     "lib_at_arm": info.last_irreversible_block_num,
                     "freeze_strategy": format!("{:?}", self.cfg.ceremony.freeze_strategy),
                     "import_cpu_scale": self.cfg.ceremony.import_cpu_scale,
+                    // The upstream backend has no import CPU scale (PulseVM v1.0.0): the value is
+                    // journaled for agreement with the event, never as if it took effect.
+                    "import_cpu_scale_effective": self.cfg.ceremony.import_backend != ImportBackend::Upstream,
                     "import_backend": format!("{:?}", self.cfg.ceremony.import_backend),
                     "rehearsal_overrides": self.cfg.rehearsal_overrides(),
                 }),
             )?;
+            for w in self.cfg.warnings() {
+                self.journal.evidence(State::Armed, json!({"config_warning": w}))?;
+                eprintln!("WARNING: {w}");
+            }
             if !self.cfg.rehearsal_overrides().is_empty() {
                 self.journal.evidence(State::Armed, json!({"REHEARSAL_OVERRIDES_ACTIVE": self.cfg.rehearsal_overrides(),
                     "note": "REHEARSAL ONLY: gates a real cut depends on are relaxed; this ceremony is not a valid cutover"}))?;

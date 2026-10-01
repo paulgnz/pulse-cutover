@@ -24,7 +24,7 @@ Human-oriented docs: **[docs/PROCESS.md](docs/PROCESS.md)** (the process, step b
    any flip/revert script, any `stop_cmd`/`start_cmd`, any restart of nodeos, metalgo, nginx or haproxy.
    Never pass the beacon's readiness-only config (`/etc/pulse-cutover/beacon.toml`) to `run`, `loop` or `await`:
    from v0.5.0-rc.5 they refuse it, but rc.4 and earlier did not.
-4. **Never change H or the target config yourself.** H, the target genesis, `import_cpu_scale` and pinned
+4. **Never change H or the target config yourself.** H, the target genesis, `import_cpu_scale` (fork backend; inert and warned about on upstream) and pinned
    versions come from the coordinator and must be identical on every producer. A mismatch = stop and tell the human.
 5. **Never skip or reorder gates.** Never ignite before VERIFIED, never flip public traffic outside the agent's
    own flip step (producer mode: the `on_live` hook, which runs *before* LIVE is journaled; api mode: the

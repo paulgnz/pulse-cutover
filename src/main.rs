@@ -361,7 +361,11 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
 
 fn load_config(args: &[String]) -> Result<Config, String> {
     let path = arg(args, "--config").ok_or("missing --config")?;
-    Config::load(&PathBuf::from(path))
+    let cfg = Config::load(&PathBuf::from(path))?;
+    for w in cfg.warnings() {
+        eprintln!("WARNING: {w}");
+    }
+    Ok(cfg)
 }
 
 fn cmd_run(args: &[String]) -> Result<(), String> {

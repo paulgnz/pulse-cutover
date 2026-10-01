@@ -1133,6 +1133,12 @@ selected by `[ceremony] import_backend = "fork" | "upstream"`:
   equal the pinned cut block id/height. Config: `[upstream]` (work_dir, export_cmd, import_bin,
   compare_bin, fingerprint_bin) — see `src/config.rs` for the documented
   fields and `examples/ceremony-upstream.toml` for a verify-only shape.
+  `[ceremony] import_cpu_scale` does **nothing** on this backend: PulseVM v1.0.0 has no import
+  CPU scale, and the checkpoint carries the source's CPU limits unchanged. A non-default value
+  is accepted (a coordinator event that carries the field must still match it on every
+  producer) but warned about at load and journaled at ARM as `config_warning`, with
+  `import_cpu_scale_effective: false` in the ARMED record. Publish upstream events with
+  `coord.mjs event --cpu-scale none` and leave the setting at its default.
 
   **Ignition from the checkpoint** (PulseVM v1.0.0 + metalgo v1.14.2-tahoe) is on when
   `[upstream] genesis_base` and `[target] create_chain_cmd` are both set (without them the
