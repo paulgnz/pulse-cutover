@@ -133,6 +133,23 @@ pub fn hyperion_hydrated(health: &serde_json::Value, cut: u64, max_lag: u64) -> 
     })
 }
 
+/// `Machine::coordinator_aborted` without borrowing the machine (the upstream pipeline polls it
+/// while its progress callback holds the journal). `last` is the rate-limit clock.
+fn coordinator_abort_poll<O: ChainOps>(cfg: &Config, ops: &O, last: &mut u64, force: bool) -> bool {
+    let Some(co) = cfg.coordination.as_ref() else { return false };
+    let Some(id) = co.event_id.as_deref() else { return false };
+    let now = ops.now_ms();
+    if !force && now.saturating_sub(*last) < 3000 {
+        return false;
+    }
+    *last = now;
+    let url = format!("{}/api/coord/{}", co.url.trim_end_matches('/'), co.network);
+    match ops.get_json(&url) {
+        Ok(Some(doc)) => crate::coord::aborted(&doc, &co.coordinator_keys, &co.network, id),
+        _ => false,
+    }
+}
+
 impl<'a, O: ChainOps> Machine<'a, O> {
     pub fn new(cfg: &'a Config, ops: &'a O, journal: Journal, recovered: Recovered) -> Self {
         let resumed = recovered.state.is_some();
@@ -491,18 +508,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// Rate-limited to one poll every 3 s; unreachable mission control = no abort (the
     /// ceremony's own gates still apply). Never consulted after IGNITED.
     fn coordinator_aborted(&mut self, force: bool) -> bool {
-        let Some(co) = self.cfg.coordination.as_ref() else { return false };
-        let Some(id) = co.event_id.as_deref() else { return false };
-        let now = self.ops.now_ms();
-        if !force && now.saturating_sub(self.last_coord_check_ms) < 3000 {
-            return false;
-        }
-        self.last_coord_check_ms = now;
-        let url = format!("{}/api/coord/{}", co.url.trim_end_matches('/'), co.network);
-        match self.ops.get_json(&url) {
-            Ok(Some(doc)) => crate::coord::aborted(&doc, &co.coordinator_keys, &co.network, id),
-            _ => false,
-        }
+        let mut last = self.last_coord_check_ms;
+        let out = coordinator_abort_poll(self.cfg, self.ops, &mut last, force);
+        self.last_coord_check_ms = last;
+        out
     }
 
     /// Pre-ignite fleet gate: wait until `fleet_quorum` producers (this one included) report
@@ -1477,7 +1486,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let chain_id = self.chain_id.clone().unwrap_or_default();
         let outcome = {
             let journal = &mut self.journal;
-            upstream::run_pipeline(
+            let (cfg, ops) = (self.cfg, self.ops);
+            let mut last_coord = self.last_coord_check_ms;
+            let out = upstream::run_pipeline(
                 &up,
                 self.ops,
                 &path,
@@ -1488,11 +1499,25 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 |evidence| {
                     let _ = journal.evidence(State::Snapshotted, evidence);
                 },
-            )
+                // A signed abort is honoured between steps and while each tool runs (it kills
+                // the tool), not only at the fleet gate after VERIFIED.
+                |force| coordinator_abort_poll(cfg, ops, &mut last_coord, force),
+            );
+            self.last_coord_check_ms = last_coord;
+            out
         };
         let outcome = match outcome {
             Ok(o) => o,
-            Err(e) => {
+            Err(upstream::PipelineError::Aborted { during }) => {
+                let event_id = self.cfg.coordination.as_ref().and_then(|c| c.event_id.clone());
+                self.abort(
+                    "coordinator aborted the event (signed) before ignition",
+                    json!({"event_id": event_id, "during": format!("upstream verification ({during})"),
+                           "verify_wall_ms": self.ops.now_ms().saturating_sub(started)}),
+                )?;
+                return Ok(());
+            }
+            Err(upstream::PipelineError::Failed(e)) => {
                 self.abort("upstream verification failed", json!({"error": e}))?;
                 return Ok(());
             }
@@ -1569,6 +1594,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 outcome.compare_allowed_mismatch.join(", ")
             ),
         };
+        if self.coordinator_aborted(true) {
+            let event_id = self.cfg.coordination.as_ref().and_then(|c| c.event_id.clone());
+            self.abort(
+                "coordinator aborted the event (signed) before ignition",
+                json!({"event_id": event_id, "during": "upstream verification (boot artifacts)"}),
+            )?;
+            return Ok(());
+        }
         self.sha256 = Some(sha256.clone());
         self.state = State::Verified;
         self.journal.transition(

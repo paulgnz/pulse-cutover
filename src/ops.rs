@@ -76,6 +76,21 @@ pub trait ChainOps {
     fn run_long(&self, cmd: &str) -> Result<String, String> {
         self.run_hook(cmd)
     }
+    /// `run_long` that can be cut short: `cancel` is polled while the step runs (and once before
+    /// it starts); when it returns true the step's process group is killed and Ok(None) is
+    /// returned. Ok(Some(output)) = the step finished. Used for the upstream pipeline so a signed
+    /// coordinator abort is honoured mid-export/import, not only after VERIFIED. Default: checks
+    /// `cancel` before and after an uninterruptible `run_long`.
+    fn run_long_cancellable(&self, cmd: &str, cancel: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
+        if cancel() {
+            return Ok(None);
+        }
+        let out = self.run_long(cmd)?;
+        if cancel() {
+            return Ok(None);
+        }
+        Ok(Some(out))
+    }
     /// GET a JSON document (hyperion /v2/health, local or public).
     /// Ok(None) while unreachable / non-JSON — health gates treat that as a
     /// transient bounded by their own timeout.
@@ -304,6 +319,25 @@ impl Drop for PgidRecord {
 /// SIGTERMs it; hooks live in their own process group and survive), `rollback` reads this file
 /// and kills the orphaned group before it runs `on_abort` or any revert.
 pub fn run_shell_timeout_tracked(cmd: &str, timeout: Duration, pgid_file: Option<&Path>) -> Result<String, String> {
+    run_shell_inner(cmd, timeout, pgid_file, None).map(|o| o.expect("no cancel: always completes"))
+}
+
+/// How often a cancellable step polls its `cancel` callback (the callback rate-limits any
+/// network check itself).
+pub const CANCEL_POLL: Duration = Duration::from_millis(250);
+
+/// `run_shell_timeout_tracked` that kills the command's process group and returns Ok(None) as
+/// soon as `cancel` returns true (polled every `CANCEL_POLL` while the command runs).
+pub fn run_shell_cancellable(cmd: &str, timeout: Duration, pgid_file: Option<&Path>, cancel: &mut dyn FnMut() -> bool)
+    -> Result<Option<String>, String> {
+    if cancel() {
+        return Ok(None);
+    }
+    run_shell_inner(cmd, timeout, pgid_file, Some(cancel))
+}
+
+fn run_shell_inner(cmd: &str, timeout: Duration, pgid_file: Option<&Path>, mut cancel: Option<&mut dyn FnMut() -> bool>)
+    -> Result<Option<String>, String> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc;
@@ -344,11 +378,25 @@ pub fn run_shell_timeout_tracked(cmd: &str, timeout: Duration, pgid_file: Option
     std::thread::spawn(move || { let _ = tx_out.send(capture(so)); });
     std::thread::spawn(move || { let _ = tx_err.send(capture(se)); });
     let started = std::time::Instant::now();
+    let mut last_cancel_poll = std::time::Instant::now();
     let status = loop {
         match child.try_wait().map_err(|e| format!("wait `{cmd}`: {e}"))? {
             Some(st) => break Some(st),
             None if started.elapsed() >= timeout => break None,
-            None => std::thread::sleep(Duration::from_millis(50)),
+            None => {
+                if let Some(c) = cancel.as_mut() {
+                    if last_cancel_poll.elapsed() >= CANCEL_POLL {
+                        last_cancel_poll = std::time::Instant::now();
+                        if c() {
+                            kill_group(pid);
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Ok(None);
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50))
+            }
         }
     };
     let Some(status) = status else {
@@ -372,7 +420,7 @@ pub fn run_shell_timeout_tracked(cmd: &str, timeout: Duration, pgid_file: Option
     let stdout = String::from_utf8_lossy(&out.unwrap_or_default()).trim().to_string();
     let stderr = String::from_utf8_lossy(&err.unwrap_or_default()).trim().to_string();
     if status.success() {
-        Ok(format!("{}{note}", if stdout.is_empty() { stderr } else { stdout }))
+        Ok(Some(format!("{}{note}", if stdout.is_empty() { stderr } else { stdout })))
     } else {
         Err(format!("`{cmd}` exited {status}: {stderr} {stdout}{note}"))
     }
@@ -674,6 +722,10 @@ impl ChainOps for HttpOps {
         run_shell_timeout_tracked(cmd, LONG_STEP_DEADLINE, self.pgid_file.as_deref())
     }
 
+    fn run_long_cancellable(&self, cmd: &str, cancel: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
+        run_shell_cancellable(cmd, LONG_STEP_DEADLINE, self.pgid_file.as_deref(), cancel)
+    }
+
     fn get_json(&self, url: &str) -> Result<Option<Value>, String> {
         match self.agent.get(url).call() {
             Ok(r) => Ok(r.into_json::<Value>().ok()),
@@ -718,6 +770,35 @@ mod placeholder_tests {
 mod group_kill_tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    /// Stage-2 run 3: a signed abort waited 23.7 s for the upstream pipeline. A cancellable long
+    /// step must stop promptly, take its whole process group with it (a background child would
+    /// otherwise finish the import after the rollback), and drop its pgid record.
+    #[test]
+    fn cancellable_step_stops_promptly_and_kills_its_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("finished");
+        let pgid_file = dir.path().join("j.hook.pgid");
+        let cmd = format!("(sleep 2; touch {m}) & sleep 2; touch {m}", m = marker.display());
+        let mut polls = 0;
+        let t = std::time::Instant::now();
+        let out = run_shell_cancellable(&cmd, Duration::from_secs(60), Some(&pgid_file), &mut || {
+            polls += 1;
+            polls >= 3
+        })
+        .unwrap();
+        assert_eq!(out, None, "cancelled");
+        assert!(t.elapsed() < Duration::from_millis(1500), "stopped promptly: {:?}", t.elapsed());
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(!marker.exists(), "neither the step nor its background child kept running");
+        assert!(!pgid_file.exists(), "the pgid record is removed with the step");
+        // Not cancelled: the output comes back like run_long's.
+        assert_eq!(run_shell_cancellable("echo ok", Duration::from_secs(5), None, &mut || false).unwrap().as_deref(), Some("ok"));
+        // Already cancelled: the command never starts.
+        let m2 = dir.path().join("never");
+        assert_eq!(run_shell_cancellable(&format!("touch {}", m2.display()), Duration::from_secs(5), None, &mut || true).unwrap(), None);
+        assert!(!m2.exists());
+    }
 
     /// Regression (Linux fault injection, 2026-09-30): killing a hook's process group must reach
     /// exactly that group, on every platform, and never this process or anything else.

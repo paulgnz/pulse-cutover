@@ -184,11 +184,47 @@ pub fn check_sidecar(path: &Path, chain_id: &str, cut_block_id: &str) -> Result<
     }))
 }
 
+/// Why `run_pipeline` did not produce an outcome.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PipelineError {
+    /// Verification failed (the machine aborts with this reason).
+    Failed(String),
+    /// The `abort` callback said stop (a signed coordinator abort): the running step was killed
+    /// and nothing after it ran. `during` names the step.
+    Aborted { during: &'static str },
+}
+
+impl From<String> for PipelineError {
+    fn from(e: String) -> Self {
+        PipelineError::Failed(e)
+    }
+}
+
+impl From<&str> for PipelineError {
+    fn from(e: &str) -> Self {
+        PipelineError::Failed(e.to_string())
+    }
+}
+
+/// One pipeline step's external command, cut short if `abort` fires while it runs.
+fn step<O: ChainOps>(ops: &O, cmd: &str, during: &'static str, abort: &mut impl FnMut(bool) -> bool)
+    -> Result<Result<String, String>, PipelineError> {
+    match ops.run_long_cancellable(cmd, &mut || abort(false)) {
+        Ok(Some(out)) => Ok(Ok(out)),
+        Ok(None) => Err(PipelineError::Aborted { during }),
+        Err(e) => Ok(Err(e)),
+    }
+}
+
 /// Drive the whole #61 pipeline over the cut snapshot. `progress` receives
-/// journal-ready evidence blobs between steps; Err is a verification failure
-/// (the machine aborts with it). Idempotent on resume: a completed export
-/// (manifest.env + chain_state_history.log present) is re-used; import,
-/// compare and fingerprint re-run into fresh arena directories every time.
+/// journal-ready evidence blobs between steps; `PipelineError::Failed` is a verification failure
+/// (the machine aborts with it). `abort(force)` is asked before every step (force = true) and
+/// polled while each external tool runs (force = false: the callback may rate-limit itself); when
+/// it returns true the running tool is killed and `PipelineError::Aborted` is returned at once
+/// (stage-2 run 3: an abort posted at SNAPSHOTTED was otherwise honoured only after VERIFIED).
+/// Idempotent on resume: a completed export (manifest.env + chain_state_history.log present) is
+/// re-used; import, compare and fingerprint re-run into fresh arena directories every time.
+#[allow(clippy::too_many_arguments)]
 pub fn run_pipeline<O: ChainOps>(
     up: &Upstream,
     ops: &O,
@@ -198,7 +234,11 @@ pub fn run_pipeline<O: ChainOps>(
     cut_block_id: &str,
     chain_id: &str,
     mut progress: impl FnMut(Value),
-) -> Result<UpstreamOutcome, String> {
+    mut abort: impl FnMut(bool) -> bool,
+) -> Result<UpstreamOutcome, PipelineError> {
+    if abort(true) {
+        return Err(PipelineError::Aborted { during: "before export" });
+    }
     std::fs::create_dir_all(&up.work_dir)
         .map_err(|e| format!("create upstream work_dir {}: {e}", up.work_dir.display()))?;
     let export_dir = up.work_dir.join(format!("export-{cut_height}"));
@@ -222,8 +262,7 @@ pub fn run_pipeline<O: ChainOps>(
                 .replace("{export_dir}", &export_dir.display().to_string());
             progress(json!({"upstream_export_cmd": cmd}));
             let started = ops.now_ms();
-            let out = ops
-                .run_long(&cmd)
+            let out = step(ops, &cmd, "export", &mut abort)?
                 .map_err(|e| format!("upstream export_cmd failed: {e}"))?;
             let log = find_file(&export_dir, "chain_state_history.log").ok_or(
                 "export_cmd succeeded but no chain_state_history.log found under the export dir",
@@ -263,14 +302,17 @@ pub fn run_pipeline<O: ChainOps>(
     match manifest_env.get("INPUT_SNAPSHOT_SHA256") {
         Some(sha) if sha.eq_ignore_ascii_case(snapshot_sha256) => {}
         Some(sha) => {
-            return Err(format!(
+            return Err(PipelineError::Failed(format!(
                 "export manifest INPUT_SNAPSHOT_SHA256 {sha} != cut snapshot sha256 \
                  {snapshot_sha256} — the export did not consume this ceremony's cut"
-            ));
+            )));
         }
         None => return Err("export manifest.env has no INPUT_SNAPSHOT_SHA256".into()),
     }
     progress(json!({"upstream_export_manifest": manifest_env}));
+    if abort(true) {
+        return Err(PipelineError::Aborted { during: "after export" });
+    }
 
     // ---- 2. xpr_import_check: SHiP log -> Arena checkpoint + manifest ----
     let checkpoint_path = up.work_dir.join(format!("checkpoint-{cut_height}.bin"));
@@ -279,15 +321,15 @@ pub fn run_pipeline<O: ChainOps>(
     let _ = std::fs::remove_file(&checkpoint_path);
     let _ = std::fs::remove_file(manifest_json_path(&checkpoint_path));
     let started = ops.now_ms();
-    let import_out = ops
-        .run_long(&format!(
-            "'{}' '{}' '{}' '{}' '{}'",
-            up.import_bin.display(),
-            ship_log.display(),
-            arena_import.display(),
-            checkpoint_path.display(),
-            sidecar.display()
-        ))
+    let import_cmd = format!(
+        "'{}' '{}' '{}' '{}' '{}'",
+        up.import_bin.display(),
+        ship_log.display(),
+        arena_import.display(),
+        checkpoint_path.display(),
+        sidecar.display()
+    );
+    let import_out = step(ops, &import_cmd, "import", &mut abort)?
         .map_err(|e| format!("xpr_import_check failed: {e}"))?;
     let checkpoint_manifest: Value = serde_json::from_str(
         &std::fs::read_to_string(manifest_json_path(&checkpoint_path))
@@ -320,15 +362,19 @@ pub fn run_pipeline<O: ChainOps>(
     }));
     // Gates: the checkpoint is OF the pinned cut.
     if checkpoint_revision != cut_height {
-        return Err(format!(
+        return Err(PipelineError::Failed(format!(
             "upstream checkpoint revision {checkpoint_revision} != pinned cut height {cut_height}"
-        ));
+        )));
     }
     if !source_block_id.eq_ignore_ascii_case(cut_block_id) {
-        return Err(format!(
+        return Err(PipelineError::Failed(format!(
             "upstream checkpoint source_block_id {source_block_id} != pinned cut block id \
              {cut_block_id}"
-        ));
+        )));
+    }
+
+    if abort(true) {
+        return Err(PipelineError::Aborted { during: "after import" });
     }
 
     // ---- 3. xpr_19_table_compare: THE verification gate (when staged) ----
@@ -342,7 +388,7 @@ pub fn run_pipeline<O: ChainOps>(
             // A non-zero exit (any nodeos-vs-Arena table difference) is a
             // verification FAILURE, unless (rehearsal only) every failing table it names is on
             // the explicit allowlist.
-            let res = ops.run_long(&format!(
+            let compare_cmd = format!(
                 "'{}' '{}' '{}' '{}' '{}' '{}' '{}'",
                 bin.display(),
                 ship_log.display(),
@@ -351,7 +397,8 @@ pub fn run_pipeline<O: ChainOps>(
                 chain_id,
                 sidecar.display(),
                 report.display()
-            ));
+            );
+            let res = step(ops, &compare_cmd, "table compare", &mut abort)?;
             let wall = ops.now_ms().saturating_sub(started);
             match res {
                 Ok(out) => {
@@ -391,10 +438,10 @@ pub fn run_pipeline<O: ChainOps>(
                                 not_allowed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
                             )
                         };
-                        return Err(format!(
+                        return Err(PipelineError::Failed(format!(
                             "xpr_19_table_compare FAILED — the nodeos SHiP snapshot and the Arena \
                              re-serialization disagree (verification failure){why}: {e}"
-                        ));
+                        )));
                     }
                     progress(json!({
                         "upstream_19_table_compare": {
@@ -419,16 +466,20 @@ pub fn run_pipeline<O: ChainOps>(
         }
     };
 
+    if abort(true) {
+        return Err(PipelineError::Aborted { during: "after table compare" });
+    }
+
     // ---- 4. xpr_state_fingerprint: whole-state root (cross-node golden) ----
     let arena_fp = up.work_dir.join(format!("arena-fingerprint-{cut_height}"));
     fresh_dir(&arena_fp)?;
-    let fp_out = ops
-        .run_long(&format!(
-            "'{}' '{}' '{}'",
-            up.fingerprint_bin.display(),
-            checkpoint_path.display(),
-            arena_fp.display()
-        ))
+    let fp_cmd = format!(
+        "'{}' '{}' '{}'",
+        up.fingerprint_bin.display(),
+        checkpoint_path.display(),
+        arena_fp.display()
+    );
+    let fp_out = step(ops, &fp_cmd, "state fingerprint", &mut abort)?
         .map_err(|e| format!("xpr_state_fingerprint failed: {e}"))?;
     let (state_root, fingerprint_tables) = verify::parse_upstream_report(&fp_out);
     progress(json!({
@@ -446,9 +497,9 @@ pub fn run_pipeline<O: ChainOps>(
                 progress(json!({"upstream_golden_state_root": "MATCH"}));
             }
             Some(root) => {
-                return Err(format!(
+                return Err(PipelineError::Failed(format!(
                     "upstream state_root {root} != published golden {golden}"
-                ));
+                )));
             }
             None => {
                 return Err("golden_state_root configured but xpr_state_fingerprint printed \

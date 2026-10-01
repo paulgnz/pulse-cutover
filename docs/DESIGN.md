@@ -204,7 +204,7 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 |---|---|---|---|
 | H not in the future (head for producers, LIB for API nodes); chain_id mismatch; producer already paused; producer API unreachable; public URL not serving the source (API mode); staged path exists; goldens file missing | preflight | ARMED | abort (nothing has changed yet) |
 | Snapshot cannot be scheduled at H | `schedule_snapshot` error | ARMED | abort; no fallback to an inexact cut |
-| Signed coordinator abort | `[coordination]` poll | ARMED–VERIFIED | abort |
+| Signed coordinator abort | `[coordination]` poll (every 3 s while waiting; before every upstream pipeline step and while each tool runs, killing it) | ARMED–VERIFIED | abort |
 | Write freeze hook fails | `on_freeze` exit / timeout | ARMED | abort |
 | H does not finalize, or the scheduled file never appears | `snapshot_timeout_secs` | FROZEN | abort |
 | Snapshot not at H | exact-H check | FROZEN | abort (rehearsal flags journal and continue) |

@@ -140,6 +140,9 @@ struct MockOps {
     /// Placeholder values bound via bind_target, and the ones in force when ignite ran.
     bound: RefCell<Vec<(String, String)>>,
     ignite_vars: RefCell<Vec<(String, String)>>,
+    /// GET /api/coord/<net> answers this doc once `<dir>/abort-now` exists (a fake pipeline tool
+    /// creates it: the coordinator's abort lands while that tool runs).
+    coord_doc_when_abort_file: RefCell<Option<serde_json::Value>>,
 }
 
 /// The stage-2 fixture block (XPR testnet 408461570, 6 receipts) re-numbered to `h`: its id is
@@ -204,6 +207,7 @@ impl MockOps {
             source_block_fails: Cell::new(false),
             bound: RefCell::new(Vec::new()),
             ignite_vars: RefCell::new(Vec::new()),
+            coord_doc_when_abort_file: RefCell::new(None),
         }
     }
 
@@ -436,8 +440,27 @@ impl ChainOps for MockOps {
         Ok(format!("ran: {cmd}"))
     }
 
+    fn run_long_cancellable(&self, cmd: &str, cancel: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
+        if !cmd.contains("fake-") {
+            return if cancel() { Ok(None) } else { self.run_long(cmd).map(Some) };
+        }
+        // Fake pipeline tools run for real and can be cut short; every cancel poll advances the
+        // mock clock by a second (the coordinator check rate-limits itself on that clock).
+        self.hooks.borrow_mut().push(cmd.to_string());
+        let now = &self.now;
+        pulse_cutover::ops::run_shell_cancellable(cmd, std::time::Duration::from_secs(120), None, &mut || {
+            now.set(now.get() + 1000);
+            cancel()
+        })
+    }
+
     fn get_json(&self, url: &str) -> Result<Option<serde_json::Value>, String> {
         if url.contains("/api/coord/") {
+            if self.dir.join("abort-now").exists() {
+                if let Some(doc) = self.coord_doc_when_abort_file.borrow().clone() {
+                    return Ok(Some(doc));
+                }
+            }
             return Ok(self.coord_doc.borrow().clone());
         }
         if url.ends_with("/api/status") {
@@ -1679,6 +1702,69 @@ fn upstream_table_compare_mismatch_fails_verification() {
     assert!(text.contains("xpr_19_table_compare FAILED"));
     // Producer-mode rollback ran: the source producer was resumed.
     assert_eq!(ops.resumes.get(), 1);
+}
+
+/// upstream_test_config + a coordinated event (e1) whose signed abort the mock relays once a
+/// fake tool touches `<dir>/abort-now`; `tool` (export/import/compare/fingerprint) does that first
+/// and then runs `sleep_secs` before doing its work.
+fn upstream_abort_rig(dir: &std::path::Path, tool: &str, sleep_secs: u64) -> (Config, MockOps) {
+    stage_fake_upstream_tools(dir, 0);
+    let script = dir.join(format!("fake-{tool}.sh"));
+    let body = std::fs::read_to_string(&script).unwrap();
+    let (shebang, rest) = body.split_once('\n').unwrap();
+    write_script(&script, &format!("{shebang}\ntouch {}/abort-now\nsleep {sleep_secs}\n{rest}", dir.display()));
+    let _ = upstream_test_config(dir, 120);
+    let path = dir.join("ceremony-upstream.toml");
+    let text = format!("{}\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\n",
+        std::fs::read_to_string(&path).unwrap(), hex::encode(coord_key().verifying_key().to_bytes()));
+    std::fs::write(&path, text).unwrap();
+    let cfg = Config::load(&path).unwrap();
+    let ops = MockOps::new(dir, 110);
+    *ops.coord_doc_when_abort_file.borrow_mut() = Some(serde_json::json!({
+        "abort": signed(serde_json::json!({"type": "abort", "event_id": "e1", "network": "rehearsal"}))}));
+    (cfg, ops)
+}
+
+#[test]
+fn stage2_signed_abort_kills_a_running_upstream_step_promptly() {
+    // Stage-2 run 3: ABORT posted 7 s after SNAPSHOTTED was honoured only after VERIFIED (23.7 s
+    // later): export, import, compare and fingerprint all ran first. Now the running tool is killed.
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, ops) = upstream_abort_rig(dir.path(), "export", 30);
+    let t = std::time::Instant::now();
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    assert!(t.elapsed() < std::time::Duration::from_secs(10), "the 30 s export was cut short: {:?}", t.elapsed());
+    let e = journal_entries(&cfg);
+    assert!(transition(&e, "VERIFIED").is_none());
+    let err = e.iter().find(|v| v["kind"] == "error").expect("abort reason journaled");
+    assert_eq!(err["state"], "SNAPSHOTTED");
+    assert_eq!(err["data"]["message"], "coordinator aborted the event (signed) before ignition");
+    assert_eq!(err["data"]["detail"]["during"], "upstream verification (export)");
+    assert_eq!(err["data"]["detail"]["event_id"], "e1");
+    assert!(pulse_cutover::upstream::find_file(&dir.path().join("upstream-work"), "manifest.env").is_none(), "the export never finished");
+    assert!(!ops.hooks.borrow().iter().any(|h| h.contains("fake-import")), "nothing after the aborted step ran");
+    assert_eq!(ops.resumes.get(), 1, "the source producer is resumed (pre-ignition rollback)");
+}
+
+#[test]
+fn stage2_signed_abort_between_upstream_steps_stops_before_the_next_one() {
+    for (tool, next, during) in [
+        ("import", "fake-compare", "upstream verification (after import)"),
+        ("compare", "fake-fingerprint", "upstream verification (after table compare)"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, ops) = upstream_abort_rig(dir.path(), tool, 0);
+        assert_eq!(run_machine(&cfg, &ops), State::Aborted, "{tool}");
+        let e = journal_entries(&cfg);
+        assert!(transition(&e, "VERIFIED").is_none(), "{tool}");
+        let err = e.iter().find(|v| v["kind"] == "error").expect("abort reason journaled");
+        assert_eq!(err["data"]["message"], "coordinator aborted the event (signed) before ignition", "{tool}");
+        let got = err["data"]["detail"]["during"].as_str().unwrap();
+        // A fast tool may finish before the in-step poll sees the abort; then the boundary check does.
+        assert!(got == during || got == format!("upstream verification ({tool})").replace("compare", "table compare"), "{tool}: {got}");
+        assert!(!ops.hooks.borrow().iter().any(|h| h.contains(next)), "{tool}: {next} never ran");
+        assert_eq!(ops.resumes.get(), 1, "{tool}");
+    }
 }
 
 #[test]
