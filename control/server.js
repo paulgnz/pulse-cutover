@@ -345,7 +345,9 @@ function stages(s, now = Date.now()) {
   };
 }
 
-// ---- coordination: relay of SIGNED coordinator messages (event / arm / abort), persisted ----------------------
+// ---- coordination: relay of SIGNED coordinator messages (event / arm / abort / complete), persisted -----------
+// `complete` closes an event that ran (LIVE): a new event may then be published without signing a fake abort
+// (an abort says "stop", which a finished ceremony is not; agents treat it as final for that id).
 // The server checks signatures against the network's configured coordinator keys so it can't be spammed,
 // but agents verify again with keys from their OWN config: this relay cannot forge anything. Readiness numbers
 // shown next to it are display data, not signed authorization.
@@ -353,20 +355,21 @@ function stages(s, now = Date.now()) {
 // on a copy, persisted atomically (write tmp + fsync + rename), and only then swapped into memory; a failed write
 // answers 503 and changes nothing. A corrupt store stops startup (never "start empty" and forget an event).
 // `used` = every event id ever published → sha256 of its payload: ids are never reusable.
-let coord = dict(); // network id → { event, arm, abort, history: [{type, event_id, at}], used: {event_id: payloadSha} }
+let coord = dict(); // network id → { event, arm, abort, complete, history: [{type, event_id, at}], used: {event_id: payloadSha} }
 const isSignedMsg = (m) => m && typeof m === 'object' && !Array.isArray(m) && typeof m.payload === 'string' && typeof m.key === 'string' && typeof m.sig === 'string';
 /** Validate one network's stored coordination entry; returns a normalized copy or throws. */
 function validCoordEntry(k, v) {
   if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error(`${k}: not an object`);
   const out = dict();
-  for (const f of ['event', 'arm', 'abort']) {
+  for (const f of ['event', 'arm', 'abort', 'complete']) {
     if (v[f] === undefined) continue;
     if (!isSignedMsg(v[f])) throw new Error(`${k}.${f}: not a signed message`);
     let pl; try { pl = JSON.parse(v[f].payload); } catch { throw new Error(`${k}.${f}: payload is not JSON`); }
     if (!pl || typeof pl.event_id !== 'string') throw new Error(`${k}.${f}: payload has no event_id`);
     out[f] = { payload: v[f].payload, key: v[f].key, sig: v[f].sig };
   }
-  if ((out.arm || out.abort) && !out.event) throw new Error(`${k}: arm/abort without an event`);
+  if ((out.arm || out.abort || out.complete) && !out.event) throw new Error(`${k}: arm/abort/complete without an event`);
+  if (out.complete && !out.arm) throw new Error(`${k}: complete without an arm`);
   if (v.history !== undefined && !Array.isArray(v.history)) throw new Error(`${k}.history: not an array`);
   out.history = (v.history || []).map((h, i) => { if (!h || typeof h !== 'object' || typeof h.event_id !== 'string') throw new Error(`${k}.history[${i}]: invalid`); return h; });
   if (v.used !== undefined && (!v.used || typeof v.used !== 'object' || Array.isArray(v.used))) throw new Error(`${k}.used: not an object`);
@@ -469,7 +472,7 @@ function coordView(n) {
   if (!ev) return null;
   const reps = Object.keys(nodes[n.id] || {}).flatMap((p) => servers(n.id, p).filter((s) => (s.report.role || 'producer') === 'producer').map((s) => [p, s]));
   const mine = (s) => s.report.coord?.event_id === ev.event_id;
-  return { event: ev, armed: !!c.arm, aborted: !!c.abort,
+  return { event: ev, armed: !!c.arm, aborted: !!c.abort, completed: !!c.complete,
     arm_at: c.arm ? JSON.parse(c.arm.payload).issued_at_ms : null,
     accepted: [...new Set(reps.filter(([, s]) => mine(s) && s.report.coord.accepted).map(([p]) => p))],
     rejected: reps.filter(([, s]) => mine(s) && s.report.coord.accepted === false).map(([p, s]) => ({ producer: p, reason: s.report.coord.reason })),
@@ -695,13 +698,13 @@ async function handle(req, res) {
     return n ? send(res, 200, one(n)) : send(res, 404, { error: 'unknown network' });
   }
   const cm = path.match(/^\/api\/coord\/([a-z0-9-]{1,32})$/);
-  if (cm && req.method === 'GET') { const c = own(coord, cm[1]) ? coord[cm[1]] : null; return send(res, 200, c ? { event: c.event || null, arm: c.arm || null, abort: c.abort || null } : {}); }
+  if (cm && req.method === 'GET') { const c = own(coord, cm[1]) ? coord[cm[1]] : null; return send(res, 200, c ? { event: c.event || null, arm: c.arm || null, abort: c.abort || null, complete: c.complete || null } : {}); }
   if (cm && req.method === 'POST') {
     const n = cfg.networks.find((x) => x.id === cm[1]); if (!n) return send(res, 404, { error: 'unknown network' });
     const raw = await readBody(req, 16384); if (raw === null) return send(res, 413, { error: 'too large' });
     let msg; try { msg = JSON.parse(raw); } catch { return send(res, 400, { error: 'bad json' }); }
     const p = verifySigned(msg, n.coordinators);
-    if (!p || p.network !== n.id || !['event', 'arm', 'abort'].includes(p.type)) return send(res, 403, { error: 'not a valid signed coordinator message for this network' });
+    if (!p || p.network !== n.id || !['event', 'arm', 'abort', 'complete'].includes(p.type)) return send(res, 403, { error: 'not a valid signed coordinator message for this network' });
     const next = clone(coord);
     if (reservedKey(p.event_id)) return send(res, 400, { error: 'reserved event id' });
     const c = own(next, n.id) ? next[n.id] : (next[n.id] = Object.assign(dict(), { history: [], used: dict() })); c.history ||= []; c.used ||= dict();
@@ -711,8 +714,8 @@ async function handle(req, res) {
     if (p.type === 'event') {
       if (n.chain_id && p.chain_id !== n.chain_id) return send(res, 409, { error: 'event chain_id does not match this network' });
       const h = sha(msg.payload);
-      if (cur && !c.abort) {
-        if (cur.event_id !== p.event_id) return send(res, 409, { error: `event ${cur.event_id} is active; abort it before publishing another` });
+      if (cur && !c.abort && !c.complete) {
+        if (cur.event_id !== p.event_id) return send(res, 409, { error: `event ${cur.event_id} is active; abort it (or, once it ran, mark it complete) before publishing another` });
         if (c.event.payload !== msg.payload) return send(res, 409, { error: 'a different payload for this event_id is already published' });
         return send(res, 200, { ok: true, type: 'event', event_id: p.event_id, event_hash: h, unchanged: true });
       }
@@ -727,10 +730,13 @@ async function handle(req, res) {
       const evHash = sha(c.event.payload);
       if (p.type === 'arm' && p.event_hash !== evHash) return send(res, 409, { error: 'arm must carry event_hash = sha256 of the published event payload (update control/coord.mjs)', event_hash: evHash });
       if (p.type === 'abort' && p.event_hash != null && p.event_hash !== evHash) return send(res, 409, { error: 'abort event_hash does not match the published event', event_hash: evHash });
+      if (p.type === 'complete' && p.event_hash !== evHash) return send(res, 409, { error: 'complete must carry event_hash = sha256 of the published event payload', event_hash: evHash });
+      if (p.type === 'complete' && !c.arm) return send(res, 409, { error: 'event was never armed: abort it instead' });
       if (c.abort) return send(res, 409, { error: 'event already aborted' });
+      if (c.complete && p.type !== 'complete') return send(res, 409, { error: 'event already complete' });
       if (own(c, p.type) && c[p.type]) return send(res, 200, { ok: true, type: p.type, event_id: p.event_id, unchanged: true });
       c[p.type] = msg; c.history.push({ type: p.type, event_id: p.event_id, at });
-      note = p.type === 'arm' ? `ARMED event ${p.event_id}` : `ABORTED event ${p.event_id}`;
+      note = p.type === 'arm' ? `ARMED event ${p.event_id}` : p.type === 'complete' ? `event ${p.event_id} COMPLETE (closed; a new event may be published)` : `ABORTED event ${p.event_id}`;
     }
     if (!commitCoord(next)) return send(res, 503, { error: 'could not persist the message; nothing was relayed, retry' });
     pushEvent(n.id, 'coordinator', note);

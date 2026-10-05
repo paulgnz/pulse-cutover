@@ -53,14 +53,16 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   (signed-message shape, JSON payloads with an event_id, `history` array, `used` map; no arm/abort without an event):
   a corrupt or invalid store, including a well-formed one like `{"testnet": null}`, stops startup (exit 3) rather than
   starting empty and forgetting a live event. Restore it from a backup, or delete it only if no event is live.
-  While an event is active and not aborted, a *different* event is refused (409). **Event ids are single-use**, even
-  after an abort. Stores written by rc.5 (no `used` map) are migrated on start: the active event and every event id in
+  While an event is active (not aborted and not complete), a *different* event is refused (409). An event that RAN
+  (LIVE) is closed with a signed `complete` (`control/coord.mjs complete`, needs an earlier arm and the event_hash);
+  never sign an abort for a finished ceremony: agents record an abort as final for that id (tombstone) and report
+  it. **Event ids are single-use**, even after an abort or completion. Stores written by rc.5 (no `used` map) are migrated on start: the active event and every event id in
   their history count as used.
 - **event_hash (the contract every signer and verifier must share):** `event_hash` = lowercase hex sha256 over the
   **UTF-8 bytes of the exact `payload` string** of the signed event message, byte for byte as signed and as stored by
   the relay: no JSON parsing, re-serialization, whitespace or key-order normalization. Test vector:
   `control/test/fixtures/event-hash-vector.json` (the Rust agent tests against the same file). `arm` must carry it
-  (409 otherwise); `abort` is checked when it carries one. `control/coord.mjs event` saves the signed event to
+  (409 otherwise), and so must `complete`; `abort` is checked when it carries one. `control/coord.mjs event` saves the signed event to
   `<event_id>.event.json` and checks the relay reports the same hash; `arm`/`abort` hash **your saved copy**
   (`--event-file`) and refuse if the relay serves a different payload (`--trust-relay yes` to sign the relay's copy).
 - **Server state** (`STATE_FILE`, default `servers.json` next to `COORD_FILE`): the replay watermark (last accepted

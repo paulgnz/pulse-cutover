@@ -7,6 +7,9 @@
 //        (--cpu-scale none omits import_cpu_scale: use it for import_backend = "upstream", where it does nothing)
 //   node control/coord.mjs arm   --url … --net rehearsal --event-id ev-… --key coordinator.pem --event-file ev-….event.json
 //   node control/coord.mjs abort --url … --net rehearsal --event-id ev-… --key coordinator.pem --event-file ev-….event.json
+//   node control/coord.mjs complete --url … --net rehearsal --event-id ev-… --key coordinator.pem --event-file ev-….event.json
+//        (closes an event that RAN — LIVE — so the next one can be published; never sign an abort for that:
+//         an abort tells every agent "stop", and they record it as final)
 //
 // Keep the private key offline/secure. Agents only act on messages signed by keys in THEIR config.
 // arm/abort carry event_hash = sha256 over the UTF-8 bytes of the exact signed event `payload` string (no
@@ -26,7 +29,7 @@ if (cmd === 'keygen') {
   console.log(rawPub(privateKey));
   process.exit(0);
 }
-if (!['event', 'arm', 'abort'].includes(cmd)) { console.error('usage: keygen | event | arm | abort (see header)'); process.exit(2); }
+if (!['event', 'arm', 'abort', 'complete'].includes(cmd)) { console.error('usage: keygen | event | arm | abort | complete (see header)'); process.exit(2); }
 const key = createPrivateKey(readFileSync(a.key));
 const base = a.url.replace(/\/$/, '');
 export const eventHashOf = (payload) => createHash('sha256').update(Buffer.from(payload, 'utf8')).digest('hex');

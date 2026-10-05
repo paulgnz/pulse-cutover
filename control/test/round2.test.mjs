@@ -181,3 +181,22 @@ test('no roster → no agreement verdict; freshness uses the report timestamp; s
   assert.equal(row.verdict, 'no roster');
   await stop(proc);
 });
+
+test('rc.21: a completed (LIVE) event is closed with a signed `complete`; a new event then needs no fake abort', async () => {
+  const dir = setup();
+  const { base } = await start(dir);
+  const ev = signed({ v: 1, type: 'event', network: 'testnet', event_id: 'ev-done', chain_id: CHAIN, h: 900, issued_at_ms: Date.now() });
+  const h = sha(ev.payload);
+  assert.equal((await postC(base, ev)).status, 200);
+  // complete before an arm: refused (an un-armed event is aborted, not completed)
+  assert.equal((await postC(base, signed({ v: 1, type: 'complete', network: 'testnet', event_id: 'ev-done', event_hash: h, issued_at_ms: Date.now() }))).status, 409);
+  assert.equal((await postC(base, signed({ v: 1, type: 'arm', network: 'testnet', event_id: 'ev-done', event_hash: h, issued_at_ms: Date.now() }))).status, 200);
+  const next = signed({ v: 1, type: 'event', network: 'testnet', event_id: 'ev-next', chain_id: CHAIN, h: 1900, issued_at_ms: Date.now() });
+  assert.equal((await postC(base, next)).status, 409, 'still active');
+  assert.equal((await postC(base, signed({ v: 1, type: 'complete', network: 'testnet', event_id: 'ev-done', event_hash: 'f'.repeat(64), issued_at_ms: Date.now() }))).status, 409, 'wrong event_hash');
+  assert.equal((await postC(base, signed({ v: 1, type: 'complete', network: 'testnet', event_id: 'ev-done', event_hash: h, issued_at_ms: Date.now() }))).status, 200);
+  const cur = await (await fetch(`${base}/api/coord/testnet`)).json();
+  assert.ok(cur.complete && !cur.abort, 'complete relayed, no abort was needed');
+  assert.equal((await postC(base, next)).status, 200, 'a new event after completion');
+  assert.equal((await postC(base, ev)).status, 409, 'event ids stay single-use');
+});
