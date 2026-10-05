@@ -805,6 +805,18 @@ fn default_true() -> bool {
 
 impl Config {
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        Self::load_inner(path, true)
+    }
+
+    /// For the beacon only: a ceremony config that fails the production profile is still loaded, so the
+    /// beacon keeps reporting (with a failing setup check listing the problems) instead of crash-looping.
+    /// Every other check, including the mainnet refusal of rehearsal overrides, still applies. A command
+    /// that can mutate anything (run, loop, await, rollback, unhalt) must use `load`.
+    pub fn load_for_report(path: &std::path::Path) -> Result<Self, String> {
+        Self::load_inner(path, false)
+    }
+
+    fn load_inner(path: &std::path::Path, enforce_production: bool) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("read config {}: {e}", path.display()))?;
         let config: Config =
@@ -821,7 +833,7 @@ impl Config {
             return Err("snapshot.path_map_from and path_map_to must be set together".into());
         }
         config.check_rehearsal_overrides()?;
-        if config.ceremony.profile == Profile::Ceremony && !config.ceremony.rehearsal {
+        if enforce_production && config.ceremony.profile == Profile::Ceremony && !config.ceremony.rehearsal {
             let problems = config.production_problems();
             if !problems.is_empty() {
                 return Err(format!(

@@ -572,6 +572,14 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         if h > 0 {
             let ok = past_ignite || state == "LIVE" || head.map(|x| x < h || !state.is_empty()).unwrap_or(false);
             checks.push(check("freeze_height", ok, format!("H = {h}{}", head.map(|x| if x < h { format!(", {} blocks away", h - x) } else { String::new() }).unwrap_or_default())));
+        } else if cfg.coordination.is_some() && !cfg.ceremony.derive_h_at_arm {
+            // An `await` config declares no H on purpose: H comes from the coordinator's SIGNED event (the
+            // ceremony then runs a derived config with it). Not a setup failure, and never "derived from LIB".
+            let detail = match journal["evidence"]["cut_height"].as_u64() {
+                Some(c) => format!("H = {c} (from the coordinator's signed event)"),
+                None => "H comes from the coordinator's signed event (await)".to_string(),
+            };
+            checks.push(check("freeze_height", true, detail));
         } else {
             checks.push(check("freeze_height", cfg.ceremony.derive_h_at_arm, "H derived at ARM from LIB + freeze_margin (rehearsal)"));
         }
@@ -586,6 +594,13 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     let overrides = cfg.rehearsal_overrides();
     if !overrides.is_empty() {
         checks.push(check("rehearsal_overrides", false, format!("rehearsal overrides active: {}", overrides.join("; "))));
+    } else if cfg.ceremony.profile == crate::config::Profile::Ceremony && !cfg.ceremony.rehearsal
+        && !cfg.production_problems().is_empty()
+    {
+        // Loaded leniently for reporting: this config could not run a real cut (or a rehearsal) as written.
+        checks.push(check("rehearsal_overrides", false, format!(
+            "NOT production-ready and not marked rehearsal (`pulse-cutover run` would refuse it): {}",
+            cfg.production_problems().join("; "))));
     } else if cfg.ceremony.rehearsal {
         // An explicit REHEARSAL ceremony (ceremony.rehearsal = true) is shown the same way: never a real cut.
         let relax = cfg.production_problems();
@@ -799,6 +814,52 @@ mod tests {
         assert!(hook_ready("sh -c true").0, "sh is on PATH");
         assert!(!hook_ready("definitely-not-a-real-command-xyz").0);
         assert!(!hook_ready("/nonexistent/hook.sh").0);
+    }
+
+    /// An `await` config (freeze_height = 0 + [coordination]) declares no H: the beacon must not report the
+    /// rehearsal "H derived at ARM" failure for it (seen on mission control throughout the rc.21 dapp runs,
+    /// including after LIVE), and it names the journaled cut once the ceremony has one.
+    #[test]
+    fn freeze_height_check_for_a_coordinated_await_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_text = || format!(
+            r#"
+journal_path = "{d}/journal.jsonl"
+[ceremony]
+rehearsal = true
+freeze_height = 0
+[source]
+rpc_url = "http://127.0.0.1:1"
+producer_api_url = "http://127.0.0.1:1"
+[snapshot]
+staged_path = "{d}/staged.bin"
+capture_roots = "{d}/roots.txt"
+[target]
+metalgo_unit = "mock.service"
+rpc_url = "http://127.0.0.1:1"
+[hooks]
+on_freeze = "true"
+post_ignite = "true"
+on_live = "true"
+{c}"#,
+            d = dir.path().display(),
+            c = "[coordination]\nurl = \"http://127.0.0.1:1\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"00\"]\n"
+        );
+        let fh = |cfg: &Config| {
+            let r = build_report(cfg, "p", "rehearsal");
+            r["checks"].as_array().unwrap().iter().find(|c| c["name"] == "freeze_height").cloned().unwrap()
+        };
+        let path = dir.path().join("await.toml");
+        std::fs::write(&path, cfg_text()).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        let c = fh(&cfg);
+        assert_eq!(c["ok"], true, "{c}");
+        assert!(c["detail"].as_str().unwrap().contains("signed event"), "{c}");
+        // once the ceremony journaled its cut, the check names it
+        std::fs::write(dir.path().join("journal.jsonl"), format!("{}\n",
+            json!({"seq": 0, "ts_ms": 1, "ts": "t", "kind": "transition", "state": "SNAPSHOTTED", "data": {"cut_height": 4242}}))).unwrap();
+        let c = fh(&cfg);
+        assert!(c["detail"].as_str().unwrap().contains("4242"), "{c}");
     }
 
     #[test]

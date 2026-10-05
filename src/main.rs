@@ -458,7 +458,9 @@ fn cmd_loop(args: &[String]) -> Result<(), String> {
 
 fn cmd_beacon(args: &[String]) -> Result<(), String> {
     let path = arg(args, "--config").ok_or("--config <ceremony.toml> is required")?;
-    let cfg = Config::load(&PathBuf::from(path))?;
+    // Read-only reporter: a config short of the production profile is reported (failing setup check),
+    // not fatal, so a beacon never crash-loops on it.
+    let cfg = Config::load_for_report(&PathBuf::from(path))?;
     pulse_cutover::beacon::run(&cfg, flag(args, "--once"))
 }
 

@@ -4583,3 +4583,23 @@ fn rc21_producer_mode_writes_the_history_boundary_before_live() {
     let _ = run_machine_result(&cfg, &MockOps::new(dir.path(), 110));
     assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("its directory does not exist"));
 }
+
+#[test]
+fn beacon_reports_a_config_short_of_the_production_profile_instead_of_refusing_it() {
+    // rc.21 field finding: a beacon pointed at an rc.20-era ceremony config crash-looped because the
+    // production profile refused the config at load. The beacon is read-only: it must keep reporting and
+    // show the problems as a failing setup check; mutating commands still refuse the same file.
+    let dir = tempfile::tempdir().unwrap();
+    test_config(dir.path(), 120);
+    let path = dir.path().join("ceremony.toml");
+    let text = std::fs::read_to_string(&path).unwrap().replace("rehearsal = true", "rehearsal = false");
+    std::fs::write(&path, &text).unwrap();
+    let strict = Config::load(&path).err().expect("the test fixture must fall short of the production profile");
+    assert!(strict.contains("PRODUCTION PROFILE"), "{strict}");
+    let cfg = Config::load_for_report(&path).expect("the beacon loads it for reporting");
+    let report = pulse_cutover::beacon::build_report(&cfg, "protonnz", "testnet");
+    let check = report["checks"].as_array().unwrap().iter()
+        .find(|c| c["name"] == "rehearsal_overrides").expect("a failing setup check names the problems");
+    assert_eq!(check["ok"], false);
+    assert!(check["detail"].as_str().unwrap().contains("NOT production-ready"), "{check}");
+}

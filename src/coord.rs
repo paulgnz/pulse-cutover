@@ -127,6 +127,16 @@ pub fn aborted(doc: &Value, keys: &[String], network: &str, event_id: &str) -> b
         .unwrap_or(false)
 }
 
+/// True when `doc` carries a valid signed `complete` for `event_id` (the coordinator closed an event that ran).
+/// `await` records it as a terminal tombstone: a completed event is never accepted or armed again, even by an
+/// agent whose journal directory never saw it run (a new run directory has no "ran" tombstone).
+pub fn completed(doc: &Value, keys: &[String], network: &str, event_id: &str) -> bool {
+    doc.get("complete").filter(|m| !m.is_null())
+        .and_then(|m| verify(m, keys).ok())
+        .map(|p| p["type"] == "complete" && p["network"].as_str() == Some(network) && p["event_id"].as_str() == Some(event_id))
+        .unwrap_or(false)
+}
+
 // ---- tombstones: decisions about an event id that are final on this node ------------------------
 // `coord-tombstones.json` next to the journal: {event_id: {kind, at, reason}}. kind = "aborted" (a
 // signed abort was seen: final for that id, whatever the relay serves later, across restarts),
@@ -294,6 +304,9 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
                     // Persisted at once: a relay that later omits the abort, or a restart, cannot
                     // resurrect the event.
                     record_tombstone(cfg, &id, "aborted", "signed abort relayed by the coordinator");
+                } else if completed(&doc, &co.coordinator_keys, &co.network, &id) && tombstone(cfg, &id).is_none() {
+                    // The coordinator closed this event (it ran): terminal here too, never accepted again.
+                    record_tombstone(cfg, &id, "completed", "signed complete relayed by the coordinator");
                 }
                 if let Some(t) = tombstone(cfg, &id).filter(|t| t["kind"] != "aborted") {
                     // Missed or already run on this node: terminal for this id.
@@ -515,5 +528,28 @@ mod tests {
         assert!(!aborted(&doc, &keys, "rehearsal", "e2"));
         assert!(!aborted(&doc, &keys, "mainnet", "e1"));
         assert!(!aborted(&json!({"abort": null}), &keys, "rehearsal", "e1"));
+    }
+
+    #[test]
+    fn a_signed_complete_is_recognised_per_event_and_network() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let other = SigningKey::from_bytes(&[8u8; 32]);
+        let keys = vec![hex::encode(sk.verifying_key().to_bytes())];
+        let doc = json!({"complete": signed(&sk, &json!({"type": "complete", "network": "rehearsal", "event_id": "e1"}))});
+        assert!(completed(&doc, &keys, "rehearsal", "e1"));
+        assert!(!completed(&doc, &keys, "rehearsal", "e2"));
+        assert!(!completed(&doc, &keys, "mainnet", "e1"));
+        assert!(!completed(&json!({"complete": null}), &keys, "rehearsal", "e1"));
+        let forged = json!({"complete": signed(&other, &json!({"type": "complete", "network": "rehearsal", "event_id": "e1"}))});
+        assert!(!completed(&forged, &keys, "rehearsal", "e1"), "only configured coordinator keys");
+        // an abort is not a complete
+        let ab = json!({"complete": signed(&sk, &json!({"type": "abort", "network": "rehearsal", "event_id": "e1"}))});
+        assert!(!completed(&ab, &keys, "rehearsal", "e1"));
+        // recorded as a terminal (non-abort) tombstone
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = readiness_cfg(dir.path());
+        record_tombstone(&cfg, "e1", "completed", "signed complete");
+        assert_eq!(tombstone(&cfg, "e1").unwrap()["kind"], "completed");
+        assert!(!is_tombstoned(&cfg, "e1"));
     }
 }

@@ -61,7 +61,10 @@ function legacyMock(req, res, body) {
   if (!S.legacyUp) return send(res, 429, { error: 'rate limited' });
   switch (u.pathname) {
     case '/v2/history/get_actions': return send(res, 200, pageOf(S.legacyActs, q, S.legacyRel));
-    case '/v2/history/get_transaction': return send(res, 200, { actions: S.legacyTx[q.get('id')] || [] });
+    case '/v2/history/get_transaction': {   // Hyperion's shape: top-level executed / trx_id / lib next to the actions
+      const acts = S.legacyTx[q.get('id')] || [];
+      return send(res, 200, { query_time_ms: 1, executed: acts.length > 0, trx_id: q.get('id'), lib: 110, actions: acts });
+    }
     case '/v1/history/get_transaction': { const t = S.legacyV1[JSON.parse(body).id]; return t ? send(res, 200, t) : send(res, S.legacyV1Status, { error: 'not found' }); }
     case '/v2/history/get_deltas': return send(res, 200, { deltas: [{ block_num: 101, x: 1 }, { block_num: 99, x: 2 }] });
     default: return send(res, 404, { error: 'no' });
@@ -115,10 +118,12 @@ after(() => { for (const p of procs) p.kill(); chainSrv?.close(); legacySrv?.clo
 test('a legacy transaction ABOVE the cut is never returned (v2 and v1)', async () => {
   reset();
   const v2 = await get(good, '/v2/history/get_transaction?id=synthetic');
-  assert.equal(v2.status, 200);
+  assert.ok(v2.status === 200 || v2.status === 404, `status ${v2.status}`);
   assert.deepEqual(v2.json.actions, [], 'block 101 on the legacy archive is not this chain\'s history');
   assert.notEqual(v2.json._premigration, true);
   assert.equal(v2.json.federation.legacy_above_cut_ignored, true);
+  assert.notEqual(v2.json.executed, true, 'the legacy archive\'s executed:true above the cut must not leak into the answer');
+  assert.equal(v2.status === 404 || v2.json.executed === false, true);
   const v1 = await post(good, '/v1/history/get_transaction', { id: 'synthetic' });
   assert.equal(v1.status, 404);
   assert.equal(v1.json.federation.legacy_above_cut_ignored, true);

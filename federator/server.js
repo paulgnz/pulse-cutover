@@ -512,10 +512,14 @@ async function getTransaction(params, b) {
       federation: { status: 'unavailable', source_errors: sourceErrors(down) } } };
   }
   const st = await absenceStatus();
-  const shape = (local.ok && local.json) || (legacy.ok && legacy.json) || null;
+  // An absence answer never carries the top-level fields of a legacy hit ABOVE the cut: Hyperion answers a
+  // transaction it holds with `executed: true` (plus trx_id, lib, ...), and a client that reads `executed` would
+  // credit a transaction from the discarded source branch (seen in the rc.21 multi-dapp rehearsal with a deposit
+  // injected on the burn-off branch). `executed` is always false here.
+  const shape = (local.ok && local.json) || (legacy.ok && !aboveCut && legacy.json) || null;
   const federation = { status: st, ...(aboveCut ? { legacy_above_cut_ignored: true, note: `the legacy archive has ${id} above the cut ${b.cut_block}: not part of this chain's history` } : {}) };
-  return shape ? { status: local.ok || legacy.ok ? 200 : 404, headers: statusHeaders(st), body: { ...shape, actions: [], federated: true, federation } }
-    : { status: 404, headers: statusHeaders(st), body: { error: `transaction ${id} not found`, federation } };
+  return shape ? { status: 200, headers: statusHeaders(st), body: { ...shape, executed: false, actions: [], federated: true, federation } }
+    : { status: 404, headers: statusHeaders(st), body: { error: `transaction ${id} not found`, executed: false, trx_id: id, actions: [], federated: true, federation } };
 }
 
 // Discovery for a key: both indexes, every spelling. Returns {names, ok:{local, legacy}, last}.
