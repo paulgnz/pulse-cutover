@@ -412,6 +412,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 problems.push(format!("staged_path dir {} missing", dir.display()));
             }
         }
+        if !(resumed && self.reached_ignited) {
+            problems.extend(self.signer_material_problems());
+        }
         // Stage-path hygiene (R12): the pre-staged target imports whatever sits
         // at snapshot_path the moment its chain first initializes. A stale file
         // from an earlier ceremony pins the chain to the WRONG cut before this
@@ -1862,6 +1865,31 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         })())
     }
 
+    /// Where the upstream ignition will put this node's signing key (the chain config built from
+    /// `chain_config_base`) must be private, and the SHARED boot inputs (genesis base) must hold
+    /// none. Checked at ARM, before anything freezes.
+    fn signer_material_problems(&self) -> Vec<String> {
+        let mut out = vec![];
+        let Some(up) = self.cfg.upstream.as_ref().filter(|u| u.ignite_configured(&self.cfg.target)) else { return out };
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+        if let Some(g) = up.genesis_base.as_ref().and_then(|p| read(p)) {
+            if crate::secrets::has_private_key(&g) {
+                out.push("upstream.genesis_base contains a private key: the migration genesis is shared with every validator and chain creation (initial_key must be a PUBLIC key)".into());
+            }
+        }
+        let holds_key = up.chain_config_base.as_ref().and_then(|p| read(p)).map(|v| crate::secrets::has_private_key(&v)).unwrap_or(false);
+        if holds_key {
+            for dir in [Some(up.work_dir.clone()), self.cfg.target.chain_config_dir.clone()].into_iter().flatten() {
+                if dir.exists() {
+                    if let Err(e) = crate::secrets::check_private_dir(&dir) {
+                        out.push(format!("the chain config will hold this node's signing key: {e}"));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Upstream backend, before the fleet gate: refuse what cannot be ignited safely, journal what
     /// stays unsolved for mainnet, and re-check the boot artifacts against their VERIFIED hashes.
     /// Ok(false) after aborting (pre-ignition: the source is resumed).
@@ -1972,9 +2000,27 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let bid = self.target_blockchain_id.clone().expect("set above");
         if let Some(dir) = self.cfg.target.chain_config_dir.clone() {
             let dest = dir.join(&bid).join("config.json");
-            let installed = std::fs::create_dir_all(dest.parent().expect("has parent"))
-                .and_then(|_| std::fs::copy(&chain_config, &dest))
-                .map_err(|e| e.to_string())
+            // The chain config may hold this node's signing key: installed 0600 from creation, into
+            // a directory nobody else can write (a fresh per-chain dir is created 0700).
+            let installed = std::fs::read(&chain_config)
+                .map_err(|e| format!("read {}: {e}", chain_config.display()))
+                .and_then(|bytes| {
+                    let private = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .map(|v| crate::secrets::has_private_key(&v))
+                        .unwrap_or(true);
+                    let parent = dest.parent().expect("has parent");
+                    let mut b = std::fs::DirBuilder::new();
+                    b.recursive(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::DirBuilderExt;
+                        if private {
+                            b.mode(0o700);
+                        }
+                    }
+                    b.create(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+                    crate::secrets::write_file(&dest, &bytes, private)
+                })
                 .and_then(|_| verify::sha256_file(&dest).map(|(h, _)| h));
             match installed {
                 Ok(h) if Some(&h) == self.boot_hashes.2.as_ref() => {

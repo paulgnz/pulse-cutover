@@ -4242,3 +4242,50 @@ fn upstream_example_configs_load_and_the_rehearsal_one_refuses_mainnet() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn rc21_signer_material_is_written_0600_and_a_shared_directory_is_refused_at_arm() {
+    use std::os::unix::fs::PermissionsExt;
+    // Review: the generated chain config copied producer_key from the base and was written with
+    // the umask's mode (0644), then installed by copy.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let ops = upstream_ops(dir.path());
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let e = journal_entries(&cfg);
+    let verified = &transition(&e, "VERIFIED").unwrap()["data"];
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(std::path::Path::new(verified["boot"]["chain_config"].as_str().unwrap())), 0o600, "built 0600");
+    let bid = e.iter().find_map(|v| v["data"]["target_blockchain_id"].as_str().map(str::to_string)).unwrap();
+    let installed = dir.path().join("chain-configs").join(&bid).join("config.json");
+    assert_eq!(mode(&installed), 0o600, "installed 0600");
+    assert_eq!(mode(installed.parent().unwrap()), 0o700, "its fresh directory 0700");
+    assert_eq!(mode(std::path::Path::new(verified["boot"]["genesis"].as_str().unwrap())), 0o644, "the shared genesis is not secret");
+
+    // A group/world-writable work dir: refused at ARM, before anything freezes.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    std::fs::create_dir_all(dir.path().join("upstream-work")).unwrap();
+    std::fs::set_permissions(dir.path().join("upstream-work"), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let ops = upstream_ops(dir.path());
+    let _ = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("writable by group/others"), "{text}");
+    assert!(!text.contains("\"FROZEN\""), "nothing froze");
+
+    // Signer material in the SHARED genesis base: refused.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let mut g: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("genesis-base.json")).unwrap()).unwrap();
+    g["note"] = serde_json::json!(pulse_cutover::keys::format_private_k1(&TEST_PRODUCER_SECRET));
+    std::fs::write(dir.path().join("genesis-base.json"), g.to_string()).unwrap();
+    let ops = upstream_ops(dir.path());
+    let _ = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("genesis_base contains a private key"), "{text}");
+    assert!(!text.contains("\"FROZEN\""));
+}

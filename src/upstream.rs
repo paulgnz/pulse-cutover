@@ -834,10 +834,11 @@ fn read_json_object(path: &Path, what: &str) -> Result<serde_json::Map<String, V
     }
 }
 
-fn write_json(path: &Path, v: &Value) -> Result<String, String> {
+/// `private`: the file holds signer material (see `crate::secrets::write_file`).
+fn write_json(path: &Path, v: &Value, private: bool) -> Result<String, String> {
     use sha2::Digest as _;
     let text = serde_json::to_string_pretty(v).expect("json") + "\n";
-    std::fs::write(path, &text).map_err(|e| format!("write {}: {e}", path.display()))?;
+    crate::secrets::write_file(path, text.as_bytes(), private)?;
     Ok(hex::encode(sha2::Sha256::digest(text.as_bytes())))
 }
 
@@ -870,7 +871,12 @@ pub fn build_boot_artifacts(
     }
     m.insert("source_block".into(), json!(hex::encode(&packed.bytes)));
     let (manifest_path, genesis_path, config_path) = boot_paths(up, cut_height);
-    let manifest_sha256 = write_json(&manifest_path, &manifest)?;
+    // The manifest and the genesis are SHARED artifacts (identical on every validator, handed to
+    // chain creation): signer material in either is refused outright.
+    if crate::secrets::has_private_key(&manifest) {
+        return Err("the checkpoint manifest contains something that looks like a private key: refusing to build a shared boot artifact from it".into());
+    }
+    let manifest_sha256 = write_json(&manifest_path, &manifest, false)?;
 
     let base = up.genesis_base.as_ref().ok_or("upstream.genesis_base is not set")?;
     let mut genesis = read_json_object(base, "upstream.genesis_base")?;
@@ -880,7 +886,15 @@ pub fn build_boot_artifacts(
         }
     }
     genesis.insert("migration_checkpoint_sha256".into(), json!(outcome.checkpoint_sha256));
-    let genesis_sha256 = write_json(&genesis_path, &Value::Object(genesis))?;
+    let genesis = Value::Object(genesis);
+    if crate::secrets::has_private_key(&genesis) {
+        return Err(format!(
+            "upstream.genesis_base {} contains a private key: the migration genesis is shared with every validator \
+             and chain creation; it may carry initial_key (a PUBLIC key) only",
+            base.display()
+        ));
+    }
+    let genesis_sha256 = write_json(&genesis_path, &genesis, false)?;
 
     let mut cc = match &up.chain_config_base {
         Some(p) => read_json_object(p, "upstream.chain_config_base")?,
@@ -888,7 +902,10 @@ pub fn build_boot_artifacts(
     };
     cc.insert("migration_checkpoint".into(), json!(outcome.checkpoint_path.display().to_string()));
     cc.insert("migration_manifest".into(), json!(manifest_path.display().to_string()));
-    let chain_config_sha256 = write_json(&config_path, &Value::Object(cc))?;
+    // Per-node: chain_config_base usually carries this node's producer_key. Written 0600 from
+    // creation, only into a directory nobody else can write (secrets::write_file).
+    let cc = Value::Object(cc);
+    let chain_config_sha256 = write_json(&config_path, &cc, crate::secrets::has_private_key(&cc))?;
     Ok(BootArtifacts {
         manifest: manifest_path,
         manifest_sha256,
