@@ -7,6 +7,11 @@
 // Writes, from the SOURCE (Leap) chain:
 //   <dir>/activated_protocol_features.json   every page of get_activated_protocol_features, merged
 //   <dir>/consensus_parameters.json          get_consensus_parameters
+//   <dir>/capture.json                       what was captured from (chain id, head, time): the edge reports it
+//                                            on every static answer (x-pulse-static-captured)
+// The edge serves these as STATIC-AT-CUT: protocol activations or parameter changes on the new chain are not
+// reflected. get_consensus_parameters is flagged x-pulse-static-stale when the chain's eosio/global row no longer
+// matches; re-run this tool against an endpoint that serves the current values, or retire the file.
 // Run it while the source still answers (before its nodeos is stopped; any time during the freeze is
 // right, since protocol features and consensus parameters cannot change while no blocks carry actions).
 // Files are written atomically (tmp + rename); a failed capture leaves the previous files untouched.
@@ -63,4 +68,5 @@ mkdirSync(dir, { recursive: true });
 const meta = { chain_id: info.chain_id, captured_at_head: info.head_block_num, captured_at_lib: info.last_irreversible_block_num, captured_time: new Date().toISOString() };
 writeAtomic(join(dir, 'activated_protocol_features.json'), { activated_protocol_features: uniq, _capture: meta });
 writeAtomic(join(dir, 'consensus_parameters.json'), consensus);
+writeAtomic(join(dir, 'capture.json'), meta);
 console.log(`captured ${uniq.length} activated protocol features + consensus parameters from chain ${String(info.chain_id).slice(0, 12)}… at head ${info.head_block_num} -> ${dir}`);

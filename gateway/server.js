@@ -7,11 +7,14 @@
 //   /v1/chain/<14 native>   -> the PulseVM node's own nodeos-compatible API (NATIVE_BASE/v1/chain/<name>),
 //                              Host: localhost (metalgo's host guard). Requests are normalized where the
 //                              native parser is stricter than nodeos (numbers vs strings, index names,
-//                              EOS… key spellings); responses pass through unchanged except get_info
-//                              (idle-chain head time, see FRESH_HEAD_TIME) and get_block_info (timestamp repair).
+//                              EOS… key spellings, eosjs-shaped transaction headers); responses pass through
+//                              unchanged except get_block_info (timestamp repair) and, only when the operator
+//                              opts in with FRESH_HEAD_TIME=1, get_info's head_block_time on an idle chain.
 //   /v1/chain/<polyfills>   -> translated from native calls / pulsevm.* JSON-RPC (RPC_URL).
 //   static-at-cut           -> get_activated_protocol_features / get_consensus_parameters from files captured
-//                              on the SOURCE chain at the cut (tools/capture-static.mjs); 501 if absent.
+//                              on the SOURCE chain at the cut (tools/capture-static.mjs); 501 if absent. Always
+//                              marked (x-pulse-edge: static-at-cut, x-pulse-static-captured) and flagged
+//                              x-pulse-static-stale when the chain shows the capture no longer matches.
 //   /v1/history/*           -> FEDERATOR_URL (pre-cut legacy + post-cut local, chain-verified state).
 //   everything else         -> 501 (known Leap endpoint PulseVM cannot serve yet) or nodeos-style 404.
 // Request bodies, paths and error bodies follow Leap 5.0.3 exactly (parse_params rules, exact paths, nodeos error
@@ -20,7 +23,12 @@
 //
 // Env: NATIVE_BASE (http://127.0.0.1:9650/ext/bc/<BID>), RPC_URL (NATIVE_BASE/rpc),
 //      FEDERATOR_URL (http://127.0.0.1:7010), STATIC_DIR (/etc/pulse-cutover/static), PORT (8899),
-//      HOST (127.0.0.1), UPSTREAM_TIMEOUT_MS (15000), FRESH_HEAD_TIME (1), MAX_BODY_BYTES (4 MiB).
+//      HOST (127.0.0.1), UPSTREAM_TIMEOUT_MS (15000), FRESH_HEAD_TIME (0), MAX_BODY_BYTES (4 MiB).
+// FRESH_HEAD_TIME=1 is a CLIENT WORKAROUND for idle chains (PulseVM builds blocks only when there are
+// transactions, so head_block_time can be minutes old and clients that compute expiration from it send
+// already-expired transactions). It replaces head_block_time with the current time: a synthesized value that
+// says nothing about block production. Off by default; when on, the real value stays in
+// pulsevm_head_block_time and every such answer carries `x-pulse-synthesized: head_block_time`.
 // No dependencies (Node >= 14). PORT=0 picks a free port (printed on start).
 'use strict';
 const http = require('http');
@@ -37,7 +45,7 @@ const STATIC_DIR = process.env.STATIC_DIR || '/etc/pulse-cutover/static';
 const PORT = Number(process.env.PORT == null ? 8899 : process.env.PORT);
 const HOST = process.env.HOST || '127.0.0.1';
 const TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 15000);
-const FRESH_HEAD_TIME = (process.env.FRESH_HEAD_TIME || '1') !== '0';
+const FRESH_HEAD_TIME = process.env.FRESH_HEAD_TIME === '1';
 const MAX_BODY = Number(process.env.MAX_BODY_BYTES || 4 * 1024 * 1024);
 const VERIFY_CONCURRENCY = 8;
 
@@ -329,6 +337,15 @@ function upstreamFailure(r, what) {
   if (r.status && r.json && r.json.error) return reply(r.status, r.json);
   return err(502, 'upstream_unavailable', `${what}: ${r.error || `HTTP ${r.status}`}`);
 }
+// A native answer that DEFINITIVELY says "no such account / block": 404, or a 400/500 whose nodeos error body
+// says so. Anything else that is not a success (timeouts, 502-504, an unexplained 500) is an upstream failure,
+// never "absent".
+const ABSENT_RE = /unknown key|unknown account|unknown block|account_query_exception|unknown_block|does not exist|not found|could not find/i;
+function nativeAbsent(r) {
+  if (r.status === 404) return true;
+  if ((r.status === 400 || r.status === 500) && r.json) return ABSENT_RE.test(JSON.stringify(r.json).slice(0, 4000));
+  return false;
+}
 function rpcFailure(e, what) {
   const msg = `${what}: ${(e && (e.data || e.message)) || 'error'}`;
   if (e && e.code === 404) return err(400, 'unknown_block_exception', msg, 'Bad Request');
@@ -347,6 +364,19 @@ async function pool(items, n, fn) {
 const INDEX_NAMES = { primary: 1, secondary: 2, tertiary: 3, fourth: 4, fifth: 5, sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10 };
 const toUint = (v) => (typeof v === 'string' && /^\d+$/.test(v.trim()) ? Number(v.trim()) : v);
 const toStr = (v) => (typeof v === 'number' || typeof v === 'bigint' ? String(v) : v);
+// get_required_keys carries an unpacked transaction. eosjs 20-22 and @proton/js send it as the header they
+// built: expiration WITH milliseconds ("2026-10-02T00:24:36.000") and no max_net_usage_words / max_cpu_usage_ms /
+// delay_sec. nodeos accepts both (fc parses the fraction; the header fields default to 0); the native PulseVM
+// parser answers 500 "Invalid JSON" to either, so every eosjs/@proton/js transact() failed before signing.
+// Normalize to what the native parser takes, changing nothing nodeos would read differently.
+function normalizeTrxJson(t) {
+  if (!t || typeof t !== 'object' || Array.isArray(t)) return t;
+  const q = { ...t };
+  if (typeof q.expiration === 'string') q.expiration = q.expiration.replace(/^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.\d+$/, '$1');
+  for (const k of ['max_net_usage_words', 'max_cpu_usage_ms', 'delay_sec']) if (q[k] === undefined || q[k] === null) q[k] = 0; else q[k] = toUint(q[k]);
+  for (const k of ['ref_block_num', 'ref_block_prefix']) q[k] = toUint(q[k]);
+  return q;
+}
 const NORMALIZE = {
   get_block: (p) => ({ ...p, block_num_or_id: toStr(p.block_num_or_id) }),
   get_block_info: (p) => ({ ...p, block_num: toUint(p.block_num) }),
@@ -366,7 +396,7 @@ const NORMALIZE = {
     for (const k of Object.keys(q)) if (q[k] === undefined) delete q[k];
     return q;
   },
-  get_required_keys: (p) => ({ ...p, available_keys: Array.isArray(p.available_keys) ? p.available_keys.map(toPubKey) : p.available_keys }),
+  get_required_keys: (p) => ({ ...p, transaction: normalizeTrxJson(p.transaction), available_keys: Array.isArray(p.available_keys) ? p.available_keys.map(toPubKey) : p.available_keys }),
   push_transaction: (p) => ({ ...p, packed_context_free_data: p.packed_context_free_data == null ? '' : p.packed_context_free_data }),
   send_transaction: (p) => ({ ...p, packed_context_free_data: p.packed_context_free_data == null ? '' : p.packed_context_free_data }),
 };
@@ -396,13 +426,13 @@ async function passNative(name, raw, params) {
   if (!r.status) return err(502, 'upstream_unavailable', `PulseVM node unreachable: ${r.error}`);
   if (r.status === 200 && r.json) {
     if (name === 'get_info' && FRESH_HEAD_TIME && r.json.head_block_time) {
-      // PulseVM builds blocks on demand: on an idle chain head_block_time is old, and clients that set
-      // expiration = head_block_time + N would send already-expired transactions. Report a fresh head time
-      // when the real one is stale; the true value stays in pulsevm_head_block_time.
+      // Opt-in client workaround (see FRESH_HEAD_TIME above): on an idle chain head_block_time is old, and
+      // clients that set expiration = head_block_time + N would send already-expired transactions. The value
+      // reported is SYNTHESIZED (the current time), marked as such; the real one stays in pulsevm_head_block_time.
       const real = Date.parse(r.json.head_block_time + 'Z'), now = Date.now();
       if (now - real > 3000) {
         return reply(200, { ...r.json, head_block_time: isoMs(Math.floor(now / 500) * 500), pulsevm_head_block_time: r.json.head_block_time },
-          { 'x-pulse-edge': 'fresh-head-time' });
+          { 'x-pulse-edge': 'fresh-head-time', 'x-pulse-synthesized': 'head_block_time' });
       }
     }
     if (name === 'get_block_info' && r.json.timestamp && repairTimestamp(r.json.timestamp) !== r.json.timestamp) {
@@ -420,7 +450,7 @@ async function passNative(name, raw, params) {
 // ---- polyfills ---------------------------------------------------------------------------------------------------
 async function blockAndHeader(id) {
   const b = await native('get_block', { block_num_or_id: toStr(id) });
-  if (b.status !== 200 || !b.json) return { fail: upstreamFailure(b, 'get_block'), notFound: b.status >= 400 && b.status < 600 };
+  if (b.status !== 200 || !b.json) return { fail: upstreamFailure(b, 'get_block'), notFound: nativeAbsent(b) };
   const blk = b.json;
   // Fields get_block omits come from the node's own get_block_info for the same height (never invented here).
   const bi = await native('get_block_info', { block_num: blk.block_num });
@@ -454,6 +484,15 @@ const POLY = {
       return leapErr(500, 3010010, 'packed_transaction_type_exception', 'Invalid packed transaction', 'Internal Service Error', [
         D('Invalid packed transaction', 'chain_plugin.cpp', 2201, 'send_transaction_gen'), castToObject(t === undefined ? null : t), D('Failed to deserialize variant', 'abi_serializer.hpp', 1003, 'from_variant')]);
     }
+    // retry_trx asks the node to keep re-sending the transaction and to answer only once it is in a block
+    // retry_trx_num_blocks deep (or irreversible). This edge cannot do that: refused like a Leap node without
+    // the retry feature, never accepted and silently dropped (a caller relying on it would think the node is
+    // tracking inclusion).
+    if (p.retry_trx === true || p.retry_trx === 'true') {
+      return err(500, 'unsupported_feature', 'Transaction retry not allowed on node: pulse-edge does not implement retry_trx '
+        + '(no re-send, no wait for inclusion). Send without retry_trx, then reconcile the transaction id (history get_transaction) '
+        + 'before building a replacement', 'Internal Service Error', { 'x-pulse-edge': 'retry-unsupported' });
+    }
     const r = await passNative('send_transaction', JSON.stringify(t), t);
     if (p.return_failure_trace === false || p.return_failure_trace === 'false') return r;
     const body = r.body || (() => { try { return JSON.parse(r.raw); } catch { return null; } })();
@@ -463,23 +502,29 @@ const POLY = {
     if (r.status < 400 || !e || PRE_EXECUTION.has(Number(e.code)) || Number(e.code) < 3000000) return r;
     let id = '0'.repeat(64);
     try { id = transactionId({ packed_trx: t.packed_trx, compression: t.compression }); } catch { /* unparsable packed_trx never reaches here */ }
-    const info = await native('get_info', {});
-    const head = (info.json && info.json.head_block_num) || 0, now = Date.now();
-    const blockTime = isoMs(Math.max(now, Date.parse(((info.json && info.json.head_block_time) || '1970-01-01T00:00:00') + 'Z') + 500));
+    const now = Date.now();
+    // The node returns an error, not a trace: there is no block this failure "happened in", so block_num /
+    // block_time are null rather than invented (nodeos would name the pending block it tried).
     return reply(202, { transaction_id: id, processed: {
-      id, block_num: head + 1, block_time: blockTime, producer_block_id: null, receipt: null, elapsed: 0, net_usage: 0, scheduled: false,
+      id, block_num: null, block_time: null, producer_block_id: null, receipt: null, elapsed: 0, net_usage: 0, scheduled: false,
       action_traces: [], account_ram_delta: null,
       except: { code: e.code, name: e.name, message: e.what, stack: (e.details || []).map((d) => ({
         context: { level: 'error', file: d.file || '', line: d.line_number || 0, method: d.method || '', hostname: '', thread_name: 'nodeos', timestamp: isoMs(now) },
         format: d.message, data: {} })) },
       error_code: '10000000000000000000',
-    } }, { 'x-pulse-edge': 'failure-trace from the node error (elapsed/net_usage and stack data not available)' });
+    } }, { 'x-pulse-edge': 'failure-trace synthesized from the node error (no block: block_num/block_time null; elapsed/net_usage and stack data not available)' });
   },
-  async push_transactions(p) {
+  async push_transactions(p, ctx) {
     if (p.length > 1000) return leapErr(500, 3100001, 'too_many_tx_at_once', 'Pushing too many transactions at once', 'Internal Service Error', [D('Attempt to push more than 1000 transactions at once', 'chain_plugin.cpp', 2185, 'push_transactions')]);
     if (!p.length) return leapErr(500, 13, 'St12out_of_range', 'vector', 'Internal Service Error', [D('rethrow vector: ', 'chain_plugin.cpp', 2190, 'push_transactions')]);
     const out = [];
-    for (const t of p) { // sequential, in order, one result per transaction (like nodeos)
+    for (const [i, t] of p.entries()) { // sequential, in order, one result per transaction (like nodeos)
+      // A client that went away (timeout, closed connection) will retry the business operation: submitting
+      // the rest of its batch now could execute it twice. Stop, and say so in the log.
+      if (ctx && ctx.gone()) {
+        console.error(`push_transactions: client disconnected after ${i} of ${p.length}; the remaining ${p.length - i} were NOT submitted`);
+        return reply(499, { error: 'client disconnected', submitted: i, not_submitted: p.length - i });
+      }
       const r = await passNative('push_transaction', JSON.stringify(t), t);
       const body = r.body || (() => { try { return JSON.parse(r.raw); } catch { return null; } })();
       if (r.status < 400 && body) out.push(body);
@@ -574,7 +619,7 @@ const POLY = {
     const ne = leapNameError(p.account_name == null ? '' : p.account_name);
     if (ne) return unparsable(ne);
     const r = await native('get_raw_abi', { account_name: p.account_name });
-    if (r.status >= 400 && r.status < 600) return leapErr(400, 3060002, 'account_query_exception', 'Account Query Exception', 'Account lookup',
+    if (nativeAbsent(r)) return leapErr(400, 3060002, 'account_query_exception', 'Account Query Exception', 'Account lookup',
       [D(`unable to retrieve account code/abi (unknown key (eosio::chain::name): ${p.account_name})`, 'chain_plugin.cpp', 2357, 'get_raw_code_and_abi')]);
     if (r.status !== 200 || !r.json) return upstreamFailure(r, 'get_raw_code_and_abi');
     return reply(200, { account_name: r.json.account_name || p.account_name, wasm: '', abi: r.json.abi || '' }, { 'x-pulse-edge': 'wasm-unavailable' });
@@ -589,11 +634,24 @@ const POLY = {
     if (p.upper_bound != null && p.upper_bound !== '') list = list.filter((f) => f[key] <= Number(p.upper_bound));
     if (p.reverse === true || p.reverse === 'true') list.reverse();
     // Leap 5.0 ignores `limit` here: every matching feature, never a `more` (checked against nodeos 5.0.0 and 5.0.3).
-    return reply(200, { activated_protocol_features: list }, { 'x-pulse-edge': 'static-at-cut' });
+    return reply(200, { activated_protocol_features: list }, { ...staticHeaders(), 'x-pulse-static-freshness': 'at the cut: activations on the new chain after the cut are not reflected' });
   },
   async get_consensus_parameters() {
     const s = loadStatic('consensus_parameters.json');
-    return s ? reply(200, s, { 'x-pulse-edge': 'static-at-cut' }) : staticMissing('get_consensus_parameters', 'consensus_parameters.json');
+    if (!s) return staticMissing('get_consensus_parameters', 'consensus_parameters.json');
+    const { _capture, ...body } = s;
+    // The chain_config fields are also kept by eosio.system in eosio/global (setparams writes both): a capture
+    // that no longer matches that row is stale (served, but flagged). An unreadable row = unknown.
+    const headers = staticHeaders();
+    const g = await native('get_table_rows', { code: 'eosio', scope: 'eosio', table: 'global', json: true, limit: 1 });
+    const row = g.status === 200 && g.json && Array.isArray(g.json.rows) ? g.json.rows[0] : null;
+    if (!row || typeof row !== 'object') headers['x-pulse-static-stale'] = 'unknown (eosio global unreadable)';
+    else {
+      const cc = (body && body.chain_config) || {};
+      const differ = Object.keys(cc).filter((k) => k in row && typeof cc[k] !== 'object' && Number(cc[k]) !== Number(row[k]));
+      if (differ.length) headers['x-pulse-static-stale'] = `chain_config differs from the chain's eosio global row: ${differ.join(', ')}`;
+    }
+    return reply(200, body, headers);
   },
   async get_scheduled_transactions() {
     // PulseVM v1.0.0 DOES keep deferred (generated) transactions — migrated from the snapshot and
@@ -617,20 +675,30 @@ const POLY = {
     if (!keys.length && !accts.length) return reply(200, { accounts: [] });
     // Discovery: the federator's verified key -> accounts and controlling -> controlled lookups (legacy
     // pre-cut index + local post-cut index). Truth: this node's get_account for every candidate.
+    // A discovery answer the federator marks `partial` (one index unreachable, a chain read failed) is an
+    // INCOMPLETE candidate set: answering from it would look complete and omit accounts. Refused, like an outage.
     const candidates = new Set();
     for (const k of keys) {
       const r = await request(`${FEDERATOR_URL}/v1/history/get_key_accounts`, { body: JSON.stringify({ public_key: String(k) }) });
       if (r.status !== 200 || !r.json || !Array.isArray(r.json.account_names)) return discoveryDown(r);
+      if (r.json.partial) return discoveryIncomplete(r);
       r.json.account_names.forEach((n) => candidates.add(n));
     }
     for (const a of accts) {
       const r = await request(`${FEDERATOR_URL}/v1/history/get_controlled_accounts`, { body: JSON.stringify({ controlling_account: String(a.actor) }) });
       if (r.status !== 200 || !r.json || !Array.isArray(r.json.controlled_accounts)) return discoveryDown(r);
+      if (r.json.partial) return discoveryIncomplete(r);
       r.json.controlled_accounts.forEach((n) => candidates.add(n));
     }
     const keyCanons = [...new Set(keys.map(keyCanon))];
     const acctRows = [], keyRows = [];
-    const results = await pool([...candidates], VERIFY_CONCURRENCY, (name) => native('get_account', { account_name: name }));
+    const names = [...candidates];
+    const results = await pool(names, VERIFY_CONCURRENCY, (name) => native('get_account', { account_name: name }));
+    const failed = names.filter((n, i) => !(results[i].status === 200 && results[i].json) && !nativeAbsent(results[i]));
+    if (failed.length) {
+      return err(503, 'verification_unavailable', `get_account failed for ${failed.length} candidate account(s) (${failed.slice(0, 5).join(', ')}${failed.length > 5 ? ', …' : ''}): `
+        + 'refusing to answer from a partially verified candidate set', undefined, { 'x-pulse-edge': 'partial-verification' });
+    }
     for (const r of results) {
       if (r.status !== 200 || !r.json) continue; // no such account on the chain now: nothing to report
       const perms = r.json.permissions || [];
@@ -676,10 +744,20 @@ const POLY = {
   send_read_only_transaction: async () => unavailable('send_read_only_transaction', 'no read-only execution endpoint'),
 };
 const DISABLE_DEFERRED_STAGE_1 = 'fce57d2331667353a0eac6b4209b67b843a7262a848af0a49a6e2fa9f6584eb4';
+const discoveryIncomplete = (r) => err(503, 'discovery_incomplete', `account discovery (federator ${FEDERATOR_URL}) answered PARTIALLY `
+  + `(${JSON.stringify(r.json.source_errors || {}).slice(0, 300)}); refusing to answer from an incomplete candidate set`, undefined, { 'x-pulse-edge': 'partial-discovery' });
 const discoveryDown = (r) => err(502, 'discovery_unavailable', `account discovery (federator ${FEDERATOR_URL}) unavailable: ${r.error || `HTTP ${r.status}`}; refusing to answer from an incomplete candidate set`);
 
 function loadStatic(file) {
   try { return JSON.parse(fs.readFileSync(path.join(STATIC_DIR, file), 'utf8')); } catch { return null; }
+}
+// Every static answer says it is static, and what it was captured from (capture.json, written by
+// tools/capture-static.mjs; older captures carry it inside activated_protocol_features.json).
+function staticHeaders() {
+  const meta = loadStatic('capture.json') || ((loadStatic('activated_protocol_features.json') || {})._capture) || null;
+  const h = { 'x-pulse-edge': 'static-at-cut' };
+  h['x-pulse-static-captured'] = meta ? `chain ${String(meta.chain_id || '?').slice(0, 12)} head ${meta.captured_at_head} at ${meta.captured_time}` : 'unknown (no capture metadata)';
+  return h;
 }
 const staticMissing = (ep, file) => err(501, 'unsupported_feature',
   `${ep} is served from ${path.join(STATIC_DIR, file)}, captured from the source chain at the cut (tools/capture-static.mjs); the file is missing`,
@@ -690,7 +768,7 @@ const SUPPORTED = [...NATIVE, 'send_transaction2', 'push_transactions', 'get_raw
   'get_producer_schedule', 'get_raw_code_and_abi', 'get_activated_protocol_features', 'get_consensus_parameters', 'get_scheduled_transactions',
   'get_accounts_by_authorizers', 'get_transaction_id'].sort();
 
-async function route(req, raw) {
+async function route(req, raw, ctx) {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname; // exact, like nodeos: a trailing slash is a different (unknown) endpoint
   if (p.startsWith('/v1/history/')) {
@@ -712,7 +790,7 @@ async function route(req, raw) {
     }
     return passNative(name, raw, parsed.params);
   }
-  return POLY[name](parsed.params);
+  return POLY[name](parsed.params, ctx);
 }
 
 function createEdge() {
@@ -723,7 +801,10 @@ function createEdge() {
       res.setHeader('access-control-allow-headers', 'content-type');
       res.statusCode = 204; return res.end();
     }
-    const chunks = []; let size = 0, tooBig = false;
+    const chunks = []; let size = 0, tooBig = false, gone = false;
+    // The response closing before it was written = the client went away (polyfills that submit several
+    // transactions stop at that point).
+    res.on('close', () => { if (!res.writableFinished) gone = true; });
     req.on('data', (c) => { size += c.length; if (size > MAX_BODY) tooBig = true; else chunks.push(c); });
     req.on('end', () => {
       const send = (out) => {
@@ -733,7 +814,7 @@ function createEdge() {
         res.end(out.raw != null ? out.raw : JSON.stringify(out.body));
       };
       if (tooBig) return send(err(413, 'request_too_large', `request body over ${MAX_BODY} bytes`));
-      route(req, Buffer.concat(chunks).toString('utf8'))
+      route(req, Buffer.concat(chunks).toString('utf8'), { gone: () => gone || res.destroyed })
         .then(send)
         .catch((e) => send(err(500, 'edge_exception', String((e && e.message) || e))));
     });

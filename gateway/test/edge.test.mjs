@@ -73,12 +73,14 @@ function mockNode(req, res, body) {
     case 'get_block':
       if (typeof p.block_num_or_id !== 'string') return json(res, 400, nodeosErr('Invalid JSON'));
       if (p.block_num_or_id === '999') return json(res, 500, nodeosErr('block 999 not found'));
+      if (p.block_num_or_id === '998') return json(res, 503, 'service unavailable');
       return json(res, 200, blockJson(Number(p.block_num_or_id) || 100));
     case 'get_block_info':
       if (typeof p.block_num !== 'number') return json(res, 400, nodeosErr('Invalid JSON'));
       return json(res, 200, { block_num: p.block_num, id: BLOCK_ID, timestamp: 'TimePoint { elapsed: Microseconds { count: 1790769600500000 } }',
         producer: 'eosio', confirmed: 0, previous: '00000063' + '0'.repeat(56), schedule_version: 0, producer_signature: 'SIG_K1_', header_extensions: [], new_producers: null, ref_block_prefix: 1 });
     case 'get_account':
+      if (p.account_name === 'flaky') return json(res, 503, 'upstream timeout'); // an outage, not an absent account
       return accounts[p.account_name] ? json(res, 200, accounts[p.account_name]) : json(res, 500, nodeosErr(`unknown account ${p.account_name}`));
     case 'get_raw_abi':
       if (p.account_name === 'nobody') return json(res, 500, nodeosErr('unknown account nobody'));
@@ -90,13 +92,14 @@ function mockNode(req, res, body) {
         const rows = p.json === false ? producers.map((r) => Buffer.from(r.owner).toString('hex')) : producers;
         return json(res, 200, { rows, more: false, next_key: '' });
       }
-      if (p.table === 'global') return json(res, 200, { rows: [{ total_producer_vote_weight: '600.50000000000000000' }], more: false, next_key: '' });
+      if (p.table === 'global') return json(res, 200, { rows: [{ total_producer_vote_weight: '600.50000000000000000', max_block_cpu_usage: 200000 }], more: false, next_key: '' });
       return json(res, 200, { rows: [{ echo: p }], more: false, next_key: '' });
     }
     case 'get_required_keys':
       if ((p.available_keys || []).some((k) => k.startsWith('EOS'))) return json(res, 400, nodeosErr('Invalid JSON'));
       return json(res, 200, { required_keys: (p.available_keys || []).filter((k) => k === DEV_PUB) });
     case 'push_transaction': case 'send_transaction':
+      if (/^51/.test(p.packed_trx || '')) return setTimeout(() => json(res, 200, { transaction_id: createHash('sha256').update(Buffer.from(p.packed_trx, 'hex')).digest('hex') }), 300);
       if (p.packed_trx === 'bad') return json(res, 500, nodeosErr('transaction declares authority that was not provided'));
       if (p.packed_trx === 'auth') return json(res, 500, leapTxErr(3090003, 'unsatisfied_authorization', 'Provided keys, permissions, and delays do not satisfy declared authorizations', "transaction declares authority '{\"actor\":\"alice\",\"permission\":\"active\"}', but does not have signatures for it", 'authorization_manager.cpp', 558, 'check_authorization'));
       if (p.packed_trx === 'expired') return json(res, 500, leapTxErr(3040005, 'expired_tx_exception', 'Expired Transaction', 'expired transaction abc', 'producer_plugin.cpp', 877, 'process_incoming_transaction_async'));
@@ -115,7 +118,11 @@ function mockFederator(req, res, body) {
     if (edge.keyCanon(p.public_key) === edge.keyCanon(THIRD)) return json(res, 200, { account_names: ['amy', 'zed'] });
     return json(res, 200, { account_names: ['alice', 'carol', 'ghost'] });
   }
-  if (url.pathname === '/v1/history/get_controlled_accounts') return json(res, 200, { controlled_accounts: p.controlling_account === 'bob' ? ['alice', 'carol'] : [] });
+  if (url.pathname === '/v1/history/get_controlled_accounts') {
+    if (p.controlling_account === 'partialbob') return json(res, 200, { controlled_accounts: ['alice'], partial: true, source_errors: { legacy: { status: 429 } } });
+    if (p.controlling_account === 'flakyboss') return json(res, 200, { controlled_accounts: ['alice', 'flaky'] });
+    return json(res, 200, { controlled_accounts: p.controlling_account === 'bob' ? ['alice', 'carol'] : [] });
+  }
   if (url.pathname === '/v1/history/get_actions') return json(res, 200, { actions: [{ ok: 1 }], from: 'federator' });
   return json(res, 404, { error: 'nope' });
 }
@@ -268,12 +275,22 @@ test('get_raw_code_and_abi and get_raw_block: nodeos error texts', async () => {
   assert.equal(b.json.error.details[0].message, 'Could not find block: 999');
   isNodeosError(await call('get_raw_block', { block_num_or_id: 'zz' }), 500);
 });
-test('get_info: stale head time on an idle chain is refreshed, true value kept', async () => {
+test('get_info: the REAL head_block_time by default (an idle chain looks idle)', async () => {
   const r = await call('get_info', undefined, 'GET');
   assert.equal(r.status, 200);
-  assert.equal(r.json.pulsevm_head_block_time, '2026-01-01T00:00:00.500');
-  assert.ok(Date.now() - Date.parse(r.json.head_block_time + 'Z') < 5000);
-  assert.equal(r.json.head_block_num, 100);
+  assert.equal(r.json.head_block_time, '2026-01-01T00:00:00.500');
+  assert.equal(r.json.pulsevm_head_block_time, undefined);
+  assert.equal(r.headers.get('x-pulse-synthesized'), null);
+});
+test('get_info: FRESH_HEAD_TIME=1 (opt-in client workaround) synthesizes a fresh head time and says so', async () => {
+  const { p, url } = await startEdge({ NATIVE_BASE: `http://127.0.0.1:${node.address().port}/ext/bc/${BID}`, FRESH_HEAD_TIME: '1' });
+  try {
+    const r = await call('get_info', undefined, 'GET', url);
+    assert.equal(r.json.pulsevm_head_block_time, '2026-01-01T00:00:00.500');
+    assert.ok(Date.now() - Date.parse(r.json.head_block_time + 'Z') < 5000);
+    assert.equal(r.headers.get('x-pulse-synthesized'), 'head_block_time');
+    assert.equal(r.json.head_block_num, 100);
+  } finally { p.kill(); }
 });
 
 // ---- polyfills ------------------------------------------------------------------------------------------------
@@ -296,7 +313,8 @@ test('send_transaction2: a failure while executing is 202 + failure trace (defau
     assert.equal(r.status, 202, 'nodeos: return_failure_trace defaults to true');
     const pr = r.json.processed;
     assert.equal(r.json.transaction_id, pr.id);
-    assert.equal(pr.block_num, 101);
+    assert.equal(pr.block_num, null, 'no block is invented for a node error');
+    assert.equal(pr.block_time, null);
     assert.equal(pr.receipt, null); assert.equal(pr.producer_block_id, null); assert.deepEqual(pr.action_traces, []); assert.equal(pr.scheduled, false);
     assert.equal(pr.except.code, 3090003); assert.equal(pr.except.name, 'unsatisfied_authorization');
     assert.equal(pr.except.message, 'Provided keys, permissions, and delays do not satisfy declared authorizations');
@@ -310,6 +328,26 @@ test('send_transaction2: a failure while executing is 202 + failure trace (defau
   const x = await call('send_transaction2', { return_failure_trace: true, transaction: { ...tx, packed_trx: 'expired' } });
   isNodeosError(x, 500);
   assert.equal(x.json.error.name, 'expired_tx_exception');
+});
+test('send_transaction2: retry_trx is refused (not implemented), never accepted and ignored', async () => {
+  const before = seen.filter((x) => x.path.includes('send_transaction')).length;
+  const r = await call('send_transaction2', { retry_trx: true, retry_trx_num_blocks: 3, transaction: { signatures: [], compression: 0, packed_trx: 'abcd' } });
+  isNodeosError(r, 500);
+  assert.equal(r.json.error.name, 'unsupported_feature');
+  assert.match(r.json.error.what, /reconcile the transaction id/);
+  assert.equal(r.headers.get('x-pulse-edge'), 'retry-unsupported');
+  assert.equal(seen.filter((x) => x.path.includes('send_transaction')).length, before, 'nothing was submitted');
+});
+test('push_transactions: a client that disconnects stops the batch (the rest is NOT submitted)', async () => {
+  const count = () => seen.filter((x) => x.path.includes('push_transaction') && /"packed_trx":"51/.test(x.body)).length;
+  const before = count();
+  const batch = ['5101', '5102', '5103', '5104', '5105', '5106'].map((h) => ({ signatures: [], compression: 0, packed_trx: h }));
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 450);
+  await assert.rejects(fetch(`${base}/v1/chain/push_transactions`, { method: 'POST', body: JSON.stringify(batch), signal: ac.signal }));
+  await new Promise((r) => setTimeout(r, 1500));
+  const sent = count() - before;
+  assert.ok(sent >= 1 && sent <= 3, `submitted ${sent} of 6 after the client left at ~450 ms (300 ms each)`);
 });
 test('push_transactions: 202, one result per transaction in order, failures as nodeos detail strings', async () => {
   const r = await call('push_transactions', [{ signatures: [], compression: 0, packed_trx: '01' }, { signatures: [], compression: 0, packed_trx: 'auth' }, { signatures: [], compression: 0, packed_trx: '02' }]);
@@ -413,8 +451,25 @@ test('get_activated_protocol_features: static-at-cut, like Leap 5.0 (limit ignor
   assert.deepEqual(r3.json.activated_protocol_features.map((f) => f.activation_block_num), [34, 32, 30]);
   assert.equal((await call('get_activated_protocol_features', '')).status, 200, 'params optional');
   assert.equal(r.headers.get('x-pulse-edge'), 'static-at-cut');
+  assert.match(r.headers.get('x-pulse-static-captured'), /no capture metadata/);
+  assert.match(r.headers.get('x-pulse-static-freshness'), /not reflected/);
   const c = await call('get_consensus_parameters', {});
   assert.equal(c.json.chain_config.max_block_cpu_usage, 200000);
+  assert.equal(c.headers.get('x-pulse-edge'), 'static-at-cut');
+  assert.equal(c.headers.get('x-pulse-static-stale'), null, 'matches the chain\'s eosio global row');
+});
+test('static capture: metadata header, and a consensus capture that no longer matches the chain is flagged stale', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'edge-stale-'));
+  writeFileSync(join(d, 'consensus_parameters.json'), JSON.stringify({ chain_config: { max_block_cpu_usage: 250000 }, wasm_config: { max_pages: 528 } }));
+  writeFileSync(join(d, 'capture.json'), JSON.stringify({ chain_id: 'c'.repeat(64), captured_at_head: 90, captured_time: '2026-01-01T00:00:00.000Z' }));
+  const { p, url } = await startEdge({ NATIVE_BASE: `http://127.0.0.1:${node.address().port}/ext/bc/${BID}`, STATIC_DIR: d });
+  try {
+    const c = await call('get_consensus_parameters', {}, 'POST', url);
+    assert.equal(c.status, 200);
+    assert.equal(c.json.chain_config.max_block_cpu_usage, 250000, 'served as captured');
+    assert.match(c.headers.get('x-pulse-static-stale'), /max_block_cpu_usage/);
+    assert.match(c.headers.get('x-pulse-static-captured'), /head 90/);
+  } finally { p.kill(); }
 });
 test('static endpoints without a capture answer a nodeos-shaped 501', async () => {
   const empty = mkdtempSync(join(tmpdir(), 'edge-empty-'));
@@ -533,4 +588,43 @@ test('get_supported_apis lists every served /v1/chain endpoint', async () => {
   const { apis } = await r.json();
   for (const n of ['get_info', 'send_transaction2', 'get_producers', 'get_accounts_by_authorizers']) assert.ok(apis.includes(`/v1/chain/${n}`));
   assert.ok(!apis.includes('/v1/chain/get_code'));
+});
+
+test('get_accounts_by_authorizers: a PARTIAL federator discovery is refused, never a complete-looking answer', async () => {
+  const r = await call('get_accounts_by_authorizers', { accounts: ['partialbob'] });
+  isNodeosError(r, 503);
+  assert.equal(r.json.error.name, 'discovery_incomplete');
+  assert.equal(r.headers.get('x-pulse-edge'), 'partial-discovery');
+  assert.notEqual(r.headers.get('x-pulse-edge'), 'polyfill; chain-verified');
+});
+test('get_accounts_by_authorizers: a failed candidate verification (5xx) is an error, not "no such account"', async () => {
+  const r = await call('get_accounts_by_authorizers', { accounts: ['flakyboss'] });
+  isNodeosError(r, 503);
+  assert.equal(r.json.error.name, 'verification_unavailable');
+  assert.match(r.json.error.what, /flaky/);
+});
+test('backend 5xx is unavailable, not absent: get_block_header on a 503 is not "Could not find block"', async () => {
+  const r = await call('get_block_header', { block_num_or_id: 998 });
+  assert.notEqual(r.status, 400);
+  isNodeosError(r, 502);
+  assert.equal(r.json.error.name, 'upstream_unavailable');
+  assert.doesNotMatch(JSON.stringify(r.json), /Could not find block/);
+  const nf = await call('get_block_header', { block_num_or_id: 999 });
+  assert.equal(nf.json.error.details[0].message, 'Could not find block header: 999');
+});
+
+test('get_required_keys: an eosjs/@proton/js-shaped transaction (expiration .000, no max_net/max_cpu/delay) reaches the node normalized', async () => {
+  const trx = { expiration: '2026-10-02T00:24:36.000', ref_block_num: 42309, ref_block_prefix: 3727885821,
+    actions: [{ account: 'eosio.token', name: 'transfer', authorization: [{ actor: 'alice', permission: 'active' }], data: '00' }],
+    transaction_extensions: [], context_free_actions: [] };
+  const r = await call('get_required_keys', { transaction: trx, available_keys: [DEV_EOS] });
+  assert.equal(r.status, 200);
+  const sent = JSON.parse(lastSeen('/get_required_keys').body).transaction;
+  assert.equal(sent.expiration, '2026-10-02T00:24:36');
+  assert.equal(sent.max_net_usage_words, 0); assert.equal(sent.max_cpu_usage_ms, 0); assert.equal(sent.delay_sec, 0);
+  assert.equal(sent.ref_block_num, 42309); assert.deepEqual(sent.actions, trx.actions);
+  // an already-native transaction is passed through unchanged
+  const native = { ...trx, expiration: '2026-10-02T00:24:36', max_net_usage_words: 0, max_cpu_usage_ms: 0, delay_sec: 0 };
+  await call('get_required_keys', { transaction: native, available_keys: [DEV_EOS] });
+  assert.deepEqual(JSON.parse(lastSeen('/get_required_keys').body).transaction, native);
 });
