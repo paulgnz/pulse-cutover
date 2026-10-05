@@ -580,6 +580,11 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     let overrides = cfg.rehearsal_overrides();
     if !overrides.is_empty() {
         checks.push(check("rehearsal_overrides", false, format!("rehearsal overrides active: {}", overrides.join("; "))));
+    } else if cfg.ceremony.rehearsal {
+        // An explicit REHEARSAL ceremony (ceremony.rehearsal = true) is shown the same way: never a real cut.
+        let relax = cfg.production_problems();
+        checks.push(check("rehearsal_overrides", false, format!("REHEARSAL ceremony (ceremony.rehearsal = true){}",
+            if relax.is_empty() { String::new() } else { format!("; relaxations: {}", relax.join("; ")) })));
     }
 
     // Hooks.

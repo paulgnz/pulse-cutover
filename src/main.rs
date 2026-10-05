@@ -629,6 +629,12 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     } else {
         println!("rehearsal_overrides: ACTIVE (REHEARSAL ONLY, never a real cut): {}", overrides.join("; "));
     }
+    if cfg.ceremony.rehearsal {
+        println!("ceremony: REHEARSAL (ceremony.rehearsal = true; never a real cut); relaxations: {}",
+            if cfg.production_problems().is_empty() { "none".to_string() } else { cfg.production_problems().join("; ") });
+    } else if cfg.ceremony.profile == pulse_cutover::config::Profile::Ceremony {
+        println!("ceremony: production profile met");
+    }
     if !cfg.journal_path.exists() {
         println!("no journal at {} — ceremony not started", cfg.journal_path.display());
         return Ok(());

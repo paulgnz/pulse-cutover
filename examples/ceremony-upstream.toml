@@ -23,6 +23,8 @@ journal_path = "/root/upstream-run/journal.jsonl"
 poll_ms = 250
 
 [ceremony]
+rehearsal = true             # verify-only drill (no ignition): a real cut drops this line and must meet the
+                             # production profile (hooks, schedule_at_h, post_live_probe_cmd; README "Production profile").
 freeze_height = 12345
 import_backend = "upstream"
 # import_cpu_scale: not used by this backend (PulseVM v1.0.0 has no import CPU scale). Leave it

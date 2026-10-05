@@ -31,6 +31,8 @@ journal_path = "/root/stage2-run/journal.jsonl"
 poll_ms = 250
 
 [ceremony]
+rehearsal = true             # REHEARSAL config: relaxes the production profile (see README "Production profile");
+                             # a real cut drops this line and must load without it. Refused for XPR mainnet.
 mode = "api"
 # A few hundred blocks ahead of the testnet's LIB at the time you start.
 freeze_height = 0

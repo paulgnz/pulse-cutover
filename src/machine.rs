@@ -344,11 +344,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     "import_cpu_scale_effective": self.cfg.ceremony.import_backend != ImportBackend::Upstream,
                     "import_backend": format!("{:?}", self.cfg.ceremony.import_backend),
                     "rehearsal_overrides": self.cfg.rehearsal_overrides(),
+                    "rehearsal": self.cfg.ceremony.rehearsal,
+                    "production_profile": if self.cfg.ceremony.rehearsal { json!(self.cfg.production_problems()) } else { json!("met") },
                 }),
             )?;
             for w in self.cfg.warnings() {
                 self.journal.evidence(State::Armed, json!({"config_warning": w}))?;
                 eprintln!("WARNING: {w}");
+            }
+            if self.cfg.ceremony.rehearsal {
+                self.journal.evidence(State::Armed, json!({"REHEARSAL": true, "relaxations": self.cfg.production_problems(),
+                    "note": "REHEARSAL ceremony (ceremony.rehearsal = true): not a valid cutover"}))?;
+                eprintln!("WARNING: REHEARSAL ceremony; relaxations: {}", self.cfg.production_problems().join("; "));
             }
             if !self.cfg.rehearsal_overrides().is_empty() {
                 self.journal.evidence(State::Armed, json!({"REHEARSAL_OVERRIDES_ACTIVE": self.cfg.rehearsal_overrides(),
@@ -401,11 +408,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         // Rehearsal overrides are refused at config load for a configured mainnet chain_id; a
         // config that leaves chain_id to discovery is caught here, before anything freezes.
-        if crate::config::is_xpr_mainnet(&info.chain_id) && !self.cfg.rehearsal_overrides().is_empty() {
-            problems.push(format!(
-                "the source is XPR MAINNET and rehearsal overrides are active ({}): refused",
-                self.cfg.rehearsal_overrides().join("; ")
-            ));
+        if crate::config::is_xpr_mainnet(&info.chain_id) && (!self.cfg.rehearsal_overrides().is_empty() || self.cfg.ceremony.rehearsal) {
+            let mut what = self.cfg.rehearsal_overrides();
+            if self.cfg.ceremony.rehearsal {
+                what.push("ceremony.rehearsal = true".into());
+            }
+            problems.push(format!("the source is XPR MAINNET and rehearsal overrides are active ({}): refused", what.join("; ")));
         }
         match self.ops.producer_paused() {
             // api mode: this node does not produce; we only need producer_api
@@ -562,6 +570,25 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
         Ok(())
+    }
+
+    /// The production profile, re-checked right before the write freeze (the config may have been
+    /// edited, or the source discovered to be mainnet, since load). Ok(false) after aborting.
+    fn production_gate(&mut self) -> Result<bool, String> {
+        let mainnet = self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet);
+        let problems = self.cfg.production_problems();
+        if self.cfg.ceremony.rehearsal && !mainnet {
+            return Ok(true);
+        }
+        if self.cfg.ceremony.rehearsal || !problems.is_empty() {
+            self.abort(
+                "production profile not met before the freeze",
+                json!({"problems": problems, "rehearsal": self.cfg.ceremony.rehearsal, "xpr_mainnet": mainnet}),
+            )?;
+            return Ok(false);
+        }
+        self.journal.evidence(State::Armed, json!({"production_profile": "met (checked before the freeze)"}))?;
+        Ok(true)
     }
 
     /// Coordinated ceremonies: has the coordinator published a SIGNED abort for this event?
@@ -1087,6 +1114,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.ops.sleep_ms(self.cfg.poll_ms);
         };
 
+        if !self.production_gate()? {
+            return Ok(());
+        }
         // The write freeze — the moment the write gap starts (R2: an
         // explicit reject at the API edge, never just a producer pause).
         let freeze_hook = if let Some(hook) = &self.cfg.hooks.on_freeze {
@@ -1157,6 +1187,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             self.ops.sleep_ms(self.cfg.poll_ms);
         };
+        if !self.production_gate()? {
+            return Ok(());
+        }
         // Optional write-freeze hook (e.g. a local gateway starts rejecting
         // writes with a clear "cutover in progress" error — R2). An API node
         // cannot freeze the network's writes; that happened (or is simulated
@@ -2126,6 +2159,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let upstream_backend = self.cfg.ceremony.import_backend == ImportBackend::Upstream;
         if upstream_backend && !self.upstream_ignite_preflight()? {
             return Ok(()); // aborted inside, with evidence
+        }
+        if !upstream_backend {
+            // The same-chain-id gaps are PulseVM's, whatever imported the state: the fork backend
+            // gets the same hard XPR-mainnet refusal as the upstream one.
+            let pending = upstream::ignite_pending_reasons();
+            if self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet) && !pending.is_empty() {
+                self.abort("ignite refused for XPR MAINNET (fork backend): a same-chain-id mainnet cutover still has unsolved prerequisites",
+                    json!({"remaining": pending}))?;
+                return Ok(());
+            }
         }
         if !self.fleet_gate()? {
             return Ok(()); // aborted inside, with evidence

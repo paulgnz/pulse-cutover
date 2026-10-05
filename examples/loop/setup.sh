@@ -75,6 +75,7 @@ journal_path = "$L/journal.jsonl"
 poll_ms = 250
 
 [ceremony]
+rehearsal = true
 mode = "api"
 freeze_height = 0
 freeze_margin = 60

@@ -26,6 +26,8 @@ poll_ms = 250
 # pick them yourself.
 # ---------------------------------------------------------------------------
 [ceremony]
+rehearsal = true             # REHEARSAL config: relaxes the production profile (see README "Production profile");
+                             # a real cut drops this line and must load without it. Refused for XPR mainnet.
 mode = "api"                 # you are an API provider (producers use "producer")  [LEAVE]
 
 # The block number where the old chain stops accepting writes ("H").

@@ -1118,6 +1118,9 @@ PRESCAN=$(mget_opt '.snapshot.prescan_path')
   echo 'poll_ms = 250'
   echo ''
   echo '[ceremony]'
+  # A REHEARSAL must say so (manifest .ceremony.rehearsal = true): without it the config must meet the
+  # production profile, and the validation below refuses it with the list of what is missing.
+  [ "$(mget_opt '.ceremony.rehearsal')" = "true" ] && echo 'rehearsal = true'
   echo "mode = \"$($API_LIKE && echo api || echo producer)\""
   echo "freeze_height = $FH"
   [ -n "$FM" ] && { echo "freeze_margin = $FM"; echo "derive_h_at_arm = true   # rehearsal: H derived at arm"; }
@@ -1148,6 +1151,8 @@ PRESCAN=$(mget_opt '.snapshot.prescan_path')
   echo "rpc_url = \"http://127.0.0.1:9650/ext/bc/$BID/rpc\""
   echo 'quorum_timeout_secs = 900'
   echo 'auto_rollback = true'
+  PROBE=$(mget_opt '.target.post_live_probe_cmd')
+  [ -n "$PROBE" ] && echo "post_live_probe_cmd = \"$PROBE\""
   if $API_LIKE; then
     echo ''
     echo '[flip]'
@@ -1166,6 +1171,11 @@ PRESCAN=$(mget_opt '.snapshot.prescan_path')
     echo 'revert_cmd = "/opt/pulse-cutover/flip-v2-revert.sh"'
     echo "public_health_url = \"http://$(mget '.flip.public_host')/v2/health\""
   fi
+  HOOKS=""
+  for h in on_freeze post_ignite on_live on_abort on_halt; do
+    v=$(mget_opt ".hooks.$h"); [ -n "$v" ] && HOOKS="$HOOKS$h = \"$v\"\n"
+  done
+  if [ -n "$HOOKS" ]; then echo ''; echo '[hooks]'; printf '%b' "$HOOKS"; fi
 } > /etc/pulse-cutover/ceremony.toml
 cp "$MANIFEST" /etc/pulse-cutover/ceremony.json
 

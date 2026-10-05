@@ -294,6 +294,19 @@ pub struct Ceremony {
     /// mission control.
     #[serde(default)]
     pub rehearsal_allow_chain_id_change: bool,
+    /// REHEARSAL ceremony (default false). Without it every ceremony config must pass the
+    /// PRODUCTION PROFILE (`Config::production_problems`): exact cut, real freeze, lineage check,
+    /// the required hooks, a sustained LIVE window, the post-LIVE watch and probe, a state
+    /// comparison, no rehearsal override. With it those relaxations are allowed but the config is
+    /// marked as a rehearsal everywhere (journal, `status`, beacon, mission control), and it is
+    /// refused for XPR mainnet (at load and at ARM).
+    #[serde(default)]
+    pub rehearsal: bool,
+    /// Where the agent writes the history boundary file for the federating router in producer mode
+    /// (or api mode without `[hyperion]`), once the target is verified at the cut and before LIVE.
+    /// `[hyperion] boundary_path` does the same in hyperion mode.
+    #[serde(default)]
+    pub boundary_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -808,6 +821,17 @@ impl Config {
             return Err("snapshot.path_map_from and path_map_to must be set together".into());
         }
         config.check_rehearsal_overrides()?;
+        if config.ceremony.profile == Profile::Ceremony && !config.ceremony.rehearsal {
+            let problems = config.production_problems();
+            if !problems.is_empty() {
+                return Err(format!(
+                    "this ceremony config does not meet the PRODUCTION PROFILE (a real cut):\n  - {}\n\
+                     Fix them, or, for a rehearsal, set `rehearsal = true` in [ceremony] (shown on the journal, \
+                     status, beacon and mission control; refused for XPR mainnet).",
+                    problems.join("\n  - ")
+                ));
+            }
+        }
         if let Some(b) = &config.beacon {
             check_beacon_url(&b.url)?;
         }
@@ -942,6 +966,62 @@ impl Config {
         out
     }
 
+    /// Everything that makes this config unfit for a REAL cut, one line each, across both import
+    /// backends (empty = production profile met). Checked at load (refused unless
+    /// `ceremony.rehearsal = true`) and again right before the write freeze.
+    pub fn production_problems(&self) -> Vec<String> {
+        let mut out = self.rehearsal_overrides();
+        let c = &self.ceremony;
+        if c.allow_inexact_cut {
+            out.push("ceremony.allow_inexact_cut = true (the cut must be exactly H)".into());
+        }
+        if c.simulate_freeze {
+            out.push("ceremony.simulate_freeze = true (a real cut freezes the source)".into());
+        }
+        if c.derive_h_at_arm {
+            out.push("ceremony.derive_h_at_arm = true (H comes from the signed event or is typed in, never derived)".into());
+        }
+        if !self.target.require_lineage_check {
+            out.push("target.require_lineage_check = false (the target's block at H must be the source's)".into());
+        }
+        if self.target.live_sustain_secs == 0 {
+            out.push("target.live_sustain_secs = 0 (LIVE needs a sustained window)".into());
+        }
+        if self.target.post_live_max_idle_secs == 0 {
+            out.push("target.post_live_max_idle_secs = 0 (the post-LIVE watch must run)".into());
+        }
+        if self.target.post_live_probe_cmd.is_none() {
+            out.push("target.post_live_probe_cmd is not set (a post-LIVE probe that executes the intended workload is required)".into());
+        }
+        if c.mode == Mode::Producer {
+            for (name, h) in [("on_freeze", &self.hooks.on_freeze), ("post_ignite", &self.hooks.post_ignite),
+                              ("on_live", &self.hooks.on_live), ("on_abort", &self.hooks.on_abort)] {
+                if h.is_none() {
+                    out.push(format!("hooks.{name} is not set (required in producer mode)"));
+                }
+            }
+            if c.freeze_strategy != FreezeStrategy::ScheduleAtH {
+                out.push("ceremony.freeze_strategy is not \"schedule_at_h\" (pause_at_h is the single-producer rehearsal mode)".into());
+            }
+            if self.source.quiesce_cmd.is_some() {
+                out.push("source.quiesce_cmd is set (a stand-in for \"every producer paused\"; rehearsals only)".into());
+            }
+        }
+        match c.import_backend {
+            ImportBackend::Upstream => {
+                if self.upstream.as_ref().is_some_and(|u| u.compare_bin.is_none()) {
+                    out.push("upstream.compare_bin is not set (VERIFIED requires the state comparison)".into());
+                }
+            }
+            ImportBackend::Fork => {
+                if self.snapshot.golden_roots.is_none() {
+                    out.push("snapshot.golden_roots is not set (fork backend: verify against published goldens; capture_roots is the rehearsal/first-node mode)".into());
+                }
+            }
+        }
+        out
+    }
+
     /// Rehearsal overrides are refused outright for XPR mainnet, and the allowlist must name real
     /// table names (no wildcards, nothing empty).
     pub fn check_rehearsal_overrides(&self) -> Result<(), String> {
@@ -962,7 +1042,10 @@ impl Config {
                 }
             }
         }
-        let overrides = self.rehearsal_overrides();
+        let mut overrides = self.rehearsal_overrides();
+        if self.ceremony.rehearsal {
+            overrides.push("ceremony.rehearsal = true".into());
+        }
         if overrides.is_empty() {
             return Ok(());
         }

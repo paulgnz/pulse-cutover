@@ -358,8 +358,12 @@ impl ChainOps for MockOps {
         // irreversible; the mock stages it up front (the machine only looks
         // after LIB >= H) and the staged target chain presents the cut.
         let m = mini(height as u32);
-        let file = self.dir.join(format!("snapshot-{}.bin", hex::encode(m.head_id())));
+        let file = self.dir.join(format!("snapshot-{}.bin", self.block_id(height)));
         std::fs::write(&file, m.build()).map_err(|e| e.to_string())?;
+        let _ = std::fs::write(
+            self.dir.join("cut-facts.env"),
+            format!("CUT_HEIGHT={height}\nCUT_BLOCK_ID={}\nCHAIN_ID={}\n", self.block_id(height), self.chain_id.borrow()),
+        );
         self.scheduled_h.set(height);
         self.target_head.set(height);
         Ok(())
@@ -581,6 +585,7 @@ journal_path = "{dir}/journal.jsonl"
 poll_ms = 1
 
 [ceremony]
+rehearsal = true
 freeze_height = {freeze_height}
 quiescence_polls = 3
 
@@ -619,6 +624,7 @@ journal_path = "{dir}/journal.jsonl"
 poll_ms = 1
 
 [ceremony]
+rehearsal = true
 mode = "api"
 freeze_height = {freeze_height}
 simulate_freeze = true
@@ -1051,6 +1057,7 @@ journal_path = "{dir}/journal.jsonl"
 poll_ms = 1
 
 [ceremony]
+rehearsal = true
 mode = "api"
 freeze_height = {freeze_height}
 simulate_freeze = true
@@ -1185,6 +1192,7 @@ journal_path = "{dir}/journal.jsonl"
 poll_ms = 1
 
 [ceremony]
+rehearsal = true
 freeze_height = 120
 freeze_strategy = "schedule_at_h"
 quiescence_polls = 3
@@ -1252,6 +1260,7 @@ journal_path = "{dir}/journal.jsonl"
 poll_ms = 1
 
 [ceremony]
+rehearsal = true
 freeze_height = 120
 freeze_strategy = "schedule_at_h"
 freeze_lead_blocks = 20
@@ -1559,6 +1568,7 @@ journal_path = "{dir}/journal.jsonl"
 poll_ms = 1
 
 [ceremony]
+rehearsal = true
 freeze_height = {freeze_height}
 quiescence_polls = 3
 import_backend = "upstream"
@@ -1827,7 +1837,7 @@ fn stage2_import_cpu_scale_is_reported_as_inert_on_the_upstream_backend() {
     assert!(e.iter().any(|v| v["state"] == "ARMED" && v["data"]["config_warning"].as_str().is_some_and(|x| x.contains("IGNORED"))));
     // Default value on upstream, or any value on the fork backend: no warning.
     let _ = test_config(dir.path(), 120);
-    let fork_text = std::fs::read_to_string(dir.path().join("ceremony.toml")).unwrap().replacen("[ceremony]\n", "[ceremony]\nimport_cpu_scale = 143\n", 1);
+    let fork_text = std::fs::read_to_string(dir.path().join("ceremony.toml")).unwrap().replacen("[ceremony]\nrehearsal = true\n", "[ceremony]\nrehearsal = true\nimport_cpu_scale = 143\n", 1);
     let fork = load_toml(dir.path(), "fork-143.toml", &fork_text).unwrap();
     assert_eq!(fork.ceremony.import_cpu_scale, 143);
     assert!(fork.warnings().is_empty());
@@ -1838,7 +1848,7 @@ fn stage2_import_cpu_scale_is_reported_as_inert_on_the_upstream_backend() {
 fn upstream_backend_requires_upstream_section() {
     let dir = tempfile::tempdir().unwrap();
     let toml_text = format!(
-        "journal_path = \"{d}/j.jsonl\"\n[ceremony]\nfreeze_height = 5\nimport_backend = \"upstream\"\n\
+        "journal_path = \"{d}/j.jsonl\"\n[ceremony]\nrehearsal = true\nfreeze_height = 5\nimport_backend = \"upstream\"\n\
          [source]\nrpc_url = \"http://m\"\nproducer_api_url = \"http://m\"\n\
          [snapshot]\nstaged_path = \"{d}/s.bin\"\n\
          [target]\nmetalgo_unit = \"m\"\nrpc_url = \"http://m\"\n",
@@ -1934,6 +1944,7 @@ fn readiness_profile_refuses_to_run_before_any_side_effect() {
     let text = format!(r#"
 journal_path = "{dir}/journal.jsonl"
 [ceremony]
+rehearsal = true
 profile = "readiness"
 mode = "api"
 [source]
@@ -2016,6 +2027,7 @@ fn sched_config(dir: &std::path::Path) -> Config {
 journal_path = "{dir}/journal.jsonl"
 poll_ms = 1
 [ceremony]
+rehearsal = true
 freeze_height = 120
 freeze_strategy = "schedule_at_h"
 quiescence_polls = 3
@@ -2471,7 +2483,7 @@ fn event_quorum_is_never_inherited_and_release_pin_needs_a_plugin() {
     use pulse_cutover::coord::{derived_config, validate_event};
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("c.toml");
-    std::fs::write(&src, "journal_path = \"/j\"\n[ceremony]\nfreeze_height = 0\n[snapshot]\nstaged_path = \"/s\"\n[coordination]\nurl = \"https://mc\"\nnetwork = \"testnet\"\nfleet_quorum = 1\n").unwrap();
+    std::fs::write(&src, "journal_path = \"/j\"\n[ceremony]\nrehearsal = true\nfreeze_height = 0\n[snapshot]\nstaged_path = \"/s\"\n[coordination]\nurl = \"https://mc\"\nnetwork = \"testnet\"\nfleet_quorum = 1\n").unwrap();
     let ev = serde_json::json!({"type": "event", "event_id": "e9", "h": 900, "roster": [{"producer": "bp1"}, {"producer": "bp2"}, {"producer": "bp3"}]});
     let out = dir.path().join("d.toml");
     derived_config(&src, &ev, &out).unwrap();
@@ -2494,6 +2506,7 @@ fn beacon_preview_writes_nothing() {
     let text = format!(r#"
 journal_path = "{j}/journal.jsonl"
 [ceremony]
+rehearsal = true
 profile = "readiness"
 [source]
 rpc_url = "http://127.0.0.1:9"
@@ -3630,6 +3643,7 @@ journal_path = "{d}/journal.jsonl"
 poll_ms = 1
 
 [ceremony]
+rehearsal = true
 freeze_height = 120
 quiescence_polls = 3
 import_backend = "upstream"
@@ -3925,13 +3939,28 @@ fn rehearsal_overrides_are_refused_for_mainnet() {
     assert!(!ops.hooks.borrow().iter().any(|h| h == "freeze-writes"));
 }
 
+/// upstream_ignite_config turned into a PRODUCTION-profile config (no `rehearsal`): exact-H
+/// scheduled snapshot, every required hook, a post-LIVE probe.
+fn upstream_production_config(dir: &std::path::Path) -> Result<Config, String> {
+    let _ = upstream_ignite_config(dir, "", "")?;
+    let path = dir.join("ceremony-upstream-ignite.toml");
+    let text = std::fs::read_to_string(&path).unwrap()
+        .replace("rehearsal = true\n", "freeze_strategy = \"schedule_at_h\"\n")
+        .replace("[snapshot]\n", &format!("[snapshot]\ndir = \"{}\"\n", dir.display()))
+        .replace("[target]\n", "[target]\npost_live_probe_cmd = \"probe-workload\"\n");
+    std::fs::write(&path, text).unwrap();
+    Config::load(&path)
+}
+
 #[test]
 fn upstream_ignite_is_refused_for_mainnet_while_gaps_remain() {
-    // No overrides, mainnet chain: verification runs, ignition is refused (pre-ignition abort).
+    // No overrides, production profile, mainnet chain: verification runs, ignition is refused
+    // (pre-ignition abort).
     let dir = tempfile::tempdir().unwrap();
     stage_fake_upstream_tools(dir.path(), 0);
-    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let cfg = upstream_production_config(dir.path()).unwrap();
     let ops = upstream_ops(dir.path());
+    ops.schedule_ok.set(true);
     *ops.chain_id.borrow_mut() = MAINNET.into();
     assert_eq!(run_machine(&cfg, &ops), State::Aborted);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
@@ -4116,6 +4145,7 @@ journal_path = "{d}/journal.jsonl"
 poll_ms = 1
 
 [ceremony]
+rehearsal = true
 mode = "api"
 freeze_height = 120
 simulate_freeze = true
@@ -4211,6 +4241,12 @@ network = "rehearsal"
     assert!(out.contains("rehearsal_overrides: none"), "{out}");
     let (_, out) = run(&without, &["beacon"]);
     assert!(!out.contains("\"rehearsal_overrides\""), "{out}");
+    // An explicit rehearsal ceremony is shown the same way (rc.21).
+    let marked = base.replace("REHEARSAL", "rehearsal = true");
+    let (_, out) = run(&marked, &["status"]);
+    assert!(out.contains("ceremony: REHEARSAL"), "{out}");
+    let (_, out) = run(&marked, &["beacon"]);
+    assert!(out.contains("REHEARSAL ceremony (ceremony.rehearsal = true)"), "{out}");
 }
 
 #[test]
@@ -4246,6 +4282,7 @@ fn stage2_post_live_watch_reports_a_stalled_target_red_in_beacon_and_status() {
     let cfg_text = |probe: &str| format!(r#"
 journal_path = "{d}/journal.jsonl"
 [ceremony]
+rehearsal = true
 profile = "readiness"
 [source]
 rpc_url = "{url}"
@@ -4406,4 +4443,52 @@ fn rc21_verified_needs_a_compare_a_state_root_and_the_exact_known_difference() {
     assert_eq!(run_machine(&cfg, &upstream_ops(dir.path())), State::Aborted);
     let j = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(j.contains("not the known difference") && !upstream_journal_has_verified(&j), "{j}");
+}
+
+#[test]
+fn rc21_production_profile_is_mandatory_unless_the_ceremony_is_an_explicit_rehearsal() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    // A production-complete config loads without `rehearsal` and its ARM journals "met".
+    let cfg = upstream_production_config(dir.path()).unwrap();
+    assert!(cfg.production_problems().is_empty(), "{:?}", cfg.production_problems());
+    // Each relaxation alone is refused at load without `rehearsal = true`.
+    let path = dir.path().join("ceremony-upstream-ignite.toml");
+    let good = std::fs::read_to_string(&path).unwrap();
+    for (edit, needle) in [
+        (good.replace("freeze_strategy = \"schedule_at_h\"\n", "allow_inexact_cut = true\nfreeze_strategy = \"schedule_at_h\"\n"), "allow_inexact_cut"),
+        (good.replace("[target]\n", "[target]\nlive_sustain_secs = 0\n"), "live_sustain_secs = 0"),
+        (good.replace("[target]\n", "[target]\npost_live_max_idle_secs = 0\n"), "post_live_max_idle_secs = 0"),
+        (good.replace("[target]\n", "[target]\nrequire_lineage_check = false\n"), "require_lineage_check"),
+        (good.replace("post_live_probe_cmd = \"probe-workload\"\n", ""), "post_live_probe_cmd"),
+        (good.replace("on_abort = \"reopen-writes\"\n", ""), "hooks.on_abort"),
+        (good.replace("on_freeze = \"freeze-writes\"\n", ""), "hooks.on_freeze"),
+        (good.replace("freeze_strategy = \"schedule_at_h\"\n", ""), "schedule_at_h"),
+        (good.replace("compare_bin = ", "# compare_bin = "), "compare_bin"),
+        (good.replace("[source]\n", "[source]\nquiesce_cmd = \"q\"\n"), "quiesce_cmd"),
+        (good.replace("[upstream]\n", "[upstream]\nrehearsal_allow_compare_mismatch = [\"global_property\"]\n"), "rehearsal_allow_compare_mismatch"),
+    ] {
+        let err = load_toml(dir.path(), "p.toml", &edit).unwrap_err();
+        assert!(err.contains("PRODUCTION PROFILE") && err.contains(needle), "{needle}: {err}");
+        // The same relaxation with an explicit rehearsal flag loads (and is listed as a relaxation).
+        let r = load_toml(dir.path(), "r.toml", &edit.replacen("[ceremony]\n", "[ceremony]\nrehearsal = true\n", 1)).unwrap();
+        assert!(r.production_problems().iter().any(|p| p.contains(needle)), "{needle}");
+    }
+    // The fork backend is held to the same profile (goldens, not a capture).
+    let fork = good.replace("import_backend = \"upstream\"\n", "");
+    assert!(load_toml(dir.path(), "f.toml", &fork).unwrap_err().contains("golden_roots"));
+    // An explicit rehearsal is refused for a configured XPR mainnet chain_id.
+    let m = good.replacen("[ceremony]\n", &format!("[ceremony]\nrehearsal = true\nchain_id = \"{MAINNET}\"\n"), 1);
+    assert!(load_toml(dir.path(), "m.toml", &m).unwrap_err().contains("MAINNET"));
+    // ...and at ARM when the source turns out to be mainnet: nothing freezes.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+    assert!(cfg.ceremony.rehearsal);
+    let ops = upstream_ops(dir.path());
+    *ops.chain_id.borrow_mut() = MAINNET.into();
+    assert!(run_machine_result(&cfg, &ops).is_err());
+    let e = journal_entries(&cfg);
+    assert!(transition(&e, "FROZEN").is_none());
+    assert!(e.iter().any(|v| v.to_string().contains("ceremony.rehearsal = true")));
 }

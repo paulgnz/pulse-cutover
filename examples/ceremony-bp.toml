@@ -34,6 +34,8 @@ journal_path = "/root/bp-cutover/journal.jsonl"   # evidence log; resumable   [C
 poll_ms = 250                                     # poll interval, ms          [LEAVE]
 
 [ceremony]
+rehearsal = true             # REHEARSAL config: relaxes the production profile (see README "Production profile");
+                             # a real cut drops this line and must load without it. Refused for XPR mainnet.
 mode = "producer"            # you are a BP                                    [LEAVE]
 freeze_height = 0            # real event: the coordinator's published H       [CHANGE per event]
 freeze_margin = 420          # rehearsal H = last-final + 420 (see note above) [LEAVE for rehearsals]

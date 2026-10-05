@@ -673,7 +673,7 @@ const CHECKS = {
   metal_synced: ['setup', 'Metal node synced', 'the Metal P-Chain has finished bootstrapping'],
   metal_reachable: ['setup', 'Staking port open', 'peers can reach port 9651/tcp from the internet'],
   producer_api_private: ['setup', 'Producer API private', '/v1/producer/* (pause, resume, snapshots) does not answer from the internet'],
-  rehearsal_overrides: ['setup', 'REHEARSAL OVERRIDES ACTIVE', 'rehearsal only: this node relaxes cutover gates (table-compare allowlist / target chain_id change); never a real cut'],
+  rehearsal_overrides: ['setup', 'REHEARSAL', 'rehearsal only: this node runs a REHEARSAL ceremony (ceremony.rehearsal = true) or relaxes cutover gates (table-compare allowlist / target chain_id change); never a real cut'],
 };
 const kind = (c) => (CHECKS[c.name] || ['health'])[0];
 const label = (c) => (CHECKS[c.name] || [0, c.name])[1];

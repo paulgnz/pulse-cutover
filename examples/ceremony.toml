@@ -17,6 +17,8 @@ journal_path = "/root/cutover-rehearsal/journal.jsonl"  # evidence log; a re-run
 poll_ms = 250                                           # chain poll interval, ms
 
 [ceremony]
+rehearsal = true             # REHEARSAL config: relaxes the production profile (see README "Production profile");
+                             # a real cut drops this line and must load without it. Refused for XPR mainnet.
 # The block where the old chain stops accepting writes. The agent freezes as
 # soon as head >= this. (Or set freeze_margin to derive it at start.)
 freeze_height = 12345
