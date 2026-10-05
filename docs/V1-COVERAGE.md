@@ -69,13 +69,17 @@ lists what the edge serves.
 
 ## /v1/history (Hyperion's v1 shim; nodeos itself does not serve these)
 
-Proxied by the edge to the federator (`FEDERATOR_URL`, default `http://127.0.0.1:7010`). Before the ceremony
-writes the boundary file the federator answers these legacy-only, exactly as before.
+Proxied by the edge to the federator (`FEDERATOR_URL`, default `http://127.0.0.1:7010`). The federator serves
+nothing without a VALID boundary file (written by the ceremony, checked against the chain and the legacy archive):
+missing, stale or mismatched = 503, never unbounded legacy history. Rows come from the local index only above the
+cut and from the legacy archive only at or below it. Every answer carries `x-pulse-federation-status`
+(`found`/`ok`, `absent`, `not_indexed_yet`, `partial`, `unavailable`): see `federator/README.md` for what a deposit
+poller can rely on.
 
 | endpoint | served by | notes |
 |---|---|---|
-| `get_actions` | federator | built on the federated `/v2` timeline. `pos = -1` (latest N): exact order across the cut. `pos ≥ 0`: positions are mapped onto the combined timeline and the response carries `federation.positional: "approximate"`. `account_action_seq` is the position in that combined timeline, not a nodeos history-plugin counter (see below) |
-| `get_transaction` | federator | local (post-cut) first, then legacy (pre-cut) |
+| `get_actions` | federator | built on the federated `/v2` timeline. `pos = -1` (latest N): exact order across the cut. `pos ≥ 0`: positions are mapped onto the combined timeline and the response carries `federation.positional: "approximate"`. `account_action_seq` is **synthesized**: the position in that combined timeline, not a nodeos history-plugin counter (`federation.account_action_seq: "synthesized"`; see below) |
+| `get_transaction` | federator | local only if its `block_num` is above the cut, legacy only at or below it; a source outage is a 503, not a 404 |
 | `get_key_accounts` | federator | discovery legacy + local in every key spelling (`EOS…`, `PUB_K1_…`), then only accounts whose **current** chain permissions contain the key |
 | `get_controlled_accounts` | federator | discovery legacy + local, then only accounts whose current permissions name the controlling account |
 

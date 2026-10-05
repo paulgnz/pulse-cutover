@@ -19,6 +19,8 @@ const fed = require('../server.js');
 const edge = require('../../gateway/server.js');
 
 const CUT = 1000;
+const CHAIN_ID = 'c'.repeat(64);
+const CUT_ID = '000003e8' + 'ab'.repeat(28);   // block ids carry their height in the first 4 bytes
 const DEV_EOS = 'EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV';
 const DEV_PUB = 'PUB_K1_6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5BoDq63';
 const OTHER = edge.pubSpelling({ type: 'K1', data: Buffer.concat([Buffer.from([3]), randomBytes(32)]) });
@@ -44,7 +46,8 @@ function chain(req, res, body) {
   const p = JSON.parse(body || '{}');
   chainCalls.push({ name, p, host: req.headers.host });
   if (!chainUp) return send(res, 502, { code: 502, message: 'node unreachable' });
-  if (name === 'get_info') return send(res, 200, { head_block_num: 1010, last_irreversible_block_num: 1010 });
+  if (name === 'get_info') return send(res, 200, { chain_id: CHAIN_ID, head_block_num: 1010, head_block_id: '000003f2' + 'cd'.repeat(28), last_irreversible_block_num: 1010 });
+  if (name === 'get_block') return p.block_num_or_id === String(CUT) ? send(res, 200, { id: CUT_ID, block_num: CUT }) : send(res, 500, { code: 500, message: 'unknown block' });
   if (name === 'get_account') return chainAccounts[p.account_name] ? send(res, 200, chainAccounts[p.account_name]) : send(res, 500, { code: 500, message: 'unknown account' });
   if (name === 'get_currency_balance') {
     const c = balances[p.code];
@@ -119,7 +122,7 @@ let chainSrv, legacySrv, localSrv, proc, base, env;
 before(async () => {
   [chainSrv, legacySrv, localSrv] = await Promise.all([listen(chain), listen(legacy), listen(local)]);
   const dir = mkdtempSync(join(tmpdir(), 'fed-test-'));
-  writeFileSync(join(dir, 'boundary.json'), JSON.stringify({ cut_block: CUT, cut_time: '2026-09-30T00:00:00.000', cut_block_id: 'x', chain_id: 'y' }));
+  writeFileSync(join(dir, 'boundary.json'), JSON.stringify({ cut_block: CUT, cut_time: '2026-09-30T00:00:00.000', cut_block_id: CUT_ID, chain_id: CHAIN_ID }));
   env = { LOCAL: `http://127.0.0.1:${localSrv.address().port}`, LEGACY: `http://127.0.0.1:${legacySrv.address().port}`, CHAIN_URL: `http://127.0.0.1:${chainSrv.address().port}` };
   ({ p: proc, url: base } = await startFederator({ ...env, BOUNDARY_FILE: join(dir, 'boundary.json') }));
 });
@@ -231,14 +234,31 @@ test('other /v2/state/* are tagged index-only', async () => {
 test('/v2/health keeps its shape (the flip gate reads federation.local.ok)', async () => {
   const r = await get('/v2/health');
   assert.equal(r.json.federation.local.ok, true);
+  assert.equal(r.json.federation.ok, true);
   assert.equal(r.json.federation.boundary.cut_block, CUT);
+  assert.equal(r.json.federation.boundary.status, 'valid');
+  assert.equal(r.json.federation.boundary.identity.cut_block_id, 'verified');
 });
 test('chain calls to a loopback CHAIN_URL carry Host: localhost', () => {
   assert.ok(chainCalls.length > 0);
   assert.ok(chainCalls.every((c) => c.host === 'localhost'));
 });
-test('before the boundary file exists: state and /v1 history are legacy-only (unchanged behaviour)', async () => {
+test('before any boundary file exists: history and state FAIL CLOSED (503), never unbounded legacy', async () => {
   const { p, url } = await startFederator({ ...env, BOUNDARY_FILE: join(tmpdir(), `absent-${Date.now()}.json`) });
+  try {
+    for (const path of ['/v2/state/get_tokens?account=alice', '/v2/history/get_actions?account=alice', '/v2/history/get_transaction?id=pre']) {
+      const r = await get(path, url);
+      assert.equal(r.status, 503, path);
+      assert.equal(r.headers.get('x-pulse-federation'), 'boundary-absent');
+    }
+    assert.equal((await post('/v1/history/get_transaction', { id: 'pre' }, url)).status, 503);
+    const h = await get('/v2/health', url);
+    assert.equal(h.json.federation.boundary.staged, false);
+    assert.equal(h.json.federation.ok, false);
+  } finally { p.kill(); }
+});
+test('ALLOW_NO_BOUNDARY=1 (pre-ceremony staging only): legacy-only until a boundary file is first seen', async () => {
+  const { p, url } = await startFederator({ ...env, ALLOW_NO_BOUNDARY: '1', BOUNDARY_FILE: join(tmpdir(), `absent-${Date.now()}.json`) });
   try {
     const t = await get('/v2/state/get_tokens?account=alice', url);
     assert.equal(t.json.tokens.find((x) => x.contract === 'eosio.token').amount, 5, 'legacy passthrough');
@@ -246,7 +266,5 @@ test('before the boundary file exists: state and /v1 history are legacy-only (un
     assert.deepEqual(k.json.account_names, ['alice', 'carol', 'zombie']);
     const tx = await post('/v1/history/get_transaction', { id: 'pre' }, url);
     assert.equal(tx.json.from, 'legacy');
-    const h = await get('/v2/health', url);
-    assert.deepEqual(h.json.federation.boundary, { staged: false });
   } finally { p.kill(); }
 });
