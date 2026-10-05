@@ -584,10 +584,7 @@ impl ChainOps for HttpOps {
             Some(json!({"block_num_or_id": block_num})),
             None,
         )?;
-        Ok(v.get("transactions")
-            .and_then(|t| t.as_array())
-            .map(|a| a.len() as u64)
-            .unwrap_or(0))
+        block_tx_count(&v, block_num)
     }
 
     fn producer_paused(&self) -> Result<bool, String> {
@@ -758,6 +755,66 @@ impl ChainOps for HttpOps {
 
     fn sleep_ms(&self, ms: u64) {
         std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+/// Transactions in a nodeos `get_block` answer for `block_num`, FAIL CLOSED: the answer must be the
+/// block asked for (its `block_num` and the height encoded in its `id`) and carry a `transactions`
+/// array. An error object, another schema or a truncated proxy answer is an error (unknown), never
+/// "0 transactions": the burn-off audit certifies empty blocks with this.
+pub fn block_tx_count(v: &Value, block_num: u64) -> Result<u64, String> {
+    let short = || {
+        let t = v.to_string();
+        if t.len() > 200 { format!("{}…", &t[..200]) } else { t }
+    };
+    let num = v.get("block_num").and_then(|x| x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok())));
+    if num != Some(block_num) {
+        return Err(format!("get_block({block_num}) answered block_num {num:?}, not the block asked for: {}", short()));
+    }
+    let id = v.get("id").and_then(|x| x.as_str()).unwrap_or_default();
+    let encoded = (id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| u32::from_str_radix(&id[..8], 16).ok())
+        .flatten();
+    if encoded.map(u64::from) != Some(block_num) {
+        return Err(format!("get_block({block_num}) has no block id for that height (id {id:?}): {}", short()));
+    }
+    v.get("transactions")
+        .and_then(|t| t.as_array())
+        .map(|a| a.len() as u64)
+        .ok_or_else(|| format!("get_block({block_num}) has no transactions array: {}", short()))
+}
+
+#[cfg(test)]
+mod block_tx_count_tests {
+    use super::*;
+
+    fn id(n: u64) -> String {
+        format!("{n:08x}{}", "ab".repeat(28))
+    }
+
+    #[test]
+    fn counts_only_a_well_formed_answer_for_the_block_asked_for() {
+        assert_eq!(block_tx_count(&json!({"block_num": 7, "id": id(7), "transactions": []}), 7), Ok(0));
+        assert_eq!(block_tx_count(&json!({"block_num": "7", "id": id(7), "transactions": [{}, {}]}), 7), Ok(2));
+    }
+
+    /// Review: a 200 carrying an error object, another schema or a truncated answer certified an
+    /// empty burn-off block.
+    #[test]
+    fn malformed_or_foreign_answers_are_errors_never_zero() {
+        for (v, why) in [
+            (json!({"code": 500, "message": "Internal Service Error", "error": {}}), "error object"),
+            (json!({"block_num": 7, "id": id(7)}), "no transactions"),
+            (json!({"block_num": 7, "id": id(7), "transactions": {}}), "transactions not an array"),
+            (json!({"block_num": 8, "id": id(8), "transactions": []}), "another block"),
+            (json!({"id": id(7), "transactions": []}), "no block_num"),
+            (json!({"block_num": 7, "transactions": []}), "no id"),
+            (json!({"block_num": 7, "id": id(8), "transactions": []}), "id of another height"),
+            (json!({"block_num": 7, "id": "zz", "transactions": []}), "malformed id"),
+            (json!(null), "null"),
+        ] {
+            assert!(block_tx_count(&v, 7).is_err(), "{why} must not count as an empty block");
+        }
     }
 }
 
