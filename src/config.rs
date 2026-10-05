@@ -953,6 +953,13 @@ impl Config {
                          (exact names as xpr_19_table_compare prints them, e.g. \"global_property\")"
                     ));
                 }
+                if !crate::upstream::KNOWN_COMPARE_DIFFERENCES.contains(&t.as_str()) {
+                    return Err(format!(
+                        "upstream.rehearsal_allow_compare_mismatch entry {t:?} has no known difference: only {} can be \
+                         allowed, and only when the failure matches that table's known signature",
+                        crate::upstream::KNOWN_COMPARE_DIFFERENCES.join(", ")
+                    ));
+                }
             }
         }
         let overrides = self.rehearsal_overrides();

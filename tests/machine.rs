@@ -1521,7 +1521,8 @@ fn stage_fake_upstream_tools(dir: &std::path::Path, compare_exit: i32) {
             "#!/bin/sh\n\
              [ -f \"$5\" ] || {{ echo 'usage: sidecar (5th arg) missing' >&2; exit 2; }}\n\
              if [ {compare_exit} -ne 0 ]; then echo 'table permission: nodeos=1 arena=2' >&2; exit {compare_exit}; fi\n\
-             echo 'table account: rows=1 sha256=aa55'\necho 'table permission: rows=2 sha256=bb66'\nexit 0\n"
+             for t in {tables}; do echo \"table $t: rows=1 sha256=aa55\"; done\nexit 0\n",
+            tables = pulse_cutover::upstream::REQUIRED_COMPARE_TABLES.join(" ")
         ),
     );
     // create_chain stand-in (the rig's Go helper): checks it was handed the migration genesis
@@ -3589,12 +3590,23 @@ const MAINNET: &str = "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab9
 
 /// Make the fake compare fail the way v1.0.0 does: real-format lines, the named tables failing.
 fn fake_compare_failing(dir: &std::path::Path, failing: &[&str]) {
-    let mut body = String::from("#!/bin/sh\necho 'table account: rows=1 sha256=aa55'\n");
-    for t in failing {
-        body.push_str(&format!("echo 'table {t}: nodeos=Some(TableReport {{ rows: 1, sha256: \"aa\" }}) arena=None'\n"));
-        body.push_str(&format!("echo 'table {t}: first differing row index 0'\n"));
+    let mut body = String::from("#!/bin/sh\n");
+    for t in pulse_cutover::upstream::REQUIRED_COMPARE_TABLES {
+        if !failing.contains(t) {
+            body.push_str(&format!("echo 'table {t}: rows=1 sha256=aa55'\n"));
+        }
     }
-    body.push_str("echo 'table permission: rows=2 sha256=bb66'\necho '21-table nodeos/Arena comparison FAILED' >&2\nexit 1\n");
+    for t in failing {
+        // The v1.0.0 signatures (tests/fixtures/compare-v1.0.0-408461570.log).
+        if *t == "global_property" {
+            body.push_str(&format!("echo 'table {t}: nodeos=Some(TableReport {{ rows: 1, sha256: \"aa\" }}) arena=Some(TableReport {{ rows: 1, sha256: \"bb\" }})'\n"));
+            body.push_str(&format!("echo 'table {t}: first differing row index 0'\necho '  nodeos present=true bytes=157 hex=01'\necho '  arena present=true bytes=143 hex=01'\n"));
+        } else {
+            body.push_str(&format!("echo 'table {t}: nodeos=Some(TableReport {{ rows: 1, sha256: \"aa\" }}) arena=None'\n"));
+            body.push_str(&format!("echo 'table {t}: first differing row index 0'\n"));
+        }
+    }
+    body.push_str("echo '21-table nodeos/Arena comparison FAILED' >&2\nexit 1\n");
     write_script(&dir.join("fake-compare.sh"), &body);
 }
 
@@ -3870,7 +3882,7 @@ fn upstream_compare_failure_on_a_table_not_allowed_still_aborts() {
     let ops = upstream_ops(dir.path());
     assert_eq!(run_machine(&cfg, &ops), State::Aborted);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
-    assert!(text.contains("not on the rehearsal allowlist: permission_link"), "{text}");
+    assert!(text.contains("not the known difference: permission_link"), "{text}");
     assert!(!upstream_journal_has_verified(&text));
     assert!(!text.contains("ignite_started"));
     // A failure that names no table cannot be allowlisted either.
@@ -3895,6 +3907,7 @@ fn rehearsal_overrides_are_refused_for_mainnet() {
         assert!(err.contains("MAINNET"), "{err}");
     }
     assert!(upstream_ignite_config(dir.path(), "", r#"rehearsal_allow_compare_mismatch = ["*"]"#).unwrap_err().contains("not a table name"));
+    assert!(upstream_ignite_config(dir.path(), "", r#"rehearsal_allow_compare_mismatch = ["permission"]"#).unwrap_err().contains("no known difference"));
     // Mainnet discovered at ARM (no chain_id configured): refused before anything freezes.
     let cfg = upstream_ignite_config(dir.path(), "rehearsal_allow_chain_id_change = true", "").unwrap();
     let ops = upstream_ops(dir.path());
@@ -4288,4 +4301,49 @@ fn rc21_signer_material_is_written_0600_and_a_shared_directory_is_refused_at_arm
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(text.contains("genesis_base contains a private key"), "{text}");
     assert!(!text.contains("\"FROZEN\""));
+}
+
+#[test]
+fn rc21_verified_needs_a_compare_a_state_root_and_the_exact_known_difference() {
+    // No compare_bin: never VERIFIED (it used to be "skipped").
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let text = std::fs::read_to_string(dir.path().join("fake-compare.sh")).unwrap();
+    assert!(text.contains("dynamic_global_property"));
+    let _ = upstream_test_config(dir.path(), 120); // writes ceremony-upstream.toml
+    let toml = std::fs::read_to_string(dir.path().join("ceremony-upstream.toml")).unwrap().replace("compare_bin =", "# compare_bin =");
+    std::fs::write(dir.path().join("ceremony-upstream.toml"), toml).unwrap();
+    let cfg2 = Config::load(&dir.path().join("ceremony-upstream.toml")).unwrap();
+    assert_eq!(run_machine(&cfg2, &MockOps::new(dir.path(), 110)), State::Aborted);
+    let j = std::fs::read_to_string(&cfg2.journal_path).unwrap();
+    assert!(j.contains("compare_bin is not configured") && !upstream_journal_has_verified(&j), "{j}");
+
+    // A compare that exits 0 but covers only some tables: not a verification.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    write_script(&dir.path().join("fake-compare.sh"), "#!/bin/sh\necho 'table account: rows=1 sha256=aa'\nexit 0\n");
+    let cfg = upstream_test_config(dir.path(), 120);
+    assert_eq!(run_machine(&cfg, &MockOps::new(dir.path(), 110)), State::Aborted);
+    let j = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(j.contains("did not report a matching line for every required table") && !upstream_journal_has_verified(&j));
+
+    // No state root: not a verification.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    write_script(&dir.path().join("fake-fingerprint.sh"), "#!/bin/sh\necho 'revision 999'\necho 'table account bytes=10 sha256=aa55'\n");
+    let cfg = upstream_test_config(dir.path(), 120);
+    assert_eq!(run_machine(&cfg, &MockOps::new(dir.path(), 110)), State::Aborted);
+    let j = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(j.contains("no usable state_root") && !upstream_journal_has_verified(&j));
+
+    // global_property on the allowlist, but failing differently than the known 14-byte gap: refused.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    fake_compare_failing(dir.path(), &["global_property"]);
+    let body = std::fs::read_to_string(dir.path().join("fake-compare.sh")).unwrap().replace("bytes=143", "bytes=150");
+    write_script(&dir.path().join("fake-compare.sh"), &body);
+    let cfg = upstream_ignite_config(dir.path(), "", r#"rehearsal_allow_compare_mismatch = ["global_property"]"#).unwrap();
+    assert_eq!(run_machine(&cfg, &upstream_ops(dir.path())), State::Aborted);
+    let j = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(j.contains("not the known difference") && !upstream_journal_has_verified(&j), "{j}");
 }

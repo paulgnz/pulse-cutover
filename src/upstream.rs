@@ -402,6 +402,17 @@ pub fn run_pipeline<O: ChainOps>(
             let wall = ops.now_ms().saturating_sub(started);
             match res {
                 Ok(out) => {
+                    // Exit 0 is not enough: the output must show a matching line for every required
+                    // table (a tool that compared nothing, or a different tool, must not certify).
+                    let missing = compare_missing_tables(&out, &[]);
+                    if !missing.is_empty() {
+                        progress(json!({"upstream_19_table_compare": {"result": "INCOMPLETE", "missing_tables": missing, "output": out}}));
+                        return Err(PipelineError::Failed(format!(
+                            "xpr_19_table_compare exited 0 but did not report a matching line for every required table \
+                             (missing: {}): not a verification",
+                            missing.join(", ")
+                        )));
+                    }
                     progress(json!({
                         "upstream_19_table_compare": {
                             "result": "MATCH",
@@ -415,7 +426,24 @@ pub fn run_pipeline<O: ChainOps>(
                 Err(e) => {
                     let failing = compare_failing_tables(&e);
                     let allow = &up.rehearsal_allow_compare_mismatch;
-                    let not_allowed: Vec<&String> = failing.iter().filter(|t| !allow.contains(t)).collect();
+                    // Allowed only when the table is on the list AND its failure is exactly the known
+                    // difference for that table (never "any mismatch in global_property").
+                    let mut known: Vec<(String, String)> = vec![];
+                    let mut not_allowed: Vec<String> = vec![];
+                    for t in &failing {
+                        if !allow.contains(t) {
+                            not_allowed.push(t.clone());
+                            continue;
+                        }
+                        match known_compare_difference(t, &e) {
+                            Ok(sig) => known.push((t.clone(), sig)),
+                            Err(why) => not_allowed.push(format!("{t} ({why})")),
+                        }
+                    }
+                    let missing = compare_missing_tables(&e, &failing);
+                    if !missing.is_empty() && !allow.is_empty() && not_allowed.is_empty() && !failing.is_empty() {
+                        not_allowed.push(format!("required table(s) not reported: {}", missing.join(", ")));
+                    }
                     if allow.is_empty() || failing.is_empty() || !not_allowed.is_empty() {
                         progress(json!({
                             "upstream_19_table_compare": {
@@ -434,8 +462,8 @@ pub fn run_pipeline<O: ChainOps>(
                             " (the failure names no table, so the rehearsal allowlist cannot apply)".to_string()
                         } else {
                             format!(
-                                " (not on the rehearsal allowlist: {})",
-                                not_allowed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                                " (not on the rehearsal allowlist, or not the known difference: {})",
+                                not_allowed.join(", ")
                             )
                         };
                         return Err(PipelineError::Failed(format!(
@@ -448,6 +476,7 @@ pub fn run_pipeline<O: ChainOps>(
                             "result": "MISMATCH ALLOWED BY REHEARSAL OVERRIDE",
                             "REHEARSAL_ONLY": "upstream.rehearsal_allow_compare_mismatch is set: this is NOT a valid verification for a real cut",
                             "failing_tables": failing,
+                            "known_differences": known.iter().map(|(t, sig)| json!({"table": t, "matched": sig})).collect::<Vec<_>>(),
                             "rehearsal_allow_compare_mismatch": allow,
                             "output": e,
                             "report": report.display().to_string(),
@@ -459,10 +488,14 @@ pub fn run_pipeline<O: ChainOps>(
             }
         }
         None => {
-            progress(json!({
-                "upstream_19_table_compare": "skipped (no compare_bin configured)"
-            }));
-            (None, None, vec![])
+            // VERIFIED means "compared": without the comparison there is no evidence of state
+            // equivalence, only a digest of whatever was imported.
+            progress(json!({"upstream_19_table_compare": "NOT CONFIGURED: verification refused"}));
+            return Err(PipelineError::Failed(
+                "upstream.compare_bin is not configured: VERIFIED requires the official table comparison \
+                 (xpr_19_table_compare); set compare_bin"
+                    .into(),
+            ));
         }
     };
 
@@ -491,6 +524,13 @@ pub fn run_pipeline<O: ChainOps>(
                 .collect::<Vec<_>>(),
         }
     }));
+    // A whole-state commitment is part of the evidence (and what the fleet gate compares).
+    let root_ok = state_root.as_deref().is_some_and(|r| r.len() >= 16 && r.chars().all(|c| c.is_ascii_hexdigit()) && r.chars().any(|c| c != '0'));
+    if !root_ok {
+        return Err(PipelineError::Failed(format!(
+            "xpr_state_fingerprint printed no usable state_root ({state_root:?}): VERIFIED requires a non-empty whole-state commitment"
+        )));
+    }
     if let Some(golden) = &up.golden_state_root {
         match &state_root {
             Some(root) if root.eq_ignore_ascii_case(golden) => {
@@ -548,6 +588,80 @@ pub fn compare_failing_tables(output: &str) -> Vec<String> {
         }
     }
     failing
+}
+
+/// Every table `xpr_19_table_compare` (PulseVM v1.0.0) reports. A passing comparison must print a
+/// matching `table <name>: rows=… sha256=…` line for each (a newer tool may print more).
+pub const REQUIRED_COMPARE_TABLES: &[&str] = &[
+    "account", "account_metadata", "code", "contract_table", "contract_row", "contract_index64",
+    "contract_index128", "contract_index256", "contract_index_double", "global_property", "protocol_state",
+    "permission", "permission_link", "resource_limits", "resource_usage", "resource_limits_state",
+    "resource_limits_config", "transaction", "dynamic_global_property",
+];
+
+/// Tables whose v1.0.0 compare failure has a KNOWN, recognisable signature (the SHiP serializer
+/// defects reported upstream). Only these may be named in `rehearsal_allow_compare_mismatch`, and
+/// a failure is allowed only when it matches the signature (see `known_compare_difference`).
+pub const KNOWN_COMPARE_DIFFERENCES: &[&str] = &["contract_index_double", "global_property"];
+
+/// Required tables with no matching line in `output`, excluding `failing` ones.
+pub fn compare_missing_tables(output: &str, failing: &[String]) -> Vec<String> {
+    REQUIRED_COMPARE_TABLES
+        .iter()
+        .filter(|t| !failing.iter().any(|f| f == *t))
+        .filter(|t| {
+            // As in compare_failing_tables: a failed command's first stdout line shares a line with
+            // the error prefix.
+            let re = regex::Regex::new(&format!(r"(?m)(?:^|[\s:])table {}: rows=", regex::escape(t))).expect("regex");
+            !re.is_match(output)
+        })
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Does `table`'s failure in the compare output match its KNOWN v1.0.0 difference? Ok(description)
+/// or Err(why not). The signatures, from the stage-2 cut:
+/// - `contract_index_double`: present on the nodeos side, absent on the Arena side (`arena=None`):
+///   Arena does not serialize that table at all. A table that exists on both sides with different
+///   rows is NOT this difference.
+/// - `global_property`: one row on each side, and the first differing row is exactly 14 bytes
+///   shorter on the Arena side (157 vs 143 on v1.0.0: the proposed-schedule envelope and the
+///   trailing configuration fields the declared ABI has and the serializer omits). Any other row
+///   count or size difference is a different defect.
+pub fn known_compare_difference(table: &str, output: &str) -> Result<String, String> {
+    let re = regex::Regex::new(&format!(
+        r"table {}: nodeos=(Some\(TableReport \{{ rows: (\d+)[^)]*\)|None) arena=(Some\(TableReport \{{ rows: (\d+)[^)]*\)|None)",
+        regex::escape(table)
+    ))
+    .expect("regex");
+    let c = re.captures(output).ok_or("no nodeos=/arena= report line for it")?;
+    let rows = |i: usize| c.get(i).and_then(|m| m.as_str().parse::<u64>().ok());
+    let (nodeos_none, arena_none) = (&c[1] == "None", &c[3] == "None");
+    match table {
+        "contract_index_double" => {
+            if !nodeos_none && arena_none {
+                Ok("known: Arena does not serialize contract_index_double (nodeos rows present, arena=None)".into())
+            } else {
+                Err("not the known difference: the table exists on the Arena side too (a real mismatch)".into())
+            }
+        }
+        "global_property" => {
+            if nodeos_none || arena_none || rows(2) != Some(1) || rows(4) != Some(1) {
+                return Err("not the known difference: expected one row on each side".into());
+            }
+            let size = |side: &str| {
+                regex::Regex::new(&format!(r"(?m)^\s*{side} present=true bytes=(\d+)"))
+                    .expect("regex")
+                    .captures(output)
+                    .and_then(|c| c[1].parse::<u64>().ok())
+            };
+            match (size("nodeos"), size("arena")) {
+                (Some(n), Some(a)) if n == a + 14 => Ok(format!("known: global_property row {n} bytes on nodeos, {a} on Arena (the 14 bytes v1.0.0 omits)")),
+                (n, a) => Err(format!("not the known difference: row sizes nodeos {n:?} / arena {a:?} (expected Arena exactly 14 bytes shorter)")),
+            }
+        }
+        other => Err(format!("{other} has no known difference")),
+    }
 }
 
 /// What still stands between an upstream ignition and a SAME-CHAIN-ID MAINNET cutover. Kept as
@@ -1032,6 +1146,24 @@ mod tests {
         let wrapped = format!("`x` exited exit status: 1:  table permission: nodeos=1 arena=2\ntable account: rows=1 sha256=aa");
         assert_eq!(compare_failing_tables(&wrapped), vec!["permission"]);
         assert!(compare_failing_tables("21-table nodeos/Arena comparison FAILED").is_empty());
+    }
+
+    /// The real v1.0.0 failure (stage-2 cut) matches the known signatures; anything else does not.
+    #[test]
+    fn known_compare_differences_match_only_their_signature() {
+        let out = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compare-v1.0.0-408461570.log")).unwrap();
+        assert!(known_compare_difference("contract_index_double", &out).is_ok());
+        assert!(known_compare_difference("global_property", &out).unwrap().contains("157"));
+        let failing = compare_failing_tables(&out);
+        assert!(compare_missing_tables(&out, &failing).is_empty(), "every other required table matched");
+        assert_eq!(compare_missing_tables(&out, &[]), vec!["contract_index_double", "global_property"]);
+        // contract_index_double present on both sides with different rows: a real mismatch.
+        let both = out.replace("arena=None", "arena=Some(TableReport { rows: 133, sha256: \"00\" })");
+        assert!(known_compare_difference("contract_index_double", &both).is_err());
+        // global_property with a different size gap, or more rows: a different defect.
+        assert!(known_compare_difference("global_property", &out.replace("bytes=143", "bytes=140")).is_err());
+        assert!(known_compare_difference("global_property", &out.replacen("rows: 1,", "rows: 2,", 1)).is_err());
+        assert!(known_compare_difference("permission", &out).is_err());
     }
 
     #[test]
