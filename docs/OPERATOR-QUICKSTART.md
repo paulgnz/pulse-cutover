@@ -10,6 +10,11 @@ service; see below.)
 
 ---
 
+> **Before a real cut** (not needed for the beacon): your ceremony's `on_freeze` hook must close **every** write
+> path into your producer's nodeos (public and private APIs, relays, bots, other direct clients), and the head
+> block number your endpoints report will step back by a few hundred once at the flip (the discarded burn-off
+> blocks; see [EXCHANGES.md](EXCHANGES.md)). Tell your API users and exchanges.
+
 ## 1. Run one command on your node
 
 Log in to the server that runs your **producer** nodeos, then run:

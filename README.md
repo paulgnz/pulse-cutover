@@ -592,17 +592,33 @@ upstream, or an open item with a workaround.
 | 13 | A HAProxy flip done only through the runtime socket was **undone by a later `systemctl reload`** (for a cert change): HAProxy re-read `haproxy.cfg` and quietly served the retired chain again | A routine config reload after the cutover silently points users at the old chain | ✅ the flip hook now also persists the swap to `haproxy.cfg` (validated), as pulse-cutover's generated scripts already do; `abort` restores both |
 | 14 | Readiness checks judged by pre-ceremony rules during the ceremony (staged snapshot "present", validator "not running" while restarting) | Mission control showed every BP "needs attention" mid-ceremony | ✅ beacon checks are phase-aware |
 
+## Production profile
+
+A ceremony config is either fit for a real cut or explicitly a rehearsal. Without `[ceremony] rehearsal = true`,
+`pulse-cutover` refuses (at load, and again right before the write freeze) any config that has: a rehearsal
+override (`rehearsal_allow_chain_id_change`, `rehearsal_allow_compare_mismatch`), `allow_inexact_cut`,
+`simulate_freeze`, `derive_h_at_arm`, `require_lineage_check = false`, `live_sustain_secs = 0`,
+`post_live_max_idle_secs = 0`, no `post_live_probe_cmd`, no state comparison (upstream `compare_bin`; fork
+`golden_roots`), and in producer mode a missing `on_freeze` / `post_ignite` / `on_live` / `on_abort` hook,
+`pause_at_h`, or the `quiesce_cmd` stand-in. A rehearsal is journaled, shown by `status`, reported as the beacon
+setup check `rehearsal_overrides` (mission control labels it REHEARSAL) and refused for XPR mainnet. The example
+configs are all rehearsals. For a real cut the operator's `on_freeze` must close **every** write path into the
+producer's nodeos (public and private APIs, relays, bots and other direct clients); the burn-off audit aborts the
+cut if anything slipped through. `install.sh` writes `rehearsal = true` only when the manifest says
+`.ceremony.rehearsal: true`, and takes `.hooks.*`, `.target.post_live_probe_cmd` and `.ceremony.boundary_path`
+from the manifest.
+
 ## Building apps that survive a cutover
 
 What a bot, wallet or exchange integration should do. All of this was
 exercised by the rehearsal bots.
 
-- [x] **Treat HTTP 503 during a migration as "hold", not "failed"**. A 503 at the edge means the write was not accepted, so retry with a *freshly built* transaction. If the outcome is ambiguous (timeout, no response), first reconcile: look the original transaction up and check your application state. Re-signing creates a new transaction id and can repeat a business operation whose first attempt did land.
+- [x] **Treat HTTP 503 during a migration as "hold", not "failed"**. A 503 at the edge means the write was not accepted: retry later, under the same application-level operation id. **Reconcile before you re-sign.** After an ambiguous outcome (timeout, lost response, 5xx), look up the ORIGINAL transaction id first and keep an application-level operation id for every business action; build and sign a replacement only once the original is found (done) or provably expired and absent. A re-signed transaction has a new id, so id-based deduplication cannot stop it from executing the same transfer twice. See [docs/EXCHANGES.md](docs/EXCHANGES.md).
 - [x] **Fail over across several BP endpoints.** During run 3 every edge answered reads throughout; writes resumed on all of them at the same moment.
 - [x] **Use `expireSeconds` ≥ 120**, and don't derive expiration from an old block (finding 4).
 - [x] **Confirm inclusion, not just acceptance.** On PulseVM a gateway "admitted" response means accepted into the mempool; read your state back (or check the block) before treating it as final.
 - [x] **Oracle-driven apps**: the chain clock jumps forward by the freeze length at the first new block. Contracts with a staleness window (e.g. 120 s) will see the last pre-freeze price as stale until a fresh one lands, so **push a fresh oracle update as the first post-cut write**. Liquidations and funding that are gated on freshness pause safely in the meantime.
-- [x] **Nothing keyed on block numbers breaks**: heights continue at H+1, and the chain_id and keys are unchanged.
+- [ ] **The head block number goes back once, at the flip.** The source keeps producing empty burn-off blocks past H (about 330 in the rehearsals) until it pauses; they are discarded and the new chain reuses those heights from H+1 with different block ids. Indexers and deposit pollers must treat H as the end of the old chain and key blocks by id, not height alone ([docs/EXCHANGES.md](docs/EXCHANGES.md)). The chain_id and keys are unchanged.
 - [x] **Contracts move as-is.** The perps contract, its oracle and token were deployed on the old chain with plain `cleos set contract` and kept working on PulseVM after the cut: orders placed, cranked and cancelled with no contract or bot changes.
 - [x] **Expect a short, bumpy restart.** Budget for about 1–2 minutes of 503s plus up to a minute of slow confirmations right after the flip (field note 10), and make your bot's retry loop tolerate both.
 
@@ -1133,8 +1149,10 @@ selected by `[ceremony] import_backend = "fork" | "upstream"`:
   a manifest binding checkpoint bytes to the source block id) — and
   **verification is upstream's own tooling**: `xpr_19_table_compare` (a
   wire-level nodeos-vs-Arena comparison of all 19 tables; any mismatch fails
-  the ceremony, **but only when `compare_bin` is configured**: it is optional
-  today and skipped otherwise) plus `xpr_state_fingerprint` (whole-state root —
+  the ceremony; since rc.21 `compare_bin` is **required** (no VERIFIED without it), an exit 0
+  must show a matching line for every required table, and the rehearsal allowlist accepts only
+  each table's known v1.0.0 difference) plus `xpr_state_fingerprint` (whole-state root, which
+  must be non-empty —
   journaled, and golden-comparable across operators via `[upstream] golden_state_root`).
   Every artifact is bound back to the ceremony's pinned cut: the export
   manifest's `INPUT_SNAPSHOT_SHA256` must equal the cut snapshot's hash, and
@@ -1162,7 +1180,11 @@ selected by `[ceremony] import_backend = "fork" | "upstream"`:
      accepted anchor byte for byte). It then writes `boot-<cut>.manifest.json` (checkpoint
      manifest + `source_block`), `migration-genesis-<cut>.json` (`genesis_base` +
      `migration_checkpoint_sha256`) and `chain-config-<cut>.json` (`chain_config_base` +
-     `migration_checkpoint` + `migration_manifest`), and journals their hashes.
+     `migration_checkpoint` + `migration_manifest`), and journals their hashes. The chain
+     config carries this node's `producer_key`: it is created 0600 from the first byte (and
+     installed 0600 into a 0700 per-chain directory), only in directories nobody else can write
+     (checked at ARM); `{chain_config}` is per-node and must not be copied anywhere shared. The
+     genesis and manifest are shared and refuse anything that looks like a private key.
   1b. *Producer mode: the signing key must be the registered one.* At ARM and again right
      before ignition, the agent reads the producer's row from the source's `eosio/producers`
      (`get_table_rows`) and requires the key the target will sign with (the public key of
@@ -1174,11 +1196,15 @@ selected by `[ceremony] import_backend = "fork" | "upstream"`:
      `onblock`; on the stage-2 rig a node signing with a different key stopped building blocks
      four blocks after the cut, without any error. The private key is never journaled.
   2. *After the fleet gate, before `ignite_started`*, the hashes are re-checked and
+     the coordinator relay must answer with no abort (an unreachable relay refuses the step), and
      `create_chain_cmd` runs (`{genesis}`, `{chain_config}`, `{manifest}`, `{checkpoint}`,
      `{genesis_sha256}`, `{cut_height}`). It creates the subnet + blockchain on Metal (the
      coordinator's / validators' job in production, a helper with the local network key on a
      rig) and prints `BLOCKCHAIN_ID=<id>` (and `SUBNET_ID=<id>`); the id is journaled at once
-     and a resumed agent never creates a second chain. A failure aborts and resumes the source.
+     and a resumed agent never creates a second chain. **Its intent record is the point of no
+     return (rc.21)**: a creation hook can submit a chain that validators already tracking the
+     subnet start, so any failure from then on (an error, no id printed, a lost answer, a
+     restart without a journaled id) HALTS for a fleet decision instead of resuming the source.
   3. From then on `{blockchain_id}`, `{subnet_id}`, `{chain_config}`, … expand in
      `target.rpc_url` (`…/ext/bc/{blockchain_id}/rpc`), `ignite_cmd` and every hook.
      `target.chain_config_dir` (metalgo `--chain-config-dir`) gets `<id>/config.json`;

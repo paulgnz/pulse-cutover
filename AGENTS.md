@@ -6,7 +6,8 @@ cutover. Read this section in full before running any command.
 Human-oriented docs: **[docs/PROCESS.md](docs/PROCESS.md)** (the process, step by step, with diagrams),
 [ATOMICITY.md](ATOMICITY.md) (what "atomic" means, what the evidence shows so far, and what is still open),
 [README.md](README.md) (operator walkthrough and field notes), [TESTING.md](TESTING.md),
-[docs/DESIGN.md](docs/DESIGN.md) (design, review findings, failure table) and [docs/EVIDENCE.md](docs/EVIDENCE.md) (every recorded run).
+[docs/DESIGN.md](docs/DESIGN.md) (design, review findings, failure table), [docs/EVIDENCE.md](docs/EVIDENCE.md) (every recorded run)
+and [docs/EXCHANGES.md](docs/EXCHANGES.md) (what exchanges, wallets and indexers must do at the cut).
 
 ---
 
@@ -32,8 +33,14 @@ Human-oriented docs: **[docs/PROCESS.md](docs/PROCESS.md)** (the process, step b
 6. **Never handle key material in the open.** Do not print, echo, log, commit or paste `PVT_…`, WIF keys,
    staker keys, signer keys, API tokens or wallet passwords. Share diagnostics only via `pulse-cutover report`
    (it redacts).
-7. **Never re-send old signed transactions.** Across the cut the chain_id is unchanged, so old signatures are valid
-   on the new chain. Apps and scripts must build a *fresh* transaction for every retry.
+7. **Reconcile before re-signing; never blindly re-send.** After an ambiguous outcome (timeout, no answer, 5xx),
+   first look up the ORIGINAL transaction id (history `get_transaction`, your own node) and use an
+   application-level operation id for every business action. Build and sign a replacement only once the original
+   is found (then do nothing) or provably dead (expired by the chain's head time and absent from an available,
+   fully indexed source). A re-signed transaction has a new id: id deduplication cannot stop it executing the same
+   transfer twice. Do not re-send old signed bytes across the cut either: whether the new chain rejects or executes
+   them depends on its chain-id/TAPOS/dedupe policy. An edge 503 during the freeze = not accepted. See
+   [docs/EXCHANGES.md](docs/EXCHANGES.md).
 8. **Rehearsals stay in the sandbox.** Test bots, oracle feeders and keepers must point only at the rehearsal
    endpoints. Many scripts default to real public endpoints; always pass them explicitly, and use test keys only.
 9. **Hooks must be executable, fast and idempotent.** Every hook runs in its own process group and is killed at
@@ -77,7 +84,7 @@ talk to each other at runtime. Steps marked **HUMAN** need an explicit yes.
 |---|---|---|---|---|
 | 1 | Survey | `pulse-cutover doctor --json` | `verdicts.bp.status == "READY"` | apply the named fixes (HUMAN for node config), re-run |
 | 2 | Check the published event | compare manifest `chain_id`, `freeze_height`, `import_cpu_scale`, target genesis hash with the coordinator's announcement | all identical | **stop**, tell the human (rule 4) |
-| 3 | Check config | `freeze_strategy = "schedule_at_h"`, `freeze_lead_blocks` (default 24), hooks `on_freeze`, `post_ignite`, `on_live`, `on_abort` present and executable (`test -x`) | all true | fix, re-check |
+| 3 | Check config | `pulse-cutover status --config …` prints `ceremony: production profile met` (a real cut) or `REHEARSAL` (a rehearsal, which must have `[ceremony] rehearsal = true`); `freeze_strategy = "schedule_at_h"`, `freeze_lead_blocks` (default 24), hooks `on_freeze`, `post_ignite`, `on_live`, `on_abort` present and executable (`test -x`); `on_freeze` closes **every** write path into this nodeos (public and private APIs, relays, bots and other direct clients) | all true | fix, re-check |
 | 4 | Check the target | PulseVM chain config has `snapshot_path` = `snapshot.staged_path`; that file does **not** exist yet; producer name/key match the target genesis | all true | fix (HUMAN), never pre-stage a snapshot |
 | 5 | **HUMAN** arm | `./cutover.sh --manifest ceremony.json` (or `pulse-cutover run --config …`) | journal: `ARMED` with `snapshot_scheduled_at == H` | read the error line, report |
 | 6 | Watch | `pulse-cutover status --config …` | `FROZEN` at H−lead → `SNAPSHOTTED` (burn-off 0) → `VERIFIED` → `IGNITED` → `LIVE` | on `ABORTED`: see [failure table](#failure--next-action) |
@@ -389,7 +396,9 @@ stateDiagram-v2
 | ceremony LIVE | verify: public URL serves the same chain_id, head advancing; report bundle for the record |
 | stuck at IGNITED, target head == H | the new chain has no transactions: check the `post_ignite` hook ran (journal `post_ignite_hook`; `Permission denied` = missing execute bit). Tell the human; with approval, run the hook by hand |
 | ABORTED: "transactions landed after the cut" | writes were not closed early enough: check `on_freeze` really closes every write path (API edge, other public endpoints); raise `freeze_lead_blocks` for the next attempt |
-| clients see timeouts / "expired" right after LIVE | expected briefly after ignite (validators re-peer); tell the human if it lasts > 2 min. Clients must retry with fresh transactions |
+| clients see timeouts / "expired" right after LIVE | expected briefly after ignite (validators re-peer); tell the human if it lasts > 2 min. Clients must reconcile the original transaction id before re-signing (rule 7) |
+| head block number dropped by ~300 at the flip | expected: the source's empty burn-off blocks above H are discarded and the new chain reuses those heights ([docs/EXCHANGES.md](docs/EXCHANGES.md)) |
+| HALTED: "create_chain_cmd failed after it started" / "resumed after create_chain_cmd started" | chain creation is past the point of no return (rc.21): a chain may exist. Do NOT unhalt or roll back on your own; escalate with the report bundle |
 
 ## Worked example: agent-driven rehearsal on a spare box
 

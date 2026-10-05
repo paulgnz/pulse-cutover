@@ -18,6 +18,7 @@ Other documents cover the rest, and this one does not repeat them:
 | [ATOMICITY.md](../ATOMICITY.md) | The five atomicity properties (A1–A5), the evidence for each, known limits, upstream re-qualification list |
 | [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md) | The fleet-wide commit-or-abort design (not implemented) |
 | [EVIDENCE.md](EVIDENCE.md) | Every recorded rehearsal run, with what it proves and what it does not |
+| [EXCHANGES.md](EXCHANGES.md) | For exchanges, wallets and indexers: the head-number step back at the flip, crediting deposits through the federated history, reconciling before re-signing |
 | [`examples/*.toml`](../examples/) | Fully commented configs per mode; `src/config.rs` documents every field |
 
 ## 1. Scope and design rules
@@ -80,8 +81,8 @@ stateDiagram-v2
     ARMED --> ABORTED
     FROZEN --> ABORTED
     SNAPSHOTTED --> ABORTED
-    VERIFIED --> ABORTED: before ignite_started
-    VERIFIED --> HALTED: after ignite_started
+    VERIFIED --> ABORTED: before create_chain / ignite_started
+    VERIFIED --> HALTED: after create_chain or ignite_started
     IGNITED --> HALTED
     FLIPPED --> HALTED
     HALTED --> ABORTED: rollback --force-after-ignite (target fenced first)
@@ -101,13 +102,18 @@ stateDiagram-v2
   the boot manifest anchored on the FULL packed cut block (its computed id must equal the cut
   block id), the migration genesis and the chain config, all hashed into the journal. In
   VERIFIED: refuse XPR mainnet while `ignite_pending_reasons()` is non-empty, journal those
-  reasons as warnings otherwise, re-hash the artifacts, run the fleet gate, then
-  `create_chain_cmd` (journaled as a side effect before it runs; its blockchain id journaled
-  the moment it is printed, reused on resume, never created twice), bind `{blockchain_id}` /
+  reasons as warnings otherwise, re-hash the artifacts, run the fleet gate, require a POSITIVE
+  "no abort" answer from the coordinator relay (an unreachable relay is unknown, not consent),
+  then `create_chain_cmd`. **Its intent record is the local point of no return** (rc.21): a
+  creation hook can submit a chain that validators already tracking the subnet start, and its
+  outcome can be lost, so from the moment it starts every failure (non-zero exit, no
+  `BLOCKCHAIN_ID=`, config install failure, a restart without a journaled id) HALTS instead of
+  resuming the source. Its blockchain id is journaled the moment it is printed, reused on
+  resume, never created twice. Then bind `{blockchain_id}` /
   `{subnet_id}` / … into the target RPC, ignite command and hooks, install the chain config,
   and only then `ignite_started`. Rehearsal-only overrides (compare allowlist, target chain_id
   change) are refused for mainnet and journaled wherever they act.
-- **ABORTED** is reachable only before `ignite_started` is journaled. It resumes the source
+- **ABORTED** is reachable only before `create_chain` (upstream) or `ignite_started` is journaled. It resumes the source
   producer (producer mode, if `target.auto_rollback`), restarts the source and reverts flips
   (API mode, if they ran), runs `on_abort`, and moves the staged snapshot aside. The rollback
   counts as complete only when a final `rollback_done` record follows every step.
@@ -116,12 +122,25 @@ stateDiagram-v2
   --i-understand`. `pulse-cutover rollback` refuses (exit 3) unless `--force-after-ignite`, which
   first stops this box's target (`target.stop_cmd`) and does not resume the source if that
   fails (exit 4). This is a local fence only.
+- **Production profile** (rc.21). A ceremony config must meet one profile, on both backends, at
+  load and again right before the write freeze: no rehearsal override, exact cut, no
+  `simulate_freeze` or derived H, lineage check on, producer hooks `on_freeze` / `post_ignite` /
+  `on_live` / `on_abort`, `schedule_at_h` without the `quiesce_cmd` stand-in,
+  `live_sustain_secs` and `post_live_max_idle_secs` above 0, a `post_live_probe_cmd`, and a state
+  comparison (upstream `compare_bin`; fork `golden_roots`). Anything else needs
+  `[ceremony] rehearsal = true`, which is journaled, shown by `status`, failed as the beacon
+  setup check `rehearsal_overrides`, labelled on mission control and refused for XPR mainnet.
+- **Aborts are final.** A signed abort is persisted as a tombstone next to the journal
+  (`coord-tombstones.json`) the moment `await` or the ceremony sees it; neither will accept or
+  arm that event id again, even if the relay later stops serving the abort or the process
+  restarts. Future-dated ARMs are refused; an ARM whose window passed is recorded as `missed`
+  and `await` exits 3.
 - **Crash recovery.** Exclusive journal lock; torn-tail repair (only a fragment after the last
   newline; a complete corrupt record is fatal); side-effect records written before the effect
   (`staged_artifact`, `ignite_started`, `flip_cmd`, `source_stop_cmd`); hooks run in their own
   process group with a deadline (`hooks.timeout_secs`, default 300) and an orphaned group is
-  killed before a resume or rollback. A resume that finds `ignite_started` without IGNITED
-  halts. The fault-injection results for this are in
+  killed before a resume or rollback. A resume that finds `ignite_started` without IGNITED,
+  or `create_chain` without a journaled blockchain id, halts. The fault-injection results for this are in
   [EVIDENCE.md](EVIDENCE.md#linux-fault-injection-rc9-and-rc10).
 
 *Historical:* the August design had no HALTED state. Every failure, including a LIVE-gate
@@ -196,7 +215,7 @@ downloaded from anyone. What is still missing (signed per-producer votes, thresh
 coordinator keys, a durable certificate) is listed in ATOMICITY Known limits #1 and #3 and
 designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 
-## 5. Failure and rollback table (rc.11, upstream ignition rows added)
+## 5. Failure and rollback table (rc.21: chain creation is past the point of no return)
 
 "Abort" = ABORTED with rollback (§3). "Halt" = HALTED, sealed, nothing reverted.
 
@@ -204,37 +223,46 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 |---|---|---|---|
 | H not in the future (head for producers, LIB for API nodes); chain_id mismatch; producer already paused; producer API unreachable; public URL not serving the source (API mode); staged path exists; goldens file missing | preflight | ARMED | abort (nothing has changed yet) |
 | Snapshot cannot be scheduled at H | `schedule_snapshot` error | ARMED | abort; no fallback to an inexact cut |
-| Signed coordinator abort | `[coordination]` poll (every 3 s while waiting; before every upstream pipeline step and while each tool runs, killing it) | ARMED–VERIFIED | abort |
+| Config does not meet the production profile and is not marked `rehearsal = true`; a rehearsal against XPR mainnet | config load; again before the freeze | — / ARMED | refused / abort |
+| Signed coordinator abort (or an abort tombstone from earlier) | `[coordination]` poll (every 3 s while waiting; before every upstream pipeline step and while each tool runs, killing it) | ARMED–VERIFIED | abort |
+| Coordinator relay does not answer when chain creation or ignition needs a positive "no abort" | 30 s of polls | VERIFIED | abort (before create / ignite_started) |
 | Write freeze hook fails | `on_freeze` exit / timeout | ARMED | abort |
 | H does not finalize, or the scheduled file never appears | `snapshot_timeout_secs` | FROZEN | abort |
 | Snapshot not at H | exact-H check | FROZEN | abort (rehearsal flags journal and continue) |
 | Pause does not take effect; `quiesce_cmd` fails | producer API; hook | FROZEN | abort |
 | Head keeps moving after the pause | quiescence window | FROZEN | late blocks journaled; the window waits up to `quiescence_timeout_secs` (default 120), then ABORT (before ignition: `on_abort` reopens writes) |
 | Snapshot block id ≠ chain's block id at H (fork at the cut); chain_id changed | block lookup | FROZEN | abort |
-| Any transaction in H+1…pause, or an unreadable block | burn-off audit | FROZEN | abort |
+| Any transaction in H+1…pause, or an unreadable block, or an answer that is not that block with a `transactions` array | burn-off audit (fails closed) | FROZEN | abort |
 | sha256 ≠ manifest; imported head, chain_id or block id ≠ the pinned cut; fingerprints ≠ goldens; staged copy hash differs | verify | SNAPSHOTTED | abort |
 | Two imports disagree | dual import (R9) | SNAPSHOTTED | abort; a VM bug to report upstream |
-| Upstream: export/import/fingerprint fails; sidecar missing or inconsistent; artifact not bound to the cut; `xpr_19_table_compare` fails (on a table not in `rehearsal_allow_compare_mismatch`, or naming no table) | upstream pipeline | SNAPSHOTTED | abort |
+| Upstream: export/import/fingerprint fails; sidecar missing or inconsistent; artifact not bound to the cut; no `compare_bin`; `xpr_19_table_compare` fails (on a table not in `rehearsal_allow_compare_mismatch`, with a signature other than that table's known difference, or naming no table) or exits 0 without a matching line for every required table; no non-empty `state_root` | upstream pipeline | SNAPSHOTTED | abort |
+| Signer material: chain config would land in a group/world-writable or foreign-owned directory; a private key in `genesis_base` (shared) | preflight; write time | ARMED / SNAPSHOTTED | abort |
 | Upstream: the full cut block cannot be fetched, does not pack, or its computed id ≠ the cut block id; boot artifacts cannot be written | boot artifacts | SNAPSHOTTED | abort |
 | Rehearsal override configured for XPR mainnet | config load / preflight | — / ARMED | refused / abort |
 | Upstream, verify-only config (no `genesis_base` + `create_chain_cmd`); XPR mainnet while `ignite_pending_reasons()` is non-empty | upstream ignite preflight | VERIFIED | abort with the remaining list |
 | Upstream, producer mode: the signing key (chain config `producer_key` = genesis `initial_key`) is not what `eosio/producers` registers for `producer_name`, or that producer is unregistered / inactive | producer key check | ARMED, VERIFIED | abort |
 | Upstream: a boot artifact missing or changed since VERIFIED | re-hash | VERIFIED | abort |
 | Fleet does not agree before `fleet_timeout_secs` | fleet gate | VERIFIED | abort |
-| Upstream: `create_chain_cmd` fails or prints no `BLOCKCHAIN_ID=`; a previous run started it without journaling an id; the chain config cannot be installed | create_chain | VERIFIED | abort (a chain created but never ignited must be retired) |
+| — `create_chain` journaled (upstream) — | | | |
+| Upstream: `create_chain_cmd` fails or prints no `BLOCKCHAIN_ID=`; a previous run started it without journaling an id; the chain config cannot be installed; a signed abort after creation | create_chain | VERIFIED | halt (a chain may exist and be starting: fleet decision) |
 | — `ignite_started` journaled — | | | |
 | Ignite command fails; target not up before `quorum_timeout_secs`; target chain_id ≠ source (unless `rehearsal_allow_chain_id_change`: accepted, both ids journaled) | ignition | VERIFIED | halt |
 | Target block id at H ≠ cut block id, or not verifiable with `require_lineage_check` | lineage check | VERIFIED | halt |
 | `post_ignite` fails; head never passes H + `live_blocks`; a gap over `live_max_gap_secs` in the sustain window; `on_live` fails | LIVE gate | IGNITED / FLIPPED | halt |
-| Hyperion does not hydrate; flip command fails; public URL does not serve the target; `/v2` gate fails; source stop fails | api/hyperion stages | IGNITED / FLIPPED | halt |
-| No new target block for `post_live_max_idle_secs`, or `post_live_probe_cmd` fails | beacon / `status` after LIVE | LIVE | reported only: HEALTH check `target_live` fails (mission control red); never an automatic rollback |
-| Agent crash | journal replay | any | resume the current step; halt if `ignite_started` has no IGNITED |
+| Hyperion does not hydrate; flip command fails; public URL does not serve the target's block at a common height above H; `/v2` gate fails (no live local source or no VALID boundary); boundary file cannot be written; source stop fails | api/hyperion stages | IGNITED / FLIPPED | halt |
+| No new target block for `post_live_max_idle_secs` (unless the probe passes on a quiet chain), `post_live_probe_cmd` fails, head goes backwards, or the target RPC serves another chain_id | beacon / `status` after LIVE | LIVE | reported only: HEALTH check `target_live` fails (mission control red); never an automatic rollback |
+| Agent crash | journal replay | any | resume the current step; halt if `ignite_started` has no IGNITED, or `create_chain` has no journaled id |
 | Operator `rollback` after ignition | `past_point_of_no_return` | IGNITED+ | refused (exit 3) unless `--force-after-ignite`, which fences this box's target first |
 
-The invariant behind the table: before ignition starts, resuming the paused producer and
-reopening writes is the whole source-side rollback; after it, only a fleet-wide decision may
-resume the source. That decision has no protocol yet, which is why a public cut must not be
-scheduled until the authority boundary exists (ATOMICITY Known limits #1).
+The invariant behind the table: before chain creation or ignition starts, resuming the paused
+producer and reopening writes is the whole source-side rollback; after it, only a fleet-wide
+decision may resume the source. That decision has no protocol yet. Moving the local boundary
+before chain creation (rc.21) stops ONE agent from resuming its source next to a chain that may
+already exist; it does not make the boundary fleet-wide: another producer that aborted before its
+own boundary still resumes its source. A fleet-wide point of no return needs an upstream
+**sealed start** (a target that cannot produce until a durable, fleet-signed commit exists) and
+durable source fencing. Until both exist, a public cut must not be scheduled (ATOMICITY Known
+limits #1).
 
 ## 6. v2 "shadow mirror" (sketch, not implemented)
 

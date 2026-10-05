@@ -93,7 +93,7 @@ flowchart TB
 | **Block producer** | `pulse-cutover` in **producer mode** | Closes writes before H, snapshots exactly H, imports, becomes a validator of the new chain | HTTP 503 on writes for the write pause |
 | **API provider** | `pulse-cutover` in **api mode** | Follows the cut, imports H, flips its public URL to the new chain. *Unfinished: api mode does not yet enforce an exact-H artifact* | 503 on writes for the write pause; reads keep being served |
 | **History provider** | api mode + `[hyperion]` | Starts indexing at H+1, serves old and new history through one URL. *Unfinished: migrating an existing legacy Hyperion archive across H* | nothing, once qualified |
-| **App / exchange** | nothing | Retry on 503 with a fresh transaction (see [§6](#6-what-users-and-apps-see)) | a short write pause |
+| **App / exchange** | nothing | Hold on 503; reconcile the original transaction id before re-signing; treat H as the end of the old chain (see [§6](#6-what-users-and-apps-see), [EXCHANGES.md](EXCHANGES.md)) | a short write pause; the head block number steps back once at the flip |
 
 ---
 
@@ -187,7 +187,7 @@ stateDiagram-v2
 
 | | |
 |---|---|
-| **Action** | At `H − freeze_lead_blocks` (default 24 ≈ 12 s) the `on_freeze` hook closes writes at the API edge (nginx flag file or HAProxy runtime map → HTTP 503). Producers keep making **empty** blocks until H is irreversible. |
+| **Action** | At `H − freeze_lead_blocks` (default 24 ≈ 12 s) the `on_freeze` hook closes writes at the API edge (nginx flag file or HAProxy runtime map → HTTP 503). It must close **every** write path into the producer's nodeos: public and private APIs, relays, bots and other direct clients. Producers keep making **empty** blocks until H is irreversible (and a few hundred more until the pause: the burn-off blocks, later discarded). |
 | **Users see** | Reads work. Writes get `503 chain migration in progress`. |
 | **Gate** | H becomes final and the file `snapshot-<id of H>.bin` appears. |
 | **Why this way** | Leap only writes a snapshot once the block is final, and a paused DPoS chain never finalizes (it deadlocks). Freezing writes *before* H lets anything still in flight land by H instead of after it. |
@@ -282,11 +282,11 @@ sequenceDiagram
     Note over URL: write freeze (H − 24)
     App->>URL: transfer
     URL-->>App: 503 · migration in progress
-    App->>App: wait, build a FRESH transaction
+    App->>App: hold; same operation id (reconcile any ambiguous id first)
     App->>URL: get_info, get_table_rows …
     URL-->>App: ✓ reads keep working (application state as of H)
     Note over URL: LIVE: backend is now PulseVM
-    App->>URL: transfer (new tx, same key)
+    App->>URL: transfer (same operation, new tx only if the first is reconciled as not executed)
     URL-->>App: ✓ accepted by the new chain
 ```
 
@@ -294,7 +294,8 @@ sequenceDiagram
 
 | Do | Why |
 |---|---|
-| Treat **503 as "hold"**; after a 503 retry with a **freshly built** transaction | A 503 means the write was not accepted. If the outcome is ambiguous (timeout, no answer), first reconcile: look up the original transaction and your application state. Re-signing creates a new transaction id and can repeat an operation whose first attempt landed. |
+| Treat **503 as "hold"**; **reconcile before re-signing** | A 503 means the write was not accepted. **Reconcile before you re-sign.** After an ambiguous outcome (timeout, lost response, 5xx), look up the ORIGINAL transaction id first and keep an application-level operation id for every business action; build and sign a replacement only once the original is found (done) or provably expired and absent. A re-signed transaction has a new id, so id-based deduplication cannot stop it from executing the same transfer twice. |
+| Treat **H as the end of the old chain** | The source makes ~330 empty burn-off blocks past H before it pauses; they are discarded and the new chain reuses those heights with other block ids, so the head number steps back once at the flip. Key blocks by id. [EXCHANGES.md](EXCHANGES.md) |
 | Use `expireSeconds ≥ 120` | The chain clock is frozen at the cut until the first new block. |
 | Fail over across several endpoints | During the rehearsal every producer's edge answered reads throughout. |
 | Confirm inclusion (read your state back) | On PulseVM an accepted transaction is in the mempool, not yet executed. |
