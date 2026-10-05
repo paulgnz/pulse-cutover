@@ -460,6 +460,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if !(resumed && self.reached_ignited) {
             problems.extend(self.signer_material_problems());
         }
+        for p in [self.cfg.ceremony.boundary_path.as_ref(), self.cfg.hyperion.as_ref().and_then(|h| h.boundary_path.as_ref())].into_iter().flatten() {
+            if p.parent().is_some_and(|d| !d.as_os_str().is_empty() && !d.is_dir()) {
+                problems.push(format!("history boundary_path {}: its directory does not exist", p.display()));
+            }
+        }
         // Stage-path hygiene (R12): the pre-staged target imports whatever sits
         // at snapshot_path the moment its chain first initializes. A stale file
         // from an earlier ceremony pins the chain to the WRONG cut before this
@@ -2456,6 +2461,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.cfg.hyperion.is_some() && !self.hyperion_hydrate()? {
             return Ok(()); // aborted inside, with evidence
         }
+        if let Some(path) = self.cfg.ceremony.boundary_path.clone() {
+            if !self.write_boundary(&path, "history_boundary_staged")? {
+                return Ok(());
+            }
+        }
         let started = self.ops.now_ms();
         let flip_cmd = self.cfg.flip.as_ref().expect("validated").cmd.clone();
         self.journal.evidence(State::Ignited, json!({"side_effect": "flip_cmd"}))?;
@@ -2515,6 +2525,28 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Ok(())
     }
 
+    /// Write the history boundary for the federating router (atomically: the router re-reads it
+    /// on change and must never see half a file). It names the source chain AND the chain the
+    /// target serves (they differ only in a rehearsal), so the router can check both. A failure
+    /// after ignition halts (abort() decides). Ok(false) after that.
+    fn write_boundary(&mut self, path: &std::path::Path, key: &str) -> Result<bool, String> {
+        let boundary = json!({
+            "cut_block": self.cut_height,
+            "cut_block_id": self.cut_block_id,
+            "cut_time": self.last_source_block_time,
+            "chain_id": self.chain_id,
+            "target_chain_id": self.accepted_target_chain_id.clone().or(self.chain_id.clone()),
+            "written_at_ms": self.ops.now_ms(),
+        });
+        let text = serde_json::to_string_pretty(&boundary).expect("boundary json") + "\n";
+        if let Err(e) = crate::secrets::write_file(path, text.as_bytes(), false) {
+            self.abort("could not write history boundary file", json!({"path": path.display().to_string(), "error": e}))?;
+            return Ok(false);
+        }
+        self.journal.evidence(State::Ignited, json!({key: path.display().to_string(), "boundary": boundary}))?;
+        Ok(true)
+    }
+
     /// hyperion mode, post-IGNITED: start hyperion-rs, write the boundary
     /// file, and hold until the indexer is hydrated against the new chain.
     /// Returns Ok(false) after aborting (start failure / hydration timeout).
@@ -2523,28 +2555,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let cut = self.cut_height.expect("cut pinned");
         // Boundary FIRST (the router must know the cut before its local
         // source comes alive), then start.
-        if let Some(path) = &hyp.boundary_path {
-            let boundary = json!({
-                "cut_block": self.cut_height,
-                "cut_block_id": self.cut_block_id,
-                "cut_time": self.last_source_block_time,
-                "chain_id": self.chain_id,
-                "written_at_ms": self.ops.now_ms(),
-            });
-            if let Err(e) = std::fs::write(
-                path,
-                serde_json::to_string_pretty(&boundary).expect("boundary json"),
-            ) {
-                self.abort(
-                    "could not write history boundary file",
-                    json!({"path": path.display().to_string(), "error": e.to_string()}),
-                )?;
+        if let Some(path) = hyp.boundary_path.clone() {
+            if !self.write_boundary(&path, "hyperion_boundary_staged")? {
                 return Ok(false);
             }
-            self.journal.evidence(
-                State::Ignited,
-                json!({"hyperion_boundary_staged": path.display().to_string(), "boundary": boundary}),
-            )?;
         }
         if let Some(cmd) = &hyp.start_cmd {
             // Placeholder substitution: the ceremony discovers the cut, and
@@ -2622,11 +2636,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 )));
             }
             if let Some(health) = self.ops.get_json(&url)? {
-                let local_ok = health
-                    .pointer("/federation/local/ok")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if local_ok {
+                let flag = |p: &str| health.pointer(p).and_then(|v| v.as_bool()).unwrap_or(false);
+                // The router must have a live local source AND a boundary it validated against the
+                // chain and the legacy archive (it serves no history otherwise).
+                if flag("/federation/local/ok") && flag("/federation/boundary/valid") {
                     return Ok(Ok(health));
                 }
             }
@@ -2708,6 +2721,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         if !self.run_post_ignite()? {
             return Ok(());
+        }
+        // Producer mode: the federating router on this operator's API/history boxes needs the cut
+        // too (dapp rehearsal: only hyperion mode wrote it). Before LIVE, so the router is valid the
+        // moment on_live reopens writes.
+        if let Some(path) = self.cfg.ceremony.boundary_path.clone() {
+            if !self.write_boundary(&path, "history_boundary_staged")? {
+                return Ok(());
+            }
         }
         let started = self.ops.now_ms();
         let deadline = started + self.cfg.target.quorum_timeout_secs * 1000;

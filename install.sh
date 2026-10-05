@@ -1127,6 +1127,8 @@ PRESCAN=$(mget_opt '.snapshot.prescan_path')
   [ "$SIM" = "true" ] && echo 'simulate_freeze = true'
   echo "chain_id = \"$CHAIN_ID\""
   echo "import_cpu_scale = $CPU_SCALE"
+  # Producer mode: where to write the history boundary for a federating router (manifest .ceremony.boundary_path).
+  BPATH=$(mget_opt '.ceremony.boundary_path'); [ -n "$BPATH" ] && echo "boundary_path = \"$BPATH\""
   echo ''
   echo '[source]'
   echo "rpc_url = \"$SRC_RPC\""

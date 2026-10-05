@@ -590,7 +590,7 @@ impl ChainOps for MockOps {
                 && self.hyperion_polls.get() >= self.hyperion_ready_after.get();
             return Ok(Some(serde_json::json!({
                 "federation": {
-                    "boundary": {"cut_block": self.target_head.get()},
+                    "boundary": {"cut_block": self.target_head.get(), "status": "valid", "valid": true},
                     "local": {"ok": local_ok},
                     "legacy": {"ok": true}
                 }
@@ -4551,4 +4551,35 @@ fn rc21_public_route_must_serve_the_targets_block_not_a_leftover_source_at_a_nea
     let e = journal_entries(&cfg);
     let flipped = &transition(&e, "FLIPPED").unwrap()["data"]["health"];
     assert!(flipped["common_block"]["height"].as_u64().unwrap() > flipped["common_block"]["above_cut"].as_u64().unwrap());
+}
+
+#[test]
+fn rc21_producer_mode_writes_the_history_boundary_before_live() {
+    // Dapp rehearsal: only hyperion mode wrote the boundary; a federator next to a producer had none.
+    let dir = tempfile::tempdir().unwrap();
+    let _ = test_config(dir.path(), 120);
+    let path = dir.path().join("ceremony.toml");
+    let text = std::fs::read_to_string(&path).unwrap().replacen("[ceremony]\n", &format!("[ceremony]\nboundary_path = \"{}/boundary.json\"\n", dir.path().display()), 1);
+    std::fs::write(&path, text).unwrap();
+    let cfg = Config::load(&path).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let b: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("boundary.json")).unwrap()).unwrap();
+    let e = journal_entries(&cfg);
+    let snap = &transition(&e, "SNAPSHOTTED").unwrap()["data"];
+    assert_eq!(b["cut_block"], snap["cut_height"]);
+    assert_eq!(b["cut_block_id"], snap["cut_block_id"]);
+    assert_eq!(b["cut_time"], snap["last_source_block_time"]);
+    assert!(b["chain_id"].is_string() && b["target_chain_id"] == b["chain_id"]);
+    let pos = |needle: &str| e.iter().position(|v| v.to_string().contains(needle)).unwrap();
+    assert!(pos("history_boundary_staged") < pos("\"state\":\"LIVE\""), "written before LIVE");
+    // A boundary_path whose directory does not exist is refused at ARM.
+    let dir = tempfile::tempdir().unwrap();
+    let _ = test_config(dir.path(), 120);
+    let path = dir.path().join("ceremony.toml");
+    let text = std::fs::read_to_string(&path).unwrap().replacen("[ceremony]\n", &format!("[ceremony]\nboundary_path = \"{}/nope/boundary.json\"\n", dir.path().display()), 1);
+    std::fs::write(&path, text).unwrap();
+    let cfg = Config::load(&path).unwrap();
+    let _ = run_machine_result(&cfg, &MockOps::new(dir.path(), 110));
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("its directory does not exist"));
 }
