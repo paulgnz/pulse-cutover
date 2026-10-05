@@ -2368,23 +2368,26 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
     }
 
-    /// Poll the PUBLIC URL until it demonstrably serves the TARGET chain:
-    /// same chain_id (that is the migration's whole point, so it cannot
-    /// discriminate) AND head agreeing with the target RPC within
-    /// `head_tolerance`, `health_polls` consecutive times. Under
-    /// simulate_freeze the still-running nodeos head is far past the cut, so
-    /// head-agreement-with-target is the discriminator that proves the swap.
+    /// Poll the PUBLIC URL until it demonstrably serves the TARGET chain, `health_polls`
+    /// consecutive times. chain_id cannot discriminate (a same-chain-id migration keeps it) and
+    /// a nearby head height cannot either (a leftover source has heights past the cut too), so the
+    /// proof is a COMMON BLOCK ID above the cut: at min(target head, public head) > cut, the block
+    /// the public endpoint serves must be the target's block (the source's block at that height,
+    /// if any, is a discarded burn-off block with another id). Heads within `head_tolerance`.
     fn public_serves_target(&mut self) -> Result<Option<serde_json::Value>, String> {
         let flip = self.cfg.flip.clone().expect("api mode validated flip");
+        let cut = self.cut_height.expect("cut pinned");
         let deadline = self.ops.now_ms() + flip.health_timeout_secs * 1000;
         let mut consecutive = 0u32;
+        let mut last_why = String::from("no poll yet");
         loop {
             if self.ops.now_ms() > deadline {
+                self.journal.evidence(self.state, json!({"public_route_check_last": last_why}))?;
                 return Ok(None);
             }
             let target = self.ops.target_info()?;
             let public = self.ops.public_info(&flip.public_url)?;
-            let ok = match (&target, &public) {
+            let proof = match (&target, &public) {
                 (Some(t), Some(p)) => {
                     let chain_ok = self
                         .accepted_target_chain_id
@@ -2392,12 +2395,34 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         .or(self.chain_id.as_ref())
                         .map(|c| p.chain_id.eq_ignore_ascii_case(c))
                         .unwrap_or(false);
-                    let diff = t.head_block_num.abs_diff(p.head_block_num);
-                    chain_ok && diff <= flip.head_tolerance
+                    let common = t.head_block_num.min(p.head_block_num);
+                    if !chain_ok {
+                        last_why = format!("public chain_id {}", p.chain_id);
+                        None
+                    } else if t.head_block_num.abs_diff(p.head_block_num) > flip.head_tolerance {
+                        last_why = format!("heads apart: target {} public {}", t.head_block_num, p.head_block_num);
+                        None
+                    } else if common <= cut {
+                        last_why = format!("no block above the cut on both yet (target {}, public {})", t.head_block_num, p.head_block_num);
+                        None
+                    } else {
+                        let tid = if common == t.head_block_num { Some(t.head_block_id.clone()) } else { self.ops.target_block_id(common)? };
+                        let pid = if common == p.head_block_num { Some(p.head_block_id.clone()) } else { self.ops.public_block_id(&flip.public_url, common)? };
+                        match (tid, pid) {
+                            (Some(a), Some(b)) if a.eq_ignore_ascii_case(&b) => Some((common, a)),
+                            (a, b) => {
+                                last_why = format!("block {common}: target {a:?} public {b:?}");
+                                None
+                            }
+                        }
+                    }
                 }
-                _ => false,
+                _ => {
+                    last_why = "target or public endpoint not answering".into();
+                    None
+                }
             };
-            if ok {
+            if let Some((height, id)) = proof {
                 consecutive += 1;
                 if consecutive >= flip.health_polls {
                     let (t, p) = (target.unwrap(), public.unwrap());
@@ -2405,6 +2430,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         "public_head": p.head_block_num,
                         "public_chain_id": p.chain_id,
                         "target_head": t.head_block_num,
+                        "common_block": {"height": height, "id": id, "above_cut": cut},
                         "consecutive_ok_polls": consecutive,
                     })));
                 }

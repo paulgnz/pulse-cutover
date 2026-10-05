@@ -99,6 +99,7 @@ struct MockOps {
     /// GET <url>/api/coord/<net> answer (signed messages), if any.
     coord_doc: RefCell<Option<serde_json::Value>>,
     coord_down: Cell<bool>,
+    public_stale_source: Cell<bool>,
     /// /api/status: producers agreeing with our evidence = `fleet_agree` once
     /// `fleet_agree_after` status polls have happened (1 before that: just us).
     fleet_agree: Cell<usize>,
@@ -205,6 +206,7 @@ impl MockOps {
             freeze_head: Cell::new(0),
             coord_doc: RefCell::new(None),
             coord_down: Cell::new(false),
+            public_stale_source: Cell::new(false),
             fleet_agree: Cell::new(0),
             fleet_agree_after: Cell::new(0),
             fleet_polls: Cell::new(0),
@@ -401,6 +403,12 @@ impl ChainOps for MockOps {
     }
 
     fn public_info(&self, _public_url: &str) -> Result<Option<ChainInfo>, String> {
+        if self.public_stale_source.get() && self.flipped.get() {
+            // The flip silently failed: the public route still reaches a leftover SOURCE that keeps
+            // producing (same chain_id) at heights right next to the target's.
+            let t = self.target_info()?;
+            return Ok(t.map(|t| self.info(t.head_block_num)).map(|mut i| { i.head_block_id = format!("5e{}", &i.head_block_id[2..]); i }));
+        }
         if self.flipped.get() {
             // Public URL routes to the gateway -> pulsevm target.
             if self.flip_breaks_public.get() {
@@ -414,6 +422,27 @@ impl ChainOps for MockOps {
             return Ok(None);
         }
         Ok(Some(self.info(self.head.get())))
+    }
+
+    fn public_block_id(&self, _public_url: &str, height: u64) -> Result<Option<String>, String> {
+        if self.public_stale_source.get() {
+            let id = self.block_id(height);
+            return Ok(Some(format!("5e{}", &id[2..])));
+        }
+        if self.flipped.get() {
+            if self.flip_breaks_public.get() || !self.ignited.get() {
+                return Ok(None);
+            }
+            // Routed to the target: the target's block (a forked target presents its own ids).
+            let id = self.block_id(height);
+            return Ok(Some(if self.target_fork.get() { format!("ff{}", &id[2..]) } else { id }));
+        }
+        if self.stopped.get() {
+            return Ok(None);
+        }
+        // Still the SOURCE: above the cut its blocks are burn-off blocks the target never had.
+        let id = self.block_id(height);
+        Ok(Some(if height > self.target_head.get() { format!("5e{}", &id[2..]) } else { id }))
     }
 
     fn ignite(&self) -> Result<String, String> {
@@ -4333,8 +4362,15 @@ network = "rehearsal"
     let c = target_live(&report(&run(&cfg_text("post_live_probe_cmd = \"echo no inclusion for {blockchain_id} >&2; exit 3\""), "beacon"))).unwrap();
     assert_eq!(c["ok"], false, "{c}");
     assert!(c["detail"].as_str().unwrap().contains("probe failed: no inclusion for"), "{c}");
-    // Disabled: no check.
-    assert!(target_live(&report(&run(&cfg_text("post_live_max_idle_secs = 0"), "beacon"))).is_none());
+    // rc.21: idle check off (rehearsal) no longer switches the probe off.
+    let c = target_live(&report(&run(&cfg_text("post_live_max_idle_secs = 0\npost_live_probe_cmd = \"exit 4\""), "beacon"))).expect("still checked");
+    assert_eq!(c["ok"], false, "{c}");
+    assert!(c["detail"].as_str().unwrap().contains("idle check off") && c["detail"].as_str().unwrap().contains("probe failed"), "{c}");
+    // A quiet chain with a PASSING probe is ok (no traffic = no blocks on PulseVM).
+    *block_time.lock().unwrap() = live_at + chrono::Duration::seconds(2);
+    let c = target_live(&report(&run(&cfg_text("post_live_probe_cmd = \"true\""), "beacon"))).unwrap();
+    assert_eq!(c["ok"], true, "{c}");
+    assert!(c["detail"].as_str().unwrap().starts_with("idle, probe passing"), "{c}");
 }
 
 #[test]
@@ -4491,4 +4527,28 @@ fn rc21_production_profile_is_mandatory_unless_the_ceremony_is_an_explicit_rehea
     let e = journal_entries(&cfg);
     assert!(transition(&e, "FROZEN").is_none());
     assert!(e.iter().any(|v| v.to_string().contains("ceremony.rehearsal = true")));
+}
+
+#[test]
+fn rc21_public_route_must_serve_the_targets_block_not_a_leftover_source_at_a_nearby_height() {
+    // Review: the public-route check compared chain_id + nearby heights; a leftover source with the
+    // same chain_id producing next to the target's height passed it.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = api_test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.drift.set(5);
+    ops.public_stale_source.set(true);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.starts_with("HALTED") && err.contains("public URL did not serve the target"), "{err}");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("public_route_check_last") && text.contains("5e"), "the differing block ids are journaled");
+    // The healthy path journals the common block it proved.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = api_test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.drift.set(5);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let e = journal_entries(&cfg);
+    let flipped = &transition(&e, "FLIPPED").unwrap()["data"]["health"];
+    assert!(flipped["common_block"]["height"].as_u64().unwrap() > flipped["common_block"]["above_cut"].as_u64().unwrap());
 }

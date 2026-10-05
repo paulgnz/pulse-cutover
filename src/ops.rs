@@ -54,6 +54,11 @@ pub trait ChainOps {
     fn target_block_id(&self, _height: u64) -> Result<Option<String>, String> {
         Ok(None)
     }
+    /// The block id at `height` as the PUBLIC endpoint serves it (`/v1/chain/get_block`). Ok(None)
+    /// when it cannot show it.
+    fn public_block_id(&self, _public_url: &str, _height: u64) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     /// The FULL source block at `block_num` as nodeos `get_block` JSON (all receipts), from
     /// `rpc_url` (a nodeos /v1 base) or, when None, the source RPC. Upstream ignition packs it
     /// into the boot manifest's anchor.
@@ -659,6 +664,14 @@ impl ChainOps for HttpOps {
         let url = format!("{}/v1/chain/get_info", public_url.trim_end_matches('/'));
         match self.post(&url, None, None) {
             Ok(v) => Ok(Self::parse_info(&v).ok()),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn public_block_id(&self, public_url: &str, height: u64) -> Result<Option<String>, String> {
+        let url = format!("{}/v1/chain/get_block", public_url.trim_end_matches('/'));
+        match self.post(&url, Some(json!({"block_num_or_id": height.to_string()})), None) {
+            Ok(v) => Ok(v.get("id").and_then(|x| x.as_str()).map(str::to_string)),
             Err(_) => Ok(None),
         }
     }

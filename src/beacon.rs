@@ -327,6 +327,8 @@ struct Acc {
     live_ts_ms: Option<u64>,
     target_blockchain_id: Option<String>,
     target_subnet_id: Option<String>,
+    /// The chain id the target presented at IGNITED (the post-LIVE watch fails if it changes).
+    target_chain_id: Option<String>,
 }
 
 static JOURNALS: Mutex<Option<HashMap<PathBuf, Acc>>> = Mutex::new(None);
@@ -431,6 +433,9 @@ fn apply_line(acc: &mut Acc, v: &Value) {
                     }
                 }
                 Some("IGNITED") => {
+                    if let Some(c) = d["target_chain_id"].as_str() {
+                        acc.target_chain_id = Some(c.to_string());
+                    }
                     put(ev, "target_head_id", &d["target_head_id"]);
                     put(ev, "lineage_at_cut", &d["lineage_at_cut"]);
                 }
@@ -501,7 +506,8 @@ pub fn journal_summary(path: &Path) -> Value {
            // Local only (the post-LIVE watch); removed from the posted report.
            "live_ts_ms": acc.live_ts_ms,
            "target_blockchain_id": acc.target_blockchain_id,
-           "target_subnet_id": acc.target_subnet_id})
+           "target_subnet_id": acc.target_subnet_id,
+           "target_chain_id": acc.target_chain_id})
 }
 
 /// Coordination status for the report, with free-text fields sanitized.
@@ -673,7 +679,7 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         }
     }
     if let Some(o) = journal.as_object_mut() {
-        for k in ["armed_ts_ms", "live_ts_ms", "target_blockchain_id", "target_subnet_id"] {
+        for k in ["armed_ts_ms", "live_ts_ms", "target_blockchain_id", "target_subnet_id", "target_chain_id"] {
             o.remove(k);
         }
     }
