@@ -133,20 +133,46 @@ pub fn hyperion_hydrated(health: &serde_json::Value, cut: u64, max_lag: u64) -> 
     })
 }
 
+/// What one poll of the coordinator's relay says about this event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortPoll {
+    /// A valid signed abort for this event.
+    Aborted,
+    /// The relay answered and carries no abort for this event.
+    Clear,
+    /// Not asked (rate limit) or the relay did not answer: NOT evidence of "no abort".
+    Unknown,
+}
+
 /// `Machine::coordinator_aborted` without borrowing the machine (the upstream pipeline polls it
 /// while its progress callback holds the journal). `last` is the rate-limit clock.
 fn coordinator_abort_poll<O: ChainOps>(cfg: &Config, ops: &O, last: &mut u64, force: bool) -> bool {
-    let Some(co) = cfg.coordination.as_ref() else { return false };
-    let Some(id) = co.event_id.as_deref() else { return false };
+    coordinator_abort_state(cfg, ops, last, force) == AbortPoll::Aborted
+}
+
+fn coordinator_abort_state<O: ChainOps>(cfg: &Config, ops: &O, last: &mut u64, force: bool) -> AbortPoll {
+    let Some(co) = cfg.coordination.as_ref() else { return AbortPoll::Clear };
+    let Some(id) = co.event_id.as_deref() else { return AbortPoll::Clear };
+    // An abort this node already saw is final, whatever the relay serves now (await tombstones).
+    if crate::coord::is_tombstoned(cfg, id) {
+        return AbortPoll::Aborted;
+    }
     let now = ops.now_ms();
     if !force && now.saturating_sub(*last) < 3000 {
-        return false;
+        return AbortPoll::Unknown;
     }
     *last = now;
     let url = format!("{}/api/coord/{}", co.url.trim_end_matches('/'), co.network);
     match ops.get_json(&url) {
-        Ok(Some(doc)) => crate::coord::aborted(&doc, &co.coordinator_keys, &co.network, id),
-        _ => false,
+        Ok(Some(doc)) if doc.is_object() => {
+            if crate::coord::aborted(&doc, &co.coordinator_keys, &co.network, id) {
+                crate::coord::record_tombstone(cfg, id, "aborted", "signed abort seen by the ceremony");
+                AbortPoll::Aborted
+            } else {
+                AbortPoll::Clear
+            }
+        }
+        _ => AbortPoll::Unknown,
     }
 }
 
@@ -256,6 +282,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.halt(
                 "resumed after ignition may have started (ignite_started journaled, no IGNITED)",
                 json!({"recovered_state": self.state.as_str()}),
+            )?;
+        }
+        if self.resumed && self.create_chain_started && self.target_blockchain_id.is_none() && !self.unhalted
+            && matches!(self.state, State::Armed | State::Frozen | State::Snapshotted | State::Verified) {
+            // create_chain_cmd started and no blockchain id was journaled: a chain may exist (and be
+            // starting on validators that already track the subnet). Neither creating another nor
+            // resuming the source can be decided locally.
+            self.halt(
+                "resumed after create_chain_cmd started without a journaled blockchain id: a target chain may exist",
+                json!({"recovered_state": self.state.as_str(),
+                       "fix": "find the chain on the P-Chain by its genesis hash; a fleet-wide decision either journals its id and continues, or retires it and rolls back with --force-after-ignite"}),
             )?;
         }
         if self.resumed && !matches!(self.state, State::Live | State::Aborted) {
@@ -537,6 +574,41 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         out
     }
 
+    /// Positive authorization for a step that cannot be undone (creating the target chain,
+    /// ignition): in a coordinated ceremony the relay must ANSWER, and carry no abort. A relay that
+    /// cannot be reached is "unknown", never "no abort": retried for up to 30 s, then the step is
+    /// refused. Ok(true) = go; Ok(false) = aborted (or halted, past the point of no return) inside.
+    fn require_no_abort(&mut self, before: &str) -> Result<bool, String> {
+        let event = self.cfg.coordination.as_ref().and_then(|c| c.event_id.clone());
+        if event.is_none() {
+            return Ok(true);
+        }
+        let deadline = self.ops.now_ms() + 30_000;
+        loop {
+            let mut last = self.last_coord_check_ms;
+            let st = coordinator_abort_state(self.cfg, self.ops, &mut last, true);
+            self.last_coord_check_ms = last;
+            match st {
+                AbortPoll::Clear => {
+                    self.journal.evidence(self.state, json!({"abort_check": "clear", "before": before, "event_id": event}))?;
+                    return Ok(true);
+                }
+                AbortPoll::Aborted => {
+                    self.abort(&format!("coordinator aborted the event (signed) before {before}"), json!({"event_id": event}))?;
+                    return Ok(false);
+                }
+                AbortPoll::Unknown if self.ops.now_ms() > deadline => {
+                    self.abort(
+                        &format!("cannot confirm the event is not aborted before {before}: the coordinator relay did not answer"),
+                        json!({"event_id": event, "note": "an unreachable relay is not an authorization"}),
+                    )?;
+                    return Ok(false);
+                }
+                AbortPoll::Unknown => self.ops.sleep_ms(2000),
+            }
+        }
+    }
+
     /// Pre-ignite fleet gate: wait until `fleet_quorum` producers (this one included) report
     /// VERIFIED-or-later with the same snapshot sha256 and fingerprint digest as ours.
     /// Returns Ok(false) after aborting (signed abort or timeout).
@@ -693,9 +765,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Err(format!("HALTED at {from}: {reason}"))
     }
 
-    /// True once this node's target may be running: IGNITED or later, or `ignite_started` journaled.
+    /// True once this node's target may be running: IGNITED or later, `ignite_started` journaled,
+    /// or (upstream backend) `create_chain` journaled: a creation hook can submit a chain that an
+    /// already-tracking validator starts, and its outcome may be unknown (lost answer, crash), so
+    /// from the moment it starts a local failure halts instead of resuming the source.
     fn past_point_of_no_return(&self) -> bool {
-        self.reached_ignited || matches!(self.state, State::Ignited | State::Flipped | State::Live | State::Halted)
+        self.reached_ignited || self.create_chain_started || matches!(self.state, State::Ignited | State::Flipped | State::Live | State::Halted)
     }
 
     /// `pulse-cutover rollback` (what `cutover.sh abort` runs), holding the journal lock: undo
@@ -1958,6 +2033,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if let Some(bid) = self.target_blockchain_id.clone() {
             self.journal.evidence(State::Verified, json!({"create_chain": "reused (journaled by a previous run)", "blockchain_id": bid}))?;
         } else if self.create_chain_started {
+            // Past the point of no return (abort() halts): never create a second chain.
             self.abort(
                 "create_chain_cmd was started by a previous run but no blockchain id was journaled: a chain may \
                  exist on Metal. Refusing to create a second one",
@@ -1965,6 +2041,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             )?;
             return Ok(false);
         } else {
+            // Last pre-boundary check: a signed abort (or an unreachable relay) stops here, while
+            // resuming the source is still safe.
+            if !self.require_no_abort("chain creation")? {
+                return Ok(false);
+            }
             let cmd = self.cfg.target.create_chain_cmd.clone().expect("validated: ignite configured");
             let cmd = crate::ops::expand_placeholders(&cmd, &[
                 ("genesis".into(), genesis.display().to_string()),
@@ -1974,13 +2055,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 ("checkpoint".into(), up.work_dir.join(format!("checkpoint-{h}.bin")).display().to_string()),
                 ("cut_height".into(), h.to_string()),
             ]);
-            self.journal.evidence(State::Verified, json!({"side_effect": "create_chain", "cmd": cmd}))?;
+            // Intent FIRST, and it is the point of no return: from here every outcome (failure, an
+            // answer without an id, a lost answer, a crash) halts for an operator decision.
+            self.journal.evidence(State::Verified, json!({"side_effect": "create_chain", "cmd": cmd,
+                "point_of_no_return": "chain creation may activate a target; any outcome from here halts instead of resuming the source"}))?;
             self.create_chain_started = true;
             let out = match self.ops.run_hook(&cmd) {
                 Ok(o) => o,
                 Err(e) => {
-                    self.abort("create_chain_cmd failed (pre-ignition)", json!({"error": e,
-                        "note": "if the chain was nevertheless created on Metal it was never ignited; retire it"}))?;
+                    self.abort("create_chain_cmd failed after it started", json!({"error": e,
+                        "note": "the chain may nevertheless exist on Metal (and start on validators tracking its subnet): operator decision"}))?;
                     return Ok(false);
                 }
             };
@@ -2048,6 +2132,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         if upstream_backend && !self.upstream_create_chain()? {
             return Ok(()); // aborted inside, with evidence
+        }
+        // Positive authorization right before ignition (fork backend: still pre-boundary, an abort
+        // resumes the source; upstream: after chain creation, an abort here halts).
+        if !self.require_no_abort("ignition")? {
+            return Ok(());
         }
         let started = self.ops.now_ms();
         // Point of no return (locally): journaled BEFORE the command runs. From here any failure

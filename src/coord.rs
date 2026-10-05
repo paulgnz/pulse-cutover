@@ -127,6 +127,71 @@ pub fn aborted(doc: &Value, keys: &[String], network: &str, event_id: &str) -> b
         .unwrap_or(false)
 }
 
+// ---- tombstones: decisions about an event id that are final on this node ------------------------
+// `coord-tombstones.json` next to the journal: {event_id: {kind, at, reason}}. kind = "aborted" (a
+// signed abort was seen: final for that id, whatever the relay serves later, across restarts),
+// "missed" (an ARM arrived too late to act on), "ran" (this node already ran a ceremony for it).
+// `await` never accepts or arms a tombstoned event; the ceremony treats an "aborted" tombstone as
+// a standing abort.
+
+fn tombstone_file(cfg: &Config) -> PathBuf {
+    cfg.journal_path.parent().unwrap_or(Path::new(".")).join("coord-tombstones.json")
+}
+
+/// The tombstone recorded for `event_id`, if any.
+pub fn tombstone(cfg: &Config, event_id: &str) -> Option<Value> {
+    let t = std::fs::read_to_string(tombstone_file(cfg)).ok()?;
+    let v: Value = serde_json::from_str(&t).ok()?;
+    v.get(event_id).cloned().filter(|x| !x.is_null())
+}
+
+/// An `aborted` tombstone: a signed abort for this id was seen on this node.
+pub fn is_tombstoned(cfg: &Config, event_id: &str) -> bool {
+    tombstone(cfg, event_id).is_some_and(|t| t["kind"] == "aborted")
+}
+
+/// Record a final decision for `event_id` (atomic rewrite; an existing "aborted" is never
+/// downgraded). Errors are logged, never fatal, but a corrupt store is NOT overwritten.
+pub fn record_tombstone(cfg: &Config, event_id: &str, kind: &str, reason: &str) {
+    let path = tombstone_file(cfg);
+    let mut all: serde_json::Map<String, Value> = match std::fs::read_to_string(&path) {
+        Ok(t) => match serde_json::from_str::<Value>(&t) {
+            Ok(Value::Object(m)) => m,
+            _ => {
+                eprintln!("await: ERROR: {} is corrupt; not overwriting it (decision for {event_id}: {kind})", path.display());
+                return;
+            }
+        },
+        Err(_) => serde_json::Map::new(),
+    };
+    if all.get(event_id).is_some_and(|t| t["kind"] == "aborted") {
+        return;
+    }
+    all.insert(event_id.to_string(), json!({"kind": kind, "at": chrono::Utc::now().to_rfc3339(), "reason": crate::beacon::sanitize_short(reason)}));
+    let text = serde_json::to_string_pretty(&Value::Object(all)).unwrap_or_default();
+    if let Err(e) = crate::secrets::write_file(&path, text.as_bytes(), false) {
+        eprintln!("await: ERROR: cannot record the {kind} decision for {event_id} in {}: {e}", path.display());
+    }
+}
+
+/// How far in the future an ARM's issued_at may be (clock skew allowance).
+pub const MAX_ARM_FUTURE_MS: u64 = 120_000;
+/// How old an ARM may be.
+pub const MAX_ARM_AGE_MS: u64 = 15 * 60_000;
+
+/// An ARM's issued_at against `now_ms`: Ok, or why it cannot be acted on. A future-dated ARM is
+/// refused (saturating arithmetic used to accept it as fresh).
+pub fn arm_fresh(arm: &Value, now_ms: u64) -> Result<(), String> {
+    let t = arm["issued_at_ms"].as_u64().ok_or("arm carries no issued_at_ms")?;
+    if t > now_ms + MAX_ARM_FUTURE_MS {
+        return Err(format!("arm is dated {} s in the future (more than {} s of clock skew): refused", (t - now_ms) / 1000, MAX_ARM_FUTURE_MS / 1000));
+    }
+    if now_ms.saturating_sub(t) >= MAX_ARM_AGE_MS {
+        return Err(format!("arm is older than {} min", MAX_ARM_AGE_MS / 60_000));
+    }
+    Ok(())
+}
+
 fn state_file(cfg: &Config) -> PathBuf {
     cfg.journal_path.parent().unwrap_or(Path::new(".")).join("coord-state.json")
 }
@@ -208,7 +273,7 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
     // body; a changed body under the same id is a different event and is validated again.
     let mut accepted: Option<(String, u64, String)> = None;
     let mut accepted_ev: Value = Value::Null;
-    // The event id whose signed abort was last recorded in the state file (written once, not every poll).
+    // The event id whose signed abort / tombstone was last recorded in the state file (written once).
     let mut aborted_seen: Option<String> = None;
     let mut last_note = String::new();
     let note = |s: &str, last: &mut String| { if s != last { eprintln!("await: {s}"); *last = s.to_string(); } };
@@ -224,7 +289,22 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
             Some(Ok(ev)) => {
                 let id = ev["event_id"].as_str().unwrap_or("").to_string();
                 let hash = doc["event"].get("payload").and_then(|_| payload_hash(&doc["event"])).unwrap_or_default();
-                if aborted(&doc, &co.coordinator_keys, &co.network, &id) {
+                let signed_abort = aborted(&doc, &co.coordinator_keys, &co.network, &id);
+                if signed_abort {
+                    // Persisted at once: a relay that later omits the abort, or a restart, cannot
+                    // resurrect the event.
+                    record_tombstone(cfg, &id, "aborted", "signed abort relayed by the coordinator");
+                }
+                if let Some(t) = tombstone(cfg, &id).filter(|t| t["kind"] != "aborted") {
+                    // Missed or already run on this node: terminal for this id.
+                    if aborted_seen.as_deref() != Some(id.as_str()) {
+                        write_state(cfg, &json!({"event_id": id, "accepted": false, "armed": false, "terminal": t["kind"],
+                            "reason": format!("event {id} is terminal on this node ({})", t["kind"].as_str().unwrap_or("?")), "at": chrono::Utc::now().to_rfc3339()}));
+                        aborted_seen = Some(id.clone());
+                    }
+                    accepted = None;
+                    note(&format!("event {id} is terminal on this node ({}): waiting for a new event", t["kind"].as_str().unwrap_or("?")), &mut last_note);
+                } else if signed_abort || is_tombstoned(cfg, &id) {
                     // A signed abort is final for its event id, whatever the event body (a new
                     // attempt is a new event id): never (re-)accept it. Without this the loop
                     // dropped the event, re-accepted it on the next poll, dropped it again
@@ -266,19 +346,33 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
                 }
             }
             if bound.is_ok() {
-                let fresh = arm["issued_at_ms"].as_u64().map(|t| (chrono::Utc::now().timestamp_millis() as u64).saturating_sub(t) < 15 * 60_000).unwrap_or(false);
+                let fresh = arm_fresh(&arm, chrono::Utc::now().timestamp_millis() as u64);
                 let confirm = cfg.journal_path.parent().unwrap_or(Path::new(".")).join(format!("confirm-{id}"));
-                if !fresh {
-                    note(&format!("arm for {id} is older than 15 min; ignoring"), &mut last_note);
+                let missed = head.is_some_and(|x| *h < x + co.min_lead_blocks / 2);
+                if let Err(why) = &fresh {
+                    note(&format!("ignoring arm for {id}: {why}"), &mut last_note);
+                } else if is_tombstoned(cfg, id) {
+                    note(&format!("arm for {id} ignored: the event is aborted"), &mut last_note);
+                } else if missed {
+                    // The window is gone for good (H too close to, or behind, the head): a terminal
+                    // decision, recorded and reported, not a loop that re-reads the same ARM forever.
+                    let why = format!("ARM for {id} missed its window: H {h} is too close to head {head:?} (needs {} blocks of lead)", co.min_lead_blocks / 2);
+                    record_tombstone(cfg, id, "missed", &why);
+                    write_state(cfg, &json!({"event_id": id, "h": h, "accepted": true, "armed": false, "terminal": "missed", "reason": why, "at": chrono::Utc::now().to_rfc3339()}));
+                    eprintln!("await: {why}. Not starting; this event is terminal on this node (publish a new event).");
+                    return Ok(3);
                 } else if !co.auto_arm && !confirm.exists() {
                     note(&format!("ARM received for {id} (H = {h}). auto_arm is off: to start, the operator runs `touch {}`", confirm.display()), &mut last_note);
-                } else if head.map(|x| *h < x + co.min_lead_blocks / 2).unwrap_or(true) {
-                    note(&format!("ARM received but H {h} is too close to head {head:?}; not starting"), &mut last_note);
+                } else if head.is_none() {
+                    note(&format!("ARM received for {id} but the source head is unknown; not starting yet"), &mut last_note);
                 } else {
                     let derived = cfg.journal_path.parent().unwrap_or(Path::new(".")).join(format!("ceremony-{id}.toml"));
                     derived_config(config_path, &accepted_ev, &derived)?;
                     write_state(cfg, &json!({"event_id": id, "h": h, "accepted": true, "armed": true, "at": chrono::Utc::now().to_rfc3339()}));
                     eprintln!("await: ARMED by signed coordinator message for {id}: running the ceremony at H = {h}");
+                    // Recorded before the run starts: a restarted `await` never arms the same event
+                    // again (the ceremony itself resumes from its journal with `run`).
+                    record_tombstone(cfg, id, "ran", "this node started the ceremony for this event");
                     let status = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
                         .args(["run", "--config"]).arg(&derived).status().map_err(|e| e.to_string())?;
                     return Ok(status.code().unwrap_or(1));
@@ -371,6 +465,45 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("missing-dir")).unwrap();
         try_write_state(&cfg, &json!({"event_id": "e1"})).unwrap();
         assert_eq!(read_state(&cfg)["event_id"], "e1");
+    }
+
+    fn readiness_cfg(dir: &Path) -> Config {
+        let p = dir.join("c.toml");
+        std::fs::write(&p, format!(
+            "journal_path = \"{}/journal.jsonl\"\n[ceremony]\nprofile = \"readiness\"\n[source]\nrpc_url = \"http://m\"\nproducer_api_url = \"http://m\"\n\
+             [snapshot]\nstaged_path = \"/s\"\n[target]\nmetalgo_unit = \"m\"\nrpc_url = \"http://m\"\n", dir.display())).unwrap();
+        Config::load(&p).unwrap()
+    }
+
+    /// Review: an abort was only an in-memory flag; a relay that later omitted it, or a restart,
+    /// let the same event be accepted again.
+    #[test]
+    fn an_abort_tombstone_is_final_across_restarts_and_never_downgraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = readiness_cfg(dir.path());
+        assert!(!is_tombstoned(&cfg, "e1"));
+        record_tombstone(&cfg, "e1", "aborted", "signed abort");
+        let again = readiness_cfg(dir.path()); // a "restart": a fresh config, same directory
+        assert!(is_tombstoned(&again, "e1"));
+        record_tombstone(&again, "e1", "ran", "later");
+        assert_eq!(tombstone(&again, "e1").unwrap()["kind"], "aborted", "an abort is never overwritten");
+        record_tombstone(&again, "e2", "missed", "too late");
+        assert!(!is_tombstoned(&again, "e2"), "missed is terminal but not an abort");
+        assert_eq!(tombstone(&again, "e2").unwrap()["kind"], "missed");
+        // A corrupt store is not overwritten (and an abort recorded there stays someone's problem to fix).
+        std::fs::write(dir.path().join("coord-tombstones.json"), "{oops").unwrap();
+        record_tombstone(&again, "e3", "ran", "x");
+        assert_eq!(std::fs::read_to_string(dir.path().join("coord-tombstones.json")).unwrap(), "{oops");
+    }
+
+    #[test]
+    fn arm_freshness_refuses_future_dated_and_stale_arms() {
+        let now = 1_000_000_000_000u64;
+        assert!(arm_fresh(&json!({"issued_at_ms": now - 1000}), now).is_ok());
+        assert!(arm_fresh(&json!({"issued_at_ms": now + 60_000}), now).is_ok(), "small clock skew");
+        assert!(arm_fresh(&json!({"issued_at_ms": now + 3_600_000}), now).unwrap_err().contains("future"));
+        assert!(arm_fresh(&json!({"issued_at_ms": now - 16 * 60_000}), now).unwrap_err().contains("older"));
+        assert!(arm_fresh(&json!({}), now).is_err());
     }
 
     #[test]

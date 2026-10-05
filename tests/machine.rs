@@ -98,6 +98,7 @@ struct MockOps {
     // --- coordination world ---
     /// GET <url>/api/coord/<net> answer (signed messages), if any.
     coord_doc: RefCell<Option<serde_json::Value>>,
+    coord_down: Cell<bool>,
     /// /api/status: producers agreeing with our evidence = `fleet_agree` once
     /// `fleet_agree_after` status polls have happened (1 before that: just us).
     fleet_agree: Cell<usize>,
@@ -203,6 +204,7 @@ impl MockOps {
             scheduled_h: Cell::new(0),
             freeze_head: Cell::new(0),
             coord_doc: RefCell::new(None),
+            coord_down: Cell::new(false),
             fleet_agree: Cell::new(0),
             fleet_agree_after: Cell::new(0),
             fleet_polls: Cell::new(0),
@@ -487,7 +489,11 @@ impl ChainOps for MockOps {
                     return Ok(Some(doc));
                 }
             }
-            return Ok(self.coord_doc.borrow().clone());
+            if self.coord_down.get() {
+                return Err("mission control unreachable".into());
+            }
+            // The relay is up and serves no abort unless a test sets one.
+            return Ok(Some(self.coord_doc.borrow().clone().unwrap_or_else(|| serde_json::json!({}))));
         }
         if url.ends_with("/api/status") {
             let polls = self.fleet_polls.get() + 1;
@@ -3958,31 +3964,92 @@ fn upstream_anchor_must_be_the_cut_block() {
 }
 
 #[test]
-fn upstream_create_chain_failure_aborts_pre_ignition_and_rolls_back() {
+fn upstream_create_chain_failure_after_it_started_halts_never_resumes_the_source() {
+    // Review: a creation hook can submit a chain that validators already tracking the subnet start;
+    // its failure (or an answer without an id, or a lost answer) is not proof that no chain exists.
+    for (script, needle) in [
+        ("#!/bin/sh\necho 'insufficient funds' >&2\nexit 1\n", "create_chain_cmd failed after it started"),
+        ("#!/bin/sh\necho created\n", "no blockchain id"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        stage_fake_upstream_tools(dir.path(), 0);
+        write_script(&dir.path().join("fake-create-chain.sh"), script);
+        let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
+        let ops = upstream_ops(dir.path());
+        let err = run_machine_result(&cfg, &ops).unwrap_err();
+        assert!(err.starts_with("HALTED") && err.contains(needle), "{err}");
+        let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+        assert!(text.contains("point_of_no_return"), "the creation intent is the boundary");
+        assert!(!text.contains("ignite_started"));
+        assert_eq!(ops.resumes.get(), 0, "the source is NOT resumed");
+        assert!(!ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "on_abort must not run");
+        // Going back needs the fleet-wide, fenced operator decision.
+        assert!(rollback_with(&cfg, &ops, false).unwrap_err().starts_with("refusing"));
+    }
+}
+
+#[test]
+fn upstream_resume_after_create_chain_started_without_a_journaled_id_halts() {
     let dir = tempfile::tempdir().unwrap();
     stage_fake_upstream_tools(dir.path(), 0);
-    write_script(&dir.path().join("fake-create-chain.sh"), "#!/bin/sh\necho 'insufficient funds' >&2\nexit 1\n");
     let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
     let ops = upstream_ops(dir.path());
+    let cmd = format!("sh {d}/fake-create-chain.sh {d}/upstream-work/migration-genesis-120.json {d}/upstream-work/chain-config-120.json {d}/upstream-work/boot-120.manifest.json", d = dir.path().display());
+    *ops.panic_on_hook.borrow_mut() = Some(cmd);
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_machine_result(&cfg, &ops)));
+    assert!(crashed.is_err(), "agent died inside create_chain");
+    let ops2 = upstream_ops(dir.path());
+    ops2.head.set(130);
+    let err = run_machine_result(&cfg, &ops2).unwrap_err();
+    assert!(err.starts_with("HALTED") && err.contains("a target chain may exist"), "{err}");
+    assert!(!dir.path().join("create-chain.calls").exists(), "never a second create");
+    assert_eq!(ops2.resumes.get(), 0);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(!text.contains("ignite_started"));
+}
+
+#[test]
+fn rc21_signed_abort_or_unreachable_relay_right_before_create_stops_before_the_boundary() {
+    let rig = |dir: &std::path::Path| {
+        stage_fake_upstream_tools(dir, 0);
+        let _ = upstream_ignite_config(dir, "", "").unwrap();
+        let path = dir.join("ceremony-upstream-ignite.toml");
+        let text = format!("{}\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\n",
+            std::fs::read_to_string(&path).unwrap(), hex::encode(coord_key().verifying_key().to_bytes()));
+        std::fs::write(&path, text).unwrap();
+        Config::load(&path).unwrap()
+    };
+    // The abort arrives as the fleet gate passes (the last fake tool touches abort-now).
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = rig(dir.path());
+    let body = std::fs::read_to_string(dir.path().join("fake-fingerprint.sh")).unwrap();
+    write_script(&dir.path().join("fake-fingerprint.sh"), &body.replacen("\n", &format!("\ntouch {}/abort-now\n", dir.path().display()), 1));
+    let ops = upstream_ops(dir.path());
+    *ops.coord_doc_when_abort_file.borrow_mut() = Some(serde_json::json!({
+        "abort": signed(serde_json::json!({"type": "abort", "event_id": "e1", "network": "rehearsal"}))}));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    assert!(!dir.path().join("create-chain.calls").exists(), "no chain created");
+    assert_eq!(ops.resumes.get(), 1, "pre-boundary: the source resumes");
+    assert!(pulse_cutover::coord::is_tombstoned(&cfg, "e1"), "the abort is persisted");
+
+    // The relay unreachable from the start: "unknown" is not an authorization to create.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = rig(dir.path());
+    let ops = upstream_ops(dir.path());
+    ops.coord_down.set(true);
     assert_eq!(run_machine(&cfg, &ops), State::Aborted);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
-    assert!(text.contains("create_chain_cmd failed (pre-ignition)") && text.contains("insufficient funds"));
-    assert!(!text.contains("ignite_started"));
-    assert!(!ops.ignited.get());
-    assert_eq!(ops.resumes.get(), 1, "pre-ignition abort resumes the source");
-    assert!(ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "on_abort ran");
-    assert!(text.contains(r#""rollback_done":true"#));
-    // An operator rollback afterwards: nothing to redo.
-    let out = rollback_with(&cfg, &ops, false).unwrap();
-    assert!(out.already && out.failed.is_empty(), "{out:?}");
+    assert!(text.contains("cannot confirm the event is not aborted before chain creation"), "{text}");
+    assert!(!dir.path().join("create-chain.calls").exists());
     assert_eq!(ops.resumes.get(), 1);
-    // Output without a blockchain id is a failure too.
+
+    // A tombstoned abort is final even when the relay no longer serves it.
     let dir = tempfile::tempdir().unwrap();
-    stage_fake_upstream_tools(dir.path(), 0);
-    write_script(&dir.path().join("fake-create-chain.sh"), "#!/bin/sh\necho created\n");
-    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
-    assert_eq!(run_machine(&cfg, &upstream_ops(dir.path())), State::Aborted);
-    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("no blockchain id"));
+    let cfg = rig(dir.path());
+    pulse_cutover::coord::record_tombstone(&cfg, "e1", "aborted", "seen earlier");
+    let ops = upstream_ops(dir.path());
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    assert!(!dir.path().join("create-chain.calls").exists());
 }
 
 #[test]
@@ -4001,27 +4068,8 @@ fn upstream_ignite_failure_halts_after_ignition_started() {
 }
 
 #[test]
-fn upstream_create_chain_started_without_a_journaled_id_is_never_repeated() {
-    let dir = tempfile::tempdir().unwrap();
-    stage_fake_upstream_tools(dir.path(), 0);
-    let cfg = upstream_ignite_config(dir.path(), "", "").unwrap();
-    let ops = upstream_ops(dir.path());
-    let cmd = format!("sh {d}/fake-create-chain.sh {d}/upstream-work/migration-genesis-120.json {d}/upstream-work/chain-config-120.json {d}/upstream-work/boot-120.manifest.json", d = dir.path().display());
-    *ops.panic_on_hook.borrow_mut() = Some(cmd);
-    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_machine_result(&cfg, &ops)));
-    assert!(crashed.is_err(), "agent died inside create_chain");
-    let ops2 = upstream_ops(dir.path());
-    ops2.head.set(130);
-    assert_eq!(run_machine(&cfg, &ops2), State::Aborted);
-    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
-    assert!(text.contains("Refusing to create a second one"), "{text}");
-    assert!(!dir.path().join("create-chain.calls").exists());
-    assert!(!text.contains("ignite_started"));
-}
-
-#[test]
 fn upstream_boot_artifact_changed_after_verified_aborts_before_ignition() {
-    // The agent dies after VERIFIED (inside create_chain); someone edits the migration genesis;
+    // The agent dies right after VERIFIED (before chain creation); someone edits the migration genesis;
     // the resumed run re-hashes the boot artifacts before anything else and aborts pre-ignition.
     let dir = tempfile::tempdir().unwrap();
     stage_fake_upstream_tools(dir.path(), 0);
@@ -4031,6 +4079,18 @@ fn upstream_boot_artifact_changed_after_verified_aborts_before_ignition() {
     *ops.panic_on_hook.borrow_mut() = Some(format!(
         "sh {d}/fake-create-chain.sh {d}/upstream-work/migration-genesis-120.json {d}/upstream-work/chain-config-120.json {d}/upstream-work/boot-120.manifest.json"));
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_machine_result(&cfg, &ops))).is_err());
+    // The crash happened right after VERIFIED, before the creation intent: keep the journal up to
+    // and including the VERIFIED transition only.
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let mut kept = String::new();
+    for l in text.lines() {
+        kept.push_str(l);
+        kept.push('\n');
+        if l.contains("\"kind\":\"transition\"") && l.contains("\"state\":\"VERIFIED\"") {
+            break;
+        }
+    }
+    std::fs::write(&cfg.journal_path, kept).unwrap();
     assert!(upstream_journal_has_verified(&std::fs::read_to_string(&cfg.journal_path).unwrap()));
     let genesis = dir.path().join("upstream-work/migration-genesis-120.json");
     let tampered = std::fs::read_to_string(&genesis).unwrap().replace("2020-04-22T17:00:00", "2020-04-22T17:00:01");
