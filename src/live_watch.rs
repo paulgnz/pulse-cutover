@@ -102,6 +102,56 @@ pub fn fetch_head(agent: &ureq::Agent, url: &str) -> Option<TargetHead> {
     })
 }
 
+/// One `pulsevm.getBlock(height)` against the target: the block's id, if it has one.
+pub fn fetch_block_id(agent: &ureq::Agent, url: &str, height: u64) -> Option<String> {
+    let v: Value = agent
+        .post(url)
+        .send_json(json!({"jsonrpc": "2.0", "method": "pulsevm.getBlock", "params": {"block_num_or_id": height.to_string()}, "id": 1}))
+        .ok()?
+        .into_json()
+        .ok()?;
+    let r = v.get("result").unwrap_or(&v);
+    ["id", "block_id"].iter().find_map(|k| r.get(*k)?.as_str()).map(|s| s.to_ascii_lowercase())
+        .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// The id of the first block after the cut, once seen (it never changes on one chain).
+static AFTER_CUT: Mutex<Option<(String, u64, String)>> = Mutex::new(None);
+
+/// What the fleet compares across producers once a target may be running (rc.23): the target's
+/// head and head block id, the chain id it serves and the id of the first block after the cut (a
+/// COMMON block above H: equal on every member of one chain, different on any fork or other
+/// chain). Public values only (heights, hex ids, the chain's Metal ids from the journal).
+pub fn target_view(cfg: &Config, summary: &Value, agent: Option<&ureq::Agent>) -> Value {
+    let (bid, sid) = (summary["target_blockchain_id"].as_str(), summary["target_subnet_id"].as_str());
+    let mut out = json!({"blockchain_id": bid, "subnet_id": sid, "chain_id": summary["target_chain_id"],
+        "head": null, "head_id": null, "after_cut_id": null});
+    let (Some(url), Some(agent)) = (target_url(cfg, bid, sid), agent) else { return out };
+    let v: Option<Value> = agent.post(&url)
+        .send_json(json!({"jsonrpc": "2.0", "method": "pulsevm.getInfo", "params": {}, "id": 1}))
+        .ok().and_then(|r| r.into_json().ok());
+    if let Some(v) = v {
+        let r = v.get("result").unwrap_or(&v);
+        out["head"] = json!(r["head_block_num"].as_u64().or_else(|| r["head_block_num"].as_str()?.parse().ok()));
+        let hex64 = |x: &Value| x.as_str().map(|s| s.to_ascii_lowercase()).filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()));
+        out["head_id"] = json!(hex64(&r["head_block_id"]));
+        if out["chain_id"].is_null() {
+            out["chain_id"] = json!(hex64(&r["chain_id"]));
+        }
+    }
+    let cut = summary["evidence"]["cut_height"].as_u64();
+    if let (Some(cut), Some(head)) = (cut, out["head"].as_u64()) {
+        let mut g = AFTER_CUT.lock().unwrap_or_else(|p| p.into_inner());
+        let cached = g.as_ref().filter(|(u, c, _)| u == &url && *c == cut).map(|(_, _, id)| id.clone());
+        let id = cached.or_else(|| (head > cut).then(|| fetch_block_id(agent, &url, cut + 1)).flatten());
+        if let Some(id) = &id {
+            *g = Some((url.clone(), cut, id.clone()));
+        }
+        out["after_cut_id"] = json!(id);
+    }
+    out
+}
+
 /// What one observer has seen of one target, across beacon cycles.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Seen {

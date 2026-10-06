@@ -44,7 +44,8 @@ mutating (normally driven by install.sh / cutover.sh):
   run             run the ceremony to LIVE (exit 0), ABORTED or HALTED (exit 1)
   loop            run N ceremonies back to back with a reset between (rehearsal boxes)
   unhalt          clear a HALTED (sealed) journal after a fleet-wide decision (--i-understand)
-  rollback        roll this node back, only if ignition provably has not started (what cutover.sh abort runs)";
+  rollback        roll this node back, only if ignition provably has not started (what cutover.sh abort runs)
+  join            a STRANDED/ABORTED producer joins the target chain a quorum of the event already runs LIVE";
 
 const HELP_RUN: &str = "\
 pulse-cutover run --config ceremony.toml
@@ -74,7 +75,7 @@ resumed run with ignition started halts again unless the cause is fixed).
 It never resumes the source chain or reverts routing itself.";
 
 const HELP_ROLLBACK: &str = "\
-pulse-cutover rollback --config ceremony.toml [--wait SECS] [--force-after-ignite] [--no-journal-i-know]
+pulse-cutover rollback --config ceremony.toml [--wait SECS] [--force-after-ignite] [--force-stranded --i-understand] [--no-journal-i-know]
 pulse-cutover rollback --config ceremony.toml --cancel-intent --i-understand
 
 What `./cutover.sh abort` runs. It takes the journal's exclusive lock (waiting up to --wait
@@ -105,6 +106,13 @@ is journaled as it completes (`rollback_step`); the rollback counts as finished 
 `rollback_done` record follows on_abort and the unstage. Every rollback is journaled (ABORTED, `operator_rollback`,
 `force_after_ignite`); with --no-journal-i-know the record goes to <journal>.rollback-<ms>.jsonl
 and the ceremony journal is not created.
+
+STRANDED (rc.23: a coordinated producer stopped before its own chain creation without proof that no
+peer had created or ignited the target): `rollback` first re-checks the fleet through the relay and
+refuses (exit 3) unless the resume guard passes now (nobody past chain creation, and the event's
+quorum unreachable without this node, or a signed coordinator abort with every member accounted
+for). --force-stranded --i-understand records an operator's fleet-wide decision instead (journaled
+with the fleet view it overrides). If the fleet went LIVE, use `pulse-cutover join` instead.
 
 A rollback records its intent (`rollback_requested`) before doing anything. If it dies before
 reaching ABORTED, `run` refuses to continue (`status` shows `rollback_pending: yes`); re-run
@@ -227,6 +235,27 @@ EXAMPLES
   pulse-cutover report
   pulse-cutover report --paranoid --out /tmp/bundle.tar.gz";
 
+const HELP_JOIN: &str = "\
+pulse-cutover join --config ceremony-<event>.toml --event <event_id>
+
+rc.23. For a producer whose ceremony ended STRANDED (it stopped before its own chain creation and
+could not prove its peers had not ignited) or ABORTED, while a quorum of the event's roster went
+LIVE on one target chain (mission control: FLEET LIVE). It tracks and ignites THAT chain, without
+creating one, then runs post_ignite / the LIVE gate / on_live like any producer.
+
+Refused (nothing changed) unless: the upstream backend, producer mode, the config of this event;
+this node reached VERIFIED and its boot artifacts (manifest, migration genesis, chain config) are
+unchanged; a quorum of fresh roster reports is LIVE on one target chain with one common block after
+H and the SAME snapshot sha256, fingerprints and migration genesis hash as this node; and this
+node's source did not produce past its journaled pause head and carries no transaction after H (a
+source that resumed and took writes is an operator decision, not a join).
+
+From the `join` journal record on, a failure HALTS: it never resumes the old chain. A crash resumes
+with `pulse-cutover run`. Exit codes as `run`: 0 = LIVE.
+
+EXAMPLES
+  pulse-cutover join --config /var/lib/pulse-cutover/ceremony-ev-42.toml --event ev-42";
+
 fn help_for(cmd: &str) -> Option<&'static str> {
     match cmd {
         "run" => Some(HELP_RUN),
@@ -240,6 +269,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "await" => Some(HELP_AWAIT),
         "unhalt" => Some(HELP_UNHALT),
         "rollback" => Some(HELP_ROLLBACK),
+        "join" => Some(HELP_JOIN),
         _ => None,
     }
 }
@@ -288,6 +318,7 @@ fn main() {
         "await" => cmd_await(&args),
         "unhalt" => cmd_unhalt(&args),
         "rollback" => cmd_rollback(&args),
+        "join" => cmd_join(&args),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -431,6 +462,20 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn cmd_join(args: &[String]) -> Result<(), String> {
+    let cfg = load_config(args)?;
+    cfg.ensure_ceremony_profile()?;
+    let event = arg(args, "--event").ok_or("missing --event <event_id>")?;
+    let ignite_cmd = cfg.target.ignite_cmd.clone().unwrap_or_else(|| format!("systemctl restart {}", cfg.target.metalgo_unit));
+    let ops = HttpOps::new(&cfg.source.rpc_url, &cfg.source.producer_api_url, &cfg.target.rpc_url, &ignite_cmd,
+        cfg.source.snapshot_timeout_secs).with_hook_timeout(cfg.hooks.timeout_secs).with_pgid_file_for(&cfg.journal_path);
+    let (journal, recovered) = Journal::open(&cfg.journal_path)?;
+    let mut machine = Machine::new(&cfg, &ops, journal, recovered);
+    let terminal = machine.join(&event)?;
+    println!("{terminal}");
+    if terminal == state::State::Live { Ok(()) } else { Err(format!("join ended in {terminal}; see {}", cfg.journal_path.display())) }
+}
+
 fn cmd_loop(args: &[String]) -> Result<(), String> {
     let cfg = load_config(args)?;
     cfg.ensure_ceremony_profile()?;
@@ -528,6 +573,10 @@ fn cmd_rollback(args: &[String]) -> Result<(), String> {
         return cancel_rollback_intent(&cfg, flag(args, "--i-understand")).map_err(|e| refuse(e));
     }
     let force = flag(args, "--force-after-ignite");
+    if flag(args, "--force-stranded") && !flag(args, "--i-understand") {
+        refuse("--force-stranded resumes the old chain although peers may have ignited: it records an operator's \
+                fleet-wide decision. Re-run with --force-stranded --i-understand".into());
+    }
     let wait: u64 = match arg(args, "--wait").map(|s| s.parse::<u64>()) {
         None => 30,
         Some(Ok(w)) => w,
@@ -567,7 +616,7 @@ fn cmd_rollback(args: &[String]) -> Result<(), String> {
         cfg.source.snapshot_timeout_secs).with_hook_timeout(cfg.hooks.timeout_secs)
         .with_pgid_file_for(&cfg.journal_path);
     let mut machine = Machine::new(&cfg, &ops, journal, recovered);
-    let result = machine.operator_rollback(force);
+    let result = machine.operator_rollback_opts(force, flag(args, "--force-stranded"));
     drop(machine); // releases the journal lock
     if audit_only {
         // The audit record's lock file is not needed once the record is written: leave no litter.
@@ -694,6 +743,10 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     } else {
         "none"
     };
+    if recovered.state == Some(state::State::Stranded) {
+        println!("stranded: yes (sealed: the source was NOT resumed; `pulse-cutover join` if the fleet went LIVE, \
+                  `pulse-cutover rollback` (re-runs the resume guard) otherwise)");
+    }
     println!("rollback_pending: {}", if recovered.rollback_pending { "yes" } else { "no" });
     println!("rollback: {rollback}");
     Ok(())

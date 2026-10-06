@@ -86,6 +86,12 @@ stateDiagram-v2
     IGNITED --> HALTED
     FLIPPED --> HALTED
     HALTED --> ABORTED: rollback --force-after-ignite (target fenced first)
+    FROZEN --> STRANDED: abort, resume guard fails (rc.23)
+    SNAPSHOTTED --> STRANDED
+    VERIFIED --> STRANDED
+    STRANDED --> ABORTED: rollback (fleet re-checked, or --force-stranded)
+    STRANDED --> VERIFIED: join (a LIVE quorum's chain, no creation)
+    ABORTED --> VERIFIED: join
     ABORTED --> [*]
     LIVE --> [*]
 ```
@@ -130,6 +136,40 @@ stateDiagram-v2
   comparison (upstream `compare_bin`; fork `golden_roots`). Anything else needs
   `[ceremony] rehearsal = true`, which is journaled, shown by `status`, failed as the beacon
   setup check `rehearsal_overrides`, labelled on mission control and refused for XPR mainnet.
+- **STRANDED** (rc.23, fleet run r4). A coordinated producer that has to stop after its writes froze
+  (FROZEN to VERIFIED, before its own chain creation) resumes the old chain only when its resume guard
+  passes (`src/fleet.rs`): the event has a roster and quorum, the relay answered, no other roster member
+  is missing, identity-conflicted or ever reported past chain creation (the relay keeps a per-event
+  high-water mark per producer that replacing an instance cannot lower), and either fewer than `quorum`
+  other members are still in the ceremony (fresh, not ABORTED / STRANDED: the quorum is unreachable
+  without this node; with quorum = N any peer's abort suffices, with quorum < N a minority that aborts
+  alone strands), or the coordinator signed an abort and every member has some report for the event.
+  The check runs twice: after the first pass the agent journals an abort intent (its beacon reports
+  `aborting`, which no peer's gate counts), waits until the relay shows that or `report_max_age_secs`
+  passes, and re-runs the guard before resuming. This rests on unsigned relay reports at one moment: it
+  narrows the r4 split, it does not prove no peer ignites. Anything else ends STRANDED: sealed like
+  HALTED, nothing rolled back, `on_halt` pages a human, `run` refuses. It leaves by `pulse-cutover join`
+  (see below) or `pulse-cutover rollback`, which re-runs the guard (`--force-stranded --i-understand`
+  records an operator's fleet-wide decision with the fleet view it overrides). The agent recognizes its
+  own roster entry by its `[beacon] producer` and instance id (derived from the machine id and the token,
+  so the ceremony and its beacon agree). `await` refuses a producer-mode event without a roster.
+- **Join** (rc.23). `pulse-cutover join --event <id>` lets a STRANDED or ABORTED producer (upstream backend,
+  producer mode) track and ignite the chain a LIVE quorum of the roster runs (a unique group: two groups with a
+  quorum are a split), without creating one. From ABORTED it first re-runs `on_freeze` (on_abort reopened writes)
+  and refuses without one. A join that died after its `join` record is finished by running `join` again. Its boot
+  artifacts must be unchanged since VERIFIED, the LIVE members' snapshot sha256, fingerprints and migration
+  genesis hash must equal its own, and its source must not have produced past the journaled pause head or
+  carry a transaction after H. The `join` record is a point of no return (like `create_chain`); the run then
+  continues at VERIFIED without a fleet gate or abort check (the fleet already committed; an abort is not
+  honoured after ignition) and goes through ignition, lineage, post_ignite and the LIVE gate.
+- **Degraded after ignition** (rc.23, fleet runs r2–r6). With a coordinated event, a local symptom after
+  ignition (a gap in the sustained-LIVE window, the head not past the cut within `quorum_timeout_secs`, a
+  failing `post_ignite` / `on_live` hook) consults the fleet first: while a quorum of the roster reports the
+  same target chain (same first block after H, heads past it, the fleet's highest head moving within
+  `fleet_stall_secs`), the ceremony journals and reports `degraded`, retries hooks with backoff
+  (`degraded_retry_secs`, doubling to 120 s) and restarts the sustain window; it halts when the fleet view
+  stops vouching, after `degraded_patience_secs` from the first symptom, or when an operator creates
+  `operator-halt` next to the journal. It never resumes the source and never reopens writes by itself.
 - **Aborts are final.** A signed abort is persisted as a tombstone next to the journal
   (`coord-tombstones.json`) the moment `await` or the ceremony sees it; neither will accept or
   arm that event id again, even if the relay later stops serving the abort or the process
@@ -242,13 +282,14 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 | Upstream, verify-only config (no `genesis_base` + `create_chain_cmd`); XPR mainnet while `ignite_pending_reasons()` is non-empty | upstream ignite preflight | VERIFIED | abort with the remaining list |
 | Upstream, producer mode: the signing key (chain config `producer_key` = genesis `initial_key`) is not what `eosio/producers` registers for `producer_name`, or that producer is unregistered / inactive | producer key check | ARMED, VERIFIED | abort |
 | Upstream: a boot artifact missing or changed since VERIFIED | re-hash | VERIFIED | abort |
-| Fleet does not agree before `fleet_timeout_secs` | fleet gate | VERIFIED | abort |
+| Fleet does not agree before `fleet_timeout_secs` | fleet gate | VERIFIED | abort (rc.23, coordinated: only if the resume guard passes; else STRANDED) |
+| Any abort after FROZEN in a coordinated producer ceremony, when the event has no roster, the relay does not answer, a roster member is missing, stale, conflicted or ever reported past chain creation, or at least `quorum` other members are still in the ceremony (no signed abort) | resume guard (rc.23, checked twice around the abort intent) | FROZEN–VERIFIED | STRANDED: source stays paused, writes frozen, `on_halt`; `join` or `rollback` (re-checked / `--force-stranded`) |
 | — `create_chain` journaled (upstream) — | | | |
 | Upstream: `create_chain_cmd` fails or prints no `BLOCKCHAIN_ID=`; a previous run started it without journaling an id; the chain config cannot be installed; a signed abort after creation | create_chain | VERIFIED | halt (a chain may exist and be starting: fleet decision) |
 | — `ignite_started` journaled — | | | |
 | Ignite command fails; target not up before `quorum_timeout_secs`; target chain_id ≠ source (unless `rehearsal_allow_chain_id_change`: accepted, both ids journaled) | ignition | VERIFIED | halt |
 | Target block id at H ≠ cut block id, or not verifiable with `require_lineage_check` | lineage check | VERIFIED | halt |
-| `post_ignite` fails; head never passes H + `live_blocks`; a gap over `live_max_gap_secs` in the sustain window; `on_live` fails | LIVE gate | IGNITED / FLIPPED | halt |
+| `post_ignite` fails; head never passes H + `live_blocks`; a gap over `live_max_gap_secs` in the sustain window; `on_live` fails | LIVE gate | IGNITED / FLIPPED | halt; rc.23, coordinated: degraded (wait, retry hooks) while a quorum reports the same target chain, halt when that stops, patience ends or `operator-halt` exists |
 | Hyperion does not hydrate; flip command fails; public URL does not serve the target's block at a common height above H; `/v2` gate fails (no live local source or no VALID boundary); boundary file cannot be written; source stop fails | api/hyperion stages | IGNITED / FLIPPED | halt |
 | No new target block for `post_live_max_idle_secs` (unless the probe passes on a quiet chain), `post_live_probe_cmd` fails, head goes backwards, or the target RPC serves another chain_id | beacon / `status` after LIVE | LIVE | reported only: HEALTH check `target_live` fails (mission control red); never an automatic rollback |
 | Agent crash | journal replay | any | resume the current step; halt if `ignite_started` has no IGNITED, or `create_chain` has no journaled id |
@@ -263,6 +304,18 @@ own boundary still resumes its source. A fleet-wide point of no return needs an 
 **sealed start** (a target that cannot produce until a durable, fleet-signed commit exists) and
 durable source fencing. Until both exist, a public cut must not be scheduled (ATOMICITY Known
 limits #1).
+
+The 5-BP fleet run on the upstream stack (2026-10-06) showed both halves of this: every healthy run
+ended with LIVE and HALTED BPs on one target chain (each BP judged liveness on its own view), and in
+run r4 a BP that lost the relay before its chain creation aborted at its fleet timeout and resumed
+the old chain while its four peers had ignited (33 writes after H). rc.23 changes the local rules so
+that each agent consults the fleet before the two decisions that split it: before resuming the old
+chain after the freeze (resume guard, STRANDED, `join`) and before halting after ignition (degraded).
+It does not change what the boundary is: those rules read unsigned relay reports, an agent that
+cannot reach the relay strands rather than decides, and nothing stops the old chain continuing after
+H. The upstream sealed start, a fleet-signed COMMIT/ABORT certificate the agents verify, and a
+protocol guard against the old chain producing after H are still what a public cut needs
+(ATOMICITY Known limits #14).
 
 ## 6. v2 "shadow mirror" (sketch, not implemented)
 

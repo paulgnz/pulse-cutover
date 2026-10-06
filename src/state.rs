@@ -43,6 +43,13 @@ pub enum State {
     /// may be producing). Nothing was rolled back. Durable: a restarted run refuses to continue
     /// or roll back until an operator clears it with `unhalt --i-understand` (journaled).
     Halted,
+    /// rc.23: a coordinated producer that froze writes had to stop BEFORE its own chain creation, but
+    /// could not prove that no other roster member had started creation or ignition (relay
+    /// unreachable, a peer past creation, stale or missing reports, a quorum agreeing at VERIFIED).
+    /// Sealed like HALTED: the old chain is NOT resumed and writes stay frozen. Leaves only by
+    /// `pulse-cutover join` (the fleet went LIVE) or `pulse-cutover rollback` (the resume guard passes
+    /// now, or `--force-stranded --i-understand` after a fleet-wide decision).
+    Stranded,
 }
 
 impl State {
@@ -57,6 +64,7 @@ impl State {
             State::Live => "LIVE",
             State::Aborted => "ABORTED",
             State::Halted => "HALTED",
+            State::Stranded => "STRANDED",
         }
     }
 }
@@ -80,6 +88,7 @@ impl FromStr for State {
             "LIVE" => State::Live,
             "ABORTED" => State::Aborted,
             "HALTED" => State::Halted,
+            "STRANDED" => State::Stranded,
             other => return Err(format!("unknown state in journal: {other}")),
         })
     }

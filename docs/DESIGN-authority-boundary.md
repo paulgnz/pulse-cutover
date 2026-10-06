@@ -5,6 +5,11 @@ P0 #3 (coordination model) once built. Parts need upstream PulseVM support (mark
 
 ## The problem
 
+*Observed (fleet run r4, 2026-10-06, upstream v1.0.0): a BP that lost the relay before its chain creation aborted
+at its fleet timeout and resumed the old chain while its four peers had ignited; 33 writes landed after H. rc.23
+narrows the local rules (resume guard → STRANDED, `join`, degraded waiting; [DESIGN.md](DESIGN.md) §3) but they
+read unsigned relay reports and cannot stop the old chain: the design below is still what closes it.*
+
 Today every agent decides on its own. Since rc.6/rc.7 a producer never resumes the source after its OWN ignition
 started (it HALTS; `pulse-cutover rollback`/`cutover.sh abort` refuse unless `--force-after-ignite`, which first
 fences this box's target). But before its own ignition, a producer's abort still resumes the source without

@@ -75,6 +75,14 @@ pub fn validate_event(ev: &Value, cfg: &Config, network: &str, head: Option<u64>
     if let Some(head) = head {
         if h < head + min_lead { return Err(format!("H {h} is only {} blocks ahead of head {head} (minimum {min_lead})", h.saturating_sub(head))); }
     }
+    // rc.23 review #8: a producer-mode event without a roster has no quorum to judge: the fleet gate would
+    // count whoever reports, and the resume guard could never tell whether peers can commit without
+    // this node. Refused (api / history nodes do not freeze a source, and may follow such an event).
+    let has_roster = ev.get("roster").and_then(|r| r.as_array()).is_some_and(|a| !a.is_empty());
+    if cfg.ceremony.mode == crate::config::Mode::Producer && !has_roster {
+        return Err("event has no roster: a producer-mode ceremony needs the event's signed roster and quorum \
+                    (coord.mjs event --roster … --quorum N)".into());
+    }
     if let Some(roster) = ev.get("roster").filter(|r| !r.is_null()) {
         let members: Vec<crate::config::RosterMember> =
             serde_json::from_value(roster.clone()).map_err(|e| format!("event roster is malformed: {e}"))?;
@@ -82,6 +90,16 @@ pub fn validate_event(ev: &Value, cfg: &Config, network: &str, head: Option<u64>
         crate::config::check_roster(&members).map_err(|e| format!("event {e}"))?;
         if let Some(q) = ev["quorum"].as_u64() {
             if q == 0 || q as usize > members.len() { return Err(format!("event quorum {q} is not within 1..={}", members.len())); }
+        }
+    }
+    // The Metal network the target runs on (a private rehearsal network, or a public one): this node's
+    // validator must be configured for the same one.
+    if let Some(n) = ev.get("metal_network_id").filter(|v| !v.is_null()) {
+        let n = n.as_u64().ok_or("event metal_network_id is not a number")?;
+        let local = cfg.target.expected_metal_network(cfg.ceremony.chain_id.as_deref().or(ev["chain_id"].as_str()));
+        if local != Some(n) {
+            return Err(format!("event metal_network_id {n} ≠ this node's {} (set target.metal_network_id)",
+                local.map(|l| l.to_string()).unwrap_or_else(|| "unknown".into())));
         }
     }
     if let Some(want) = ev["release_sha256"].as_str() {

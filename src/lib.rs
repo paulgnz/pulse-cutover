@@ -6,6 +6,7 @@ pub mod beacon;
 pub mod config;
 pub mod coord;
 pub mod doctor;
+pub mod fleet;
 pub mod journal;
 pub mod keys;
 pub mod live_watch;

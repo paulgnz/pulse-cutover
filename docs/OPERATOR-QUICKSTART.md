@@ -77,6 +77,65 @@ Before your source nodeos stops, capture two facts the edge serves from the old 
 node tools/capture-static.mjs http://127.0.0.1:8888 /etc/pulse-cutover/static
 ```
 
+## 6. During a ceremony: read the fleet verdict, not only your own state
+
+Each agent decides from its own observations, so one event can end with different states on different BPs (the
+5-BP rehearsal on the upstream stack ended every run with some BPs LIVE and some HALTED on the same new chain).
+Since rc.23 mission control shows one **fleet verdict** for the current event, under the network switch, computed
+from the event's signed roster and the beacons' reports (`fleet` in `GET /api/status`):
+
+| Verdict | Means | What you do |
+|---|---|---|
+| `PENDING` | no roster member has started chain creation or ignition | nothing; follow your agent |
+| `LIVE` | at least `quorum` roster members are LIVE on **one** target chain, with the same first block after H | if your box is HALTED or STRANDED on that chain, recover onto it (`unhalt` + `run`, or `join`; see below) |
+| `DEGRADED` | a target chain may be running, but no quorum is LIVE on one chain yet | do not reopen writes by hand; wait for LIVE or for the coordinator |
+| `SPLIT` (red) | a roster member resumed the old chain after others started chain creation or ignition, or members report different target chains / different blocks after H / different blocks at one height | stop: do not reopen writes anywhere until the coordinator resolves it; the alarm names the BPs |
+| `ABORTED` | every reporting member aborted before chain creation | the old chain continues; wait for a new event |
+
+A `SPLIT` stays red (latched) for that event even if the reports that showed it change later. Only the
+mission-control operator clears it, once the split is resolved, from a shell on the mission-control host:
+`curl -X POST 'http://127.0.0.1:8787/api/admin/clear-split?net=testnet'` (its own port; accepted on loopback only,
+never through the public proxy). If the condition still holds, it latches again. Details: `control/README.md`.
+
+How it is computed: for each roster member (its pinned instance, if the event names one) the freshest report for this
+event; LIVE members are grouped by target chain (Metal blockchain id, else chain id) and by the id of the first block
+after the cut, which every member of one chain shares and any fork does not. Each beacon reports its target's head,
+head block id and that first-block id (`ceremony.target`) once its target may be running. The verdict is
+relay-reported and unsigned: it is evidence for people, not an authorization; the agents' own gates still decide.
+
+What your agent does with the same view (rc.23, coordinated events only):
+
+- **Before chain creation.** If your ceremony has to stop after writes froze (fleet timeout, a failed check, the
+  relay unreachable) it resumes the old chain only when its **resume guard** passes: the relay answers, no roster
+  member is missing, identity-conflicted or was ever reported past chain creation, and either fewer than `quorum`
+  other members are still in the ceremony (fresh reports, not ABORTED / STRANDED: the event cannot reach its quorum
+  without this node), or the coordinator signed an abort and every member has a report for the event. It checks
+  twice: after the first pass it withdraws its own VERIFIED report (abort intent) and waits until the relay shows that
+  (or the report is too old for any gate), then re-checks. That is evidence from unsigned relay reports, not proof
+  that no peer ignites. A producer-mode event must carry a roster (`await` refuses one without). Otherwise it ends
+  **STRANDED**: sealed like HALTED, the source stays paused, writes
+  stay frozen, `on_halt` pages you. Put your `[beacon] producer` in the ceremony config so the agent can recognize
+  its own entry in the roster. From STRANDED: if the verdict is `LIVE`, run
+  `pulse-cutover join --config <the event's ceremony config> --event <id>` (it checks your verified artifacts
+  against the LIVE members' and that your source took nothing after H, then tracks and ignites their chain);
+  otherwise `pulse-cutover rollback --config …` re-runs the guard and resumes the old chain only if it passes
+  (`--force-stranded --i-understand` records a fleet-wide decision instead, journaled with the fleet view it
+  overrides).
+- **After ignition.** A local symptom (a block gap in the sustained-LIVE window, a slow first block, a failing
+  `post_ignite` / `on_live` hook) no longer halts at once while a quorum of the roster reports the same target chain
+  with a common block after H and a moving head: the ceremony shows **degraded**, retries hooks with backoff (they
+  must be safe to re-run) and keeps waiting up to `[coordination] degraded_patience_secs` (default 900). It halts
+  when the fleet view stops vouching, when patience runs out, or when you create `operator-halt` next to the
+  journal. It never resumes the old chain.
+
+### Block producers on PulseVM: no rotation
+
+There is no alphabetical 12-block rotation after the cut. Snowman / ProposerVM give validators stake-weighted
+proposal windows and blocks are built on demand; a block's `producer` field is the producer name configured on the
+node that built it (PulseVM v1.0.0 `controller.rs` lines 2210–2236), and in rehearsals every validator shares one
+name and key (MetalBlockchain/pulsevm#107), so all blocks show the same producer. Missed-block trackers,
+`unpaid_blocks`-based pay and tools that assume a rotation will report nonsense. Details: [EXCHANGES.md §5](EXCHANGES.md#5-block-producers-after-the-cut-no-12-block-rotation).
+
 ---
 
 ## If something goes wrong

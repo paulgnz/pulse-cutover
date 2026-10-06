@@ -79,3 +79,27 @@ and direct clients (bots, keepers, oracle feeders). A path left open lets transa
 blocks; the agent then aborts the cut (it audits every block between H and the pause) instead of losing them,
 but the cutover does not happen. If you run your own nodes peered to a producer, expect your writes to be
 refused for the freeze window.
+
+## 5. Block producers after the cut: no 12-block rotation
+
+On the old chain, the active schedule's 21 producers take turns in alphabetical order, 12 blocks each, every
+0.5 s. PulseVM does not work that way:
+
+- **Who builds a block** is decided by Snowman consensus and ProposerVM: validators get stake-weighted proposal
+  windows, and a node builds a block **on demand**, when it has transactions. A quiet chain makes no blocks; a busy
+  one makes them as fast as they are proposed and accepted (in the 5-validator rehearsal on 4-vCPU hosts: about
+  1.35 s per accepted block, gaps quantized to ~5 s windows, and up to tens of seconds under light traffic).
+- **A block's `producer` field** is the producer name configured on the node that built it, stamped into the
+  block, and the node refuses to build unless its key is that name's key in the active schedule (PulseVM v1.0.0,
+  `crates/pulsevm_core/src/chain/controller.rs`, lines 2210–2236). It is not a schedule slot. In rehearsals every
+  validator ran the same producer name and key (MetalBlockchain/pulsevm#107), so every block says `protonnz`
+  whoever built it.
+- **What behaves differently:** missed-block or "round" trackers that expect each scheduled producer to produce
+  12 consecutive blocks per round; producer pay or monitoring based on `unpaid_blocks` and block counts per
+  producer; dashboards that show "next producer" or a rotation order; anything that infers liveness of one
+  producer from its slots. Head block time is the time of the last block, not wall clock minus 0.5 s: on a quiet
+  chain it can be minutes old while the chain is healthy (use the head **and** a recent transaction of your own to
+  judge liveness, see section 2).
+
+Nothing here changes how you sign, verify or credit transactions; it changes what you can infer from block
+headers.

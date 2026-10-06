@@ -65,18 +65,35 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   (409 otherwise), and so must `complete`; `abort` is checked when it carries one. `control/coord.mjs event` saves the signed event to
   `<event_id>.event.json` and checks the relay reports the same hash; `arm`/`abort` hash **your saved copy**
   (`--event-file`) and refuse if the relay serves a different payload (`--trust-relay yes` to sign the relay's copy).
+- **Fleet bindings on an event (rc.23):** `coord.mjs event … --roster bp1,bp2,bp3[:<32-hex instance id>] --quorum N
+  --release-sha256 <hex> --snapshot-sha256 <hex>` put the roster, quorum, plugin hash and expected snapshot hash into
+  the signed payload (validated before signing: account names, each member once, an instance id that is a beacon's
+  32-hex `beacon.instance`, 1 ≤ quorum ≤ roster size, 64-hex hashes). Without `--roster` the agents' fleet gate has no
+  roster and counts whoever reports, and mission control has no fleet verdict for the event.
 - **Server state** (`STATE_FILE`, default `servers.json` next to `COORD_FILE`): the replay watermark (last accepted
   report timestamp per server) and every server entry (latest report, first seen, instance id, conflict flag) are
   written synchronously (fsync + rename + directory fsync) **before** a report or an operator change is acknowledged.
   A crash right after a 200 can therefore neither accept a replay of that report nor forget an identity conflict;
   a failed write answers 503 and the report is not accepted. Only the per-server chart history is memory-only.
   A corrupt state file stops startup (exit 3). rc.6's `replay.json` watermark is migrated on first start.
-- **Identity conflicts:** every entry of one token is flagged while that token has more than one instance. Conflicted
+- **Identity conflicts:** every entry of one token is flagged while that token has more than one instance. A new
+  instance whose predecessor had already gone silent (its last report older than the silence window, measured from
+  the new report) **replaces** it (rc.23: a beacon restarted with another run directory, a reinstalled box); two
+  instances reporting at the same time stay a conflict. Conflicted
   servers never count as prepared and their evidence never counts toward agreement (shown as `conflicted`).
 - **Operator clear** (identity conflicts): removes only the selected instance; the token's remaining instances stay
   flagged while more than one remains. On the mission-control host itself,
   `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-server?net=<net>&producer=<acct>&sid=<sid>'`. Accepted only on
   loopback without `X-Real-IP`/`X-Forwarded-For`, i.e. never through the public proxy (which always sets X-Real-IP).
+- **Fleet verdict and the latched SPLIT** (rc.23): `/api/status` carries `fleet` per network for the current event
+  (LIVE / DEGRADED / SPLIT / ABORTED / PENDING, see `fleetVerdict` in `lib.mjs`) and, per producer, `event_max`: the
+  highest stage each producer reported per event id (only raised, kept across restarts in `servers.json`; the agents'
+  resume guard reads it). A SPLIT is **latched** in the coordination store for that event and stays red, whatever the
+  reports say later, until an operator clears it after the split is resolved. On the mission-control host itself:
+  `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-split?net=<net>'` (use the port mission control listens on).
+  Same rule as clear-server: loopback only, refused (403) with `X-Real-IP`/`X-Forwarded-For`, so never through the
+  public proxy; 404 when nothing is latched. The clear is persisted and logged; if the condition still holds, the
+  next status computation latches it again. A new event id starts without a latch.
 - **Tokens file reload** is validated before it replaces the current set (a bad edit keeps the old set and logs);
   deleting the file revokes every token.
 - No dependencies, Node ≥ 18. The page loads fonts from Google Fonts and the globe's land outline from jsDelivr

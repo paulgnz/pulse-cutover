@@ -123,6 +123,31 @@ pub struct Coordination {
     /// Max age of a roster member's beacon report for the fleet gate to count it.
     #[serde(default = "default_report_max_age")]
     pub report_max_age_secs: u64,
+    /// rc.23, after ignition: a local liveness symptom (a block gap in the sustained-LIVE window, the
+    /// head not past the cut by `quorum_timeout_secs`, a failing `post_ignite` / `on_live` hook) is
+    /// waited out as DEGRADED instead of halting while a quorum of the event's roster reports the SAME
+    /// target chain (common block after the cut, heads past it, still advancing). This bounds that wait:
+    /// past it, or as soon as the fleet view stops showing that, the ceremony halts as before.
+    #[serde(default = "default_degraded_patience")]
+    pub degraded_patience_secs: u64,
+    /// First retry delay for a failing post-ignition hook while degraded (doubles, at most 120 s).
+    /// Hooks must be safe to re-run (they already are re-run on resume).
+    #[serde(default = "default_degraded_retry")]
+    pub degraded_retry_secs: u64,
+    /// While degraded: the fleet's highest reported target head must move at least this often, or
+    /// the fleet counts as stalled too (and the ceremony halts).
+    #[serde(default = "default_fleet_stall")]
+    pub fleet_stall_secs: u64,
+}
+
+fn default_degraded_patience() -> u64 {
+    900
+}
+fn default_degraded_retry() -> u64 {
+    10
+}
+fn default_fleet_stall() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
@@ -695,6 +720,26 @@ pub struct Target {
     /// anything else fails `target_live`. `{blockchain_id}` / `{subnet_id}` expand.
     #[serde(default)]
     pub post_live_probe_cmd: Option<String>,
+    /// The Metal network id this target runs on. Default: the network the source chain moves to
+    /// (XPR mainnet → 1, XPR testnet → Tahoe 5; unknown chains are not judged). Set it for a
+    /// private Metal network (rehearsals): the beacon's `metal_synced` then checks against it and
+    /// `metal_reachable` is not probed from the internet. A value that differs from the network an
+    /// XPR chain moves to is a rehearsal override (refused for XPR mainnet). A coordinator event
+    /// may pin it (`metal_network_id`); `await` refuses an event that disagrees.
+    #[serde(default)]
+    pub metal_network_id: Option<u64>,
+}
+
+impl Target {
+    /// The Metal network id the target is expected on (config, else derived from the source chain).
+    pub fn expected_metal_network(&self, source_chain_id: Option<&str>) -> Option<u64> {
+        self.metal_network_id.or_else(|| crate::beacon::expected_metal_network(source_chain_id))
+    }
+}
+
+/// Public Metal networks (mainnet 1, Tahoe 5): anything else is a private network.
+pub fn is_public_metal_network(id: u64) -> bool {
+    matches!(id, 1 | 5)
 }
 
 impl Target {
@@ -957,6 +1002,20 @@ impl Config {
                 self.ceremony.import_cpu_scale
             ));
         }
+        // Re-check #5: a roster entry for THIS producer that pins another instance id never matches this node:
+        // its own report never counts at the gate and every guarded abort strands.
+        if let (Some(co), Some(b)) = (self.coordination.as_ref(), self.beacon.as_ref()) {
+            if let Some(mine) = crate::beacon::instance_id_readonly(self) {
+                for m in co.roster.iter().filter(|m| m.producer == b.producer) {
+                    if let Some(pin) = m.instance_id.as_deref().filter(|p| !p.eq_ignore_ascii_case(&mine)) {
+                        out.push(format!(
+                            "the event roster pins instance {pin} for producer {}, but this node's beacon instance is {mine}: \
+                             this node will not recognize itself (its report never counts, and a guarded abort strands). \
+                             Check the roster / beacon.instance next to the token", b.producer));
+                    }
+                }
+            }
+        }
         out
     }
 
@@ -973,6 +1032,11 @@ impl Config {
                     "upstream.rehearsal_allow_compare_mismatch = [{}] (xpr_19_table_compare may fail on these tables)",
                     up.rehearsal_allow_compare_mismatch.join(", ")
                 ));
+            }
+        }
+        if let (Some(n), Some(want)) = (self.target.metal_network_id, crate::beacon::expected_metal_network(self.ceremony.chain_id.as_deref())) {
+            if n != want {
+                out.push(format!("target.metal_network_id = {n} (private Metal network; this chain moves to network {want})"));
             }
         }
         out

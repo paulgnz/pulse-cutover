@@ -107,6 +107,13 @@ struct MockOps {
     fleet_polls: Cell<u32>,
     /// Override for GET /api/status (roster fleet-gate tests).
     status_doc: RefCell<Option<serde_json::Value>>,
+    /// rc.23: after this many status polls, serve this document instead.
+    status_doc_after: RefCell<Option<(u32, serde_json::Value)>>,
+    /// rc.23: the next N status polls fail (a transient relay error).
+    status_fail_times: Cell<u32>,
+    /// rc.23: when this hook command first fails (flaky), arm `status_fail_times` with N.
+    fail_status_on_hook: RefCell<Option<(String, u32)>>,
+    status_failures_served: Cell<u32>,
     /// Stale reports age like the real relay's: `age_ms` values >= 60 000 grow 2 s per poll.
     age_stale_per_poll: Cell<bool>,
     // --- fault injection ---
@@ -114,6 +121,10 @@ struct MockOps {
     target_fork: Cell<bool>,
     /// Target head stops advancing after this many target polls (post-LIVE stall).
     target_stall_after: Cell<u64>,
+    /// rc.23: ... and resumes at this poll (0 = never): a temporary stall.
+    target_stall_until: Cell<u64>,
+    /// rc.23: a hook command that fails this many times, then succeeds.
+    flaky_hook: RefCell<Option<(String, u32)>>,
     /// Source info calls (a readiness refusal must make none).
     source_calls: Cell<u32>,
     /// The ignite command fails (after possibly starting the target).
@@ -211,9 +222,15 @@ impl MockOps {
             fleet_agree_after: Cell::new(0),
             fleet_polls: Cell::new(0),
             status_doc: RefCell::new(None),
+            status_doc_after: RefCell::new(None),
+            status_fail_times: Cell::new(0),
+            fail_status_on_hook: RefCell::new(None),
+            status_failures_served: Cell::new(0),
             age_stale_per_poll: Cell::new(false),
             target_fork: Cell::new(false),
             target_stall_after: Cell::new(u64::MAX),
+            target_stall_until: Cell::new(0),
+            flaky_hook: RefCell::new(None),
             source_calls: Cell::new(0),
             ignite_fails: Cell::new(false),
             target_latency_ms: Cell::new(0),
@@ -387,8 +404,10 @@ impl ChainOps for MockOps {
         // The imported chain presents the cut height; it only mints past it
         // once transactions flow again (post_ignite traffic hook / public flip),
         // and keeps producing unless a stall is injected.
+        let (a, b) = (self.target_stall_after.get(), self.target_stall_until.get());
+        let progress = if b > a && polls >= b { a + (polls - b) } else { polls.min(a) };
         let head = if traffic_resumed {
-            self.target_head.get() + polls.min(self.target_stall_after.get())
+            self.target_head.get() + progress
         } else {
             self.target_head.get()
         };
@@ -463,6 +482,15 @@ impl ChainOps for MockOps {
         if cmd.starts_with("fail-") {
             return Err(format!("`{cmd}` exited 1"));
         }
+        if let Some((name, left)) = self.flaky_hook.borrow_mut().as_mut() {
+            if name == cmd && *left > 0 {
+                *left -= 1;
+                if let Some((h, n)) = self.fail_status_on_hook.borrow_mut().take() {
+                    if h == cmd { self.status_fail_times.set(n); }
+                }
+                return Err(format!("`{cmd}` exited 1 (flaky)"));
+            }
+        }
         if cmd == "freeze-writes" {
             self.freeze_head.set(self.head.get());
         }
@@ -529,9 +557,18 @@ impl ChainOps for MockOps {
             return Ok(Some(self.coord_doc.borrow().clone().unwrap_or_else(|| serde_json::json!({}))));
         }
         if url.ends_with("/api/status") {
+            if self.coord_down.get() {
+                return Err("mission control unreachable".into());
+            }
+            if self.status_fail_times.get() > 0 {
+                self.status_fail_times.set(self.status_fail_times.get() - 1);
+                self.status_failures_served.set(self.status_failures_served.get() + 1);
+                return Err("HTTP 502 (transient)".into());
+            }
             let polls = self.fleet_polls.get() + 1;
             self.fleet_polls.set(polls);
-            if let Some(mut doc) = self.status_doc.borrow().clone() {
+            let after = self.status_doc_after.borrow().clone().filter(|(n, _)| polls > *n).map(|(_, d)| d);
+            if let Some(mut doc) = after.or_else(|| self.status_doc.borrow().clone()) {
                 if self.age_stale_per_poll.get() {
                     fn bump(v: &mut serde_json::Value, polls: u64) {
                         match v {
@@ -706,8 +743,14 @@ fn open_journal(path: &std::path::Path) -> (Journal, pulse_cutover::journal::Rec
     panic!("journal lock still busy after 2 s: {}", path.display())
 }
 
+/// Runs to a terminal state. rc.23: STRANDED ends the run with an error (sealed, like HALTED); it is
+/// returned here as the state so tests can assert it.
 fn run_machine(cfg: &Config, ops: &MockOps) -> State {
-    run_machine_result(cfg, ops).unwrap()
+    match run_machine_result(cfg, ops) {
+        Ok(s) => s,
+        Err(e) if e.starts_with("STRANDED") => State::Stranded,
+        Err(e) => panic!("{e}"),
+    }
 }
 
 fn run_machine_result(cfg: &Config, ops: &MockOps) -> Result<State, String> {
@@ -1804,7 +1847,8 @@ fn stage2_signed_abort_kills_a_running_upstream_step_promptly() {
     let dir = tempfile::tempdir().unwrap();
     let (cfg, ops) = upstream_abort_rig(dir.path(), "export", 30);
     let t = std::time::Instant::now();
-    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    // rc.23 review #8: this rig's event has no roster, so the resume guard cannot judge the fleet: STRANDED.
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
     assert!(t.elapsed() < std::time::Duration::from_secs(10), "the 30 s export was cut short: {:?}", t.elapsed());
     let e = journal_entries(&cfg);
     assert!(transition(&e, "VERIFIED").is_none());
@@ -1815,7 +1859,7 @@ fn stage2_signed_abort_kills_a_running_upstream_step_promptly() {
     assert_eq!(err["data"]["detail"]["event_id"], "e1");
     assert!(pulse_cutover::upstream::find_file(&dir.path().join("upstream-work"), "manifest.env").is_none(), "the export never finished");
     assert!(!ops.hooks.borrow().iter().any(|h| h.contains("fake-import")), "nothing after the aborted step ran");
-    assert_eq!(ops.resumes.get(), 1, "the source producer is resumed (pre-ignition rollback)");
+    assert_eq!(ops.resumes.get(), 0, "no roster: the source is NOT resumed (rc.23 review #8)");
 }
 
 #[test]
@@ -1826,7 +1870,7 @@ fn stage2_signed_abort_between_upstream_steps_stops_before_the_next_one() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, ops) = upstream_abort_rig(dir.path(), tool, 0);
-        assert_eq!(run_machine(&cfg, &ops), State::Aborted, "{tool}");
+        assert_eq!(run_machine(&cfg, &ops), State::Stranded, "{tool} (no roster: rc.23 review #8)");
         let e = journal_entries(&cfg);
         assert!(transition(&e, "VERIFIED").is_none(), "{tool}");
         let err = e.iter().find(|v| v["kind"] == "error").expect("abort reason journaled");
@@ -1835,7 +1879,7 @@ fn stage2_signed_abort_between_upstream_steps_stops_before_the_next_one() {
         // A fast tool may finish before the in-step poll sees the abort; then the boundary check does.
         assert!(got == during || got == format!("upstream verification ({tool})").replace("compare", "table compare"), "{tool}: {got}");
         assert!(!ops.hooks.borrow().iter().any(|h| h.contains(next)), "{tool}: {next} never ran");
-        assert_eq!(ops.resumes.get(), 1, "{tool}");
+        assert_eq!(ops.resumes.get(), 0, "{tool}");
     }
 }
 
@@ -1854,7 +1898,7 @@ fn stage2_import_cpu_scale_is_reported_as_inert_on_the_upstream_backend() {
     assert_eq!(w.len(), 1);
     assert!(w[0].contains("import_cpu_scale = 143 is IGNORED"), "{w:?}");
     // Still part of the agreement with a signed event (payload unchanged, hash-compatible).
-    let ev = |scale: u64| serde_json::json!({"type": "event", "network": "rehearsal", "h": 5000, "import_cpu_scale": scale});
+    let ev = |scale: u64| serde_json::json!({"type": "event", "network": "rehearsal", "h": 5000, "import_cpu_scale": scale, "roster": [{"producer": "bp1"}]});
     assert!(pulse_cutover::coord::validate_event(&ev(143), &cfg, "rehearsal", None, 0).is_ok());
     assert!(pulse_cutover::coord::validate_event(&ev(1), &cfg, "rehearsal", None, 0).unwrap_err().contains("import_cpu_scale"));
     // Journaled at ARM as not effective, with the warning.
@@ -1957,10 +2001,11 @@ fn fleet_gate_times_out_and_rolls_back() {
     let cfg = coord_config(dir.path(), 120, 3, 5);
     let ops = MockOps::new(dir.path(), 110);
     ops.fleet_agree.set(1);
-    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    // rc.23 review #8: without a roster the resume guard cannot judge reachability: STRANDED, not resumed.
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
-    assert!(text.contains("fleet did not reach verified agreement"));
-    assert!(ops.resumes.get() >= 1, "source producer resumed");
+    assert!(text.contains("fleet did not reach verified agreement") && text.contains("no roster or quorum"));
+    assert_eq!(ops.resumes.get(), 0);
 }
 
 
@@ -2475,7 +2520,8 @@ fn roster_fleet_gate_counts_only_fresh_roster_members() {
         (st, std::fs::read_to_string(d.path().join("journal.jsonl")).unwrap())
     };
     let (st, text) = run(false);
-    assert_eq!(st, State::Aborted, "outsiders + a stale member + a wrong instance must not satisfy the roster");
+    // rc.23: a stale member and a missing pinned instance are unknown states: STRANDED, never a resume.
+    assert_eq!(st, State::Stranded, "outsiders + a stale member + a wrong instance must not satisfy the roster");
     assert!(text.contains("fleet did not reach verified agreement"));
     let (st, text) = run(true);
     assert_eq!(st, State::Live, "{text}");
@@ -2504,7 +2550,7 @@ fn roster_members_count_once_and_only_for_this_event() {
         {"name": "bp2", "beacons": [{"age_ms": 1000, "report": {"instance_id": "bb", "coord": {"event_id": "e1"},
             "ceremony": {"state": "VERIFIED", "evidence": {}}}}]},
     ]}]}));
-    assert_eq!(run_machine(&cfg, &ops), State::Aborted, "wrong event + empty evidence must not satisfy the gate");
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded, "wrong event + empty evidence must not satisfy the gate (rc.23: bp1 has no report for this event)");
 }
 
 #[test]
@@ -2522,7 +2568,10 @@ fn event_quorum_is_never_inherited_and_release_pin_needs_a_plugin() {
     let cfg = test_config(dir.path(), 120);
     let dup = serde_json::json!({"type": "event", "network": "rehearsal", "h": 100_000, "roster": [{"producer": "bp1"}, {"producer": "bp1"}]});
     assert!(validate_event(&dup, &cfg, "rehearsal", Some(10), 10).unwrap_err().contains("more than once"));
-    let pinned = serde_json::json!({"type": "event", "network": "rehearsal", "h": 100_000, "release_sha256": "ab".repeat(32)});
+    let pinned = serde_json::json!({"type": "event", "network": "rehearsal", "h": 100_000, "release_sha256": "ab".repeat(32), "roster": [{"producer": "bp1"}]});
+    // rc.23 review #8: a producer-mode event without a roster is refused.
+    let bare = serde_json::json!({"type": "event", "network": "rehearsal", "h": 100_000});
+    assert!(validate_event(&bare, &cfg, "rehearsal", Some(10), 10).unwrap_err().contains("no roster"));
     assert!(validate_event(&pinned, &cfg, "rehearsal", Some(10), 10).unwrap_err().contains("plugin_path"));
 }
 
@@ -2682,7 +2731,9 @@ fn r3_conflicted_reports_never_count_toward_the_fleet_gate() {
     *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
         {"name": "bp1", "beacons": [{"age_ms": 1000, "conflict": true, "report": rep("aa")}]},
         {"name": "bp2", "beacons": [{"age_ms": 1000, "conflict": true, "report": rep("bb")}]}]}]}));
-    assert_eq!(run_machine(&cfg, &ops), State::Aborted, "conflicted evidence must not satisfy the roster");
+    // rc.23: and with conflicted members the fleet's state is unknown: STRANDED, the source is not resumed.
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded, "conflicted evidence must not satisfy the roster");
+    assert_eq!(ops.resumes.get(), 0);
 
     // Legacy (no roster) gate: the same exclusion, and reports must be FRESH too.
     let d2 = tempfile::tempdir().unwrap();
@@ -2691,7 +2742,7 @@ fn r3_conflicted_reports_never_count_toward_the_fleet_gate() {
     *ops2.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
         {"name": "bp1", "age_ms": 999_000, "report": rep("aa")},
         {"name": "bp2", "beacons": [{"age_ms": 1000, "conflict": true, "report": rep("bb")}]}]}]}));
-    assert_eq!(run_machine(&cfg2, &ops2), State::Aborted, "a stale legacy report and a conflicted one are not a quorum of 2");
+    assert_eq!(run_machine(&cfg2, &ops2), State::Stranded, "a stale legacy report and a conflicted one are not a quorum of 2 (and not proof)");
 }
 
 #[test]
@@ -3101,7 +3152,9 @@ fn r4_fleet_gate_ignores_reports_with_failing_health_but_not_setup_checks() {
     *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
         {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aa", sick.clone())}]},
         {"name": "bp2", "beacons": [{"age_ms": 1000, "report": rep("bb", setup_only.clone())}]}]}]}));
-    assert_eq!(run_machine(&cfg, &ops), State::Aborted, "bp1's failing health check excludes it: 1 of 2");
+    // rc.23: the gate fails (bp1 excluded), but both members agree at VERIFIED: they may create the chain, so
+    // this producer is STRANDED rather than resuming the old chain.
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded, "bp1's failing health check excludes it: 1 of 2");
     let d2 = tempfile::tempdir().unwrap();
     let cfg2 = roster_config(d2.path());
     let ops2 = MockOps::new(d2.path(), 110);
@@ -3116,7 +3169,7 @@ fn r4_await_never_launches_the_ceremony_for_an_arm_with_the_wrong_event_hash() {
     // Review #4 residual: the arm-hash check was only unit-tested through check_arm.
     fn run_await_against(dir: &std::path::Path, wrong_hash: bool) -> String {
         let _ = coord_config(dir, 120, 0, 60);
-        let ev = signed(serde_json::json!({"type": "event", "event_id": "e1", "network": "rehearsal", "h": 5000u64}));
+        let ev = signed(serde_json::json!({"type": "event", "event_id": "e1", "network": "rehearsal", "h": 5000u64, "roster": [{"producer": "bp1"}]}));
         let good = pulse_cutover::coord::payload_hash(&ev).unwrap();
         let hash = if wrong_hash { "00".repeat(32) } else { good };
         let arm = signed(serde_json::json!({"type": "arm", "event_id": "e1", "network": "rehearsal", "event_hash": hash,
@@ -3279,8 +3332,11 @@ fn r5_automatic_abort_after_staging_moves_its_own_snapshot_aside() {
     let ops = MockOps::new(d.path(), 110);
     let rep = serde_json::json!({"instance_id": "aa", "checks": [], "coord": {"event_id": "e1"},
         "ceremony": {"state": "VERIFIED", "evidence": ours}});
+    // rc.23: bp2 already aborted, so the quorum (2) is unreachable without this node: the guard passes, a real abort.
+    let behind = serde_json::json!({"instance_id": "bb", "checks": [], "coord": {"event_id": "e1"}, "ceremony": {"state": "ABORTED"}});
     *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
-        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep}]}]}]}));
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep}]},
+        {"name": "bp2", "beacons": [{"age_ms": 1000, "report": behind}]}]}]}));
     assert_eq!(run_machine(&cfg, &ops), State::Aborted);
     assert!(!cfg.snapshot.staged_path.exists(), "the agent's own abort unstages the snapshot it staged");
     let aside = std::fs::read_dir(d.path()).unwrap().filter_map(|e| e.ok())
@@ -3420,7 +3476,7 @@ fn r5_fleet_gate_journals_why_each_report_was_excluded() {
     *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
         {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aa", serde_json::json!([{"name": "disk_free", "ok": false, "detail": "2 GB free"}]))}]},
         {"name": "bp2", "beacons": [{"age_ms": 1000, "report": rep("bb", serde_json::json!([]))}]}]}]}));
-    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded, "rc.23: two members agree at VERIFIED: not proof the fleet did not commit");
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(text.contains("fleet_gate_excluded") && text.contains("disk_free"), "per-report reason journaled: {text}");
 }
@@ -3487,7 +3543,7 @@ fn r6_steady_stale_report_is_journaled_once_and_non_roster_producers_are_not_nam
         {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aa")}]},
         {"name": "bp2", "beacons": [{"age_ms": 100000, "report": rep("bb")}]},
         {"name": "outsider", "beacons": [{"age_ms": 100000, "report": rep("zz")}]}]}]}));
-    assert_eq!(run_machine(&cfg, &ops), State::Aborted, "quorum 2 never reached");
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded, "quorum 2 never reached; bp2 stale = unknown (rc.23)");
     assert!(ops.fleet_polls.get() >= 50, "fixture: many polls ({})", ops.fleet_polls.get());
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     let lines = text.lines().filter(|l| l.contains("\"fleet_gate\"")).count();
@@ -4085,9 +4141,10 @@ fn rc21_signed_abort_or_unreachable_relay_right_before_create_stops_before_the_b
     let ops = upstream_ops(dir.path());
     *ops.coord_doc_when_abort_file.borrow_mut() = Some(serde_json::json!({
         "abort": signed(serde_json::json!({"type": "abort", "event_id": "e1", "network": "rehearsal"}))}));
-    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    // rc.23 review #8: no roster in this rig's event, so even a signed abort cannot show the fleet is accounted for.
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
     assert!(!dir.path().join("create-chain.calls").exists(), "no chain created");
-    assert_eq!(ops.resumes.get(), 1, "pre-boundary: the source resumes");
+    assert_eq!(ops.resumes.get(), 0, "no roster: not resumed");
     assert!(pulse_cutover::coord::is_tombstoned(&cfg, "e1"), "the abort is persisted");
 
     // The relay unreachable from the start: "unknown" is not an authorization to create.
@@ -4095,11 +4152,13 @@ fn rc21_signed_abort_or_unreachable_relay_right_before_create_stops_before_the_b
     let cfg = rig(dir.path());
     let ops = upstream_ops(dir.path());
     ops.coord_down.set(true);
-    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    // rc.23: and the same unreachable relay cannot show that no peer created the chain: STRANDED (sealed), the
+    // source is NOT resumed.
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(text.contains("cannot confirm the event is not aborted before chain creation"), "{text}");
     assert!(!dir.path().join("create-chain.calls").exists());
-    assert_eq!(ops.resumes.get(), 1);
+    assert_eq!(ops.resumes.get(), 0);
 
     // A tombstoned abort is final even when the relay no longer serves it.
     let dir = tempfile::tempdir().unwrap();
@@ -4602,4 +4661,570 @@ fn beacon_reports_a_config_short_of_the_production_profile_instead_of_refusing_i
         .find(|c| c["name"] == "rehearsal_overrides").expect("a failing setup check names the problems");
     assert_eq!(check["ok"], false);
     assert!(check["detail"].as_str().unwrap().contains("NOT production-ready"), "{check}");
+}
+
+// ---- rc.23: fleet rehearsal on the upstream stack (2026-10-06) ------------------------------------------------
+
+/// §4.5: the beacon judged every validator against Tahoe (network 5, public staking port), so a private
+/// rehearsal network was permanently red. The network now comes from config (or the event); a private one on
+/// an XPR chain is a labelled rehearsal override and refused for XPR mainnet.
+#[test]
+fn rc23_private_metal_network_is_configurable_labelled_and_refused_for_mainnet() {
+    let dir = tempfile::tempdir().unwrap();
+    test_config(dir.path(), 120);
+    let base = std::fs::read_to_string(dir.path().join("ceremony.toml")).unwrap();
+    let testnet = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd";
+    let with = |chain: &str, net: &str| base.replace("freeze_height = 120", &format!("freeze_height = 120\nchain_id = \"{chain}\""))
+        .replace("quorum_timeout_secs = 60", &format!("quorum_timeout_secs = 60\nmetal_network_id = {net}"));
+    let cfg = load_toml(dir.path(), "private.toml", &with(testnet, "12345")).unwrap();
+    assert_eq!(cfg.target.expected_metal_network(Some(testnet)), Some(12345));
+    assert!(cfg.rehearsal_overrides().iter().any(|o| o.contains("metal_network_id = 12345")), "{:?}", cfg.rehearsal_overrides());
+    // Tahoe for the testnet chain is no override at all.
+    let cfg = load_toml(dir.path(), "tahoe.toml", &with(testnet, "5")).unwrap();
+    assert!(cfg.rehearsal_overrides().is_empty());
+    let mainnet = "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0";
+    let err = load_toml(dir.path(), "mainnet.toml", &with(mainnet, "12345")).unwrap_err();
+    assert!(err.contains("MAINNET") && err.contains("metal_network_id"), "{err}");
+
+    // An event pinning the network must match this node's.
+    use pulse_cutover::coord::validate_event;
+    let cfg = load_toml(dir.path(), "private2.toml", &with(testnet, "12345")).unwrap();
+    let ev = |n: u64| serde_json::json!({"type": "event", "network": "rehearsal", "chain_id": testnet, "h": 100_000, "metal_network_id": n, "roster": [{"producer": "bp1"}]});
+    assert!(validate_event(&ev(12345), &cfg, "rehearsal", Some(10), 10).is_ok());
+    assert!(validate_event(&ev(5), &cfg, "rehearsal", Some(10), 10).unwrap_err().contains("metal_network_id"));
+}
+
+/// A 5-member roster (quorum 4, as in run r4) with on_abort / on_halt hooks; this node is bp1 (its beacon
+/// identity is in the ceremony config, so the resume guard can leave it out).
+fn rc23_fleet_config(dir: &std::path::Path) -> Config {
+    let base = std::fs::read_to_string({ coord_config(dir, 120, 0, 5); dir.join("ceremony-coord.toml") }).unwrap();
+    let mut text = base.replace("fleet_quorum = 0", "fleet_quorum = 4\nreport_max_age_secs = 60")
+        .replace("on_live = \"flip-gateway\"", "on_live = \"flip-gateway\"\non_abort = \"reopen-writes\"\non_halt = \"page-human\"");
+    for p in ["bp1", "bp2", "bp3", "bp4", "bp5"] {
+        text += &format!("\n[[coordination.roster]]\nproducer = \"{p}\"\n");
+    }
+    // A real beacon identity (url + token): its instance id is persisted next to the token, so the ceremony and
+    // the beacon agree on it (the self-match in the resume guard).
+    std::fs::write(dir.join("beacon.token"), "tok\n").unwrap();
+    text += &format!("\n[beacon]\nurl = \"https://mc.example/api/report\"\nproducer = \"bp1\"\nnetwork = \"rehearsal\"\ntoken_file = \"{}/beacon.token\"\n", dir.display());
+    load_toml(dir, "fleet.toml", &text).unwrap()
+}
+
+fn rc23_status(members: &[(&str, serde_json::Value)]) -> serde_json::Value {
+    serde_json::json!({"networks": [{"id": "rehearsal", "producers": members.iter().map(|(n, c)| serde_json::json!({"name": n,
+        "beacons": [{"age_ms": 1000, "report": {"coord": {"event_id": "e1"}, "ceremony": c}}]})).collect::<Vec<_>>()}]})
+}
+
+/// Run r4: one BP lost the relay before chain creation; the other four ignited. At its fleet timeout it ABORTED and
+/// resumed the old chain, which took 33 writes after H. rc.23: unknown is not "no": it is STRANDED, the source stays
+/// paused, writes stay frozen (no on_abort), on_halt pages a human, and `run` / `rollback` refuse until the fleet
+/// view proves no commit or an operator records a fleet-wide decision.
+#[test]
+fn rc23_r4_isolated_producer_is_stranded_not_resumed() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    ops.coord_down.set(true);
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    assert_eq!(ops.resumes.get(), 0, "the old chain is NOT resumed");
+    assert!(ops.paused.get(), "the source producer stays paused");
+    let hooks = ops.hooks.borrow().clone();
+    assert!(!hooks.iter().any(|h| h == "reopen-writes"), "writes stay frozen: {hooks:?}");
+    assert!(hooks.iter().any(|h| h == "page-human"), "on_halt pages a human");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("fleet did not reach verified agreement") && text.contains("refusing to resume the source"), "{text}");
+    // Sealed: a re-run refuses; the beacon reports STRANDED.
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.starts_with("STRANDED") && err.contains("join"), "{err}");
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["state"], "STRANDED");
+    // The operator's rollback re-checks the fleet: the relay is still down → refused, nothing changed.
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let err = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).unwrap_err();
+    assert!(err.starts_with("refusing") && err.contains("STRANDED"), "{err}");
+    assert_eq!(ops.resumes.get(), 0);
+    // Once every peer reports a state before chain creation, the same rollback resumes the old chain.
+    ops.coord_down.set(false);
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "FROZEN"})),
+        ("bp4", serde_json::json!({"state": "SNAPSHOTTED"})), ("bp5", serde_json::json!({"state": "ARMED"}))]));
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).unwrap();
+    assert_eq!(out.state, State::Aborted);
+    assert!(out.failed.is_empty(), "{:?}", out.failed);
+    assert_eq!(ops.resumes.get(), 1);
+}
+
+#[test]
+fn rc23_a_peer_past_creation_strands_and_force_stranded_is_an_operator_override() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    // The relay answers, but the gate is short (only bp2 past VERIFIED, other evidence) and bp2 has ignited.
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp2", serde_json::json!({"state": "IGNITED", "ignition_started": true})),
+        ("bp3", serde_json::json!({"state": "VERIFIED"})), ("bp4", serde_json::json!({"state": "VERIFIED"})), ("bp5", serde_json::json!({"state": "VERIFIED"}))]));
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("bp2 is past chain creation or ignition (IGNITED)"), "{text}");
+    assert_eq!(ops.resumes.get(), 0);
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert!(Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).unwrap_err().contains("bp2 is past"));
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, true).unwrap();
+    assert_eq!(out.state, State::Aborted);
+    assert_eq!(ops.resumes.get(), 1, "--force-stranded: the operator's fleet-wide decision resumes the old chain");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("overridden by the operator (--force-stranded --i-understand)") && text.contains("overridden_fleet_view")
+        && text.contains("bp2 is past"), "review #10: the overridden view is journaled");
+}
+
+#[test]
+fn rc23_signed_abort_resumes_only_with_every_member_accounted_for() {
+    // Review #2: the old version of this test resumed with 3 of 4 peers missing from the relay (and its comment
+    // claimed the relay was unreachable). A signed abort now needs every roster member to have some report for
+    // the event, none past creation (including the relay's high-water mark).
+    let abort = serde_json::json!({"abort": signed(serde_json::json!({"type": "abort", "network": "rehearsal", "event_id": "e1"}))});
+    let peers = |states: &[(&str, &str)]| rc23_status(&states.iter().map(|(p, st)| (*p, serde_json::json!({"state": st}))).collect::<Vec<_>>());
+    let run = |doc: serde_json::Value| {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = rc23_fleet_config(d.path());
+        let ops = MockOps::new(d.path(), 118); // freezes at the first ARMED poll: the abort is seen after the freeze
+        *ops.coord_doc.borrow_mut() = Some(abort.clone());
+        *ops.status_doc.borrow_mut() = Some(doc);
+        let st = run_machine(&cfg, &ops);
+        assert!(ops.hooks.borrow().iter().any(|h| h == "freeze-writes"), "the abort came after the freeze");
+        (st, ops.resumes.get(), std::fs::read_to_string(&cfg.journal_path).unwrap())
+    };
+    // Every member accounted for (a stale one is accepted under a signed abort), nobody past creation: resumed.
+    let (st, resumes, text) = run(peers(&[("bp2", "VERIFIED"), ("bp3", "VERIFIED"), ("bp4", "FROZEN"), ("bp5", "VERIFIED")]));
+    assert_eq!(st, State::Aborted, "{text}");
+    assert!(resumes >= 1);
+    assert!(text.contains("signed coordinator abort, every member accounted for"));
+    // Three of four peers missing: unknown → STRANDED.
+    let (st, resumes, text) = run(peers(&[("bp2", "VERIFIED")]));
+    assert_eq!((st, resumes), (State::Stranded, 0));
+    assert!(text.contains("bp3 has no report"), "{text}");
+    // A peer past creation.
+    let (st, _, text) = run(peers(&[("bp2", "HALTED"), ("bp3", "VERIFIED"), ("bp4", "VERIFIED"), ("bp5", "VERIFIED")]));
+    assert_eq!(st, State::Stranded);
+    assert!(text.contains("bp2 is past chain creation"), "{text}");
+    // A peer whose IGNITED entry was replaced by a new silent-instance report: the relay's high-water mark still
+    // shows it past creation.
+    let mut doc = peers(&[("bp2", "VERIFIED"), ("bp3", "VERIFIED"), ("bp4", "VERIFIED"), ("bp5", "VERIFIED")]);
+    doc["networks"][0]["producers"][0]["event_max"] = serde_json::json!({"e1": {"past_create": true, "state": "IGNITED"}});
+    let (st, _, text) = run(doc);
+    assert_eq!(st, State::Stranded);
+    assert!(text.contains("high-water mark"), "{text}");
+}
+
+/// Review #1/§6: a LOCAL abort after the freeze (here: burn-off transactions) while the peers are still before
+/// VERIFIED. With quorum 4 of 5, the four peers can reach it without this node: STRANDED (the old code resumed,
+/// and the peers ignited without it). Once enough peers aborted too, the same abort resumes.
+#[test]
+fn rc23_local_abort_after_the_freeze_strands_while_the_rest_can_reach_quorum() {
+    let run = |states: &[&str]| {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = rc23_fleet_config(d.path());
+        let ops = MockOps::new(d.path(), 110);
+        ops.burnoff_tx_per_block.set(1);
+        *ops.status_doc.borrow_mut() = Some(rc23_status(&["bp2", "bp3", "bp4", "bp5"].iter().zip(states)
+            .map(|(p, st)| (*p, serde_json::json!({"state": st}))).collect::<Vec<_>>()));
+        let st = run_machine(&cfg, &ops);
+        (st, ops.resumes.get(), std::fs::read_to_string(&cfg.journal_path).unwrap())
+    };
+    let (st, resumes, text) = run(&["FROZEN", "FROZEN", "SNAPSHOTTED", "FROZEN"]);
+    assert_eq!((st, resumes), (State::Stranded, 0), "{text}");
+    assert!(text.contains("transactions landed after the cut") && text.contains("can reach it without this node"));
+    let (st, resumes, text) = run(&["ABORTED", "ABORTED", "FROZEN", "FROZEN"]);
+    assert_eq!(st, State::Aborted, "{text}");
+    assert!(resumes >= 1);
+}
+
+/// Review #3/§6 stale-self race: before resuming, the agent journals its abort intent and waits until the relay
+/// shows its own report no longer VERIFIED (or the report would be too old for any gate), then re-runs the guard.
+#[test]
+fn rc23_resume_waits_for_its_own_verified_report_to_be_withdrawn_and_re_checks() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    ops.burnoff_tx_per_block.set(1);
+    let me = pulse_cutover::beacon::instance_id(&cfg);
+    let with_self = |self_state: serde_json::Value| {
+        let mut doc = rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
+            ("bp4", serde_json::json!({"state": "FROZEN"})), ("bp5", serde_json::json!({"state": "FROZEN"}))]);
+        doc["networks"][0]["producers"].as_array_mut().unwrap().push(serde_json::json!({"name": "bp1", "beacons": [{"age_ms": 1000,
+            "report": {"instance_id": me, "coord": {"event_id": "e1"}, "ceremony": self_state}}]}));
+        doc
+    };
+    // The relay shows this node aborting: the wait ends at once, the guard passes again, resumed.
+    *ops.status_doc.borrow_mut() = Some(with_self(serde_json::json!({"state": "FROZEN", "aborting": true})));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let intent = text.find(r#""abort_intent":true"#).expect("intent journaled");
+    let withdrawn = text.find("the relay shows this node aborting").expect("withdrawal seen");
+    let resumed = text.find(r#""rollback_step":"resume""#).expect("resumed");
+    assert!(intent < withdrawn && withdrawn < resumed, "intent → withdrawn → second guard → resume");
+    assert_eq!(text.matches(r#""resume_guard":"clear""#).count(), 2, "the guard ran twice");
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["aborting"], false, "cleared by the ABORTED transition");
+
+    // While it waits, peers move on (two of them back to VERIFIED with the quorum reachable): the second guard strands.
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    ops.burnoff_tx_per_block.set(1);
+    // Self never shows as withdrawn (still VERIFIED): the wait runs the whole report_max_age_secs; the fleet view
+    // the second pass sees is the scripted one after the first relay read.
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
+        ("bp4", serde_json::json!({"state": "FROZEN"})), ("bp5", serde_json::json!({"state": "FROZEN"}))]));
+    *ops.status_doc_after.borrow_mut() = Some((3, rc23_status(&[("bp2", serde_json::json!({"state": "VERIFIED"})), ("bp3", serde_json::json!({"state": "VERIFIED"})),
+        ("bp4", serde_json::json!({"state": "VERIFIED"})), ("bp5", serde_json::json!({"state": "VERIFIED"}))])));
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    assert_eq!(ops.resumes.get(), 0);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("too old for any gate") && text.contains("can reach it without this node"), "{text}");
+}
+
+/// An upstream (ignition-configured) ceremony in a 5-member roster (quorum 4); this node is bp1.
+fn rc23_upstream_fleet(dir: &std::path::Path) -> Config {
+    stage_fake_upstream_tools(dir, 0);
+    let _ = upstream_ignite_config(dir, "", "").unwrap();
+    let path = dir.join("ceremony-upstream-ignite.toml");
+    let mut text = format!("{}\non_halt = \"page-human\"\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nfleet_quorum = 4\nfleet_timeout_secs = 5\n",
+        std::fs::read_to_string(&path).unwrap(), hex::encode(coord_key().verifying_key().to_bytes()));
+    for p in ["bp1", "bp2", "bp3", "bp4", "bp5"] {
+        text += &format!("\n[[coordination.roster]]\nproducer = \"{p}\"\n");
+    }
+    text += "\n[beacon]\nurl = \"\"\nproducer = \"bp1\"\nnetwork = \"rehearsal\"\n";
+    std::fs::write(&path, text).unwrap();
+    Config::load(&path).unwrap()
+}
+
+const JOIN_BID: &str = "TargetChainAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+fn rc23_live_peers(evidence: &serde_json::Value, peers: &[&str]) -> serde_json::Value {
+    let t = serde_json::json!({"blockchain_id": JOIN_BID, "subnet_id": "TargetSubnetBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "head": 140, "after_cut_id": "a1".repeat(32)});
+    rc23_status(&peers.iter().map(|p| (*p, serde_json::json!({"state": "LIVE", "evidence": evidence, "target": t}))).collect::<Vec<_>>())
+}
+
+/// Run r4's missing path: the isolated BP (here: STRANDED, as rc.23 leaves it) joins the chain its peers run LIVE,
+/// without creating one, after checking its own artifacts, the fleet's evidence and its source.
+#[test]
+fn rc23_join_tracks_the_live_quorums_chain_without_creating_one() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_upstream_fleet(d.path());
+    let ops = upstream_ops(d.path());
+    ops.coord_down.set(true);
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    assert!(!d.path().join("create-chain.calls").exists());
+    let ours = pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"].clone();
+    assert!(ours["boot_genesis_sha256"].is_string() && ours["fingerprints_digest"].is_string());
+    let join = |ops: &MockOps| {
+        let (j, rec) = open_journal(&cfg.journal_path);
+        Machine::new(&cfg, ops, j, rec).join("e1")
+    };
+    ops.coord_down.set(false);
+    // Refused: wrong event; a quorum not LIVE; evidence that differs from ours.
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert!(Machine::new(&cfg, &ops, j, rec).join("e2").unwrap_err().contains("not e2"));
+    *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&ours, &["bp2", "bp3", "bp4"]));
+    assert!(join(&ops).unwrap_err().contains("quorum 4"));
+    let mut other = ours.clone();
+    other["boot_genesis_sha256"] = serde_json::json!("cd".repeat(32));
+    *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&other, &["bp2", "bp3", "bp4", "bp5"]));
+    assert!(join(&ops).unwrap_err().contains("boot_genesis_sha256"));
+    assert_eq!(pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap().state, Some(State::Stranded), "refusals change nothing");
+    // Joined: tracks the fleet's chain, installs the chain config under ITS id, ignites, reaches LIVE.
+    *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&ours, &["bp2", "bp3", "bp4", "bp5"]));
+    assert_eq!(join(&ops).unwrap(), State::Live);
+    assert!(!d.path().join("create-chain.calls").exists(), "a join never creates a chain");
+    assert!(d.path().join("chain-configs").join(JOIN_BID).join("config.json").exists());
+    assert!(ops.ignite_vars.borrow().iter().any(|(k, v)| k == "blockchain_id" && v == JOIN_BID));
+    assert_eq!(ops.resumes.get(), 0, "the old chain was never resumed");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""side_effect":"join""#) && text.contains(r#""joined":true"#));
+    let s = pulse_cutover::beacon::journal_summary(&cfg.journal_path);
+    assert_eq!((s["state"].as_str(), s["joined"].as_bool()), (Some("LIVE"), Some(true)));
+}
+
+#[test]
+fn rc23_join_refuses_a_source_that_moved_on_after_h() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_upstream_fleet(d.path());
+    let ops = upstream_ops(d.path());
+    ops.coord_down.set(true);
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    ops.coord_down.set(false);
+    let ours = pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"].clone();
+    *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&ours, &["bp2", "bp3", "bp4", "bp5"]));
+    // r4: the isolated BP resumed and produced (with writes) after the cut.
+    ops.head.set(ops.head.get() + 64);
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let err = Machine::new(&cfg, &ops, j, rec).join("e1").unwrap_err();
+    assert!(err.contains("past the journaled pause head"), "{err}");
+    ops.head.set(ops.head.get() - 64);
+    ops.burnoff_tx_per_block.set(1);
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert!(Machine::new(&cfg, &ops, j, rec).join("e1").unwrap_err().contains("transaction(s) on the source after H"));
+    assert!(!ops.ignited.get());
+}
+
+/// Fleet runs r2–r6: every run ended with LIVE and HALTED BPs on ONE target chain, each halting on its own view
+/// of a slow, gappy target. rc.23: while a quorum of the roster reports the same target chain (common block
+/// after the cut, heads moving), a local symptom is waited out as DEGRADED; it halts when the fleet view stops
+/// vouching, patience runs out, or the operator decides.
+fn rc23_degraded_rig(d: &std::path::Path, peers_state: &str, patience: u64) -> (Config, MockOps) {
+    rc23_degraded_rig_head(d, peers_state, patience, 200)
+}
+
+fn rc23_degraded_rig_head(d: &std::path::Path, peers_state: &str, patience: u64, peers_head: u64) -> (Config, MockOps) {
+    let probe = tempfile::tempdir().unwrap();
+    let _ = run_machine_result(&test_config(probe.path(), 120), &MockOps::new(probe.path(), 110));
+    let ours = pulse_cutover::beacon::journal_summary(&probe.path().join("journal.jsonl"))["evidence"].clone();
+    let base = std::fs::read_to_string({ rc23_fleet_config(d); d.join("fleet.toml") }).unwrap();
+    let cfg = load_toml(d, "fleet-degraded.toml", &base.replace("report_max_age_secs = 60",
+        &format!("report_max_age_secs = 60\ndegraded_patience_secs = {patience}\ndegraded_retry_secs = 1"))).unwrap();
+    let ops = MockOps::new(d, 110);
+    let t = serde_json::json!({"head": peers_head, "after_cut_id": "a1".repeat(32)});
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&["bp2", "bp3", "bp4", "bp5"].iter()
+        .map(|p| (*p, serde_json::json!({"state": peers_state, "evidence": ours.clone(), "target": t.clone()}))).collect::<Vec<_>>()));
+    (cfg, ops)
+}
+
+#[test]
+fn rc23_a_gap_is_waited_out_while_the_fleet_is_live_on_the_same_chain() {
+    let d = tempfile::tempdir().unwrap();
+    let (cfg, ops) = rc23_degraded_rig(d.path(), "LIVE", 900);
+    ops.target_latency_ms.set(1000); // ~1 s per target poll
+    ops.target_stall_after.set(5);
+    ops.target_stall_until.set(40); // a ~35 s gap (live_max_gap 20 s), then blocks again
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""degraded":{"#) && text.contains("sustain: no new target block"), "{text}");
+    assert!(text.contains(r#""degraded_cleared":true"#));
+    assert!(!text.contains("HALTED"));
+}
+
+#[test]
+fn rc23_a_failing_post_ignite_hook_is_retried_while_the_fleet_is_live() {
+    let d = tempfile::tempdir().unwrap();
+    let (cfg, ops) = rc23_degraded_rig(d.path(), "IGNITED", 900);
+    *ops.flaky_hook.borrow_mut() = Some(("resume-traffic".into(), 2));
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""attempts":3,"hook_retry_succeeded":"post_ignite""#), "{text}");
+    // on_live too
+    let d = tempfile::tempdir().unwrap();
+    let (cfg, ops) = rc23_degraded_rig(d.path(), "LIVE", 900);
+    *ops.flaky_hook.borrow_mut() = Some(("flip-gateway".into(), 1));
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+}
+
+#[test]
+fn rc23_degraded_ends_in_a_halt_when_the_fleet_does_not_vouch_patience_runs_out_or_the_operator_decides() {
+    // Peers ignited but none shows a block after the cut: the fleet does not vouch for the chain → halt as before.
+    let d = tempfile::tempdir().unwrap();
+    let (cfg, ops) = rc23_degraded_rig_head(d.path(), "IGNITED", 900, 120);
+    *ops.flaky_hook.borrow_mut() = Some(("resume-traffic".into(), 99));
+    assert!(run_machine_result(&cfg, &ops).unwrap_err().starts_with("HALTED"));
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("the fleet view does not vouch"));
+    // A permanent stall with a live fleet: patience (30 s) runs out → halt.
+    let d = tempfile::tempdir().unwrap();
+    let (cfg, ops) = rc23_degraded_rig(d.path(), "LIVE", 30);
+    ops.target_latency_ms.set(1000);
+    ops.target_stall_after.set(5);
+    assert!(run_machine_result(&cfg, &ops).unwrap_err().starts_with("HALTED"));
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""degraded":{"#) && text.contains("patience exhausted"), "{text}");
+    assert_eq!(ops.resumes.get(), 0, "never resumes the source after ignition");
+    // The operator's explicit decision.
+    let d = tempfile::tempdir().unwrap();
+    let (cfg, ops) = rc23_degraded_rig(d.path(), "LIVE", 900);
+    *ops.flaky_hook.borrow_mut() = Some(("resume-traffic".into(), 99));
+    std::fs::write(d.path().join("operator-halt"), "").unwrap();
+    assert!(run_machine_result(&cfg, &ops).unwrap_err().starts_with("HALTED"));
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("operator decision"));
+    // Without a coordinated event nothing changes: a gap halts at once.
+    let d = tempfile::tempdir().unwrap();
+    let cfg = test_config(d.path(), 120);
+    let ops = MockOps::new(d.path(), 110);
+    ops.target_latency_ms.set(1000);
+    ops.target_stall_after.set(5);
+    assert!(run_machine_result(&cfg, &ops).unwrap_err().starts_with("HALTED"));
+    assert!(!std::fs::read_to_string(&cfg.journal_path).unwrap().contains("degraded"));
+}
+
+/// Review #4/§6: a join from ABORTED (on_abort reopened writes on the old chain) re-runs on_freeze first.
+#[test]
+fn rc23_join_from_aborted_freezes_writes_again_before_anything_else() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_upstream_fleet(d.path());
+    let ops = upstream_ops(d.path());
+    // The gate fails; two peers already aborted, so the quorum (4) is unreachable without this node: ABORTED.
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
+        ("bp4", serde_json::json!({"state": "FROZEN"})), ("bp5", serde_json::json!({"state": "FROZEN"}))]));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let reopened = ops.hooks.borrow().iter().rposition(|h| h == "reopen-writes").expect("on_abort reopened writes");
+    // Later the others recovered and went LIVE (e.g. by join); this node's producer is not producing.
+    ops.paused.set(true);
+    let ours = pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"].clone();
+    *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&ours, &["bp2", "bp3", "bp4", "bp5"]));
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert_eq!(Machine::new(&cfg, &ops, j, rec).join("e1").unwrap(), State::Live);
+    let hooks = ops.hooks.borrow().clone();
+    let refrozen = hooks.iter().rposition(|h| h == "freeze-writes").unwrap();
+    assert!(refrozen > reopened, "on_freeze re-ran after on_abort: {hooks:?}");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let refreeze = text.find(r#""join_refreeze""#).expect("journaled");
+    assert!(refreeze < text.find(r#""join":{"#).unwrap(), "the re-freeze comes before the join checks are journaled");
+    assert!(!d.path().join("create-chain.calls").exists());
+}
+
+/// Review #5/§6: a crash between the `join` record and the chain-id record: `join` resumes (re-reading the id from
+/// the fleet) instead of refusing; a crash after the ids: `join` resumes from there.
+#[test]
+fn rc23_join_resumes_after_a_crash_between_its_journal_records() {
+    for crash_after_ids in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = rc23_upstream_fleet(d.path());
+        let ops = upstream_ops(d.path());
+        ops.coord_down.set(true);
+        assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+        ops.coord_down.set(false);
+        let ours = pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"].clone();
+        *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&ours, &["bp2", "bp3", "bp4", "bp5"]));
+        {
+            // What a join that died right after its point-of-no-return record left behind.
+            let (mut j, _) = open_journal(&cfg.journal_path);
+            j.evidence(State::Stranded, serde_json::json!({"side_effect": "join"})).unwrap();
+            if crash_after_ids {
+                j.evidence(State::Stranded, serde_json::json!({"target_blockchain_id": JOIN_BID, "target_subnet_id": "TargetSubnetBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"})).unwrap();
+            }
+        }
+        // `run` stays sealed; `join` finishes the join.
+        assert!(run_machine_result(&cfg, &ops).unwrap_err().starts_with("STRANDED"));
+        let (j, rec) = open_journal(&cfg.journal_path);
+        assert_eq!(Machine::new(&cfg, &ops, j, rec).join("e1").unwrap(), State::Live, "crash_after_ids={crash_after_ids}");
+        assert!(ops.ignite_vars.borrow().iter().any(|(k, v)| k == "blockchain_id" && v == JOIN_BID));
+        assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains(r#""join_resumed":true"#));
+        assert_eq!(ops.resumes.get(), 0);
+        assert!(!d.path().join("create-chain.calls").exists());
+    }
+}
+
+/// Review #7/§6: one transient relay error does not end a degraded wait (fleet reads are retried), and the
+/// start of the wait is journaled so a resumed run keeps the same patience.
+#[test]
+fn rc23_degraded_survives_a_transient_relay_error_and_journals_its_start() {
+    let d = tempfile::tempdir().unwrap();
+    let (cfg, ops) = rc23_degraded_rig(d.path(), "IGNITED", 900);
+    *ops.flaky_hook.borrow_mut() = Some(("resume-traffic".into(), 1));
+    // The hook's failure arms two failing relay reads: exactly the degraded check's reads.
+    ops.fail_status_on_hook.borrow_mut().replace(("resume-traffic".into(), 2));
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""degraded_since_ms""#) && text.contains(r#""hook_retry_succeeded":"post_ignite""#), "{text}");
+    assert!(ops.status_failures_served.get() >= 2, "the transient errors were really served");
+    let rec = pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap();
+    assert!(rec.degraded_since_ms.is_some(), "recovered on resume");
+}
+
+/// Review #10: `--force-stranded` alone is refused (exit 3, nothing changed); it needs `--i-understand`.
+#[test]
+fn rc23_force_stranded_needs_i_understand() {
+    let d = tempfile::tempdir().unwrap();
+    let _ = rc23_fleet_config(d.path());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pulse-cutover"))
+        .args(["rollback", "--config"]).arg(d.path().join("fleet.toml")).arg("--force-stranded").output().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--force-stranded --i-understand"));
+    assert!(!d.path().join("journal.jsonl").exists(), "nothing was touched");
+}
+
+/// Re-check #2: after its own withdrawal is visible, the agent waits a beacon cycle (≥ 10 s) before the second
+/// guard pass, so a peer that started chain creation just before (and reports it a cycle later) is seen.
+#[test]
+fn rc23_second_guard_pass_waits_a_beacon_cycle_and_sees_a_late_create_started() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    ops.burnoff_tx_per_block.set(1);
+    let me = pulse_cutover::beacon::instance_id(&cfg);
+    let doc = |bp4: serde_json::Value| {
+        let mut doc = rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
+            ("bp4", bp4), ("bp5", serde_json::json!({"state": "FROZEN"}))]);
+        doc["networks"][0]["producers"].as_array_mut().unwrap().push(serde_json::json!({"name": "bp1", "beacons": [{"age_ms": 1000,
+            "report": {"instance_id": me, "coord": {"event_id": "e1"}, "ceremony": {"state": "FROZEN", "aborting": true}}}]}));
+        doc
+    };
+    *ops.status_doc.borrow_mut() = Some(doc(serde_json::json!({"state": "VERIFIED"})));
+    // Polls: 1 = first guard, 2 = withdrawal seen; from poll 3 (after the settle) bp4 reports create_started.
+    *ops.status_doc_after.borrow_mut() = Some((2, doc(serde_json::json!({"state": "VERIFIED", "create_started": true}))));
+    let t0 = ops.now.get();
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    assert_eq!(ops.resumes.get(), 0);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""settle_before_second_guard_ms":10000"#), "{text}");
+    assert!(text.contains("bp4 is past chain creation"), "{text}");
+    assert!(ops.now.get() - t0 >= 10_000, "the settle really waited (mock clock)");
+}
+
+/// Re-check #3: a join from ABORTED that is refused AFTER re-running on_freeze says writes are frozen and what to
+/// do; `rollback` then reopens them (re-runs on_abort) instead of reporting "already rolled back".
+#[test]
+fn rc23_join_refused_after_refreeze_says_writes_are_frozen_and_rollback_reopens_them() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_upstream_fleet(d.path());
+    let ops = upstream_ops(d.path());
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
+        ("bp4", serde_json::json!({"state": "FROZEN"})), ("bp5", serde_json::json!({"state": "FROZEN"}))]));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    // The resumed old chain moved on: the join must refuse, after re-freezing writes.
+    let ours = pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"].clone();
+    *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&ours, &["bp2", "bp3", "bp4", "bp5"]));
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let err = Machine::new(&cfg, &ops, j, rec).join("e1").unwrap_err();
+    assert!(err.contains("past the journaled pause head") && err.contains("Writes are now FROZEN on the old chain")
+        && err.contains("pulse-cutover rollback"), "{err}");
+    assert_eq!(ops.hooks.borrow().last().map(String::as_str), Some("freeze-writes"));
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["rollback_complete"], false, "mission control sees it");
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback(false).unwrap();
+    assert!(!out.already && out.failed.is_empty(), "{out:?}");
+    assert_eq!(ops.hooks.borrow().last().map(String::as_str), Some("reopen-writes"), "on_abort reopened writes");
+    assert!(pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap().aborted_rollback_complete);
+}
+
+/// Re-check #3: a join resumed after a crash uses the chain id in its journaled `join` record (the relay may be down).
+#[test]
+fn rc23_join_resume_uses_the_journaled_join_record_without_the_relay() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_upstream_fleet(d.path());
+    let ops = upstream_ops(d.path());
+    ops.coord_down.set(true);
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    {
+        let (mut j, _) = open_journal(&cfg.journal_path);
+        j.evidence(State::Stranded, serde_json::json!({"join": {"event_id": "e1", "blockchain_id": JOIN_BID, "subnet_id": "TargetSubnetBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}})).unwrap();
+        j.evidence(State::Stranded, serde_json::json!({"side_effect": "join"})).unwrap();
+    }
+    // The relay stays down: the id comes from the journal.
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert_eq!(Machine::new(&cfg, &ops, j, rec).join("e1").unwrap(), State::Live);
+    assert!(ops.ignite_vars.borrow().iter().any(|(k, v)| k == "blockchain_id" && v == JOIN_BID));
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("the journaled join record"));
+}
+
+/// Re-check #5: a roster that pins another instance id for this producer is warned about at load (and journaled at ARM).
+#[test]
+fn rc23_a_roster_pin_that_is_not_this_node_is_warned_about() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let mine = pulse_cutover::beacon::instance_id_readonly(&cfg).unwrap();
+    assert_eq!(mine, pulse_cutover::beacon::instance_id(&cfg), "read-only and persisting agree");
+    assert!(cfg.warnings().iter().all(|w| !w.contains("pins instance")));
+    let text = std::fs::read_to_string(d.path().join("fleet.toml")).unwrap()
+        .replacen("producer = \"bp1\"\n", &format!("producer = \"bp1\"\ninstance_id = \"{}\"\n", "0".repeat(32)), 1);
+    let bad = load_toml(d.path(), "fleet-pin.toml", &text).unwrap();
+    assert!(bad.warnings().iter().any(|w| w.contains("pins instance") && w.contains(&mine)), "{:?}", bad.warnings());
+    let ok = load_toml(d.path(), "fleet-pin-ok.toml", &std::fs::read_to_string(d.path().join("fleet.toml")).unwrap()
+        .replacen("producer = \"bp1\"\n", &format!("producer = \"bp1\"\ninstance_id = \"{mine}\"\n"), 1)).unwrap();
+    assert!(ok.warnings().iter().all(|w| !w.contains("pins instance")));
 }

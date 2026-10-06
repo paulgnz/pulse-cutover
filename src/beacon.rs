@@ -7,7 +7,7 @@
 //! control is down the beacon logs and retries; the ceremony never waits on it.
 //! Read-only on the box: it calls nodeos' chain API, reads files, and asks
 //! systemd whether a unit is active. The only thing it ever writes is its own
-//! `beacon.instance` id (once). After LIVE it also asks the target for its head and, if the
+//! `beacon.instance` id (once, next to the token file). After LIVE it also asks the target for its head and, if the
 //! operator configured one, runs `target.post_live_probe_cmd` (see live_watch.rs).
 //!
 //! Public by design: mission control's dashboard is public, so every string in a
@@ -114,6 +114,11 @@ pub fn expected_metal_network(chain_id: Option<&str>) -> Option<u64> {
     }
 }
 
+/// The target runs on a configured private Metal network (`target.metal_network_id`, not 1 or 5).
+fn private_metal(cfg: &Config) -> bool {
+    cfg.target.metal_network_id.is_some_and(|n| !crate::config::is_public_metal_network(n))
+}
+
 /// Last port-reachability verdict from mission control (it dials this server's IP on 9651 only).
 /// Asked at most every 10 minutes; `None` until the first answer.
 static REACH: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
@@ -203,11 +208,13 @@ fn metal_info(cfg: &Config, b: &Budget) -> Value {
         "version": ver.as_ref().map(|v| v["version"].clone()).unwrap_or(Value::Null),
         "rpcchainvm": ver.as_ref().map(|v| v["rpcProtocolVersion"].clone()).unwrap_or(Value::Null),
         "network_id": network_id,
-        "expected_network_id": expected_metal_network(cfg.ceremony.chain_id.as_deref()),
+        "expected_network_id": cfg.target.expected_metal_network(cfg.ceremony.chain_id.as_deref()),
         "peers": peer_n,
         "bootstrapped": {"P": boot("P"), "X": boot("X"), "C": boot("C")},
         "healthy": metal_healthy(b, &base),
-        "staking_reachable": staking_reachable(cfg, b),
+        // Mission control can only dial a public network's staking port; a private network's (rehearsal) is
+        // firewalled to its own validators by design, so it is not asked.
+        "staking_reachable": if private_metal(cfg) { Value::Null } else { json!(staking_reachable(cfg, b)) },
     })
 }
 
@@ -266,14 +273,20 @@ fn unit_state(unit: &str) -> String {
 }
 
 /// Stable per-server identity for mission control (so two servers can never overwrite each
-/// other, whatever their display labels). 16 random bytes, generated once. Looked up next to
-/// the token file first (installers may create it), then in the journal directory (the one
-/// place the sandboxed beacon may write); if neither can be written, derived from the token.
+/// other, whatever their display labels). It must be the same for one token on one machine
+/// whatever config or run directory the beacon is started with: the fleet rehearsal (rc.22) wrote
+/// it into the journal directory, so every new run directory reported a NEW instance for the same
+/// token, the relay flagged the token as conflicted and the fleet gate read 0/5.
+///
+/// Order: `beacon.instance` next to the token file (the installers create it there); else the id
+/// derived from this machine's id and the token, persisted next to the token file when that
+/// directory is writable (a read-only one, e.g. a sandboxed unit, computes the same id without the
+/// file). Never the journal directory. A preview (no url) gets an ephemeral id and persists nothing.
 pub fn instance_id(cfg: &Config) -> String {
-    let token_dir = cfg.beacon.as_ref().and_then(|b| b.token_file.as_ref()).and_then(|p| p.parent().map(Path::to_path_buf));
-    let journal_dir = cfg.journal_path.parent().map(Path::to_path_buf);
+    let token_file = cfg.beacon.as_ref().and_then(|b| b.token_file.as_ref());
+    let token_dir = token_file.and_then(|p| p.parent().map(Path::to_path_buf));
     let valid = |s: &str| s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit());
-    for dir in [token_dir.as_ref(), journal_dir.as_ref()].into_iter().flatten() {
+    if let Some(dir) = token_dir.as_ref() {
         if let Ok(t) = std::fs::read_to_string(dir.join("beacon.instance")) {
             let t = t.trim().to_lowercase();
             if valid(&t) {
@@ -289,17 +302,54 @@ pub fn instance_id(cfg: &Config) -> String {
     if random && !persist {
         return hex::encode(buf);
     }
-    if random {
-        let id = hex::encode(buf);
-        if let Some(dir) = journal_dir.as_ref() {
-            let _ = std::fs::create_dir_all(dir);
-            if std::fs::write(dir.join("beacon.instance"), format!("{id}\n")).is_ok() {
-                return id;
+    if let Some(dir) = token_dir.as_ref().filter(|d| d.is_dir()) {
+        // The persisted id is the DERIVED one (not random): a process that cannot write here (an unprivileged
+        // beacon next to a root ceremony, or the reverse) computes the same id, so the agent's self-match in
+        // the resume guard agrees with what its beacon reports (rc.23 review).
+        let id = derived_instance_id(token_file);
+        let path = dir.join("beacon.instance");
+        // create_new: two beacons starting at once must not overwrite each other's id; the loser
+        // reads the winner's.
+        let wrote = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{id}\n").as_bytes()));
+        if wrote.is_ok() {
+            return id;
+        }
+        if let Ok(t) = std::fs::read_to_string(&path) {
+            let t = t.trim().to_lowercase();
+            if valid(&t) {
+                return t;
             }
         }
     }
-    let token = cfg.beacon.as_ref().and_then(|b| b.token_file.as_ref()).and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-    hex::encode(&Sha256::digest(format!("pulse-cutover-instance:{}", token.trim()).as_bytes())[..16])
+    derived_instance_id(token_file)
+}
+
+/// This node's instance id without writing anything: the file next to the token, else the derived id
+/// (what `instance_id` would persist). None without a beacon identity (url + token) to derive from.
+pub fn instance_id_readonly(cfg: &Config) -> Option<String> {
+    let b = cfg.beacon.as_ref().filter(|b| !b.url.is_empty())?;
+    let token_file = b.token_file.as_ref()?;
+    if let Some(t) = token_file.parent().and_then(|d| std::fs::read_to_string(d.join("beacon.instance")).ok()) {
+        let t = t.trim().to_lowercase();
+        if t.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(t);
+        }
+    }
+    Some(derived_instance_id(Some(token_file)))
+}
+
+/// The file-less fallback: sha256 over this machine's id and the token. Stable for one token on
+/// one machine (any config, any run directory); two machines sharing a token still differ, so the
+/// relay keeps flagging that as a conflict.
+fn derived_instance_id(token_file: Option<&PathBuf>) -> String {
+    let token = token_file.and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let machine = ["/etc/machine-id", "/var/lib/dbus/machine-id"].iter()
+        .find_map(|p| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+        .or_else(|| std::process::Command::new("hostname").output().ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty()))
+        .unwrap_or_default();
+    hex::encode(&Sha256::digest(format!("pulse-cutover-instance:{machine}:{}", token.trim()).as_bytes())[..16])
 }
 
 /// Incremental journal reader state: the beacon runs every few seconds against a journal that
@@ -329,6 +379,18 @@ struct Acc {
     target_subnet_id: Option<String>,
     /// The chain id the target presented at IGNITED (the post-LIVE watch fails if it changes).
     target_chain_id: Option<String>,
+    /// rc.23: chain creation (or a join of an existing target chain) was started on this box: the fleet
+    /// must treat this member as past the point where resuming the old chain is safe.
+    create_started: bool,
+    /// rc.23: the last ABORTED resumed the old chain (producer resumed / source restarted).
+    source_resumed: bool,
+    /// rc.23: the ceremony is waiting out a post-ignition symptom because the fleet is live (reason).
+    degraded: Option<String>,
+    /// rc.23: this ceremony joined a target chain other members created (`pulse-cutover join`).
+    joined: bool,
+    /// rc.23 review #3: an abort intent was journaled (the agent is about to resume the old chain once
+    /// the guard passes again): peers' gates must not count this node's VERIFIED any more.
+    aborting: bool,
 }
 
 static JOURNALS: Mutex<Option<HashMap<PathBuf, Acc>>> = Mutex::new(None);
@@ -376,6 +438,24 @@ fn apply_line(acc: &mut Acc, v: &Value) {
     if matches!(d["side_effect"].as_str(), Some("ignite_started" | "ignite")) {
         acc.ignition_started = true;
     }
+    if matches!(d["side_effect"].as_str(), Some("create_chain" | "join")) {
+        acc.create_started = true;
+    }
+    if d["side_effect"].as_str() == Some("join") {
+        acc.joined = true;
+    }
+    if d["rollback_step"].as_str() == Some("resume") && d["ok"].as_bool() == Some(true) {
+        acc.source_resumed = true;
+    }
+    if let Some(sym) = d["degraded"]["symptom"].as_str() {
+        acc.degraded = Some(sym.to_string());
+    }
+    if d["abort_intent"].as_bool() == Some(true) {
+        acc.aborting = true;
+    }
+    if d["degraded_cleared"].as_bool() == Some(true) {
+        acc.degraded = None;
+    }
     if d["rollback_done"].as_bool() == Some(true) {
         acc.rollback_complete = Some(true);
     }
@@ -397,6 +477,11 @@ fn apply_line(acc: &mut Acc, v: &Value) {
     match v["kind"].as_str() {
         Some("transition") => {
             acc.state = v["state"].clone();
+            acc.degraded = None;
+            acc.aborting = false;
+            // A resumed old chain is about the last ABORTED; any later state (e.g. a join) is not on it.
+            acc.source_resumed = v["state"].as_str() == Some("ABORTED")
+                && (acc.source_resumed || d["source_producer_resumed"].as_bool() == Some(true) || d.get("source_restarted").is_some());
             if matches!(v["state"].as_str(), Some("IGNITED" | "FLIPPED" | "LIVE" | "HALTED")) {
                 acc.ignition_started = true;
             }
@@ -423,9 +508,11 @@ fn apply_line(acc: &mut Acc, v: &Value) {
                     put(ev, "cut_height", &d["cut_height"]);
                     put(ev, "cut_block_id", &d["cut_block_id"]);
                     put(ev, "burnoff_transactions", &d["burnoff_transactions"]);
+                    put(ev, "head_at_pause", &d["head_at_pause"]);
                 }
                 Some("VERIFIED") => {
                     put(ev, "snapshot_sha256", &d["sha256"]);
+                    put(ev, "boot_genesis_sha256", &d["boot_genesis_sha256"]);
                     if d["fingerprints"].is_object() {
                         let canon = serde_json::to_string(&d["fingerprints"]).unwrap_or_default();
                         // Full 256-bit digest: a shortened one would let different state collide.
@@ -443,8 +530,8 @@ fn apply_line(acc: &mut Acc, v: &Value) {
                     acc.live_ts_ms = v["ts_ms"].as_u64();
                     put(ev, "write_gap_ms", &d["write_gap_ms_wallclock"]);
                 }
-                // rc.7: the HALTED transition itself carries the reason (one durable record).
-                Some("HALTED") => {
+                // rc.7: the HALTED (rc.23: STRANDED) transition itself carries the reason (one durable record).
+                Some("HALTED" | "STRANDED") => {
                     if let Some(m) = d["message"].as_str() {
                         acc.last_error = Some(m.to_string());
                     }
@@ -507,7 +594,13 @@ pub fn journal_summary(path: &Path) -> Value {
            "live_ts_ms": acc.live_ts_ms,
            "target_blockchain_id": acc.target_blockchain_id,
            "target_subnet_id": acc.target_subnet_id,
-           "target_chain_id": acc.target_chain_id})
+           "target_chain_id": acc.target_chain_id,
+           "create_started": acc.create_started,
+           "source_resumed": acc.source_resumed,
+           "degraded": acc.degraded.is_some(),
+           "degraded_reason": acc.degraded.as_deref().map(sanitize_short),
+           "joined": acc.joined,
+           "aborting": acc.aborting})
 }
 
 /// Coordination status for the report, with free-text fields sanitized.
@@ -530,7 +623,7 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         || (state == "ABORTED" && journal["ignition_started"].as_bool() == Some(true));
     // From VERIFIED on, the staged snapshot is supposed to exist, and ignition restarts the
     // validator: judge those checks by phase, not by the pre-ceremony rule.
-    let past_verify = past_ignite || state == "VERIFIED";
+    let past_verify = past_ignite || state == "VERIFIED" || state == "STRANDED";
     let in_ignite = matches!(state.as_str(), "VERIFIED" | "IGNITED");
     let skipped = || "skipped (collection time budget exhausted)".to_string();
 
@@ -645,16 +738,19 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
             let peers = metal["peers"].as_u64().unwrap_or(0);
             let (net, want) = (metal["network_id"].as_u64(), metal["expected_network_id"].as_u64());
             let net_ok = match (net, want) { (Some(n), Some(w)) => n == w, _ => true };
+            let private = if private_metal(cfg) { " · private network (rehearsal)" } else { "" };
             let detail = if !net_ok {
-                format!("on Metal network {}, this chain moves to network {}", net.unwrap_or(0), want.unwrap_or(0))
+                format!("on Metal network {}, this target is configured for network {}", net.unwrap_or(0), want.unwrap_or(0))
             } else if p {
-                format!("P-Chain synced · {peers} peers")
+                format!("P-Chain synced · {peers} peers{private}")
             } else {
                 format!("P-Chain syncing · {peers} peers")
             };
             checks.push(check("metal_synced", p && net_ok, detail));
             // Visible even when unknown: an untested staking port is not a ready one.
             match metal["staking_reachable"].as_bool() {
+                _ if private_metal(cfg) => checks.push(check("metal_reachable", true, format!(
+                    "private Metal network {}: staking port not probed from the internet", cfg.target.metal_network_id.unwrap_or(0)))),
                 Some(r) => checks.push(check("metal_reachable", r, if r { "port 9651 reachable from the internet" } else { "port 9651 not reachable from the internet" })),
                 None => checks.push(check("metal_reachable", false, "not tested yet")),
             }
@@ -692,6 +788,13 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
                 }
             }
         }
+    }
+    // Once a target may exist: what the fleet verdict compares (rc.23). The chain's Metal ids are public.
+    let may_have_target = past_ignite || journal["create_started"].as_bool() == Some(true)
+        || journal["target_blockchain_id"].is_string();
+    if may_have_target {
+        let view = crate::live_watch::target_view(cfg, &journal, budget.agent(Duration::from_secs(2)).as_ref());
+        journal["target"] = view;
     }
     if let Some(o) = journal.as_object_mut() {
         for k in ["armed_ts_ms", "live_ts_ms", "target_blockchain_id", "target_subnet_id", "target_chain_id"] {
@@ -809,6 +912,42 @@ mod tests {
         assert!(s2.get("last_error").is_none());
     }
 
+    /// rc.23: what the fleet verdict needs from the journal: chain creation started, the old chain resumed
+    /// by the last ABORTED (and forgotten once a later state follows), a degraded wait and its end, a join.
+    #[test]
+    fn journal_summary_reports_create_resume_degraded_and_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.jsonl");
+        let mut seq = 0u64;
+        let mut add = |kind: &str, state: &str, data: Value| {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p).unwrap();
+            writeln!(f, "{}", json!({"seq": seq, "ts_ms": 1000 + seq, "ts": "t", "kind": kind, "state": state, "data": data})).unwrap();
+            seq += 1;
+        };
+        add("transition", "VERIFIED", json!({"sha256": "ff", "boot_genesis_sha256": "ab".repeat(32)}));
+        let s = journal_summary(&p);
+        assert_eq!(s["create_started"], false);
+        assert_eq!(s["evidence"]["boot_genesis_sha256"], "ab".repeat(32));
+        add("transition", "ABORTED", json!({"source_producer_resumed": true, "reverts_ok": true}));
+        add("evidence", "ABORTED", json!({"rollback_step": "resume", "ok": true}));
+        assert_eq!(journal_summary(&p)["source_resumed"], true);
+        add("evidence", "ABORTED", json!({"side_effect": "join"}));
+        add("evidence", "ABORTED", json!({"target_blockchain_id": "X"}));
+        add("transition", "VERIFIED", json!({"joined": true}));
+        let s = journal_summary(&p);
+        assert_eq!(s["source_resumed"], false, "a later state is not on the old chain any more");
+        assert_eq!(s["create_started"], true);
+        assert_eq!(s["joined"], true);
+        add("transition", "IGNITED", json!({}));
+        add("evidence", "IGNITED", json!({"degraded": {"symptom": "post_ignite hook failed: `/opt/h.sh` exited 1", "site": "post_ignite"}}));
+        let s = journal_summary(&p);
+        assert_eq!(s["degraded"], true);
+        assert!(!s["degraded_reason"].as_str().unwrap().contains("/opt"));
+        add("evidence", "IGNITED", json!({"degraded_cleared": true}));
+        assert_eq!(journal_summary(&p)["degraded"], false);
+    }
+
     #[test]
     fn hook_ready_resolves_bare_names_on_path_and_rejects_missing() {
         assert!(hook_ready("sh -c true").0, "sh is on PATH");
@@ -860,6 +999,83 @@ on_live = "true"
             json!({"seq": 0, "ts_ms": 1, "ts": "t", "kind": "transition", "state": "SNAPSHOTTED", "data": {"cut_height": 4242}}))).unwrap();
         let c = fh(&cfg);
         assert!(c["detail"].as_str().unwrap().contains("4242"), "{c}");
+    }
+
+    fn beacon_cfg(dir: &Path, journal_dir: &Path, token_dir: &Path, url: &str) -> Config {
+        std::fs::create_dir_all(token_dir).unwrap();
+        std::fs::write(token_dir.join("beacon.token"), "tok-1\n").unwrap();
+        let text = format!(r#"
+journal_path = "{j}/journal.jsonl"
+[ceremony]
+profile = "readiness"
+[source]
+rpc_url = "http://127.0.0.1:9"
+producer_api_url = "http://127.0.0.1:9"
+[snapshot]
+staged_path = "{j}/staged.bin"
+[target]
+metalgo_unit = "metalgo-none"
+rpc_url = "http://127.0.0.1:9/ext/bc/X/rpc"
+[beacon]
+url = "{url}"
+producer = "bp1"
+network = "rehearsal"
+token_file = "{t}/beacon.token"
+"#, j = journal_dir.display(), t = token_dir.display());
+        let p = dir.join(format!("b-{}.toml", journal_dir.file_name().unwrap().to_string_lossy()));
+        std::fs::write(&p, text).unwrap();
+        Config::load_for_report(&p).unwrap()
+    }
+
+    /// Fleet rehearsal §4.1: each new run directory created a new instance id for the same token
+    /// (it was persisted in the journal directory), and the relay flagged the token as conflicted.
+    #[test]
+    fn instance_id_is_stable_across_run_directories_and_never_written_to_the_journal_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokens = dir.path().join("etc");
+        let a = beacon_cfg(dir.path(), &dir.path().join("run-1"), &tokens, "https://mc.example/api/report");
+        let b = beacon_cfg(dir.path(), &dir.path().join("run-2"), &tokens, "https://mc.example/api/report");
+        let id = instance_id(&a);
+        assert_eq!(id.len(), 32);
+        assert_eq!(instance_id(&b), id, "a second run directory reuses the id kept next to the token");
+        assert_eq!(std::fs::read_to_string(tokens.join("beacon.instance")).unwrap().trim(), id);
+        assert_eq!(id, derived_instance_id(Some(&tokens.join("beacon.token"))),
+            "the persisted id is the derived one: a process that cannot write the file (root ceremony vs unprivileged beacon) agrees");
+        assert!(!dir.path().join("run-1").join("beacon.instance").exists());
+        assert!(!dir.path().join("run-2").join("beacon.instance").exists());
+        // An id left in a journal directory by rc.22 or older is ignored (it differs per run).
+        std::fs::create_dir_all(dir.path().join("run-3")).unwrap();
+        std::fs::write(dir.path().join("run-3").join("beacon.instance"), format!("{}\n", "0".repeat(32))).unwrap();
+        let c = beacon_cfg(dir.path(), &dir.path().join("run-3"), &tokens, "https://mc.example/api/report");
+        assert_eq!(instance_id(&c), id);
+    }
+
+    #[test]
+    fn instance_id_without_a_writable_token_dir_is_derived_and_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokens = dir.path().join("ro");
+        let a = beacon_cfg(dir.path(), &dir.path().join("run-1"), &tokens, "https://mc.example/api/report");
+        // The token file sits in a directory the beacon cannot write (a sandboxed unit's /etc).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tokens, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let b = beacon_cfg(dir.path(), &dir.path().join("run-2"), &dir.path().join("ro"), "https://mc.example/api/report");
+        let (x, y) = (instance_id(&a), instance_id(&b));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tokens, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        if !tokens.join("beacon.instance").exists() {
+            assert_eq!(x, y, "the derived id is the same for every run directory");
+            assert_eq!(x, derived_instance_id(Some(&tokens.join("beacon.token"))));
+        }
+        assert!(!dir.path().join("run-1").join("beacon.instance").exists());
+        // Another token on the same machine is another server.
+        std::fs::write(dir.path().join("other.token"), "tok-2\n").unwrap();
+        assert_ne!(derived_instance_id(Some(&dir.path().join("other.token"))), derived_instance_id(Some(&tokens.join("beacon.token"))));
     }
 
     #[test]

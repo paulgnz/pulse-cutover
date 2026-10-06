@@ -76,6 +76,17 @@ pub struct Machine<'a, O: ChainOps> {
     accepted_target_chain_id: Option<String>,
     /// Upstream backend: boot artifact hashes journaled at VERIFIED (manifest, genesis, config).
     boot_hashes: (Option<String>, Option<String>, Option<String>),
+    /// rc.23: this ceremony is joining a target chain other roster members created (`join`): no
+    /// fleet gate, no chain creation, no abort check before ignition (the fleet already committed);
+    /// past the point of no return (a failure halts).
+    joining: bool,
+    head_at_pause: Option<u64>,
+    /// rc.23: the post-ignition degraded wait (`degraded_continue`): when the first symptom was seen
+    /// (patience counts from there, across symptoms), the fleet's highest reported target head and
+    /// when it last moved, and the last journaled degraded note (journaled on change only).
+    degraded_since_ms: Option<u64>,
+    fleet_head: (u64, u64),
+    degraded_note: String,
 }
 
 /// What `pulse-cutover rollback` did. `failed` lists every step that did not succeed; the
@@ -176,6 +187,16 @@ fn coordinator_abort_state<O: ChainOps>(cfg: &Config, ops: &O, last: &mut u64, f
     }
 }
 
+/// The target chain ids from the last journaled `join` record (blockchain_id, subnet_id).
+fn journaled_join_ids(path: &std::path::Path) -> Option<(String, Option<String>)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().rev().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find_map(|v| {
+            let j = &v["data"]["join"];
+            j["blockchain_id"].as_str().map(|b| (b.to_string(), j["subnet_id"].as_str().map(str::to_string)))
+        })
+}
+
 impl<'a, O: ChainOps> Machine<'a, O> {
     pub fn new(cfg: &'a Config, ops: &'a O, journal: Journal, recovered: Recovered) -> Self {
         let resumed = recovered.state.is_some();
@@ -193,7 +214,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let aborted_rollback_complete = recovered.aborted_rollback_complete;
         let rollback_steps_done = recovered.rollback_steps_done.clone();
         let rollback_pending = recovered.rollback_pending;
-        let create_chain_started = recovered.side_effects.iter().any(|s| s == "create_chain");
+        let joining = recovered.side_effects.iter().any(|s| s == "join");
+        let create_chain_started = recovered.side_effects.iter().any(|s| s == "create_chain") || joining;
         Machine {
             cfg,
             ops,
@@ -228,6 +250,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             create_chain_started,
             accepted_target_chain_id: recovered.accepted_target_chain_id,
             boot_hashes: (recovered.boot_manifest_sha256, recovered.boot_genesis_sha256, recovered.boot_chain_config_sha256),
+            joining,
+            head_at_pause: recovered.head_at_pause,
+            degraded_since_ms: recovered.degraded_since_ms,
+            fleet_head: (0, 0),
+            degraded_note: String::new(),
         }
     }
 
@@ -276,6 +303,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.journal.path().display()
             ));
         }
+        if self.state == State::Stranded {
+            return Err(self.stranded_message());
+        }
         if self.resumed && self.reached_ignited && !self.unhalted && matches!(self.state, State::Armed | State::Frozen | State::Snapshotted | State::Verified) {
             // The previous run journaled `ignite_started` and died before IGNITED: the target may
             // be running. Continuing (re-igniting) or rolling back are both unsafe to decide locally.
@@ -295,7 +325,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                        "fix": "find the chain on the P-Chain by its genesis hash; a fleet-wide decision either journals its id and continues, or retires it and rolls back with --force-after-ignite"}),
             )?;
         }
-        if self.resumed && !matches!(self.state, State::Live | State::Aborted) {
+        if self.resumed && !matches!(self.state, State::Live | State::Aborted | State::Stranded) {
             // A recovered run gets the same invariant checks as a fresh one (minus the ones
             // that are legitimately stale mid-ceremony, like "H is in the future").
             let info = self.ops.source_info();
@@ -374,6 +404,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 State::Flipped => self.step_flipped()?,
                 State::Live | State::Aborted => return Ok(self.state),
                 State::Halted => return Err(format!("HALTED at {}", self.state)),
+                State::Stranded => return Err(self.stranded_message()),
             }
         }
     }
@@ -673,6 +704,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     None => true,
                 };
                 matches!(c["state"].as_str(), Some("VERIFIED" | "IGNITED" | "FLIPPED" | "LIVE"))
+                    // rc.23: a member withdrawing its VERIFIED report before resuming its source never counts.
+                    && c["aborting"].as_bool() != Some(true)
                     && same("snapshot_sha256")
                     && same("fingerprints_digest")
                     && event_ok
@@ -813,6 +846,39 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// rollback actions (not gated on `target.auto_rollback`: the operator asked for them).
     /// Err = refused/nothing changed (message starts with "refusing") or a journal I/O error.
     pub fn operator_rollback(&mut self, force: bool) -> Result<RollbackOutcome, String> {
+        self.operator_rollback_opts(force, false)
+    }
+
+    /// `operator_rollback`, plus rc.23's STRANDED rule: a stranded journal is rolled back (the old chain
+    /// resumed) only if the resume guard passes now, or with
+    /// `force_stranded` (an operator's record of a fleet-wide decision, journaled).
+    pub fn operator_rollback_opts(&mut self, force: bool, force_stranded: bool) -> Result<RollbackOutcome, String> {
+        if self.state == State::Stranded {
+            if force_stranded {
+                // The fleet view being overridden is journaled with the override (review #10).
+                let co = self.cfg.coordination.clone();
+                let status = self.fleet_status();
+                let me = self.me();
+                let view = co.as_ref().map(|co| {
+                    let members: Vec<_> = status.as_ref().map(|st| crate::fleet::members(st, co)).unwrap_or_default().into_iter()
+                        .map(|m| json!({"producer": m.producer, "state": m.last.as_ref().map(|r| r["ceremony"]["state"].clone()),
+                            "fresh": m.report.is_some(), "missing": m.missing, "conflict": m.conflict, "max_past": m.max_past})).collect();
+                    let signed = co.event_id.as_deref().is_some_and(|e| crate::coord::is_tombstoned(self.cfg, e));
+                    json!({"relay_answered": status.is_some(), "members": members,
+                        "guard": match crate::fleet::resume_guard(status.as_ref(), co, me.as_ref().map(|(p, i)| (p.as_str(), i.as_str())), signed) {
+                            Ok(_) => "would pass".to_string(), Err(why) => why }})
+                });
+                self.journal.evidence(self.state, json!({"resume_guard": "overridden by the operator (--force-stranded --i-understand)",
+                    "overridden_fleet_view": view,
+                    "by": std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "unknown".into())}))?;
+            } else if self.cfg.coordination.as_ref().is_some_and(|c| c.event_id.is_some()) {
+                if let Err(why) = self.resume_guard()? {
+                    return Err(format!(
+                        "refusing to roll back a STRANDED ceremony: {why}. Nothing was changed. If the fleet went LIVE, \
+                         use `pulse-cutover join`; after a fleet-wide decision to resume the old chain, re-run with --force-stranded."));
+                }
+            }
+        }
         let past = self.past_point_of_no_return();
         let mut notes = vec![];
         // FIRST, on every path (including "already rolled back"): an agent killed mid-hook or mid
@@ -930,9 +996,152 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return self.halt(reason, detail);
         }
         let perform = self.cfg.target.auto_rollback;
+        // rc.23 (fleet run r4): a coordinated producer that froze writes resumes the OLD chain only when the
+        // resume guard passes (fleet::resume_guard: nobody past chain creation, and the quorum unreachable
+        // without this node, or a signed abort with every member accounted for). Otherwise it is STRANDED:
+        // sealed, writes stay frozen. Two phases (review #3): after a first pass, the abort intent is
+        // journaled (the beacon then stops presenting this node as VERIFIED), the agent waits until the
+        // relay shows that (or until its last VERIFIED report is too old for any peer's gate to count),
+        // and only a second pass of the guard lets it resume.
+        if perform && self.needs_resume_guard() {
+            if let Err(why) = self.resume_guard()? {
+                return self.strand(reason, detail, &why);
+            }
+            self.journal.evidence(self.state, json!({"abort_intent": true, "reason": reason,
+                "note": "withdrawing this node's VERIFIED report before resuming the old chain"}))?;
+            self.wait_own_report_withdrawn()?;
+            if let Err(why) = self.resume_guard()? {
+                return self.strand(reason, detail, &why);
+            }
+        }
         let (failed, _notes) = self.rollback_steps(reason, detail, perform, false)?;
         if !failed.is_empty() {
             eprintln!("ABORTED, but the rollback is INCOMPLETE: {}", failed.join("; "));
+        }
+        Ok(())
+    }
+
+    /// The resume guard applies to a coordinated producer whose source this ceremony froze (FROZEN to
+    /// VERIFIED): peers of the same event may be creating or igniting the target.
+    fn needs_resume_guard(&self) -> bool {
+        self.cfg.ceremony.mode == Mode::Producer
+            && self.cfg.coordination.as_ref().is_some_and(|c| c.event_id.is_some())
+            && matches!(self.state, State::Frozen | State::Snapshotted | State::Verified)
+    }
+
+    /// This node as the relay knows it: (beacon producer, beacon instance id).
+    fn me(&self) -> Option<(String, String)> {
+        self.cfg.beacon.as_ref().map(|b| (b.producer.clone(), crate::beacon::instance_id(self.cfg)))
+    }
+
+    /// The relay's `/api/status`, retried for up to ~10 s (None = it did not answer).
+    fn fleet_status(&self) -> Option<serde_json::Value> {
+        let co = self.cfg.coordination.as_ref()?;
+        let url = format!("{}/api/status", co.url.trim_end_matches('/'));
+        for i in 0..5 {
+            if let Ok(Some(doc)) = self.ops.get_json(&url) {
+                if doc.is_object() {
+                    return Some(doc);
+                }
+            }
+            if i < 4 {
+                self.ops.sleep_ms(2000);
+            }
+        }
+        None
+    }
+
+    /// Phase 2 of a guarded resume: wait until the relay shows this node's own report as no longer
+    /// VERIFIED (state moved on, or `aborting`), at most `report_max_age_secs` (after that no peer's gate
+    /// counts the old report anyway: it is stale).
+    fn wait_own_report_withdrawn(&mut self) -> Result<(), String> {
+        let co = self.cfg.coordination.clone().expect("checked by needs_resume_guard");
+        let me = self.me();
+        let event = co.event_id.clone().unwrap_or_default();
+        let deadline = self.ops.now_ms() + co.report_max_age_secs * 1000;
+        let url = format!("{}/api/status", co.url.trim_end_matches('/'));
+        loop {
+            if let (Some((prod, inst)), Ok(Some(doc))) = (me.as_ref(), self.ops.get_json(&url)) {
+                let mine = doc["networks"].as_array().into_iter().flatten()
+                    .filter(|n| n["id"].as_str() == Some(co.network.as_str()))
+                    .flat_map(|n| n["producers"].as_array().cloned().unwrap_or_default())
+                    .filter(|p| p["name"].as_str() == Some(prod.as_str()))
+                    .flat_map(|p| p["beacons"].as_array().cloned().unwrap_or_default())
+                    .map(|b| b["report"].clone())
+                    .filter(|r| r["coord"]["event_id"].as_str() == Some(event.as_str()) && r["instance_id"].as_str().is_none_or(|i| i == inst))
+                    .collect::<Vec<_>>();
+                if !mine.is_empty() && mine.iter().all(|r| r["ceremony"]["state"].as_str() != Some("VERIFIED")
+                    || r["ceremony"]["aborting"].as_bool() == Some(true)) {
+                    self.journal.evidence(self.state, json!({"own_report_withdrawn": "the relay shows this node aborting"}))?;
+                    // Re-check #2: a peer that journaled create_chain just before may not have REPORTED it yet.
+                    // Wait one beacon cycle (its interval, at least 10 s) before the second guard pass.
+                    let interval = self.cfg.beacon.as_ref().map(|b| b.interval_secs).unwrap_or(5);
+                    let settle_ms = interval.max(10) * 1000;
+                    let until = self.ops.now_ms() + settle_ms;
+                    while self.ops.now_ms() < until {
+                        self.ops.sleep_ms(1000);
+                    }
+                    self.journal.evidence(self.state, json!({"settle_before_second_guard_ms": settle_ms}))?;
+                    return Ok(());
+                }
+            }
+            if self.ops.now_ms() > deadline {
+                self.journal.evidence(self.state, json!({"own_report_withdrawn": format!(
+                    "not seen on the relay; waited report_max_age_secs ({} s): the last VERIFIED report is now too old for any gate", co.report_max_age_secs)}))?;
+                return Ok(());
+            }
+            self.ops.sleep_ms(2000);
+        }
+    }
+
+    /// May the old chain be resumed? Ok(Ok(())) after journaling why; Ok(Err(why)) = no (fleet::resume_guard).
+    fn resume_guard(&mut self) -> Result<Result<(), String>, String> {
+        let co = self.cfg.coordination.clone().expect("checked by needs_resume_guard");
+        let event = co.event_id.clone().unwrap_or_default();
+        let status = self.fleet_status();
+        let signed_abort = crate::coord::is_tombstoned(self.cfg, &event)
+            || self.ops.get_json(&format!("{}/api/coord/{}", co.url.trim_end_matches('/'), co.network)).ok().flatten()
+                .is_some_and(|d| crate::coord::aborted(&d, &co.coordinator_keys, &co.network, &event));
+        let me = self.me();
+        let me_ref = me.as_ref().map(|(p, i)| (p.as_str(), i.as_str()));
+        match crate::fleet::resume_guard(status.as_ref(), &co, me_ref, signed_abort) {
+            Ok(ev) => {
+                self.journal.evidence(self.state, json!({"resume_guard": "clear", "signed_abort": signed_abort, "fleet": ev}))?;
+                Ok(Ok(()))
+            }
+            Err(why) => {
+                self.journal.evidence(self.state, json!({"resume_guard": "refused", "signed_abort": signed_abort, "why": why}))?;
+                Ok(Err(why))
+            }
+        }
+    }
+
+    fn stranded_message(&self) -> String {
+        format!(
+            "STRANDED (journaled): this producer stopped before its own chain creation but could not prove that no \
+             other roster member had started creation or ignition, so the old chain was NOT resumed and writes stay \
+             frozen. If the fleet went LIVE: `pulse-cutover join --config <file> --event <id>`. Otherwise: \
+             `pulse-cutover rollback --config <file>` (re-runs the resume guard; `--force-stranded --i-understand` only \
+             after a fleet-wide decision). Journal: {}",
+            self.journal.path().display()
+        )
+    }
+
+    /// STRANDED: like HALTED, nothing is rolled back (source paused, writes frozen, staged files kept);
+    /// `on_halt` pages a human.
+    fn strand(&mut self, reason: &str, detail: serde_json::Value, why: &str) -> Result<(), String> {
+        let from = self.state;
+        self.journal.error(self.state, reason, detail.clone())?;
+        self.state = State::Stranded;
+        self.journal.transition(State::Stranded, json!({
+            "stranded_from": from.as_str(), "reason": reason, "detail": detail,
+            "message": format!("STRANDED: {reason}; peers may have ignited ({why}): refusing to resume the source"),
+            "guard": why, "sealed": true, "source_resumed": false, "writes_reopened": false,
+            "clear_with": "pulse-cutover join --config <file> --event <id> (fleet LIVE) | pulse-cutover rollback --config <file> [--force-stranded]"}))?;
+        eprintln!("STRANDED at {from}: {reason}; peers may have ignited ({why}); refusing to resume the source");
+        if let Some(hook) = &self.cfg.hooks.on_halt {
+            let result = self.ops.run_hook(hook);
+            self.journal.evidence(State::Stranded, json!({"on_halt_hook": format!("{result:?}")}))?;
         }
         Ok(())
     }
@@ -2158,6 +2367,186 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Ok(true)
     }
 
+    /// rc.23 `pulse-cutover join --event <id>`: a producer that is STRANDED or ABORTED while a quorum of
+    /// the event's roster went LIVE on target chain X tracks and ignites X (no chain creation) and goes
+    /// through post_ignite / LIVE like any producer. Refused unless: the upstream backend in producer
+    /// mode, this event, this node reached VERIFIED with the same snapshot hash, fingerprints and
+    /// migration genesis the LIVE quorum reports, its boot artifacts are unchanged, and its source did
+    /// not produce past its journaled pause head nor carry any transaction after H. Everything checked
+    /// is journaled; from the `join` record on, a failure HALTS (never resumes the old chain).
+    pub fn join(&mut self, event_id: &str) -> Result<State, String> {
+        self.cfg.ensure_ceremony_profile()?;
+        let co = self.cfg.coordination.clone().ok_or("join needs the event's [coordination] config (the one `await` derived)")?;
+        if co.event_id.as_deref() != Some(event_id) {
+            return Err(format!("this config is for event {:?}, not {event_id}", co.event_id));
+        }
+        if self.cfg.ceremony.import_backend != ImportBackend::Upstream || self.cfg.ceremony.mode != Mode::Producer
+            || !self.cfg.upstream.as_ref().is_some_and(|u| u.ignite_configured(&self.cfg.target)) {
+            return Err("join supports producer mode on the upstream backend with ignition configured \
+                        (upstream.genesis_base + target.create_chain_cmd)".into());
+        }
+        if self.rollback_pending {
+            return Err("an operator rollback is pending on this journal: finish it first".into());
+        }
+        if self.joining {
+            // A join was committed (its `join` record is journaled) and the process died: finish it
+            // instead of refusing (review #5). Its checks passed when it committed.
+            return self.resume_join(event_id);
+        }
+        if !matches!(self.state, State::Stranded | State::Aborted) {
+            return Err(format!("join is for a STRANDED or ABORTED ceremony; this journal is {} (HALTED: use unhalt)", self.state));
+        }
+        if self.reached_ignited || self.target_blockchain_id.is_some() {
+            return Err("this node already started its own ignition or chain creation: not a join (operator decision)".into());
+        }
+        let (Some(h), Some(cut_id), Some(sha)) = (self.cut_height, self.cut_block_id.clone(), self.sha256.clone()) else {
+            return Err("this ceremony never reached VERIFIED (no cut / snapshot hash journaled): nothing to join with".into());
+        };
+        if self.boot_hashes.0.is_none() || self.boot_hashes.1.is_none() || self.boot_hashes.2.is_none() {
+            return Err("no boot artifacts journaled at VERIFIED: nothing to join with".into());
+        }
+        // 0. Writes frozen again (review #4): an ABORTED ceremony's on_abort reopened them on the old chain.
+        //    on_freeze is re-run (it must be idempotent, like every hook) before any other join step;
+        //    without it a join from ABORTED is refused. A STRANDED ceremony never reopened them.
+        let refrozen = self.state == State::Aborted;
+        if refrozen {
+            let Some(hook) = self.cfg.hooks.on_freeze.clone() else {
+                return Err("join refused: this ceremony ABORTED (on_abort reopened writes) and has no hooks.on_freeze to close \
+                            them again first. Nothing was changed.".into());
+            };
+            match self.ops.run_hook(&hook) {
+                Ok(o) => self.journal.evidence(self.state, json!({"join_refreeze": o, "note": "writes frozen again before the join"}))?,
+                Err(e) => {
+                    self.journal.evidence(self.state, json!({"join_refreeze_error": e}))?;
+                    return Err(self.join_refused_after_refreeze(format!("join refused: re-running on_freeze to close writes failed: {e}"))?);
+                }
+            }
+        }
+        let (bid, sid, members, info, paused_head, paused, ours) = match self.join_checks(&co, h) {
+            Ok(x) => x,
+            Err(e) if refrozen => return Err(self.join_refused_after_refreeze(e)?),
+            Err(e) => return Err(e),
+        };
+        // 4. Commit to the join (point of no return), then continue as a producer that verified.
+        let from = self.state;
+        self.journal.evidence(self.state, json!({"join": {"event_id": event_id, "blockchain_id": bid, "subnet_id": sid,
+            "live_members": members, "source_head": info.head_block_num, "head_at_pause": paused_head,
+            "burnoff_transactions": 0, "source_paused": paused, "evidence": ours}}))?;
+        if !paused {
+            self.ops.pause()?;
+            self.journal.evidence(self.state, json!({"join_paused_source": true}))?;
+        }
+        self.journal.evidence(self.state, json!({"side_effect": "join",
+            "point_of_no_return": "joining an existing target chain: any failure from here halts"}))?;
+        self.joining = true;
+        self.create_chain_started = true;
+        self.journal.evidence(self.state, json!({"target_blockchain_id": bid, "target_subnet_id": sid}))?;
+        self.target_blockchain_id = Some(bid);
+        self.target_subnet_id = sid;
+        let _ = (sha, cut_id);
+        self.join_to_verified(event_id, from)?;
+        self.bind_target_vars();
+        self.resumed = true;
+        self.run()
+    }
+
+    /// Steps 1-3 of a join: unchanged boot artifacts, a unique LIVE quorum with our evidence, a source
+    /// that did not move on after H. Changes nothing.
+    #[allow(clippy::type_complexity)]
+    fn join_checks(&mut self, co: &crate::config::Coordination, h: u64)
+        -> Result<(String, Option<String>, Vec<String>, crate::ops::ChainInfo, u64, bool, serde_json::Value), String> {
+        let up = self.cfg.upstream.clone().expect("checked");
+        let (manifest, genesis, chain_config) = upstream::boot_paths(&up, h);
+        for (what, path, want) in [("boot manifest", &manifest, &self.boot_hashes.0), ("migration genesis", &genesis, &self.boot_hashes.1),
+                                   ("chain config", &chain_config, &self.boot_hashes.2)] {
+            let got = verify::sha256_file(path).map(|(x, _)| x).ok();
+            if got.as_deref() != want.as_deref() {
+                return Err(format!("join refused: the {what} ({}) changed since VERIFIED", path.display()));
+            }
+        }
+        let ours = crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"].clone();
+        let status = self.fleet_status();
+        let (bid, sid, members) = crate::fleet::join_view(status.as_ref(), co, &ours).map_err(|e| format!("join refused: {e}"))?;
+        let info = self.ops.source_info().map_err(|e| format!("join refused: cannot read the source chain: {e}"))?;
+        let paused_head = self.head_at_pause.ok_or("join refused: no journaled pause head (the source was never paused at the cut)")?;
+        if info.head_block_num > paused_head {
+            return Err(format!(
+                "join refused: the source produced {} block(s) past the journaled pause head {paused_head} (head now {}): this node's \
+                 old chain continued after H (it may carry writes the new chain does not have). Operator decision.",
+                info.head_block_num - paused_head, info.head_block_num));
+        }
+        let mut txs = 0u64;
+        for n in (h + 1)..=info.head_block_num {
+            match self.ops.source_block_tx_count(n) {
+                Ok(c) => txs += c,
+                Err(e) => return Err(format!("join refused: the burn-off audit cannot read block {n}: {e}")),
+            }
+        }
+        if txs > 0 {
+            return Err(format!("join refused: {txs} transaction(s) on the source after H {h}"));
+        }
+        let paused = self.ops.producer_paused().map_err(|e| format!("join refused: producer API: {e}"))?;
+        Ok((bid, sid, members, info, paused_head, paused, ours))
+    }
+
+    /// A join from ABORTED that re-ran on_freeze and was then refused (re-check #3): writes are now FROZEN on
+    /// the old chain. Journaled as an incomplete rollback whose on_abort must run again, so `pulse-cutover
+    /// rollback` reopens them; the message says so.
+    fn join_refused_after_refreeze(&mut self, why: String) -> Result<String, String> {
+        self.journal.evidence(self.state, json!({"join_refused_after_refreeze": why, "writes_frozen": true}))?;
+        self.journal.evidence(self.state, json!({"rollback_incomplete": [
+            "a refused join froze writes on the old chain again (on_freeze): `pulse-cutover rollback` reopens them (re-runs on_abort)"],
+            "rollback_complete": false}))?;
+        Ok(format!(
+            "{why}\nWrites are now FROZEN on the old chain (the join re-ran on_freeze before its checks); the source \
+             producer was not touched. Either fix the cause and run `pulse-cutover join --config <file> --event <id>` \
+             again, or reopen writes on the old chain with `pulse-cutover rollback --config <file>` (it re-runs on_abort)."))
+    }
+
+    /// The VERIFIED transition a join continues from (carrying the verified evidence forward).
+    fn join_to_verified(&mut self, event_id: &str, from: State) -> Result<(), String> {
+        self.state = State::Verified;
+        self.journal.transition(State::Verified, json!({"joined": true, "joined_from": from.as_str(), "event_id": event_id,
+            "sha256": self.sha256, "cut_height": self.cut_height, "cut_block_id": self.cut_block_id, "chain_id": self.chain_id,
+            "boot_manifest_sha256": self.boot_hashes.0, "boot_genesis_sha256": self.boot_hashes.1,
+            "boot_chain_config_sha256": self.boot_hashes.2}))
+    }
+
+    /// Finish a join whose `join` record is journaled (crash-resume). If the process died before the
+    /// target chain's id was journaled, the id is read again from the fleet (the same LIVE-quorum rule);
+    /// then the VERIFIED transition (if missing) and the run continue. Never resumes the old chain.
+    fn resume_join(&mut self, event_id: &str) -> Result<State, String> {
+        self.journal.evidence(self.state, json!({"join_resumed": true, "state": self.state.as_str()}))?;
+        if self.target_blockchain_id.is_none() {
+            // The `join` record (journaled before the point of no return) names the chain: use it (re-check #3).
+            if let Some((bid, sid)) = journaled_join_ids(self.journal.path()) {
+                self.journal.evidence(self.state, json!({"join_resumed_ids_from": "the journaled join record"}))?;
+                self.journal.evidence(self.state, json!({"target_blockchain_id": bid, "target_subnet_id": sid}))?;
+                self.target_blockchain_id = Some(bid);
+                self.target_subnet_id = sid;
+            }
+        }
+        if self.target_blockchain_id.is_none() {
+            let co = self.cfg.coordination.clone().expect("checked by join");
+            let ours = crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"].clone();
+            let status = self.fleet_status();
+            let (bid, sid, members) = crate::fleet::join_view(status.as_ref(), &co, &ours)
+                .map_err(|e| format!("join resume: the target chain id was not journaled and cannot be re-read from the fleet ({e}); \
+                                      this ceremony is past its join (it will not resume the old chain): retry when the relay shows the LIVE quorum"))?;
+            self.journal.evidence(self.state, json!({"join_resumed_ids_from": members}))?;
+            self.journal.evidence(self.state, json!({"target_blockchain_id": bid, "target_subnet_id": sid}))?;
+            self.target_blockchain_id = Some(bid);
+            self.target_subnet_id = sid;
+        }
+        if matches!(self.state, State::Stranded | State::Aborted) {
+            let from = self.state;
+            self.join_to_verified(event_id, from)?;
+        }
+        self.bind_target_vars();
+        self.resumed = true;
+        self.run()
+    }
+
     /// VERIFIED: ignite the target and wait for it to present the source
     /// chain at the cut height.
     fn step_verified(&mut self) -> Result<(), String> {
@@ -2175,7 +2564,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(());
             }
         }
-        if !self.fleet_gate()? {
+        if !self.joining && !self.fleet_gate()? {
             return Ok(()); // aborted inside, with evidence
         }
         if upstream_backend && !self.upstream_create_chain()? {
@@ -2183,7 +2572,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         // Positive authorization right before ignition (fork backend: still pre-boundary, an abort
         // resumes the source; upstream: after chain creation, an abort here halts).
-        if !self.require_no_abort("ignition")? {
+        // A join tracks a chain a quorum already runs LIVE: an abort is not honoured after ignition, and
+        // the join checked the fleet itself.
+        if !self.joining && !self.require_no_abort("ignition")? {
             return Ok(());
         }
         let started = self.ops.now_ms();
@@ -2292,19 +2683,120 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Ok(())
     }
 
+    /// rc.23, after ignition: a LOCAL liveness symptom (a gap in the sustained-LIVE window, the head
+    /// not past the cut in time, a failing post_ignite / on_live hook) halted each BP on its own view
+    /// in every fleet rehearsal run, leaving LIVE and HALTED BPs on one target chain. With a coordinated
+    /// event this asks the fleet first: Ok(true) = keep waiting ("degraded", journaled and reported by
+    /// the beacon) because a quorum of the roster reports the SAME target chain (common block after
+    /// the cut, heads past it, the fleet's head still moving within `fleet_stall_secs`); Ok(false) =
+    /// halt now: no coordinated event, the fleet view does not show that (or the relay did not
+    /// answer), `degraded_patience_secs` since the first symptom ran out, or an operator created
+    /// `operator-halt` next to the journal (the explicit decision). Never reopens anything itself.
+    fn degraded_continue(&mut self, site: &str, symptom: &str) -> Result<bool, String> {
+        let Some(co) = self.cfg.coordination.clone().filter(|c| c.event_id.is_some()) else { return Ok(false) };
+        let state = self.state;
+        let end = |m: &mut Self, why: String| -> Result<bool, String> {
+            m.journal.evidence(state, json!({"degraded_end": why, "site": site, "symptom": symptom}))?;
+            Ok(false)
+        };
+        let halt_file = self.cfg.journal_path.parent().unwrap_or(std::path::Path::new(".")).join("operator-halt");
+        if halt_file.exists() {
+            return end(self, format!("operator decision ({} exists)", halt_file.display()));
+        }
+        let now = self.ops.now_ms();
+        let since = match self.degraded_since_ms {
+            Some(t) => t,
+            None => {
+                // Journaled: a crash and resume does not restart the patience (review #7).
+                self.journal.evidence(state, json!({"degraded_since_ms": now}))?;
+                self.degraded_since_ms = Some(now);
+                now
+            }
+        };
+        if now.saturating_sub(since) > co.degraded_patience_secs * 1000 {
+            return end(self, format!("patience exhausted ({} s since the first symptom)", co.degraded_patience_secs));
+        }
+        let Some(cut) = self.cut_height else { return Ok(false) };
+        // Retried like every other fleet read: one transient relay error is not "the fleet does not vouch".
+        let status = self.fleet_status();
+        let ours = self.ops.target_block_id(cut + 1).ok().flatten();
+        let v = crate::fleet::live_view(status.as_ref(), &co, cut, self.target_blockchain_id.as_deref(), ours.as_deref());
+        if !v.healthy {
+            return end(self, format!("the fleet view does not vouch for the chain: {}", v.why));
+        }
+        if v.max_head > self.fleet_head.0 {
+            self.fleet_head = (v.max_head, now);
+        } else if self.fleet_head.1 == 0 {
+            self.fleet_head.1 = now;
+        }
+        if now.saturating_sub(self.fleet_head.1) > co.fleet_stall_secs * 1000 {
+            return end(self, format!("the fleet's target head has not moved for {} s (head {})", co.fleet_stall_secs, v.max_head));
+        }
+        let note = format!("{site}: {symptom}");
+        if note != self.degraded_note {
+            self.journal.evidence(state, json!({"degraded": {"site": site, "symptom": note, "fleet": {"members": v.members,
+                "max_head": v.max_head, "after_cut_id": v.after_cut_id, "why": v.why},
+                "patience_left_secs": (co.degraded_patience_secs * 1000).saturating_sub(now.saturating_sub(since)) / 1000,
+                "note": "a quorum of the roster is on the same target chain: waiting out a local symptom instead of halting"}}))?;
+            eprintln!("DEGRADED ({site}): {symptom}; the fleet is live ({}): waiting", v.why);
+            self.degraded_note = note;
+        }
+        Ok(true)
+    }
+
+    /// A degraded wait ended well (the symptom cleared): journaled once.
+    fn degraded_cleared(&mut self, site: &str) -> Result<(), String> {
+        if !self.degraded_note.is_empty() {
+            self.journal.evidence(self.state, json!({"degraded_cleared": true, "site": site}))?;
+            self.degraded_note.clear();
+        }
+        Ok(())
+    }
+
+    /// Retry delay while degraded: `degraded_retry_secs`, doubling per attempt, at most 120 s.
+    fn degraded_backoff_ms(&self, attempt: u32) -> u64 {
+        let base = self.cfg.coordination.as_ref().map(|c| c.degraded_retry_secs).unwrap_or(10).max(1);
+        base.saturating_mul(1u64 << attempt.min(6)).min(120) * 1000
+    }
+
+    /// Run a required post-ignition hook; while degraded it is retried with backoff (hooks must be safe
+    /// to re-run: they already are re-run on resume). Ok(Some(output)), or Ok(None) after halting.
+    fn run_required_hook(&mut self, site: &str, hook: &str) -> Result<Option<String>, String> {
+        let mut attempt = 0u32;
+        loop {
+            match self.ops.run_hook(hook) {
+                Ok(o) => {
+                    if attempt > 0 {
+                        self.journal.evidence(self.state, json!({"hook_retry_succeeded": site, "attempts": attempt + 1}))?;
+                        self.degraded_cleared(site)?;
+                    }
+                    return Ok(Some(o));
+                }
+                Err(e) => {
+                    if self.degraded_continue(site, &format!("{site} hook failed: {e}"))? {
+                        self.ops.sleep_ms(self.degraded_backoff_ms(attempt));
+                        attempt += 1;
+                        continue;
+                    }
+                    let reason = if site == "on_live" { "on_live hook failed (writes may not be open on the new chain)" } else { "post_ignite hook failed" };
+                    self.abort(reason, json!({"error": e, "attempts": attempt + 1}))?;
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
     /// Required post-ignite hook. After IGNITED a failure halts (sealed) — never "journaled and
     /// carried on" (run 5: a non-executable hook let the ceremony continue without its checks).
+    /// rc.23: while the fleet is live on this chain, retried with backoff first (degraded).
     fn run_post_ignite(&mut self) -> Result<bool, String> {
         let Some(hook) = self.cfg.hooks.post_ignite.clone() else { return Ok(true) };
-        match self.ops.run_hook(&hook) {
-            Ok(o) => {
+        match self.run_required_hook("post_ignite", &hook)? {
+            Some(o) => {
                 self.journal.evidence(State::Ignited, json!({"post_ignite_hook": o}))?;
                 Ok(true)
             }
-            Err(e) => {
-                self.abort("post_ignite hook failed", json!({"error": e}))?;
-                Ok(false)
-            }
+            None => Ok(false),
         }
     }
 
@@ -2317,7 +2809,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(json!({"sustain_secs": 0}));
         }
         let max_gap_ms = self.cfg.target.live_max_gap_secs * 1000;
-        let start = self.ops.now_ms();
+        let mut start = self.ops.now_ms();
         let (mut last_head, mut last_change, mut worst_gap) = (0u64, start, 0u64);
         loop {
             // A gap is measured between OBSERVATIONS of progress, including RPC latency: a poll
@@ -2335,6 +2827,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             if gap > max_gap_ms {
                 self.journal.evidence(state, json!({"live_stall": {"head": last_head, "gap_ms": gap,
                     "poll_ms": poll_ms, "max_gap_ms": max_gap_ms, "into_sustain_ms": t1 - start}}))?;
+                if self.degraded_continue("sustain", &format!("no new target block for {} s (head {last_head})", gap / 1000))? {
+                    // The fleet is live on this chain: start the sustained window over.
+                    start = t1;
+                    last_change = t1;
+                    if advanced {
+                        last_head = info.map(|i| i.head_block_num).unwrap_or(last_head);
+                    }
+                    self.ops.sleep_ms(self.cfg.poll_ms);
+                    continue;
+                }
                 self.abort(
                     "target stalled during the sustained LIVE window",
                     json!({"head": last_head, "gap_ms": gap, "live_max_gap_secs": self.cfg.target.live_max_gap_secs}),
@@ -2349,6 +2851,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 last_change = t1;
             }
             if t1 - start >= sustain_ms {
+                self.degraded_cleared("sustain")?;
                 return Ok(json!({"sustain_secs": self.cfg.target.live_sustain_secs,
                                  "worst_gap_ms": worst_gap.max(t1.saturating_sub(last_change)), "head_at_end": last_head}));
             }
@@ -2361,15 +2864,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// never reached users.
     fn run_on_live(&mut self, state: State) -> Result<Option<serde_json::Value>, String> {
         let Some(hook) = self.cfg.hooks.on_live.clone() else { return Ok(Some(serde_json::Value::Null)) };
-        match self.ops.run_hook(&hook) {
-            Ok(o) => {
+        match self.run_required_hook("on_live", &hook)? {
+            Some(o) => {
                 self.journal.evidence(state, json!({"on_live_hook": o}))?;
                 Ok(Some(json!(o)))
             }
-            Err(e) => {
-                self.abort("on_live hook failed (writes may not be open on the new chain)", json!({"error": e}))?;
-                Ok(None)
-            }
+            None => Ok(None),
         }
     }
 
@@ -2731,11 +3231,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
         let started = self.ops.now_ms();
-        let deadline = started + self.cfg.target.quorum_timeout_secs * 1000;
+        let mut deadline = started + self.cfg.target.quorum_timeout_secs * 1000;
         let cut_height = self.cut_height.expect("cut pinned");
         let goal = cut_height + self.cfg.target.live_blocks;
+        let mut waits = 0u32;
         let info = loop {
             if self.ops.now_ms() > deadline {
+                if self.degraded_continue("live_gate", &format!("head not past {goal} within {} s", self.cfg.target.quorum_timeout_secs))? {
+                    deadline = self.ops.now_ms() + self.degraded_backoff_ms(waits);
+                    waits += 1;
+                    continue;
+                }
                 self.abort(
                     "target head did not advance past the cut (no quorum / no activity)",
                     json!({"goal": goal, "quorum_timeout_secs": self.cfg.target.quorum_timeout_secs}),
@@ -2749,6 +3255,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             self.ops.sleep_ms(self.cfg.poll_ms);
         };
+        self.degraded_cleared("live_gate")?;
         let reached_goal_ts = self.ops.now_ms();
         let sustained = self.sustain_live(State::Ignited)?;
         let Some(on_live) = self.run_on_live(State::Ignited)? else { return Ok(()) };

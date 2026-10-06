@@ -134,6 +134,7 @@ pulse-cutover run --config "$CONFIG" 2>&1 | while IFS= read -r line; do
     *"-> LIVE"*)        echo "[LIVE]        ceremony complete. Source retired. Same URL, same chain, new engine." ;;
     *"-> ABORTED"*)     echo "[ABORTED]     ceremony stopped before ignition and rolled back — the source chain is still the real one. The journal has the reason." ;;
     *"-> HALTED"*)      echo "[HALTED]      SEALED: ignition may have started, so nothing was rolled back. The coordinator decides for the fleet." ;;
+    *"-> STRANDED"*)    echo "[STRANDED]    SEALED: stopped before this node's chain creation, but peers may have ignited: the source was NOT resumed, writes stay frozen." ;;
     *) echo "  $line" ;;
   esac
 done
@@ -151,6 +152,10 @@ else
   echo "    restart the source on your own: the coordinator decides for the whole fleet, then either"
   echo "    'pulse-cutover unhalt --config $CONFIG --i-understand' (carry on) or"
   echo "    './cutover.sh abort --force-after-ignite' (fleet-wide rollback)."
+  echo "  - If STRANDED printed: it is SEALED. This node stopped before its own chain creation, but it could"
+  echo "    not prove that no other producer had created or ignited the new chain, so the old chain was NOT"
+  echo "    resumed. Check the fleet verdict on mission control. Fleet LIVE: 'pulse-cutover join --config"
+  echo "    $CONFIG --event <id>'. Otherwise: 'pulse-cutover rollback --config $CONFIG' (re-checks the fleet)."
   echo "Full evidence: $JOURNAL"
   echo "Next: run 'pulse-cutover report' — it builds a sanitized bundle (journal + doctor survey +"
   echo "service logs, keys auto-redacted) to attach to a GitHub issue or post in the Telegram group."

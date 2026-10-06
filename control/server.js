@@ -18,7 +18,7 @@ import { readFileSync, existsSync, watchFile, renameSync, mkdirSync, openSync, w
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isPublicIp, normIp, resolvePublic, limiter, safeRequest, probeProducerApi, safeJson, safeDecode, RE, UA, endpointId, endpointRef, reservedKey,
-  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth } from './lib.mjs';
+  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, pastCreate } from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = +(process.env.PORT ?? 8787);
@@ -370,6 +370,11 @@ function validCoordEntry(k, v) {
   }
   if ((out.arm || out.abort || out.complete) && !out.event) throw new Error(`${k}: arm/abort/complete without an event`);
   if (out.complete && !out.arm) throw new Error(`${k}: complete without an arm`);
+  if (v.split_latch !== undefined && v.split_latch !== null) {
+    const l = v.split_latch;
+    if (!l || typeof l !== 'object' || typeof l.event_id !== 'string' || !Array.isArray(l.alarms)) throw new Error(`${k}.split_latch: invalid`);
+    out.split_latch = { event_id: l.event_id, alarms: l.alarms.map((a) => String(a).slice(0, 400)).slice(0, 10), at: String(l.at || '') };
+  }
   if (v.history !== undefined && !Array.isArray(v.history)) throw new Error(`${k}.history: not an array`);
   out.history = (v.history || []).map((h, i) => { if (!h || typeof h !== 'object' || typeof h.event_id !== 'string') throw new Error(`${k}.history[${i}]: invalid`); return h; });
   if (v.used !== undefined && (!v.used || typeof v.used !== 'object' || Array.isArray(v.used))) throw new Error(`${k}.used: not an object`);
@@ -407,6 +412,13 @@ function commitCoord(next) {
 // report nor forget an identity conflict. Only the per-server chart history is memory-only.
 // A corrupt state file stops startup (same rule as the coordination store).
 const lastTs = dict();
+// Per network, per producer, PER EVENT ID: the highest ceremony stage reported for that event (rc.23 review #2).
+// Only ever raised; a report for another event id never touches it (a token holder bouncing its event id cannot
+// reset it), and replacing a silent instance never lowers it, so an agent's resume guard still sees a member that
+// once reported chain creation / ignition. Persisted with the server state; the last EVENT_MAX_KEEP event ids per
+// producer are kept.
+const eventMax = dict();
+const EVENT_MAX_KEEP = 20;
 const KEY_RE = /^[0-9a-f]{64}(:[0-9a-f]{32})?$/;
 function loadServerState() {
   if (existsSync(STATE_FILE)) {
@@ -425,6 +437,21 @@ function loadServerState() {
         }
       }
     }
+    if (j.event_max && typeof j.event_max === 'object') {
+      for (const [netId, prods] of Object.entries(j.event_max)) {
+        if (!RE.net.test(netId) || !prods || typeof prods !== 'object') continue;
+        for (const [prod, m] of Object.entries(prods)) {
+          if (!RE.producer.test(prod) || !m || typeof m !== 'object') continue;
+          // rc.23 first shape {event_id, past_create, state}; now {event_id: {past_create, state, at}}.
+          const byEvent = typeof m.event_id === 'string' ? { [m.event_id]: m } : m;
+          for (const [eid, x] of Object.entries(byEvent)) {
+            if (!/^[\w.:-]{1,64}$/.test(eid) || reservedKey(eid) || !x || typeof x.past_create !== 'boolean') continue;
+            ((eventMax[netId] ||= dict())[prod] ||= dict())[eid] = { past_create: x.past_create,
+              state: typeof x.state === 'string' ? x.state.slice(0, 16) : null, at: Number.isFinite(x.at) ? x.at : 0 };
+          }
+        }
+      }
+    }
     return;
   }
   // rc.6 kept only a replay watermark (written ~1 s after acknowledging): carry it over.
@@ -436,8 +463,10 @@ function loadServerState() {
 try { loadServerState(); }
 catch (e) { console.error(`servers: ${STATE_FILE} is unreadable or corrupt (${e.message}). Refusing to start: fix or restore it (deleting it forgets replay protection and identity conflicts).`); process.exit(3); }
 /** The whole server state with `override` = [netId, producer, byKey] swapped in (not yet live), as a plain object. */
-function serverSnapshot(override, lastOverride) {
-  const out = { v: 1, lastTs: { ...lastTs, ...(lastOverride || {}) }, nodes: {} };
+function serverSnapshot(override, lastOverride, emOverride) {
+  const em = JSON.parse(JSON.stringify(eventMax));
+  if (emOverride) (em[emOverride[0]] ||= {})[emOverride[1]] = emOverride[2]; // the producer's whole per-event map
+  const out = { v: 1, lastTs: { ...lastTs, ...(lastOverride || {}) }, nodes: {}, event_max: em };
   const put = (netId, prod, byKey) => { const o = ((out.nodes[netId] ||= {})[prod] = {});
     for (const [k, e] of Object.entries(byKey)) o[k] = { report: e.report, received: e.received, first_seen: e.first_seen, instance_id: e.instance_id ?? null, conflict: !!e.conflict }; };
   for (const [netId, prods] of Object.entries(nodes)) for (const [prod, byKey] of Object.entries(prods)) {
@@ -446,8 +475,8 @@ function serverSnapshot(override, lastOverride) {
   return out;
 }
 /** Durably persist the state with the proposed change; true only if it is on disk. Nothing live changes here. */
-function commitServers(override, lastOverride) {
-  try { atomicWrite(STATE_FILE, serverSnapshot(override, lastOverride)); return true; }
+function commitServers(override, lastOverride, emOverride) {
+  try { atomicWrite(STATE_FILE, serverSnapshot(override, lastOverride, emOverride)); return true; }
   catch (e) { console.error(`servers: persist failed (${e.message}); change NOT accepted`); return false; }
 }
 /** One token = one machine: every entry of a token is in conflict while the token has more than one entry. */
@@ -529,6 +558,43 @@ function agreement(n) {
   return rows;
 }
 
+// ---- fleet verdict per event (rc.23) --------------------------------------------------------------------
+// One verdict per network for the current (or last) coordinated event, from the roster's producer-role reports:
+// LIVE / DEGRADED / SPLIT (red alarm) / ABORTED / PENDING. See fleetVerdict in lib.mjs. A change is logged.
+const lastVerdict = dict();
+function fleet(n) {
+  const c = coord[n.id];
+  const ev = c?.event ? JSON.parse(c.event.payload) : null;
+  if (!ev) return null;
+  const now = Date.now();
+  const byProducer = dict();
+  for (const p of Object.keys(nodes[n.id] || {})) {
+    byProducer[p] = servers(n.id, p).filter((s) => (s.report.role || 'producer') === 'producer')
+      .map((s) => ({ report: s.report, silent: isSilent(s, now), conflict: !!s.conflict }));
+  }
+  const marks = dict();
+  for (const [p, m] of Object.entries(eventMax[n.id] || {})) if (m[ev.event_id]) marks[p] = m[ev.event_id];
+  const v = fleetVerdict(ev, byProducer, marks);
+  // A SPLIT is LATCHED per event (review #6): it stays red until an operator clears it on the mission-control
+  // host (POST /api/admin/clear-split?net=…), even if the reports that showed it change or go silent.
+  const latch = c.split_latch && c.split_latch.event_id === ev.event_id ? c.split_latch : null;
+  if (v.verdict === 'SPLIT' && !latch) {
+    const next = clone(coord);
+    next[n.id].split_latch = { event_id: ev.event_id, alarms: v.alarms.slice(0, 10), at: new Date().toISOString() };
+    if (commitCoord(next)) pushEvent(n.id, 'fleet', `SPLIT latched for ${ev.event_id} (cleared only by the operator)`);
+  } else if (latch && v.verdict !== 'SPLIT') {
+    v.verdict = 'SPLIT';
+    v.alarms = [...latch.alarms, `(latched at ${latch.at}; clear with POST /api/admin/clear-split on the mission-control host)`];
+  }
+  if (latch || coord[n.id]?.split_latch?.event_id === ev.event_id) v.latched = true;
+  const sig = `${ev.event_id}|${v.verdict}|${v.alarms.join('|')}`;
+  if (lastVerdict[n.id] !== undefined && lastVerdict[n.id] !== sig) {
+    pushEvent(n.id, 'fleet', v.verdict === 'SPLIT' ? `FLEET SPLIT (${ev.event_id}): ${v.alarms.join('; ')}` : `fleet verdict for ${ev.event_id}: ${v.verdict}`);
+  }
+  lastVerdict[n.id] = sig;
+  return v;
+}
+
 function status() {
   const now = Date.now();
   return {
@@ -559,7 +625,10 @@ function status() {
           // "prepared" (API field kept as `ready` for compatibility): every one of its servers reports, all checks
           // green, no identity conflict. Preparation only: not admission, not authorization to cut.
           ready: beacons.length > 0 && liveB.length === beacons.length && liveB.every((b) => b.report.ready) && !beacons.some((b) => b.conflict),
-          silent: r ? beacons.some((b) => b.silent) : null, age_ms: age, report: r?.report || null, beacons };
+          silent: r ? beacons.some((b) => b.silent) : null, age_ms: age, report: r?.report || null, beacons,
+          // rc.23: the relay's per-event high-water mark for this producer (read by the agents' resume guard).
+          // {event_id: {past_create, state, at}} for the last event ids this producer reported.
+          event_max: eventMax[n.id]?.[name] || null };
       }).sort((a, b) => (b.scheduled - a.scheduled) || ((a.rank || 999) - (b.rank || 999)) || a.name.localeCompare(b.name));
       return { id: n.id, name: n.name, label: n.label, priority: n.priority ?? 9, description: n.description || '',
         expected_chain_id: n.chain_id, metal: n.metal || null, event: n.event || null, chain: { ...c, schedule: undefined }, schedule: c.schedule || [],
@@ -567,7 +636,7 @@ function status() {
           roster: roster(n).length,
           reporting: producers.filter((p) => p.reporting).length, ready: producers.filter((p) => p.ready).length,
           servers: serversAll, servers_reporting: serversLive, servers_ready: serversReady, servers_prepared: serversReady, servers_silent: serversAll - serversLive, servers_conflict: serversConflict, states },
-        producers, agreement: agreement(n), coordination: coordView(n), events: (events[n.id] || []).slice(0, 40) };
+        producers, agreement: agreement(n), coordination: coordView(n), fleet: fleet(n), events: (events[n.id] || []).slice(0, 40) };
     }).sort((a, b) => a.priority - b.priority),
   };
 }
@@ -742,6 +811,18 @@ async function handle(req, res) {
     pushEvent(n.id, 'coordinator', note);
     return send(res, 200, { ok: true, type: p.type, event_id: p.event_id, ...(p.type === 'event' ? { event_hash: sha(msg.payload) } : {}) });
   }
+  if (req.method === 'POST' && path === '/api/admin/clear-split') {
+    // Operator-only (same rule as clear-server): clears a latched fleet SPLIT once it has been resolved.
+    const sock = normIp(req.socket.remoteAddress);
+    if (!(sock === '127.0.0.1' || sock === '::1') || req.headers['x-real-ip'] || req.headers['x-forwarded-for']) return send(res, 403, { error: 'local operator only' });
+    const netId = url.searchParams.get('net');
+    if (!RE.net.test(netId || '') || !own(coord, netId) || !coord[netId].split_latch) return send(res, 404, { error: 'no latched split for that network' });
+    const next = clone(coord); delete next[netId].split_latch;
+    if (!commitCoord(next)) return send(res, 503, { error: 'could not persist; nothing changed' });
+    delete lastVerdict[netId];
+    pushEvent(netId, 'operator', 'cleared the latched fleet SPLIT');
+    return send(res, 200, { ok: true });
+  }
   if (req.method === 'POST' && path === '/api/admin/clear-server') {
     // Operator-only, from the box itself: the reverse proxy always sets X-Real-IP, so a request that arrives on
     // loopback WITHOUT it came from a local shell (curl on the mission-control host), never from the internet.
@@ -788,15 +869,42 @@ async function handle(req, res) {
     const lagNow = chain[r.network]?.head && r.source?.head ? Math.max(0, chain[r.network].head - r.source.head) : null;
     hist.push({ t: ts, head: r.source?.head ?? null, lag: lagNow, peers: r.metal?.peers ?? null, ok: r.checks.filter((c) => c.ok).length, n: r.checks.length });
     byKey[key] = { report: r, received: now, hist, first_seen: prevE?.first_seen || now, instance_id: r.instance_id || null, conflict: false };
+    // A new instance for a token whose other instance(s) went SILENT is a replacement (a reinstalled box, a beacon
+    // restarted with another config), not a second machine: the silent entries are dropped (rc.22 fleet rehearsal:
+    // one instance per run directory left every token conflicted and the fleet gate at 0/5). Their replay watermark
+    // stays. Two instances that BOTH report within the silence window remain a real conflict.
+    // "Silent" is judged against the NEW report's own timestamp (the old instance stopped reporting before the new
+    // one started), and the old one must also be silent now.
+    const replaced = Object.keys(byKey).filter((k) => k !== key && k.split(':')[0] === tokenHash
+      && isSilent({ ...byKey[k] }, now) && isSilent({ ...byKey[k] }, ts));
+    for (const k of replaced) delete byKey[k];
     // One token on two machines shows up as a second instance_id: keep BOTH entries, flag every entry of the token
-    // as a conflict, until an operator removes one (POST /api/admin/clear-server) or re-enrolls with separate tokens.
+    // as a conflict, until an operator removes one (POST /api/admin/clear-server), one goes silent (replaced
+    // above), or the operator re-enrolls with separate tokens.
     recomputeConflicts(byKey, tokenHash);
     const conflict = byKey[key].conflict;
-    if (!commitServers([r.network, r.producer, byKey], { [key]: ts })) return send(res, 503, { error: 'could not persist the report; not accepted, retry' });
+    // The per-event high-water mark (only raised; a new event id starts over).
+    let em = null;
+    const evId = r.coord?.event_id, ce = r.ceremony;
+    if (evId && ce && (r.role || 'producer') === 'producer' && !reservedKey(evId)) {
+      const mine = eventMax[r.network]?.[r.producer] || {};
+      const cur = mine[evId];
+      const past = pastCreate(ce);
+      if (!cur || (past && !cur.past_create)) {
+        const next = Object.assign(dict(), mine, { [evId]: { past_create: !!(cur?.past_create || past), state: past ? (ce.state || null) : (cur?.state ?? ce.state ?? null), at: now } });
+        // Bound the map: drop the oldest event ids, never the one just written.
+        const ids = Object.keys(next).sort((a, b) => (next[a].at || 0) - (next[b].at || 0));
+        while (ids.length > EVENT_MAX_KEEP) delete next[ids.shift()];
+        em = next;
+      }
+    }
+    if (!commitServers([r.network, r.producer, byKey], { [key]: ts }, em ? [r.network, r.producer, em] : null)) return send(res, 503, { error: 'could not persist the report; not accepted, retry' });
     (nodes[r.network] ||= dict())[r.producer] = byKey;
+    if (em) (eventMax[r.network] ||= dict())[r.producer] = em;
     lastTs[key] = ts;
     const label = servers(r.network, r.producer).find((s) => s.key === key)?.label || r.node;
     const who = Object.keys(byKey).length > 1 || r.node ? `${r.producer} · ${label}` : r.producer;
+    if (replaced.length) pushEvent(r.network, who, `replaced ${replaced.length} silent instance${replaced.length > 1 ? 's' : ''} of this beacon token (new instance id; the old one stopped reporting)`);
     if (conflict && !prevE?.conflict) pushEvent(r.network, who, 'the same beacon token is reporting from two machines (second instance id): both kept and flagged');
     if (prev && prev.node !== r.node) pushEvent(r.network, who, `renamed from ${prev.node}`);
     const was = prev?.ceremony?.state, is = r.ceremony?.state;

@@ -267,11 +267,12 @@ export function redact(s, max = 120) {
 }
 
 // ---- beacon report schema + public projection -----------------------------------------------------------
-export const STATES = ['ARMED', 'FROZEN', 'SNAPSHOTTED', 'VERIFIED', 'IGNITED', 'FLIPPED', 'LIVE', 'ABORTED', 'HALTED'];
+export const STATES = ['ARMED', 'FROZEN', 'SNAPSHOTTED', 'VERIFIED', 'IGNITED', 'FLIPPED', 'LIVE', 'ABORTED', 'HALTED', 'STRANDED'];
 export const PROFILES = ['readiness', 'ceremony'];
 export const ROLES = ['producer', 'history', 'api', 'seed', 'query'];
 export const EVIDENCE_ALLOW = ['h', 'chain_id', 'freeze_at', 'cut_height', 'cut_block_id', 'burnoff_transactions', 'snapshot_sha256',
-  'fingerprints_digest', 'target_head_id', 'write_gap_ms', 'state_diff_identical', 'state_digest', 'state_diff_b_head', 'lineage_at_cut'];
+  'fingerprints_digest', 'target_head_id', 'write_gap_ms', 'state_diff_identical', 'state_digest', 'state_diff_b_head', 'lineage_at_cut',
+  'boot_genesis_sha256', 'head_at_pause'];
 
 class Bad extends Error {}
 const bad = (path, what) => { throw new Bad(`${path}: ${what}`); };
@@ -313,6 +314,18 @@ function lineage(v) {
   const hex = (x, p) => x == null ? null : str(x, p, { max: 64, re: /^[0-9a-fA-F]{64}$/ }).toLowerCase();
   return { h: int(v.h, 'ceremony.evidence.lineage_at_cut.h'), source_block_id: hex(v.source_block_id, 'ceremony.evidence.lineage_at_cut.source_block_id'),
     target_block_id: hex(v.target_block_id, 'ceremony.evidence.lineage_at_cut.target_block_id'), match: bool(v.match, 'ceremony.evidence.lineage_at_cut.match') };
+}
+
+/** ceremony.target (rc.23): what the fleet verdict compares — the target chain's Metal ids, the chain id it serves,
+ *  its head and head block id, and the id of the first block after the cut (a common block above H). */
+function targetView(t) {
+  if (t == null) return null;
+  if (!isObj(t)) bad('ceremony.target', 'must be an object');
+  const hex = (x, p) => x == null ? null : str(x, p, { max: 64, re: /^[0-9a-fA-F]{64}$/ }).toLowerCase();
+  const cb58 = (x, p) => str(x, p, { max: 64, nullable: true, re: /^[1-9A-HJ-NP-Za-km-z]{20,64}$/ });
+  return { blockchain_id: cb58(t.blockchain_id, 'ceremony.target.blockchain_id'), subnet_id: cb58(t.subnet_id, 'ceremony.target.subnet_id'),
+    chain_id: hex(t.chain_id, 'ceremony.target.chain_id'), head: int(t.head, 'ceremony.target.head'),
+    head_id: hex(t.head_id, 'ceremony.target.head_id'), after_cut_id: hex(t.after_cut_id, 'ceremony.target.after_cut_id') };
 }
 
 /**
@@ -384,6 +397,17 @@ export function projectReport(r) {
       rollback_complete: bool(ce.rollback_complete, 'ceremony.rollback_complete'),
       // rc.9+: an operator rollback recorded its intent and has not finished (`run` refuses there).
       rollback_pending: bool(ce.rollback_pending, 'ceremony.rollback_pending'),
+      // rc.23 (fleet verdict): chain creation / a join started on this box; the last ABORTED resumed the old chain;
+      // a post-ignition symptom is being waited out because the fleet is live; this ceremony joined a chain.
+      create_started: bool(ce.create_started, 'ceremony.create_started'),
+      source_resumed: bool(ce.source_resumed, 'ceremony.source_resumed'),
+      degraded: bool(ce.degraded, 'ceremony.degraded'),
+      degraded_reason: ce.degraded_reason == null ? null
+        : (typeof ce.degraded_reason === 'string' && ce.degraded_reason.length <= 400 ? redact(ce.degraded_reason, 120) : bad('ceremony.degraded_reason', 'must be a string ≤ 400')),
+      joined: bool(ce.joined, 'ceremony.joined'),
+      // rc.23 review #3: the agent journaled an abort intent; it is withdrawing its VERIFIED report.
+      aborting: bool(ce.aborting, 'ceremony.aborting'),
+      target: targetView(ce.target),
     };
   }
   const co = r.coord ?? null;
@@ -417,3 +441,108 @@ export const isBad = (e) => e instanceof Bad;
 
 /** Heartbeat deadline for a report: 3 × its interval, never under 45 s. */
 export const silentAfterMs = (report) => Math.max(3 * (report?.interval_secs || 10), 45) * 1000;
+
+// ---- fleet verdict (rc.23) ---------------------------------------------------------------------------------
+// The 5-BP rehearsal on the upstream stack ended every run with a LIVE/HALTED mix on ONE target chain, and once
+// with a BP that resumed the old chain after its peers ignited — while the board showed only per-server states.
+// fleetVerdict() turns the roster's reports for one event into one verdict BPs can read:
+//   LIVE      ≥ quorum roster members LIVE on one target chain with a common block above H (same first post-cut id)
+//   DEGRADED  a target may be running (ignition/creation started somewhere) but no quorum is LIVE on one chain yet
+//   SPLIT     RED: a member resumed the old chain while another is past chain creation/ignition, or members report
+//             different target chains / different blocks after the cut / different blocks at one height
+//   ABORTED   every reporting member aborted before chain creation (symmetric abort)
+//   PENDING   no member is past chain creation yet
+// It is display only (relay-reported, unsigned), never an authorization.
+const PAST = ['IGNITED', 'FLIPPED', 'LIVE', 'HALTED'];
+/** Did this report's last ABORTED resume the old chain? */
+export const resumedOldChain = (ce) => !!ce && ce.state === 'ABORTED'
+  && (ce.source_resumed === true || ['resumed', 'forced'].includes(abortKind(ce)));
+/** Is this member past the point where a target chain may exist (creation/join/ignition started)? */
+export const pastCreate = (ce) => !!ce && ce.state !== 'ABORTED'
+  && (PAST.includes(ce.state) || ce.create_started === true || ce.ignition_started === true || ce.joined === true);
+/**
+ * @param ev     the event payload ({event_id, h, roster?, quorum?})
+ * @param byProducer  { producer: [{ report, silent, conflict }] } (producer-role servers)
+ */
+/** Blocks past the cut the old chain may legitimately have (burn-off) when no member reports its pause head. */
+export const BURNOFF_BOUND = 360;
+/** Pause skew tolerated above the highest reported pause head (blocks). */
+export const BURNOFF_TOLERANCE = 12;
+/** @param eventMax { producer: {past_create, state} } for THIS event — the relay's per-event high-water mark (an
+ *  instance replacement cannot lower it). */
+export function fleetVerdict(ev, byProducer, eventMax = {}) {
+  if (!ev) return null;
+  const roster = Array.isArray(ev.roster) && ev.roster.length ? ev.roster : null;
+  const names = roster ? roster.map((m) => m.producer) : Object.keys(byProducer).filter((p) => (byProducer[p] || []).some((s) => s.report?.coord?.event_id === ev.event_id));
+  const quorum = roster ? (Number.isInteger(ev.quorum) ? ev.quorum : roster.length) : null;
+  const members = names.map((producer, i) => {
+    const pin = roster?.[i]?.instance_id || null;
+    const mine = (byProducer[producer] || []).filter((s) => s.report?.coord?.event_id === ev.event_id && (!pin || s.report.instance_id === pin));
+    const usable = mine.filter((s) => !s.conflict);
+    const s = usable.find((x) => !x.silent) || usable[0] || null;
+    const ce = s?.report?.ceremony || null;
+    const em = eventMax?.[producer];
+    const markPast = !!em && em.past_create === true && (em.event_id === undefined || em.event_id === ev.event_id);
+    return { producer, state: ce?.state || null, fresh: !!s && !s.silent, conflict: mine.length > 0 && !usable.length,
+      missing: !s, target: ce?.target || null, resumed: resumedOldChain(ce), past: pastCreate(ce) || markPast, degraded: ce?.degraded === true,
+      joined: ce?.joined === true, source_head: s?.report?.source?.head ?? null, head_at_pause: ce?.evidence?.head_at_pause ?? null,
+      cut: ce?.evidence?.cut_height ?? null };
+  });
+  const alarms = [];
+  // The old chain advanced past the cut + burn-off while a member is past creation (review #6): judged from ANY
+  // member's source head, so it fires even when the BP that resumed is silent (r4: it had lost the relay, and the
+  // others' nodeos followed its fork).
+  const cut = ev.h ?? members.find((m) => m.cut != null)?.cut ?? null;
+  if (cut != null) {
+    // The bound is the highest reported pause head only when it is COMPLETE: every member that reached
+    // SNAPSHOTTED (it reports a cut height) also reported its pause head. Otherwise (an older or stale beacon
+    // without head_at_pause) it is never below cut + BURNOFF_BOUND, so a member that paused later than the
+    // others cannot latch a false red. Plus a small tolerance for pause skew.
+    const pauses = members.map((m) => m.head_at_pause).filter((x) => Number.isInteger(x));
+    const complete = pauses.length > 0 && members.every((m) => m.cut == null || Number.isInteger(m.head_at_pause));
+    const bound = complete ? Math.max(...pauses) + BURNOFF_TOLERANCE : Math.max(cut + BURNOFF_BOUND, ...pauses);
+    const pastOnes = members.filter((m) => m.past);
+    const ahead = members.filter((m) => Number.isInteger(m.source_head) && m.source_head > bound);
+    if (pastOnes.length && ahead.length) {
+      alarms.push(`split: the old chain advanced past the cut (${ahead.map((m) => `${m.producer} source head ${m.source_head}`).join(', ')} > ${bound}) while ${pastOnes.map((m) => `${m.producer} ${m.state || 'past creation'}`).join(', ')} is past chain creation`);
+    }
+  }
+  const past = members.filter((m) => m.past);
+  for (const m of members.filter((x) => x.resumed)) {
+    const others = past.filter((x) => x.producer !== m.producer).map((x) => `${x.producer} ${x.state}`);
+    if (others.length) alarms.push(`split: ${m.producer} resumed the old chain after peers ignited (${others.join(', ')})`);
+  }
+  const withTarget = past.filter((m) => m.target);
+  const distinct = (f) => [...new Set(withTarget.map(f).filter((x) => x != null))];
+  const chains = distinct((m) => m.target.blockchain_id || m.target.chain_id);
+  if (chains.length > 1) alarms.push(`split: members report different target chains (${chains.map((c) => `${String(c).slice(0, 12)}…: ${withTarget.filter((m) => (m.target.blockchain_id || m.target.chain_id) === c).map((m) => m.producer).join(', ')}`).join(' | ')})`);
+  const firsts = distinct((m) => m.target.after_cut_id);
+  if (firsts.length > 1) alarms.push(`split: members report different blocks after the cut (${firsts.map((f) => `${f.slice(0, 12)}…: ${withTarget.filter((m) => m.target.after_cut_id === f).map((m) => m.producer).join(', ')}`).join(' | ')})`);
+  const atHeight = {};
+  for (const m of withTarget) if (Number.isInteger(m.target.head) && m.target.head_id) (atHeight[m.target.head] ||= new Set()).add(m.target.head_id);
+  for (const [h, ids] of Object.entries(atHeight)) if (ids.size > 1) alarms.push(`split: members report different blocks at height ${h}`);
+  // LIVE quorum: fresh LIVE members on one chain with one common block after the cut.
+  const groups = {};
+  for (const m of members.filter((x) => x.fresh && x.state === 'LIVE' && x.target?.after_cut_id)) {
+    const k = `${m.target.blockchain_id || m.target.chain_id || '?'}|${m.target.after_cut_id}`;
+    (groups[k] ||= []).push(m.producer);
+  }
+  const ranked = Object.entries(groups).sort((a, b) => b[1].length - a[1].length);
+  const best = ranked[0] || null;
+  // Review #9: LIVE only for a UNIQUE group reaching the quorum (two groups each with a quorum is a split).
+  const uniqueBest = !ranked[1] || !quorum || ranked[1][1].length < quorum;
+  const liveChain = best ? { chain: best[0].split('|')[0], after_cut_id: best[0].split('|')[1], members: best[1] } : null;
+  let verdict;
+  if (alarms.length) verdict = 'SPLIT';
+  else if (quorum && liveChain && liveChain.members.length >= quorum && uniqueBest) verdict = 'LIVE';
+  else if (past.length) verdict = 'DEGRADED';
+  else if (members.length && members.filter((m) => !m.missing).every((m) => m.state === 'ABORTED') && members.some((m) => !m.missing)) verdict = 'ABORTED';
+  else verdict = 'PENDING';
+  const notLive = liveChain ? members.filter((m) => !liveChain.members.includes(m.producer)).map((m) => `${m.producer}: ${m.missing ? 'no report' : m.conflict ? 'identity conflict' : !m.fresh ? `silent (${m.state || '?'})` : m.state}`) : [];
+  return { event_id: ev.event_id, h: ev.h ?? null, roster: roster ? roster.length : null, quorum, verdict, alarms,
+    live_chain: liveChain, not_live: notLive,
+    detail: !roster ? 'no roster in the event: LIVE needs a roster and quorum' : null,
+    members: members.map(({ producer, state, fresh, missing, conflict, resumed, past: p, degraded, joined, target }) =>
+      ({ producer, state, fresh, missing, conflict, resumed, past_create: p, degraded, joined,
+        target_chain: target ? (target.blockchain_id || target.chain_id) : null, head: target?.head ?? null, after_cut_id: target?.after_cut_id ?? null })) };
+}

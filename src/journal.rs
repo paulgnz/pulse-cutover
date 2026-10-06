@@ -114,6 +114,12 @@ pub struct Recovered {
     pub boot_manifest_sha256: Option<String>,
     pub boot_genesis_sha256: Option<String>,
     pub boot_chain_config_sha256: Option<String>,
+    /// The source head when the producer pause took effect (SNAPSHOTTED `head_at_pause`): `join`
+    /// refuses a source that produced past it.
+    pub head_at_pause: Option<u64>,
+    /// rc.23: when the first post-ignition degraded symptom was seen (patience counts from there,
+    /// across a crash and resume).
+    pub degraded_since_ms: Option<u64>,
 }
 
 impl Journal {
@@ -413,6 +419,11 @@ impl Journal {
             if entry.data.get("rollback_incomplete").is_some() {
                 out.aborted_rollback_complete = false;
             }
+            // A refused join re-froze writes (re-check #3): on_abort must run again on the next rollback.
+            if entry.data.get("join_refused_after_refreeze").is_some() {
+                out.aborted_rollback_complete = false;
+                out.rollback_steps_done.retain(|x| x != "on_abort");
+            }
             if let Some(step) = entry.data.get("rollback_step").and_then(|v| v.as_str()) {
                 if entry.data.get("ok").and_then(|v| v.as_bool()) == Some(true)
                     && !out.rollback_steps_done.iter().any(|x| x == step)
@@ -451,6 +462,12 @@ impl Journal {
             }
             if let Some(v) = entry.data.get("cut_height").and_then(|v| v.as_u64()) {
                 out.cut_height = Some(v);
+            }
+            if let Some(v) = entry.data.get("degraded_since_ms").and_then(|v| v.as_u64()) {
+                out.degraded_since_ms.get_or_insert(v);
+            }
+            if let Some(v) = entry.data.get("head_at_pause").and_then(|v| v.as_u64()) {
+                out.head_at_pause = Some(v);
             }
             if let Some(v) = entry.data.get("resolved_h").and_then(|v| v.as_u64()) {
                 out.resolved_h = Some(v);

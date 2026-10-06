@@ -133,6 +133,15 @@ section{margin-top:26px}
 .badge.state{color:var(--sky);border-color:rgba(96,165,250,.35)}
 .badge.LIVE{color:var(--ok);border-color:rgba(52,211,153,.35)}.badge.ABORTED{color:var(--bad);border-color:rgba(251,113,133,.4)}
 .badge.FROZEN,.badge.SNAPSHOTTED{color:var(--warn);border-color:rgba(251,191,36,.35)}
+.badge.HALTED,.badge.STRANDED{color:var(--bad);border-color:rgba(251,113,133,.4)}
+/* fleet verdict (rc.23): one line per event under the network switch; SPLIT is a red alarm */
+.fleet{margin:0 0 14px;padding:12px 16px;border-radius:14px;border:1px solid var(--line);font-size:13.5px;line-height:1.55;color:var(--muted)}
+.fleet b.v{font:700 12px var(--sans);letter-spacing:.8px;margin-right:8px}
+.fleet.LIVE{border-color:rgba(52,211,153,.4)}.fleet.LIVE b.v{color:var(--ok)}
+.fleet.DEGRADED,.fleet.PENDING{border-color:rgba(251,191,36,.35)}.fleet.DEGRADED b.v,.fleet.PENDING b.v{color:var(--warn)}
+.fleet.ABORTED b.v{color:var(--muted)}
+.fleet.SPLIT{border-color:var(--bad);background:rgba(251,113,133,.12);color:#fecdd3}.fleet.SPLIT b.v{color:var(--bad)}
+.fleet ul{margin:6px 0 0 18px;padding:0}
 .checks{display:flex;gap:3px;margin-top:12px;height:6px}
 .checks i{flex:1;border-radius:3px;background:rgba(255,255,255,.07)}
 .checks i.ok{background:linear-gradient(90deg,#10b981,var(--ok))}.checks i.bad{background:var(--bad)}.checks i.todo{background:transparent;box-shadow:inset 0 0 0 1px rgba(251,191,36,.6)}
@@ -392,6 +401,7 @@ a.tilelink{color:inherit;text-decoration:none;display:block}
 
 <main class="wrap">
   <nav class="switch" id="switch" role="tablist" aria-label="Network"><span class="pill" id="pill"></span></nav>
+  <div class="fleet" id="fleet" role="status" hidden></div>
   <div id="v-page" hidden></div>
   <div id="v-overview">
 
@@ -709,6 +719,17 @@ function render() {
     sw.querySelectorAll('button').forEach((b) => b.onclick = () => { try { localStorage.setItem('mc-net', b.dataset.id); } catch {} G.arcs = []; showAll = false; lastHead = {}; go(pathFor(b.dataset.id)); }); }
   const on = sw.querySelector('button[aria-selected=true]'), pill = sw.querySelector('.pill');
   if (on && pill) { pill.style.left = on.offsetLeft + 'px'; pill.style.width = on.offsetWidth + 'px'; }
+
+  // fleet verdict for the current event (rc.23): see control/lib.mjs fleetVerdict and docs/OPERATOR-QUICKSTART.md
+  const fv = net.fleet, fb = $('fleet');
+  if (!fv) { fb.hidden = true; fb.innerHTML = ''; } else {
+    const what = { LIVE: `${fv.live_chain?.members.length}/${fv.roster} roster members LIVE on one target chain (quorum ${fv.quorum}; common block after H ${esc((fv.live_chain?.after_cut_id || '').slice(0, 12))}…)`,
+      DEGRADED: 'a target chain may be running, but no quorum is LIVE on one chain yet', PENDING: 'no roster member has started chain creation or ignition',
+      ABORTED: 'every reporting roster member aborted before chain creation', SPLIT: 'FLEET SPLIT: do not reopen writes anywhere until resolved' }[fv.verdict] || '';
+    const items = [...fv.alarms, ...(fv.verdict !== 'SPLIT' ? fv.not_live : [])];
+    const html = `<b class="v">FLEET ${esc(fv.verdict)}</b>${esc(fv.event_id)} · ${what}${fv.detail ? ` · ${esc(fv.detail)}` : ''}${items.length ? `<ul>${items.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}`;
+    fb.className = `fleet ${fv.verdict}`; fb.hidden = false; if (fb.dataset.sig !== html) { fb.innerHTML = html; fb.dataset.sig = html; }
+  }
 
   const c = net.chain || {}, s = net.summary;
   $('net-label').textContent = `${net.label}${c.chain_id ? ' · chain ' + c.chain_id.slice(0, 8) : ''}`;

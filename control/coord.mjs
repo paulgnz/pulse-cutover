@@ -5,6 +5,9 @@
 //   node control/coord.mjs event --url https://control… --net rehearsal --chain-id <hex> --h 9000 \
 //        --lead 24 --cpu-scale 143 --key coordinator.pem [--event-id ev-…]
 //        (--cpu-scale none omits import_cpu_scale: use it for import_backend = "upstream", where it does nothing)
+//        [--roster bp1,bp2,…|producer:instance_id,…] [--quorum N] [--release-sha256 <hex>] [--snapshot-sha256 <hex>] [--metal-network-id N]
+//        (fleet bindings, signed with the event; see control/coordlib.mjs. Without --roster the agents' fleet gate
+//         has no roster and falls back to counting whoever reports)
 //   node control/coord.mjs arm   --url … --net rehearsal --event-id ev-… --key coordinator.pem --event-file ev-….event.json
 //   node control/coord.mjs abort --url … --net rehearsal --event-id ev-… --key coordinator.pem --event-file ev-….event.json
 //   node control/coord.mjs complete --url … --net rehearsal --event-id ev-… --key coordinator.pem --event-file ev-….event.json
@@ -20,6 +23,7 @@
 // Event ids are single-use.
 import { generateKeyPairSync, createPrivateKey, createPublicKey, sign, createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
+import { eventPayload } from './coordlib.mjs';
 const [cmd, ...rest] = process.argv.slice(2);
 const a = {}; for (let i = 0; i < rest.length; i += 2) a[rest[i].replace(/^--/, '')] = rest[i + 1];
 const rawPub = (k) => createPublicKey(k).export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex');
@@ -49,10 +53,12 @@ if (cmd !== 'event') {
   } else { console.error('pass --event-file <event_id>.event.json (saved when the event was published), or --trust-relay yes'); process.exit(2); }
   console.error(`signing ${cmd} for ${ev.event_id} (H ${ev.h}, event_hash ${eventHash.slice(0, 16)}…)`);
 }
-const payload = JSON.stringify(cmd === 'event'
-  ? { v: 1, type: 'event', network: a.net, event_id: a['event-id'] || `ev-${Date.now().toString(36)}`, chain_id: a['chain-id'], h: +a.h,
-      freeze_lead_blocks: +(a.lead || 24), ...(a['cpu-scale'] === 'none' ? {} : { import_cpu_scale: +(a['cpu-scale'] || 143) }), issued_at_ms: Date.now() }
-  : { v: 1, type: cmd, network: a.net, event_id: a['event-id'], event_hash: eventHash, issued_at_ms: Date.now() });
+let payloadObj;
+try {
+  payloadObj = cmd === 'event' ? eventPayload(a)
+    : { v: 1, type: cmd, network: a.net, event_id: a['event-id'], event_hash: eventHash, issued_at_ms: Date.now() };
+} catch (e) { console.error(String(e.message || e)); process.exit(2); }
+const payload = JSON.stringify(payloadObj);
 const msg = { payload, sig: sign(null, Buffer.from(payload), key).toString('hex'), key: rawPub(key) };
 if (cmd === 'event') { const f = `${JSON.parse(payload).event_id}.event.json`; writeFileSync(f, JSON.stringify(msg, null, 1)); console.error(`saved the signed event to ${f} (arm/abort need it)`); }
 const r = await fetch(`${base}/api/coord/${a.net}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(msg) });
