@@ -27,7 +27,7 @@
 #          [--producer-api <url>] [--snapshots-dir <dir>] [--interval 10] [--force] [--dry-run] [--yes] [--uninstall]
 set -euo pipefail
 
-VERSION_DEFAULT="v0.5.0-rc.22"
+VERSION_DEFAULT="v0.5.0-rc.23"
 URL_DEFAULT="https://control-rehearsal.protonnz.com"
 ETC=/etc/pulse-cutover; VAR=/var/lib/pulse-cutover; STATE=/var/lib/pulse-beacon; BIN=/usr/local/bin/pulse-cutover
 # Version of an installed pulse-cutover binary: rc.16+ prints it; older builds only embed the string.
