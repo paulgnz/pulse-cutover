@@ -448,8 +448,9 @@ export const silentAfterMs = (report) => Math.max(3 * (report?.interval_secs || 
 // fleetVerdict() turns the roster's reports for one event into one verdict BPs can read:
 //   LIVE      ≥ quorum roster members LIVE on one target chain with a common block above H (same first post-cut id)
 //   DEGRADED  a target may be running (ignition/creation started somewhere) but no quorum is LIVE on one chain yet
-//   SPLIT     RED: a member resumed the old chain while another is past chain creation/ignition, or members report
-//             different target chains / different blocks after the cut / different blocks at one height
+//   SPLIT     RED: a member resumed the old chain while another is past chain creation/ignition, the old chain moved
+//             past the complete pause-head bound or kept advancing once every member was paused (rc.24 movement
+//             rule), or members report different target chains / different blocks after the cut / at one height
 //   ABORTED   every reporting member aborted before chain creation (symmetric abort)
 //   PENDING   no member is past chain creation yet
 // It is display only (relay-reported, unsigned), never an authorization.
@@ -464,11 +465,68 @@ export const pastCreate = (ce) => !!ce && ce.state !== 'ABORTED'
  * @param ev     the event payload ({event_id, h, roster?, quorum?})
  * @param byProducer  { producer: [{ report, silent, conflict }] } (producer-role servers)
  */
-/** Blocks past the cut the old chain may legitimately have (burn-off) when no member reports its pause head. */
-export const BURNOFF_BOUND = 360;
-/** Pause skew tolerated above the highest reported pause head (blocks). */
+/** Pause skew tolerated above the highest reported pause head, and head movement tolerated once every member is
+ *  paused (late blocks absorbed after the pause), in blocks. */
 export const BURNOFF_TOLERANCE = 12;
-/** @param eventMax { producer: {past_create, state} } for THIS event — the relay's per-event high-water mark (an
+// rc.24: there is no fixed burn-off bound any more. rc.23 fell back to cut + 360 when a beacon did not publish
+// head_at_pause, and the 5-BP rehearsal (rc.22 beacons) paused correctly at cut + 377 (DPoS finality lag + the
+// freeze lead + quiescence): a false latched SPLIT. Real XPR finality lag has no fixed bound, so the old-chain
+// rules are (1) the COMPLETE pause-head bound, and (2) MOVEMENT: the old chain's head moving after the point where
+// every honest source must be paused (see movementArmed / nextEventMark).
+/** Ceremony state rank for the relay's per-event high-water mark. ABORTED / unknown rank 0 (the mark keeps the
+ *  highest rank seen, so a member that paused and later aborted keeps its SNAPSHOTTED rank); STRANDED is a sealed
+ *  post-verify state; HALTED is judged like post-ignition. */
+export const STATE_RANK = Object.freeze({ ARMED: 1, FROZEN: 2, SNAPSHOTTED: 3, VERIFIED: 4, STRANDED: 4, IGNITED: 5, HALTED: 5, FLIPPED: 6, LIVE: 7 });
+export const stateRank = (s) => (typeof s === 'string' && Object.hasOwn(STATE_RANK, s) ? STATE_RANK[s] : 0);
+/** From SNAPSHOTTED on, a member's producer is paused at the cut. */
+export const PAUSED_RANK = STATE_RANK.SNAPSHOTTED;
+/**
+ * Is the movement rule armed for this event? (the point after which the old chain's head must not move.)
+ *   A. every roster member's mark is ≥ SNAPSHOTTED (all paused) and at least one member is past chain creation; or
+ *   B. every REPORTING roster member (`fresh`) is ≥ SNAPSHOTTED and at least `quorum` members are past creation.
+ * B exists so a member that went silent before reporting SNAPSHOTTED (r4: it lost the relay) cannot block the rule
+ * forever. Its cost: a silent member that really is still in burn-off when a quorum is already past creation can
+ * raise the alarm. That is accepted: once a quorum has a target chain, an old chain still advancing is the r4 risk.
+ * Before either holds, a slow member's producers may legitimately still be making burn-off blocks.
+ * @param ev     {roster?, quorum?}
+ * @param marks  { producer: {rank, past_create} } for THIS event
+ * @param fresh  Set of producers currently reporting this event
+ */
+export function movementArmed(ev, marks, fresh) {
+  const roster = Array.isArray(ev?.roster) && ev.roster.length ? ev.roster.map((m) => m.producer) : null;
+  const names = roster || Object.keys(marks || {});
+  if (!names.length) return false;
+  const quorum = roster ? (Number.isInteger(ev.quorum) && ev.quorum > 0 ? ev.quorum : roster.length) : names.length;
+  const rank = (p) => (Number.isInteger(marks?.[p]?.rank) ? marks[p].rank : 0);
+  const pastN = names.filter((p) => marks?.[p]?.past_create === true).length;
+  if (!pastN) return false;
+  if (names.every((p) => rank(p) >= PAUSED_RANK)) return true;
+  const rep = names.filter((p) => fresh?.has(p));
+  return rep.length > 0 && rep.every((p) => rank(p) >= PAUSED_RANK) && pastN >= quorum;
+}
+/**
+ * The next per-event mark for a producer from one report (pure). Only ever raised: past_create, rank, src_max.
+ * Once `armed` (or once src_first exists), the reporting member's source head is tracked: src_first is the first
+ * head seen from that point, src_max the highest.
+ * @returns the new mark, or null when nothing changed
+ */
+export function nextEventMark(cur, ce, sourceHead, armed, now) {
+  const past = pastCreate(ce);
+  const rank = Math.max(Number.isInteger(cur?.rank) ? cur.rank : 0, stateRank(ce?.state));
+  const next = { past_create: !!(cur?.past_create || past), state: past ? (ce?.state || null) : (cur?.state ?? ce?.state ?? null),
+    at: now, rank };
+  let srcFirst = Number.isInteger(cur?.src_first) ? cur.src_first : null, srcMax = Number.isInteger(cur?.src_max) ? cur.src_max : null;
+  if (Number.isInteger(sourceHead) && (armed || srcFirst != null)) {
+    if (srcFirst == null) srcFirst = sourceHead;
+    srcMax = Math.max(srcMax ?? sourceHead, sourceHead);
+  }
+  if (srcFirst != null) { next.src_first = srcFirst; next.src_max = srcMax ?? srcFirst; }
+  if (!cur) return next;
+  const same = cur.past_create === next.past_create && cur.state === next.state && cur.rank === next.rank
+    && (cur.src_first ?? null) === (next.src_first ?? null) && (cur.src_max ?? null) === (next.src_max ?? null);
+  return same ? null : next;
+}
+/** @param eventMax { producer: {past_create, state, rank?, src_first?, src_max?} } for THIS event — the relay's per-event high-water mark (an
  *  instance replacement cannot lower it). */
 export function fleetVerdict(ev, byProducer, eventMax = {}) {
   if (!ev) return null;
@@ -494,18 +552,27 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
   // others' nodeos followed its fork).
   const cut = ev.h ?? members.find((m) => m.cut != null)?.cut ?? null;
   if (cut != null) {
-    // The bound is the highest reported pause head only when it is COMPLETE: every member that reached
-    // SNAPSHOTTED (it reports a cut height) also reported its pause head. Otherwise (an older or stale beacon
-    // without head_at_pause) it is never below cut + BURNOFF_BOUND, so a member that paused later than the
-    // others cannot latch a false red. Plus a small tolerance for pause skew.
+    // The bound is the highest reported pause head, and only when it is COMPLETE: every member that reached
+    // SNAPSHOTTED (it reports a cut height) also reported its pause head. Plus a small tolerance for pause skew.
+    // Incomplete (an older beacon without head_at_pause): no bound at all (rc.24; a fixed cut + N is wrong for
+    // real finality lag) and the movement rule below covers it.
     const pauses = members.map((m) => m.head_at_pause).filter((x) => Number.isInteger(x));
     const complete = pauses.length > 0 && members.every((m) => m.cut == null || Number.isInteger(m.head_at_pause));
-    const bound = complete ? Math.max(...pauses) + BURNOFF_TOLERANCE : Math.max(cut + BURNOFF_BOUND, ...pauses);
+    const bound = complete ? Math.max(...pauses) + BURNOFF_TOLERANCE : null;
     const pastOnes = members.filter((m) => m.past);
-    const ahead = members.filter((m) => Number.isInteger(m.source_head) && m.source_head > bound);
+    const ahead = bound == null ? [] : members.filter((m) => Number.isInteger(m.source_head) && m.source_head > bound);
     if (pastOnes.length && ahead.length) {
       alarms.push(`split: the old chain advanced past the cut (${ahead.map((m) => `${m.producer} source head ${m.source_head}`).join(', ')} > ${bound}) while ${pastOnes.map((m) => `${m.producer} ${m.state || 'past creation'}`).join(', ')} is past chain creation`);
     }
+  }
+  // Movement (rc.24): the relay tracks each member's source head from the point where every honest source must be
+  // paused (movementArmed: all members ≥ SNAPSHOTTED and someone past creation). From there the head only moves if
+  // a producer resumed the old chain (r4), whatever the finality lag was. Judged from the high-water mark, so it
+  // holds when the resumer itself is silent and after the heads look normal again.
+  const moved = names.map((p) => [p, eventMax?.[p]]).filter(([, em]) => em && (em.event_id === undefined || em.event_id === ev.event_id)
+    && Number.isInteger(em.src_first) && Number.isInteger(em.src_max) && em.src_max - em.src_first > BURNOFF_TOLERANCE);
+  if (moved.length) {
+    alarms.push(`split: the old chain is still advancing after chain creation (${moved.map(([p, em]) => `${p} source head ${em.src_first}→${em.src_max}`).join(', ')})`);
   }
   const past = members.filter((m) => m.past);
   for (const m of members.filter((x) => x.resumed)) {

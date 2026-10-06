@@ -18,7 +18,7 @@ import { readFileSync, existsSync, watchFile, renameSync, mkdirSync, openSync, w
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isPublicIp, normIp, resolvePublic, limiter, safeRequest, probeProducerApi, safeJson, safeDecode, RE, UA, endpointId, endpointRef, reservedKey,
-  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, pastCreate } from './lib.mjs';
+  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, STATE_RANK } from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = +(process.env.PORT ?? 8787);
@@ -417,8 +417,12 @@ const lastTs = dict();
 // reset it), and replacing a silent instance never lowers it, so an agent's resume guard still sees a member that
 // once reported chain creation / ignition. Persisted with the server state; the last EVENT_MAX_KEEP event ids per
 // producer are kept.
+// rc.24: each mark also keeps the highest ceremony state rank seen (`rank`) and, once the movement rule is armed
+// for the event (every member paused, someone past creation), the member's first and highest source head from that
+// point (`src_first`, `src_max`): the old chain moving after that is the r4 split, whatever the finality lag.
 const eventMax = dict();
 const EVENT_MAX_KEEP = 20;
+const MAX_RANK = Math.max(...Object.values(STATE_RANK));
 const KEY_RE = /^[0-9a-f]{64}(:[0-9a-f]{32})?$/;
 function loadServerState() {
   if (existsSync(STATE_FILE)) {
@@ -446,8 +450,13 @@ function loadServerState() {
           const byEvent = typeof m.event_id === 'string' ? { [m.event_id]: m } : m;
           for (const [eid, x] of Object.entries(byEvent)) {
             if (!/^[\w.:-]{1,64}$/.test(eid) || reservedKey(eid) || !x || typeof x.past_create !== 'boolean') continue;
-            ((eventMax[netId] ||= dict())[prod] ||= dict())[eid] = { past_create: x.past_create,
+            // rc.24 fields (rank, src_first, src_max) are optional: an rc.23 mark loads without them.
+            const height = (v) => Number.isSafeInteger(v) && v >= 0;
+            const mark = { past_create: x.past_create,
               state: typeof x.state === 'string' ? x.state.slice(0, 16) : null, at: Number.isFinite(x.at) ? x.at : 0 };
+            if (Number.isInteger(x.rank) && x.rank >= 0 && x.rank <= MAX_RANK) mark.rank = x.rank;
+            if (height(x.src_first) && height(x.src_max) && x.src_max >= x.src_first) { mark.src_first = x.src_first; mark.src_max = x.src_max; }
+            ((eventMax[netId] ||= dict())[prod] ||= dict())[eid] = mark;
           }
         }
       }
@@ -889,9 +898,20 @@ async function handle(req, res) {
     if (evId && ce && (r.role || 'producer') === 'producer' && !reservedKey(evId)) {
       const mine = eventMax[r.network]?.[r.producer] || {};
       const cur = mine[evId];
-      const past = pastCreate(ce);
-      if (!cur || (past && !cur.past_create)) {
-        const next = Object.assign(dict(), mine, { [evId]: { past_create: !!(cur?.past_create || past), state: past ? (ce.state || null) : (cur?.state ?? ce.state ?? null), at: now } });
+      // Movement arming is judged with this report's own rank included (the other members' marks as stored) and
+      // the current coordinated event's roster when this report is for it.
+      const evNow = coord[r.network]?.event ? (() => { try { return JSON.parse(coord[r.network].event.payload); } catch { return null; } })() : null;
+      const evFor = evNow && evNow.event_id === evId ? evNow : {};
+      const marks = dict();
+      for (const [p, m] of Object.entries(eventMax[r.network] || {})) if (m[evId]) marks[p] = m[evId];
+      marks[r.producer] = nextEventMark(cur, ce, null, false, now) || cur;
+      const fresh = new Set([r.producer]);
+      for (const p of Object.keys(nodes[r.network] || {})) {
+        if (servers(r.network, p).some((x) => (x.report.role || 'producer') === 'producer' && !x.conflict && x.report.coord?.event_id === evId && !isSilent(x, now))) fresh.add(p);
+      }
+      const nm = nextEventMark(cur, ce, Number.isSafeInteger(r.source?.head) ? r.source.head : null, movementArmed(evFor, marks, fresh), now);
+      if (nm) {
+        const next = Object.assign(dict(), mine, { [evId]: nm });
         // Bound the map: drop the oldest event ids, never the one just written.
         const ids = Object.keys(next).sort((a, b) => (next[a].at || 0) - (next[b].at || 0));
         while (ids.length > EVENT_MAX_KEEP) delete next[ids.shift()];

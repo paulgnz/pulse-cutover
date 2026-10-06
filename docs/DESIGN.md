@@ -317,6 +317,12 @@ H. The upstream sealed start, a fleet-signed COMMIT/ABORT certificate the agents
 protocol guard against the old chain producing after H are still what a public cut needs
 (ATOMICITY Known limits #14).
 
+Mission control's fleet verdict watches the old chain without a fixed burn-off bound (rc.24): a source head above the
+highest published pause head (only when every paused member published one), or the source head moving after every
+member has paused and one is past chain creation (the relay keeps each member's first and highest source head from
+that point). A fixed bound (rc.23: cut + 360) cannot fit real finality lag: the 5-BP rehearsal paused correctly at
+cut + 377 and latched a false SPLIT. This is display evidence only, as above.
+
 ## 6. v2 "shadow mirror" (sketch, not implemented)
 
 In v1 the write gap is dominated by the source chain's finality wait plus snapshot and

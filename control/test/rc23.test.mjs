@@ -227,6 +227,7 @@ test('re-check #4: an incomplete pause-head bound (a beacon without head_at_paus
   assert.notEqual(fleetVerdict(ev(), { ...byP, bpc: m('VERIFIED', 1030, { cut_height: 1000, head_at_pause: 1024 }) }).verdict, 'SPLIT');
   // Complete bound, a head well past it: split.
   assert.equal(fleetVerdict(ev(), { ...byP, bpc: m('VERIFIED', 1080, { cut_height: 1000, head_at_pause: 1024 }) }).verdict, 'SPLIT');
-  // Incomplete bound, a head past cut + 360: split.
-  assert.equal(fleetVerdict(ev(), { ...byP, bpc: m('VERIFIED', 1400, { cut_height: 1000 }) }).verdict, 'SPLIT');
+  // rc.24: an incomplete bound is no bound at all (the fixed cut + 360 fallback latched a false split on a real
+  // finality lag of 377); a pause head far past the cut is judged by the movement rule instead (rc24.test.mjs).
+  assert.notEqual(fleetVerdict(ev(), { ...byP, bpc: m('VERIFIED', 1400, { cut_height: 1000 }) }).verdict, 'SPLIT');
 });

@@ -89,7 +89,7 @@ from the event's signed roster and the beacons' reports (`fleet` in `GET /api/st
 | `PENDING` | no roster member has started chain creation or ignition | nothing; follow your agent |
 | `LIVE` | at least `quorum` roster members are LIVE on **one** target chain, with the same first block after H | if your box is HALTED or STRANDED on that chain, recover onto it (`unhalt` + `run`, or `join`; see below) |
 | `DEGRADED` | a target chain may be running, but no quorum is LIVE on one chain yet | do not reopen writes by hand; wait for LIVE or for the coordinator |
-| `SPLIT` (red) | a roster member resumed the old chain after others started chain creation or ignition, or members report different target chains / different blocks after H / different blocks at one height | stop: do not reopen writes anywhere until the coordinator resolves it; the alarm names the BPs |
+| `SPLIT` (red) | a roster member resumed the old chain after others started chain creation or ignition, the old chain's head moved after every member had paused and someone had started chain creation, or members report different target chains / different blocks after H / different blocks at one height | stop: do not reopen writes anywhere until the coordinator resolves it; the alarm names the BPs |
 | `ABORTED` | every reporting member aborted before chain creation | the old chain continues; wait for a new event |
 
 A `SPLIT` stays red (latched) for that event even if the reports that showed it change later. Only the
@@ -102,6 +102,19 @@ event; LIVE members are grouped by target chain (Metal blockchain id, else chain
 after the cut, which every member of one chain shares and any fork does not. Each beacon reports its target's head,
 head block id and that first-block id (`ceremony.target`) once its target may be running. The verdict is
 relay-reported and unsigned: it is evidence for people, not an authorization; the agents' own gates still decide.
+
+The old chain is judged two ways (rc.24), neither with a guessed burn-off length (the old chain keeps making empty
+blocks past H until H is final and the producers pause, a few hundred on XPR, and that lag is not fixed):
+
+- **Pause-head bound.** When every member that reached SNAPSHOTTED published its pause head (`head_at_pause`), a
+  source head more than 12 blocks above the highest one while a member is past chain creation is a split. With any
+  pause head missing (an older beacon) this rule is skipped.
+- **Movement.** Once every roster member has reached SNAPSHOTTED (all producers paused) and one is past chain
+  creation, the relay records each member's source head from then on (first and highest). If it moves more than 12
+  blocks, a producer resumed the old chain: split. A member that went silent before reaching SNAPSHOTTED does not
+  hold this rule back forever: it also applies once every member that is still reporting has reached SNAPSHOTTED and
+  at least `quorum` members are past chain creation. Before that, a slow BP's producer may still be making burn-off
+  blocks and the head moving is normal.
 
 What your agent does with the same view (rc.23, coordinated events only):
 

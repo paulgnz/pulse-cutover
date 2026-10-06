@@ -88,7 +88,14 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
 - **Fleet verdict and the latched SPLIT** (rc.23): `/api/status` carries `fleet` per network for the current event
   (LIVE / DEGRADED / SPLIT / ABORTED / PENDING, see `fleetVerdict` in `lib.mjs`) and, per producer, `event_max`: the
   highest stage each producer reported per event id (only raised, kept across restarts in `servers.json`; the agents'
-  resume guard reads it). A SPLIT is **latched** in the coordination store for that event and stays red, whatever the
+  resume guard reads it). rc.24 adds to each mark the highest state rank seen (`rank`) and, once the movement rule is
+  armed for the event (every roster member ≥ SNAPSHOTTED and one past chain creation; or every *reporting* member ≥
+  SNAPSHOTTED and `quorum` past creation, so a member silent since before its pause cannot block it), the member's
+  first and highest source head from that point (`src_first`, `src_max`). `src_max − src_first > 12` is a SPLIT
+  ("the old chain is still advancing after chain creation"). The other old-chain rule is the complete pause-head
+  bound (every SNAPSHOTTED member published `head_at_pause`: a source head above the highest + 12). rc.23's fixed
+  fallback (cut + 360 when a pause head was missing) is gone: a real pause at cut + 377 latched a false SPLIT.
+  rc.23 state files (marks without these fields) load unchanged. A SPLIT is **latched** in the coordination store for that event and stays red, whatever the
   reports say later, until an operator clears it after the split is resolved. On the mission-control host itself:
   `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-split?net=<net>'` (use the port mission control listens on).
   Same rule as clear-server: loopback only, refused (403) with `X-Real-IP`/`X-Forwarded-For`, so never through the
