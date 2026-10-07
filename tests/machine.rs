@@ -5087,6 +5087,25 @@ fn rc26_join_reverify_accepts_the_same_rehearsal_compare_allowlist_as_the_live_q
     assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"]["compare_allowed_digest"], good["compare_allowed_digest"]);
 }
 
+/// rc.26 review M1: a rehearsal config (here: rehearsal = true) is refused for a join whose journal recorded XPR
+/// mainnet as the source chain, even when the config leaves chain_id to discovery (the load-time check cannot see it).
+#[test]
+fn rc26_join_refuses_a_rehearsal_config_on_a_mainnet_journal() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_upstream_fleet(d.path());
+    assert!(cfg.ceremony.rehearsal, "the fleet fixture is a rehearsal config");
+    let ops = upstream_ops(d.path());
+    ops.coord_down.set(true);
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    let (mut j, _) = open_journal(&cfg.journal_path);
+    j.evidence(State::Stranded, serde_json::json!({"chain_id": pulse_cutover::config::XPR_MAINNET_CHAIN_ID})).unwrap();
+    drop(j);
+    ops.coord_down.set(false);
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let e = Machine::new(&cfg, &ops, j, rec).join_with("e1", false).unwrap_err();
+    assert!(e.contains("XPR MAINNET"), "{e}");
+}
+
 #[test]
 fn rc23_join_refuses_a_source_that_moved_on_after_h() {
     let d = tempfile::tempdir().unwrap();

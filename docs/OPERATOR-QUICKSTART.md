@@ -136,7 +136,8 @@ What your agent does with the same view (rc.23, coordinated events only):
   against the LIVE members' and that your source took nothing after H, then tracks and ignites their chain;
   if your own verification failed or never finished, e.g. a broken table compare, fix the cause and add
   `--reverify`: it re-runs the verification on your journaled cut snapshot first and joins only if the snapshot
-  sha256, state fingerprints and migration genesis all equal theirs; a node that did verify uses plain `join`);
+  sha256, state fingerprints and migration genesis all equal theirs; a node that did verify uses plain `join`; in a
+  rehearsal that verified under the compare allowlist, every LIVE member and mission control must run rc.26 or later);
   otherwise `pulse-cutover rollback --config …` re-runs the guard and resumes the old chain only if it passes
   (`--force-stranded --i-understand` records a fleet-wide decision instead, journaled with the fleet view it
   overrides).

@@ -903,7 +903,7 @@ pub fn run(cfg: &Config, once: bool) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-
+    use super::*;
     #[test]
     fn compare_allowed_digest_is_order_independent_and_absent_when_empty() {
         let a = compare_allowed_digest(&json!(["global_property", "contract_index_double"]));
@@ -913,7 +913,6 @@ mod tests {
         assert_eq!(compare_allowed_digest(&json!([])), None);
         assert_eq!(compare_allowed_digest(&Value::Null), None);
     }
-    use super::*;
 
     #[test]
     fn sanitize_short_strips_paths_urls_ips_and_commands() {

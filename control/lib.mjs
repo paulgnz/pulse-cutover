@@ -629,11 +629,13 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
   else if (past.length) verdict = 'DEGRADED';
   // rc.26 (fleet run d3): every reporting member sealed (STRANDED, or ABORTED), at least one STRANDED, nobody past
   // creation: the fleet stopped and waits for an operator decision (rollback or join); PENDING read as "nothing yet".
-  else if (members.some((m) => !m.missing) && members.filter((m) => !m.missing).every((m) => ['STRANDED', 'ABORTED'].includes(m.state))
+  // Review M3: a fleet-wide claim needs every member present and fresh; otherwise PENDING with who is unaccounted for.
+  else if (members.length && members.every((m) => !m.missing && m.fresh && ['STRANDED', 'ABORTED'].includes(m.state))
     && members.some((m) => m.state === 'STRANDED')) verdict = 'STRANDED';
   else if (members.length && members.filter((m) => !m.missing).every((m) => m.state === 'ABORTED') && members.some((m) => !m.missing)) verdict = 'ABORTED';
   else verdict = 'PENDING';
-  const notLive = liveChain ? members.filter((m) => !liveChain.members.includes(m.producer)).map((m) => `${m.producer}: ${m.missing ? 'no report' : m.conflict ? 'identity conflict' : !m.fresh ? `silent (${m.state || '?'})` : m.state}`) : [];
+  const unaccounted = members.filter((m) => m.missing || !m.fresh).map((m) => `${m.producer}: ${m.missing ? 'no report' : `silent (${m.state || '?'})`}`);
+  const notLive = !liveChain && verdict !== 'SPLIT' ? unaccounted : liveChain ? members.filter((m) => !liveChain.members.includes(m.producer)).map((m) => `${m.producer}: ${m.missing ? 'no report' : m.conflict ? 'identity conflict' : !m.fresh ? `silent (${m.state || '?'})` : m.state}`) : [];
   return { event_id: ev.event_id, h: ev.h ?? null, roster: roster ? roster.length : null, quorum, verdict, alarms,
     live_chain: liveChain, not_live: notLive,
     detail: !roster ? 'no roster in the event: LIVE needs a roster and quorum' : null,

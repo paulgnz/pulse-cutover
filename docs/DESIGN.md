@@ -172,7 +172,10 @@ stateDiagram-v2
   quorum's. Only then is a `reverified` record journaled (the beacon reports it like VERIFIED evidence), just before
   the `join` record. A re-verification that fails, passes under a rehearsal compare override outside a rehearsal ceremony (rc.26: in a
   rehearsal it is accepted when the LIVE quorum verified under the same allowed set, `compare_allowed_digest` in the
-  beacon evidence, and the record carries the override label like VERIFIED does), lacks any of the
+  beacon evidence, and the record carries the override label like VERIFIED does; the same digest is compared on a
+  plain join, so a rehearsal join under the allowlist needs rc.26+ beacons on the LIVE members and an rc.26+ relay,
+  else it refuses with "compare_allowed_digest missing"; `join` refuses any rehearsal config on a journal whose source
+  is XPR mainnet), lacks any of the
   three or does not match refuses with nothing changed on either chain and nothing journaled as evidence (only the
   node's verification work files were rewritten).
 - **Degraded after ignition** (rc.23, fleet runs r2–r6). With a coordinated event, a local symptom after

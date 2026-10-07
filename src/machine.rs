@@ -2438,6 +2438,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if !matches!(self.state, State::Stranded | State::Aborted) {
             return Err(format!("join is for a STRANDED or ABORTED ceremony; this journal is {} (HALTED: use unhalt)", self.state));
         }
+        // rc.26 review M1: the mainnet refusal of rehearsal configs runs at load (configured chain_id) and at ARM; a
+        // config edited after ARM must not bring one into a join either. The journal knows the source chain.
+        if self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet)
+            && (self.cfg.ceremony.rehearsal || !self.cfg.rehearsal_overrides().is_empty()) {
+            return Err("join refused: this journal's source is XPR MAINNET and the config is a rehearsal or carries rehearsal \
+                        overrides: refused for mainnet. Nothing was changed.".into());
+        }
         if self.reached_ignited || self.target_blockchain_id.is_some() {
             return Err("this node already started its own ignition or chain creation: not a join (operator decision)".into());
         }
@@ -2559,7 +2566,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // rc.26 F7 (fleet run d1): on PulseVM v1.0.0 every node's VERIFIED needs the rehearsal compare allowlist (#109),
         // so refusing it outright left a rehearsal with no route onto the LIVE chain. In a REHEARSAL ceremony it is
         // accepted when the LIVE quorum verified under the SAME set (compare_allowed_digest is part of the evidence the
-        // join compares); outside one (and so always for XPR mainnet) it refuses.
+        // join compares); outside one it refuses, and `join_with` refuses rehearsal configs on a mainnet journal.
         let allowed = json!(v.outcome.compare_allowed_mismatch);
         if !v.outcome.compare_allowed_mismatch.is_empty() && !self.cfg.ceremony.rehearsal {
             self.journal.evidence(self.state, json!({"reverify_failed": {"reason": "table compare mismatch allowed by a rehearsal override",
@@ -2605,6 +2612,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
         let ours = ours_override.unwrap_or_else(|| crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"].clone());
+        // Review LOW-1: the comparison only checks keys WE have; every one of the three that bind the state must be ours.
+        if let Some(k) = ["snapshot_sha256", "fingerprints_digest", "boot_genesis_sha256"].into_iter().find(|k| ours[*k].is_null()) {
+            return Err(format!("join refused: this node's verified evidence lacks {k}: the LIVE quorum's state cannot be matched"));
+        }
         let status = self.fleet_status();
         let (bid, sid, members) = crate::fleet::join_view(status.as_ref(), co, &ours).map_err(|e| format!("join refused: {e}"))?;
         let info = self.ops.source_info().map_err(|e| format!("join refused: cannot read the source chain: {e}"))?;

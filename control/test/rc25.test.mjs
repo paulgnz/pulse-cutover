@@ -35,3 +35,15 @@ test('rc.26: an all-sealed fleet (STRANDED / ABORTED, nobody past creation) read
   assert.equal(fleetVerdict(ev, byS(['ABORTED', 'ABORTED', 'ABORTED', 'ABORTED', 'ABORTED'])).verdict, 'ABORTED');
   assert.equal(fleetVerdict(ev, byS(['STRANDED', 'FROZEN', 'ABORTED', 'ABORTED', 'ABORTED'])).verdict, 'PENDING', 'someone still in the ceremony');
 });
+
+test('rc.26 review M3: STRANDED needs every member present and fresh; otherwise PENDING listing who is unaccounted for', () => {
+  const sealed = { state: 'STRANDED', evidence: { h: H } };
+  const byP = Object.fromEntries(BPS.slice(0, 4).map((p) => [p, [{ report: { coord: { event_id: 'e1' }, ceremony: sealed }, silent: false, conflict: false }]]));
+  const v = fleetVerdict(ev, byP);
+  assert.equal(v.verdict, 'PENDING');
+  assert.ok(v.not_live.includes('bp5: no report'), JSON.stringify(v.not_live));
+  byP.bp5 = [{ report: { coord: { event_id: 'e1' }, ceremony: sealed }, silent: true, conflict: false }];
+  assert.equal(fleetVerdict(ev, byP).verdict, 'PENDING', 'a silent member is not proof');
+  byP.bp5[0].silent = false;
+  assert.equal(fleetVerdict(ev, byP).verdict, 'STRANDED');
+});

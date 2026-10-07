@@ -382,7 +382,11 @@ pub fn join_view(status: Option<&Value>, co: &Coordination, ours: &Value) -> Res
         return Err(format!("only {} member(s) LIVE on one target chain ({}), quorum {q}", members.len(), members.join(", ")));
     }
     if !mismatches.is_empty() {
-        return Err(format!("the LIVE members' evidence differs from this node's: {}", mismatches.join("; ")));
+        let hint = if mismatches.iter().any(|m| m.contains("compare_allowed_digest missing")) {
+            " (compare_allowed_digest missing: the LIVE members' beacons or the relay may predate rc.26, which a rehearsal \
+             join under the compare allowlist needs)"
+        } else { "" };
+        return Err(format!("the LIVE members' evidence differs from this node's: {}{hint}", mismatches.join("; ")));
     }
     Ok((bid, subnet, members))
 }
@@ -570,6 +574,23 @@ mod tests {
         assert_eq!(drop_foreign_ceremonies(&mut st2, "rehearsal", 100), 1);
         let mut inexact = rep("VERIFIED", json!({})); inexact["ceremony"]["evidence"]["cut_height"] = json!(103);
         assert_eq!(drop_foreign_ceremonies(&mut status_me(&[("bp2", inexact, 1000)]), "rehearsal", 100), 0);
+    }
+
+    /// rc.26 review M2: the rehearsal compare allowlist digest is part of the joined evidence: a different allowed
+    /// set (different tables failed) refuses; a LIVE quorum without one (older beacons/relay) refuses with a hint.
+    #[test]
+    fn join_view_compares_the_allowed_compare_set() {
+        let c = co(&["bp1", "bp2", "bp3", "bp4", "bp5"], 4);
+        let t = |dg: Option<&str>| {
+            let mut x = json!({"target": {"blockchain_id": "X", "subnet_id": "S", "head": 120, "after_cut_id": "a".repeat(64)}});
+            if let Some(dg) = dg { x["evidence"] = json!({"snapshot_sha256": "aa", "fingerprints_digest": "ff", "compare_allowed_digest": dg}); }
+            rep("LIVE", x)
+        };
+        let ours = json!({"snapshot_sha256": "aa", "fingerprints_digest": "ff", "compare_allowed_digest": "d1"});
+        let live = |dg: Option<&str>| status(&["bp2", "bp3", "bp4", "bp5"].iter().map(|p| (*p, t(dg), 1000)).collect::<Vec<_>>());
+        assert!(join_view(Some(&live(Some("d1"))), &c, &ours).is_ok());
+        assert!(join_view(Some(&live(Some("d2"))), &c, &ours).unwrap_err().contains("compare_allowed_digest"));
+        assert!(join_view(Some(&live(None)), &c, &ours).unwrap_err().contains("may predate rc.26"));
     }
 
     /// Review #1: with quorum = N the quorum rule always passes, so a peer's past-creation state is the one fact that
