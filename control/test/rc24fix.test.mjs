@@ -15,7 +15,7 @@ const marksPastLive = Object.fromEntries(BPS.map((p) => [p, { past_create: true,
 test('a journal armed for another H is not this event\'s evidence (no false SPLIT)', () => {
   assert.equal(ceremonyFor({ ceremony: staleAborted }, ev), null);
   assert.equal(ceremonyFor({ ceremony: { ...staleAborted, evidence: { h: H } } }, ev).state, 'ABORTED');
-  assert.equal(ceremonyFor({ ceremony: { state: 'VERIFIED', evidence: { cut_height: OLD_H } } }, ev), null, 'cut_height when h is absent');
+  assert.equal(ceremonyFor({ ceremony: { state: 'VERIFIED', evidence: { cut_height: OLD_H } } }, ev).state, 'VERIFIED', 'rc.25: no cut_height fallback (an inexact cut is not another event)');
   assert.equal(ceremonyFor({ ceremony: { state: 'ARMED', evidence: {} } }, ev).state, 'ARMED', 'no height: kept');
   assert.equal(ceremonyFor({ ceremony: staleAborted }, {}).state, 'ABORTED', 'no event H known: kept');
   const v = fleetVerdict(ev, by(staleAborted), marksPastLive);

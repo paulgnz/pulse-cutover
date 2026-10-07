@@ -112,9 +112,17 @@ pub fn drop_foreign_ceremonies(status: &mut Value, network: &str, h: u64) -> usi
         let Some(prods) = net["producers"].as_array_mut() else { continue };
         for p in prods.iter_mut() {
             let mut fix = |r: &mut Value| {
-                let ev = &r["ceremony"]["evidence"];
-                let jh = ev["h"].as_u64().or_else(|| ev["cut_height"].as_u64());
+                // `evidence.h` only (every beacon since rc.10 reports it): a cut-height fallback made a correctly
+                // reporting older peer "foreign" on an inexact rehearsal cut (rc.25 review #5).
+                let jh = r["ceremony"]["evidence"]["h"].as_u64();
                 if jh.is_some_and(|j| j != h) {
+                    // Asymmetric (rc.25 review #1): a foreign report loses its PERMISSIVE facts (ABORTED, a resumed
+                    // source, LIVE) but never a blocking one. If it says past creation / ignition, that is kept as
+                    // `foreign_past_create`, which `past_create` honours: a peer whose H differs from ours (our
+                    // config may be the wrong one) and that ignited must still stop a resume.
+                    if past_create(r) {
+                        r["foreign_past_create"] = json!(r["ceremony"]["state"].as_str().unwrap_or("past creation"));
+                    }
                     r["ceremony"] = Value::Null;
                     dropped += 1;
                 }
@@ -135,6 +143,9 @@ pub fn drop_foreign_ceremonies(status: &mut Value, network: &str, h: u64) -> usi
 /// A report is past the point where resuming the old chain is safe: creation, a join or ignition
 /// started, or a state after it.
 pub fn past_create(report: &Value) -> bool {
+    if report["foreign_past_create"].is_string() {
+        return true;
+    }
     let c = &report["ceremony"];
     matches!(c["state"].as_str(), Some("IGNITED" | "FLIPPED" | "LIVE" | "HALTED"))
         || c["create_started"].as_bool() == Some(true)
@@ -149,6 +160,18 @@ fn quorum_of(co: &Coordination) -> usize {
 /// Is `m` this node? (Matched by beacon producer and, when the roster pins one, instance id.)
 fn is_self(m: &MemberView, me: Option<(&str, &str)>) -> bool {
     me.is_some_and(|(prod, inst)| m.producer == prod && m.instance_id.as_deref().is_none_or(|i| i == inst))
+}
+
+/// This node's OWN fresh report for the event, from THIS instance (rc.25 review #2): another box reporting under the
+/// same producer name with its own token (a standby, an old box) must not stand in for a silent beacon. A report
+/// without an instance id (an older beacon) matches by producer.
+fn own_report_visible(status: &Value, co: &Coordination, me: (&str, &str)) -> bool {
+    let max_age = co.report_max_age_secs * 1000;
+    producers(status, &co.network).iter().filter(|p| p["name"].as_str() == Some(me.0)).any(|p| {
+        beacons(p).into_iter().any(|(r, age, conflict)| !conflict && age.is_some_and(|a| a <= max_age)
+            && co.event_id.as_deref().is_none_or(|e| r["coord"]["event_id"].as_str() == Some(e))
+            && r["instance_id"].as_str().is_none_or(|i| i.eq_ignore_ascii_case(me.1)))
+    })
 }
 
 /// May an agent that froze writes resume the old chain? Err(why) unless (unknown is never "no"):
@@ -178,11 +201,17 @@ pub fn resume_guard(status: Option<&Value>, co: &Coordination, me: Option<(&str,
     // it may resume. Otherwise its peers cannot account for it (they strand, since it "may have ignited unseen")
     // while it alone resumes: the one silent member deciding for everyone, backwards.
     let mine: Vec<&MemberView> = all.iter().filter(|m| is_self(m, me)).collect();
-    if me.is_none() || mine.is_empty() || mine.iter().any(|m| m.missing || m.conflict || m.report.is_none()) {
+    if me.is_none() || mine.is_empty() || mine.iter().any(|m| m.missing || m.conflict || m.report.is_none())
+        || !me.is_some_and(|me| own_report_visible(status, co, me)) {
         return Err("own beacon not visible on the relay (this node's report for the event is missing, stale or identity-conflicted): \
                     peers cannot account for this node, so it must not resume the old chain".into());
     }
     let (mut seen, mut in_ceremony) = (vec![], vec![]);
+    if let Some((m, st)) = all.iter().filter(|m| !is_self(m, me))
+        .find_map(|m| m.report.as_ref().or(m.last.as_ref())?["foreign_past_create"].as_str().map(|st| (m, st))) {
+        return Err(format!("{} reports a ceremony for another H that is past chain creation or ignition ({st}): this node's \
+            event config may be the wrong one; unknown, so no resume", m.producer));
+    }
     // First the strongest evidence: anyone ever reported past creation for this event.
     if let Some(m) = all.iter().filter(|m| !is_self(m, me)).find(|m| m.max_past.is_some()) {
         return Err(format!("{} was reported past chain creation or ignition for this event ({}; relay high-water mark)",
@@ -533,12 +562,44 @@ mod tests {
         assert!(st["networks"][0]["producers"][2]["beacons"][0]["report"]["ceremony"].is_object(), "a journal for this H stays");
         // After: bp2 has a report for the event but no known state: still in the ceremony, the quorum is reachable.
         assert!(resume_guard(Some(&st), &c, me, false).unwrap_err().contains("still in the ceremony"));
-        // cut_height is used when the ARMED height is absent; another network is untouched.
-        let mut r = rep("LIVE", json!({})); r["ceremony"]["evidence"]["cut_height"] = json!(7);
+        // Review #5: no cut_height fallback (an inexact cut is not another event); another network is untouched.
+        let mut r = rep("LIVE", json!({})); r["ceremony"]["evidence"]["h"] = json!(7);
         let mut st2 = status_me(&[("bp2", r, 1000)]);
         assert_eq!(drop_foreign_ceremonies(&mut st2, "other", 100), 0);
         assert_eq!(drop_foreign_ceremonies(&mut st2, "rehearsal", 7), 0);
         assert_eq!(drop_foreign_ceremonies(&mut st2, "rehearsal", 100), 1);
+        let mut inexact = rep("VERIFIED", json!({})); inexact["ceremony"]["evidence"]["cut_height"] = json!(103);
+        assert_eq!(drop_foreign_ceremonies(&mut status_me(&[("bp2", inexact, 1000)]), "rehearsal", 100), 0);
+    }
+
+    /// Review #1: with quorum = N the quorum rule always passes, so a peer's past-creation state is the one fact that
+    /// blocks a resume. A report for another H (our config may be the wrong one) loses permissive facts, never that.
+    #[test]
+    fn a_foreign_report_past_creation_still_blocks_a_resume() {
+        let me = Some(("bp1", "i"));
+        let c = co(&["bp1", "bp2", "bp3"], 3);
+        let mut ignited = rep("IGNITED", json!({"ignition_started": true})); ignited["ceremony"]["evidence"]["h"] = json!(999);
+        let mut st = status_me(&[("bp2", ignited, 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
+        assert_eq!(drop_foreign_ceremonies(&mut st, "rehearsal", 100), 1);
+        assert!(st["networks"][0]["producers"][1]["beacons"][0]["report"]["ceremony"].is_null());
+        let e = resume_guard(Some(&st), &c, me, false).unwrap_err();
+        assert!(e.contains("bp2 reports a ceremony for another H that is past chain creation"), "{e}");
+        assert!(resume_guard(Some(&st), &c, me, true).is_err(), "a signed abort does not override it either");
+    }
+
+    /// Review #2: another box reporting under this producer name (its own instance) does not stand in for this
+    /// node's own silent beacon.
+    #[test]
+    fn another_instance_under_my_name_is_not_my_own_report() {
+        let c = co(&["bp1", "bp2"], 2);
+        let mut other_box = rep("ABORTED", json!({})); other_box["instance_id"] = json!("b".repeat(32));
+        let st = status(&[("bp1", other_box.clone(), 1000), ("bp2", rep("ABORTED", json!({})), 1000)]);
+        let me = Some(("bp1", "a".repeat(32)));
+        let me = me.as_ref().map(|(p, i)| (*p, i.as_str()));
+        assert!(resume_guard(Some(&st), &c, me, false).unwrap_err().contains("own beacon not visible"));
+        let mut mine = other_box; mine["instance_id"] = json!("a".repeat(32));
+        let st = status(&[("bp1", mine, 1000), ("bp2", rep("ABORTED", json!({})), 1000)]);
+        assert!(resume_guard(Some(&st), &c, me, false).is_ok());
     }
 
     /// rc.24 fleet rehearsal (c3a): a HALTED peer whose validator runs the chain still counts; a split is "hard".

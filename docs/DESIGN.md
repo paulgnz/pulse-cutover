@@ -165,11 +165,14 @@ stateDiagram-v2
   carry a transaction after H. The `join` record is a point of no return (like `create_chain`); the run then
   continues at VERIFIED without a fleet gate or abort check (the fleet already committed; an abort is not
   honoured after ignition) and goes through ignition, lineage, post_ignite and the LIVE gate.
-  `join --reverify` (rc.25, fleet run c3a: a BP whose table compare broke had no route onto the LIVE chain) first
-  re-runs the upstream verification on the journaled cut snapshot (same pipeline, boot artifacts rebuilt), journals
-  a `reverified` record (which the beacon reports like VERIFIED evidence) and then requires all three of snapshot
-  sha256, fingerprints and migration genesis to equal the LIVE quorum's; a re-verification that fails, passes only
-  under a rehearsal compare override, or lacks any of the three refuses with nothing changed.
+  `join --reverify` (rc.25, fleet run c3a: a BP whose table compare broke had no route onto the LIVE chain) is for a
+  ceremony without VERIFIED evidence only (a verified node uses a plain join). It refuses at once if the source moved
+  past its pause head, then re-runs the upstream verification on the journaled cut snapshot (same pipeline, boot
+  artifacts rebuilt) and requires all three of snapshot sha256, fingerprints and migration genesis to equal the LIVE
+  quorum's. Only then is a `reverified` record journaled (the beacon reports it like VERIFIED evidence), just before
+  the `join` record. A re-verification that fails, passes only under a rehearsal compare override, lacks any of the
+  three or does not match refuses with nothing changed on either chain and nothing journaled as evidence (only the
+  node's verification work files were rewritten).
 - **Degraded after ignition** (rc.23, fleet runs r2–r6). With a coordinated event, a local symptom after
   ignition (a gap in the sustained-LIVE window, the head not past the cut within `quorum_timeout_secs`, a
   failing `post_ignite` / `on_live` hook) consults the fleet first: while a quorum of the roster reports the
@@ -334,9 +337,13 @@ cut + 377 and latched a false SPLIT. This is display evidence only, as above.
 rc.25 (fleet run c1): with quorum = N the verdict flapped LIVE↔DEGRADED whenever one beacon's target read timed out,
 because the beacon then also dropped its block after the cut. The beacon keeps that block id (it never changes on one
 chain) and reports `target.unread_for_ms`; mission control and the agent's live view count such a member on its chain
-for up to 60 s of failed reads (`UNREAD_GRACE_MS`), then drop it. After a halt on a fleet still short of quorum
-(rc.25 F2) degraded mode gives a lagging peer a bounded grace (`degraded_fleet_short`), counts HALTED members whose
-validators still run the chain, and an `unhalt` restarts the degraded patience.
+for up to 60 s of failed reads (`UNREAD_GRACE_MS`), then drop it. In degraded mode (rc.25 F2) a fleet view merely
+short of quorum gets a bounded grace (`degraded_fleet_short`, at most 120 s per agent run: it is not journaled, so a
+restart grants it again), HALTED members count when their beacon still reads a target head past the cut (a halt
+never stops the validator, so in practice they still run the chain), and an `unhalt` restarts the degraded patience.
+A fork of this node ends degraded mode at once only when its own block after the cut can be read. HALTED members
+count in the agent's live view but not in mission control's LIVE group or in `join`, so an agent can see a healthy
+fleet while the board shows DEGRADED.
 
 ## 6. v2 "shadow mirror" (sketch, not implemented)
 

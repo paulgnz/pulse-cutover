@@ -98,7 +98,9 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   rc.25: a LIVE member whose target head read failed keeps counting toward the LIVE group for 60 s
   (`target.unread_for_ms` ≤ `UNREAD_GRACE_MS`; the beacon keeps its block after the cut), so one timed-out read no
   longer flaps a quorum = N verdict to DEGRADED; and a report whose journal was armed for another H is no ceremony
-  for the event (no false SPLIT from a stale journal on a reused run directory).
+  for the event (no false SPLIT from a stale journal on a reused run directory). HALTED members count toward the
+  agents' own live view (their validators keep running the chain) but not toward this LIVE group, so the board can
+  show DEGRADED while agents wait as degraded rather than halting.
   rc.23 state files (marks without these fields) load unchanged. A SPLIT is **latched** in the coordination store for that event and stays red, whatever the
   reports say later, until an operator clears it after the split is resolved. On the mission-control host itself:
   `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-split?net=<net>'` (use the port mission control listens on).

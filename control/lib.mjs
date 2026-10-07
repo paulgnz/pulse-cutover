@@ -540,7 +540,8 @@ export function nextEventMark(cur, ce, sourceHead, armed, now) {
 export function ceremonyFor(report, ev) {
   const ce = report?.ceremony || null;
   if (!ce || !ev || !Number.isInteger(ev.h)) return ce;
-  const jh = Number.isInteger(ce.evidence?.h) ? ce.evidence.h : ce.evidence?.cut_height;
+  // `evidence.h` only (every beacon since rc.10): a cut-height fallback dropped real peers on an inexact cut (rc.25).
+  const jh = ce.evidence?.h;
   return Number.isInteger(jh) && jh !== ev.h ? null : ce;
 }
 /** @param eventMax { producer: {past_create, state, rank?, src_first?, src_max?} } for THIS event — the relay's per-event high-water mark (an
@@ -609,7 +610,8 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
   const groups = {};
   // A member whose head read failed keeps its (immutable) block after the cut for UNREAD_GRACE_MS (rc.25 F4: one
   // timed-out read flapped the verdict LIVE↔DEGRADED with quorum = N); a target unreadable for longer drops out.
-  const readable = (t) => t.head != null || !Number.isInteger(t.unread_for_ms) || t.unread_for_ms <= UNREAD_GRACE_MS;
+  // Same rule as the agent (src/fleet.rs live_view): no head and no read age (an older beacon) does not count.
+  const readable = (t) => t.head != null || (Number.isInteger(t.unread_for_ms) && t.unread_for_ms <= UNREAD_GRACE_MS);
   for (const m of members.filter((x) => x.fresh && x.state === 'LIVE' && x.target?.after_cut_id && readable(x.target))) {
     const k = `${m.target.blockchain_id || m.target.chain_id || '?'}|${m.target.after_cut_id}`;
     (groups[k] ||= []).push(m.producer);

@@ -251,10 +251,11 @@ node's source did not produce past its journaled pause head and carries no trans
 source that resumed and took writes is an operator decision, not a join).
 
 --reverify (rc.25): for a producer whose own verification failed or never finished (it took the cut
-snapshot but has no VERIFIED evidence, e.g. its table compare broke). It re-runs the upstream
-verification on the journaled cut snapshot first and joins only if the snapshot sha256, the state
-fingerprints and the migration genesis hash ALL equal the LIVE quorum's. A failed re-verification
-changes nothing on either chain.
+snapshot but has no VERIFIED evidence, e.g. its table compare broke; a node that verified uses plain
+join). It re-runs the upstream verification on the journaled cut snapshot first and joins only if the
+snapshot sha256, the state fingerprints and the migration genesis hash ALL equal the LIVE quorum's.
+A refused re-verification changes nothing on either chain and journals no evidence (only this node's
+verification work files are rewritten).
 
 From the `join` journal record on, a failure HALTS: it never resumes the old chain. A crash resumes
 with `pulse-cutover run`. Exit codes as `run`: 0 = LIVE.

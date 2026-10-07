@@ -24,4 +24,5 @@ test('a target unreadable past the grace drops out (DEGRADED), and an older beac
   assert.equal(v.verdict, 'DEGRADED');
   assert.ok(v.not_live.some((s) => s.startsWith('bp5')));
   assert.equal(fleetVerdict(ev, by(live({ head: null, after_cut_id: null }))).verdict, 'DEGRADED');
+  assert.equal(fleetVerdict(ev, by(live({ head: null }))).verdict, 'DEGRADED', 'no head and no read age: not counted (as the agent)');
 });

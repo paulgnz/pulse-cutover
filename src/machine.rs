@@ -2442,19 +2442,36 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Err("this node already started its own ignition or chain creation: not a join (operator decision)".into());
         }
         let verified = self.sha256.is_some() && self.boot_hashes.0.is_some() && self.boot_hashes.1.is_some() && self.boot_hashes.2.is_some();
-        let mut ours_override = None;
-        if !verified || reverify {
+        let (mut ours_override, mut reverified) = (None, None);
+        if verified && reverify {
+            // rc.25 review #3: a re-verification rewrites the boot artifacts in place; on a node that verified they
+            // are what its VERIFIED record binds. Same snapshot, same result: a plain join is the path.
+            return Err("join --reverify is for a ceremony WITHOUT VERIFIED evidence; this one verified: use `join` without \
+                        --reverify (its artifacts are checked against the LIVE quorum's)".into());
+        }
+        if !verified {
             if !reverify {
                 return Err("this ceremony never reached VERIFIED (no snapshot hash / boot artifacts journaled): nothing to join with. \
                             If it took the cut snapshot (SNAPSHOTTED), `join --reverify` re-runs the verification on it first".into());
             }
-            ours_override = Some(self.join_reverify()?);
+            let (ours, record) = self.join_reverify()?;
+            ours_override = Some(ours);
+            reverified = Some(record);
         }
+        // Until the `reverified` record is journaled (only after the LIVE quorum accepts the evidence), a refusal
+        // leaves the journal as it was: the in-memory evidence is dropped again (rc.25 review #3).
+        let forget = |m: &mut Self, e: String| -> String {
+            if reverified.is_some() {
+                m.sha256 = None;
+                m.boot_hashes = (None, None, None);
+            }
+            e
+        };
         let (Some(h), Some(cut_id), Some(sha)) = (self.cut_height, self.cut_block_id.clone(), self.sha256.clone()) else {
             return Err("this ceremony never reached VERIFIED (no cut / snapshot hash journaled): nothing to join with".into());
         };
         if self.boot_hashes.0.is_none() || self.boot_hashes.1.is_none() || self.boot_hashes.2.is_none() {
-            return Err("no boot artifacts journaled at VERIFIED: nothing to join with".into());
+            return Err(forget(self, "no boot artifacts journaled at VERIFIED: nothing to join with".into()));
         }
         // 0. Writes frozen again (review #4): an ABORTED ceremony's on_abort reopened them on the old chain.
         //    on_freeze is re-run (it must be idempotent, like every hook) before any other join step;
@@ -2462,22 +2479,29 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let refrozen = self.state == State::Aborted;
         if refrozen {
             let Some(hook) = self.cfg.hooks.on_freeze.clone() else {
-                return Err("join refused: this ceremony ABORTED (on_abort reopened writes) and has no hooks.on_freeze to close \
-                            them again first. Nothing was changed.".into());
+                return Err(forget(self, "join refused: this ceremony ABORTED (on_abort reopened writes) and has no hooks.on_freeze to close \
+                            them again first. Nothing was changed on either chain.".into()));
             };
             match self.ops.run_hook(&hook) {
                 Ok(o) => self.journal.evidence(self.state, json!({"join_refreeze": o, "note": "writes frozen again before the join"}))?,
                 Err(e) => {
                     self.journal.evidence(self.state, json!({"join_refreeze_error": e}))?;
-                    return Err(self.join_refused_after_refreeze(format!("join refused: re-running on_freeze to close writes failed: {e}"))?);
+                    let e = forget(self, format!("join refused: re-running on_freeze to close writes failed: {e}"));
+                    return Err(self.join_refused_after_refreeze(e)?);
                 }
             }
         }
         let (bid, sid, members, info, paused_head, paused, ours) = match self.join_checks(&co, h, ours_override) {
             Ok(x) => x,
-            Err(e) if refrozen => return Err(self.join_refused_after_refreeze(e)?),
-            Err(e) => return Err(e),
+            Err(e) if refrozen => {
+                let e = forget(self, e);
+                return Err(self.join_refused_after_refreeze(e)?);
+            }
+            Err(e) => return Err(forget(self, e)),
         };
+        if let Some(record) = reverified {
+            self.journal.evidence(self.state, record)?;
+        }
         // 4. Commit to the join (point of no return), then continue as a producer that verified.
         let from = self.state;
         self.journal.evidence(self.state, json!({"join": {"event_id": event_id, "blockchain_id": bid, "subnet_id": sid,
@@ -2501,12 +2525,21 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.run()
     }
 
-    /// `join --reverify` (rc.25 F5): the upstream verification again, on this node's journaled cut snapshot. Ok = the
-    /// fleet evidence it produced (every field present), journaled as a `reverified` record; Err = refused, nothing
-    /// changed on either chain (the boot artifacts it may have rewritten are only ever used by a join or ignition).
-    fn join_reverify(&mut self) -> Result<serde_json::Value, String> {
+    /// `join --reverify` (rc.25 F5): the upstream verification again, on this node's journaled cut snapshot (only for a
+    /// ceremony without VERIFIED evidence). Ok = the fleet evidence it produced (every field present) and the
+    /// `reverified` record the caller journals once the LIVE quorum's evidence matches; Err = refused, nothing changed
+    /// on either chain (only this node's verification work files were rewritten; no record binds them).
+    fn join_reverify(&mut self) -> Result<(serde_json::Value, serde_json::Value), String> {
         if self.cut_height.is_none() || self.cut_block_id.is_none() {
             return Err("join --reverify: this ceremony never took the cut (no cut height / block id journaled): nothing to verify".into());
+        }
+        // Cheap first (rc.25 review #4): a source that produced past its pause head can never join; say so before
+        // minutes of pipeline (and, from ABORTED, before writes are frozen again).
+        if let (Some(paused), Ok(info)) = (self.head_at_pause, self.ops.source_info()) {
+            if info.head_block_num > paused {
+                return Err(format!("join refused: the source produced {} block(s) past the journaled pause head {paused} (head now {}): \
+                    this node's old chain continued after H. Operator decision. Nothing was changed.", info.head_block_num - paused, info.head_block_num));
+            }
         }
         match self.snapshot_file.as_deref() {
             Some(f) if std::path::Path::new(f).is_file() => {}
@@ -2518,29 +2551,34 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             Ok(v) => v,
             Err((reason, detail)) => {
                 self.journal.evidence(self.state, json!({"reverify_failed": {"reason": reason, "detail": detail}}))?;
-                return Err(format!("join refused: re-verification failed: {reason} ({detail}). Nothing was changed."));
+                self.boot_hashes = (None, None, None);
+                return Err(format!("join refused: re-verification failed: {reason} ({detail}). Nothing was changed on either chain \
+                                    (only this node's verification work files were rewritten)."));
             }
         };
         if !v.outcome.compare_allowed_mismatch.is_empty() {
             self.journal.evidence(self.state, json!({"reverify_failed": {"reason": "table compare mismatch allowed by a rehearsal override",
                 "allowed": v.outcome.compare_allowed_mismatch}}))?;
+            self.boot_hashes = (None, None, None);
             return Err("join refused: the re-verification's table compare only passed under a rehearsal override \
                         (compare_allowed_mismatch): not a verification to join with".into());
         }
         let ours = v.fleet_evidence();
         if ["snapshot_sha256", "fingerprints_digest", "boot_genesis_sha256"].iter().any(|k| ours[*k].is_null()) {
             self.journal.evidence(self.state, json!({"reverify_failed": {"reason": "incomplete evidence", "evidence": ours}}))?;
+            self.boot_hashes = (None, None, None);
             return Err(format!("join refused: the re-verification did not produce all of snapshot sha256, state fingerprints and \
-                                migration genesis ({ours}): the LIVE quorum's state cannot be matched. Nothing was changed."));
+                                migration genesis ({ours}): the LIVE quorum's state cannot be matched. Nothing was changed on either chain."));
         }
         self.sha256 = Some(v.sha256.clone());
-        self.journal.evidence(self.state, json!({"reverified": true, "evidence": ours,
+        // Journaled by the caller only once the LIVE quorum's evidence matched (review #3).
+        let record = json!({"reverified": true, "evidence": ours,
             "sha256": v.sha256, "size_bytes": v.file_size, "cut_height": v.cut_height, "cut_block_id": v.cut_block_id, "chain_id": v.chain_id,
             "fingerprints": v.outcome.state_root.as_ref().map(|r| json!({"upstream_state_root": r})), "state_root": v.outcome.state_root,
             "table_compare": v.table_compare, "boot": v.boot, "boot_manifest_sha256": v.boot_hashes.0,
             "boot_genesis_sha256": v.boot_hashes.1, "boot_chain_config_sha256": v.boot_hashes.2,
-            "checkpoint_sha256": v.outcome.checkpoint_sha256, "verify_wall_ms": self.ops.now_ms().saturating_sub(v.started)}))?;
-        Ok(ours)
+            "checkpoint_sha256": v.outcome.checkpoint_sha256, "verify_wall_ms": self.ops.now_ms().saturating_sub(v.started)});
+        Ok((ours, record))
     }
 
     /// Steps 1-3 of a join: unchanged boot artifacts, a unique LIVE quorum with our evidence, a source

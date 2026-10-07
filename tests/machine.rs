@@ -5015,7 +5015,16 @@ fn rc25_join_reverify_lets_a_node_whose_verification_failed_join_the_live_chain(
     *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&other, &["bp2", "bp3", "bp4", "bp5"]));
     assert!(join(true).unwrap_err().contains("fingerprints_digest"));
     assert_eq!(pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap().state, Some(st), "refusals change nothing");
-    assert!(!std::fs::read_to_string(&cfg.journal_path).unwrap().contains(r#""side_effect":"join""#));
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(!text.contains(r#""side_effect":"join""#));
+    // Review #3: a refused re-verification journals no evidence (replay recovers none, the beacon reports none), so
+    // a plain join still refuses instead of treating the unaccepted result as VERIFIED.
+    assert!(!text.contains(r#""reverified":true"#));
+    assert!(pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap().sha256.is_none());
+    assert!(join(false).unwrap_err().contains("--reverify"));
+    // A node that verified uses a plain join: --reverify would rewrite the artifacts its VERIFIED record binds.
+    let (j, rec) = open_journal(&pcfg.journal_path);
+    assert!(Machine::new(&pcfg, &pops, j, rec).join_with("e1", true).unwrap_err().contains("WITHOUT VERIFIED"));
     // Fixed compare, equal evidence: re-verified, joined, LIVE, never created a chain or resumed the old one.
     *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&good, &["bp2", "bp3", "bp4", "bp5"]));
     assert_eq!(join(true).unwrap(), State::Live);
