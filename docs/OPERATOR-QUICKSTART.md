@@ -128,9 +128,14 @@ What your agent does with the same view (rc.23, coordinated events only):
   that no peer ignites. A producer-mode event must carry a roster (`await` refuses one without). Otherwise it ends
   **STRANDED**: sealed like HALTED, the source stays paused, writes
   stay frozen, `on_halt` pages you. Put your `[beacon] producer` in the ceremony config so the agent can recognize
-  its own entry in the roster. From STRANDED: if the verdict is `LIVE`, run
+  its own entry in the roster: since rc.25 it never resumes unless its OWN report for the event is visible on the
+  relay (peers cannot account for a node they cannot see), and the config warns when a roster has no `[beacon]` or
+  the beacon's producer is not in it. From STRANDED: if the verdict is `LIVE`, run
   `pulse-cutover join --config <the event's ceremony config> --event <id>` (it checks your verified artifacts
-  against the LIVE members' and that your source took nothing after H, then tracks and ignites their chain);
+  against the LIVE members' and that your source took nothing after H, then tracks and ignites their chain;
+  if your own verification failed or never finished, e.g. a broken table compare, fix the cause and add
+  `--reverify`: it re-runs the verification on your journaled cut snapshot first and joins only if the snapshot
+  sha256, state fingerprints and migration genesis all equal theirs);
   otherwise `pulse-cutover rollback --config …` re-runs the guard and resumes the old chain only if it passes
   (`--force-stranded --i-understand` records a fleet-wide decision instead, journaled with the fleet view it
   overrides).

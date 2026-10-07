@@ -199,6 +199,29 @@ fn journaled_join_ids(path: &std::path::Path) -> Option<(String, Option<String>)
         })
 }
 
+/// What the upstream verification produced (SNAPSHOTTED→VERIFIED and `join --reverify` share it, rc.25 F5).
+struct UpstreamVerified {
+    sha256: String,
+    file_size: u64,
+    outcome: upstream::UpstreamOutcome,
+    boot: serde_json::Value,
+    boot_hashes: (Option<String>, Option<String>, Option<String>),
+    table_compare: String,
+    cut_height: u64,
+    cut_block_id: String,
+    chain_id: String,
+    started: u64,
+}
+
+impl UpstreamVerified {
+    /// The evidence the fleet compares (the beacon's snapshot_sha256 / fingerprints_digest / boot_genesis_sha256).
+    fn fleet_evidence(&self) -> serde_json::Value {
+        let fingerprints = self.outcome.state_root.as_ref().map(|r| json!({"upstream_state_root": r}));
+        json!({"snapshot_sha256": self.sha256, "boot_genesis_sha256": self.boot_hashes.1,
+            "fingerprints_digest": fingerprints.map(|f| crate::beacon::fingerprints_digest(&f))})
+    }
+}
+
 impl<'a, O: ChainOps> Machine<'a, O> {
     pub fn new(cfg: &'a Config, ops: &'a O, journal: Journal, recovered: Recovered) -> Self {
         let resumed = recovered.state.is_some();
@@ -1814,30 +1837,29 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// bound back to the ceremony's pinned cut (snapshot sha256, cut block
     /// id, cut height). The fork importer is not part of verification here;
     /// `[upstream] fork_audit = true` may journal it as a labeled dev extra.
-    fn step_snapshotted_upstream(&mut self) -> Result<(), String> {
-        let path = std::path::PathBuf::from(
-            self.snapshot_file.clone().expect("snapshot file recorded"),
-        );
+    /// The upstream verification of the journaled cut snapshot: sha256, the #61 pipeline, the advisory scan, the fork
+    /// audit and the boot artifacts, journaled as evidence under `stage`. `Ok(Err((reason, detail)))` changed no state:
+    /// the caller aborts (SNAPSHOTTED) or refuses (`join --reverify`, rc.25 F5). Outer Err = journal failure.
+    fn upstream_verify(&mut self, stage: State) -> Result<Result<UpstreamVerified, (String, serde_json::Value)>, String> {
+        let Some(file) = self.snapshot_file.clone() else {
+            return Ok(Err(("no cut snapshot journaled".into(), json!({}))));
+        };
+        let path = std::path::PathBuf::from(file);
         let up = self.cfg.upstream.clone().expect("validated: upstream section");
         let started = self.ops.now_ms();
         let (sha256, file_size) = match verify::sha256_file(&path) {
             Ok(v) => v,
-            Err(e) => {
-                self.abort("cannot hash cut snapshot", json!({"error": e}))?;
-                return Ok(());
-            }
+            Err(e) => return Ok(Err(("cannot hash cut snapshot".into(), json!({"error": e})))),
         };
         if let Some(expected) = &self.cfg.snapshot.expected_sha256 {
             if !sha256.eq_ignore_ascii_case(expected) {
-                self.abort(
-                    "snapshot sha256 mismatch vs ceremony manifest",
-                    json!({"computed": sha256, "expected": expected}),
-                )?;
-                return Ok(());
+                return Ok(Err(("snapshot sha256 mismatch vs ceremony manifest".into(),
+                    json!({"computed": sha256, "expected": expected}))));
             }
         }
-        let cut_height = self.cut_height.expect("cut pinned");
-        let cut_block_id = self.cut_block_id.clone().expect("cut pinned");
+        let (Some(cut_height), Some(cut_block_id)) = (self.cut_height, self.cut_block_id.clone()) else {
+            return Ok(Err(("no cut height / cut block id journaled".into(), json!({}))));
+        };
         let chain_id = self.chain_id.clone().unwrap_or_default();
         let outcome = {
             let journal = &mut self.journal;
@@ -1852,7 +1874,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 &cut_block_id,
                 &chain_id,
                 |evidence| {
-                    let _ = journal.evidence(State::Snapshotted, evidence);
+                    let _ = journal.evidence(stage, evidence);
                 },
                 // A signed abort is honoured between steps and while each tool runs (it kills
                 // the tool), not only at the fleet gate after VERIFIED.
@@ -1865,21 +1887,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             Ok(o) => o,
             Err(upstream::PipelineError::Aborted { during }) => {
                 let event_id = self.cfg.coordination.as_ref().and_then(|c| c.event_id.clone());
-                self.abort(
-                    "coordinator aborted the event (signed) before ignition",
+                return Ok(Err(("coordinator aborted the event (signed) before ignition".into(),
                     json!({"event_id": event_id, "during": format!("upstream verification ({during})"),
-                           "verify_wall_ms": self.ops.now_ms().saturating_sub(started)}),
-                )?;
-                return Ok(());
+                           "verify_wall_ms": self.ops.now_ms().saturating_sub(started)}))));
             }
             Err(upstream::PipelineError::Failed(e)) => {
-                self.abort("upstream verification failed", json!({"error": e}))?;
-                return Ok(());
+                return Ok(Err(("upstream verification failed".into(), json!({"error": e}))));
             }
         };
         // Advisory stubbed-intrinsic scan of the actual cut (read-only audit
         // over the deployed code objects; backend-independent).
-        self.advisory_scan(&path, State::Snapshotted)?;
+        self.advisory_scan(&path, stage)?;
         // Dev/audit extra, clearly labeled and NEVER a gate: the fork
         // importer's dual-arena fingerprints over the same cut.
         if up.fork_audit {
@@ -1891,7 +1909,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         .map(|(n, r)| (n.clone(), json!(format!("{r:016x}"))))
                         .collect();
                     self.journal.evidence(
-                        State::Snapshotted,
+                        stage,
                         json!({"fork_audit": {
                             "note": "release-validation audit only — not an operator step, not a gate",
                             "fingerprints": roots,
@@ -1899,7 +1917,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     )?;
                 }
                 Err(e) => self.journal.evidence(
-                    State::Snapshotted,
+                    stage,
                     json!({"fork_audit_error": e, "advisory": true}),
                 )?,
             }
@@ -1914,12 +1932,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let block = match self.ops.source_block(cut_height, rpc) {
                 Ok(b) => b,
                 Err(e) => {
-                    self.abort(
-                        "cannot fetch the full source cut block for the boot manifest anchor",
+                    return Ok(Err(("cannot fetch the full source cut block for the boot manifest anchor".into(),
                         json!({"error": e, "cut_height": cut_height,
-                               "fix": "the source RPC (or upstream.source_block_rpc_url) must serve get_block at the cut"}),
-                    )?;
-                    return Ok(());
+                               "fix": "the source RPC (or upstream.source_block_rpc_url) must serve get_block at the cut"}))));
                 }
             };
             match upstream::build_boot_artifacts(&up, &outcome, &block, cut_height, &cut_block_id, &chain_id) {
@@ -1934,10 +1949,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     });
                     boot_hashes = (Some(a.manifest_sha256), Some(a.genesis_sha256), Some(a.chain_config_sha256));
                 }
-                Err(e) => {
-                    self.abort("cannot build the upstream boot artifacts", json!({"error": e}))?;
-                    return Ok(());
-                }
+                Err(e) => return Ok(Err(("cannot build the upstream boot artifacts".into(), json!({"error": e})))),
             }
         }
         self.boot_hashes = boot_hashes.clone();
@@ -1949,6 +1961,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 outcome.compare_allowed_mismatch.join(", ")
             ),
         };
+        Ok(Ok(UpstreamVerified { sha256, file_size, outcome, boot, boot_hashes, table_compare, cut_height, cut_block_id, chain_id, started }))
+    }
+
+    fn step_snapshotted_upstream(&mut self) -> Result<(), String> {
+        let v = match self.upstream_verify(State::Snapshotted)? {
+            Ok(v) => v,
+            Err((reason, detail)) => {
+                self.abort(&reason, detail)?;
+                return Ok(());
+            }
+        };
+        let UpstreamVerified { sha256, file_size, outcome, boot, boot_hashes, table_compare, cut_height, cut_block_id, chain_id, started } = v;
         if self.coordinator_aborted(true) {
             let event_id = self.cfg.coordination.as_ref().and_then(|c| c.event_id.clone());
             self.abort(
@@ -2385,6 +2409,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// not produce past its journaled pause head nor carry any transaction after H. Everything checked
     /// is journaled; from the `join` record on, a failure HALTS (never resumes the old chain).
     pub fn join(&mut self, event_id: &str) -> Result<State, String> {
+        self.join_with(event_id, false)
+    }
+
+    /// `join`, optionally re-verifying first (rc.25 F5, `join --reverify`): a producer whose own verification failed
+    /// or never finished (no VERIFIED evidence) re-runs the upstream verification on its journaled cut snapshot, and
+    /// joins only if the result (snapshot sha256, state fingerprints, migration genesis — all three required) equals
+    /// the LIVE quorum's. A failed re-verification changes nothing on either chain.
+    pub fn join_with(&mut self, event_id: &str, reverify: bool) -> Result<State, String> {
         self.cfg.ensure_ceremony_profile()?;
         let co = self.cfg.coordination.clone().ok_or("join needs the event's [coordination] config (the one `await` derived)")?;
         if co.event_id.as_deref() != Some(event_id) {
@@ -2409,6 +2441,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.reached_ignited || self.target_blockchain_id.is_some() {
             return Err("this node already started its own ignition or chain creation: not a join (operator decision)".into());
         }
+        let verified = self.sha256.is_some() && self.boot_hashes.0.is_some() && self.boot_hashes.1.is_some() && self.boot_hashes.2.is_some();
+        let mut ours_override = None;
+        if !verified || reverify {
+            if !reverify {
+                return Err("this ceremony never reached VERIFIED (no snapshot hash / boot artifacts journaled): nothing to join with. \
+                            If it took the cut snapshot (SNAPSHOTTED), `join --reverify` re-runs the verification on it first".into());
+            }
+            ours_override = Some(self.join_reverify()?);
+        }
         let (Some(h), Some(cut_id), Some(sha)) = (self.cut_height, self.cut_block_id.clone(), self.sha256.clone()) else {
             return Err("this ceremony never reached VERIFIED (no cut / snapshot hash journaled): nothing to join with".into());
         };
@@ -2432,7 +2473,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 }
             }
         }
-        let (bid, sid, members, info, paused_head, paused, ours) = match self.join_checks(&co, h) {
+        let (bid, sid, members, info, paused_head, paused, ours) = match self.join_checks(&co, h, ours_override) {
             Ok(x) => x,
             Err(e) if refrozen => return Err(self.join_refused_after_refreeze(e)?),
             Err(e) => return Err(e),
@@ -2460,10 +2501,52 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.run()
     }
 
+    /// `join --reverify` (rc.25 F5): the upstream verification again, on this node's journaled cut snapshot. Ok = the
+    /// fleet evidence it produced (every field present), journaled as a `reverified` record; Err = refused, nothing
+    /// changed on either chain (the boot artifacts it may have rewritten are only ever used by a join or ignition).
+    fn join_reverify(&mut self) -> Result<serde_json::Value, String> {
+        if self.cut_height.is_none() || self.cut_block_id.is_none() {
+            return Err("join --reverify: this ceremony never took the cut (no cut height / block id journaled): nothing to verify".into());
+        }
+        match self.snapshot_file.as_deref() {
+            Some(f) if std::path::Path::new(f).is_file() => {}
+            Some(f) => return Err(format!("join --reverify: the journaled cut snapshot {f} is gone: nothing to verify")),
+            None => return Err("join --reverify: no cut snapshot journaled (the ceremony stopped before SNAPSHOTTED)".into()),
+        }
+        self.journal.evidence(self.state, json!({"reverify_started": {"snapshot_file": self.snapshot_file, "cut_height": self.cut_height}}))?;
+        let v = match self.upstream_verify(self.state)? {
+            Ok(v) => v,
+            Err((reason, detail)) => {
+                self.journal.evidence(self.state, json!({"reverify_failed": {"reason": reason, "detail": detail}}))?;
+                return Err(format!("join refused: re-verification failed: {reason} ({detail}). Nothing was changed."));
+            }
+        };
+        if !v.outcome.compare_allowed_mismatch.is_empty() {
+            self.journal.evidence(self.state, json!({"reverify_failed": {"reason": "table compare mismatch allowed by a rehearsal override",
+                "allowed": v.outcome.compare_allowed_mismatch}}))?;
+            return Err("join refused: the re-verification's table compare only passed under a rehearsal override \
+                        (compare_allowed_mismatch): not a verification to join with".into());
+        }
+        let ours = v.fleet_evidence();
+        if ["snapshot_sha256", "fingerprints_digest", "boot_genesis_sha256"].iter().any(|k| ours[*k].is_null()) {
+            self.journal.evidence(self.state, json!({"reverify_failed": {"reason": "incomplete evidence", "evidence": ours}}))?;
+            return Err(format!("join refused: the re-verification did not produce all of snapshot sha256, state fingerprints and \
+                                migration genesis ({ours}): the LIVE quorum's state cannot be matched. Nothing was changed."));
+        }
+        self.sha256 = Some(v.sha256.clone());
+        self.journal.evidence(self.state, json!({"reverified": true, "evidence": ours,
+            "sha256": v.sha256, "size_bytes": v.file_size, "cut_height": v.cut_height, "cut_block_id": v.cut_block_id, "chain_id": v.chain_id,
+            "fingerprints": v.outcome.state_root.as_ref().map(|r| json!({"upstream_state_root": r})), "state_root": v.outcome.state_root,
+            "table_compare": v.table_compare, "boot": v.boot, "boot_manifest_sha256": v.boot_hashes.0,
+            "boot_genesis_sha256": v.boot_hashes.1, "boot_chain_config_sha256": v.boot_hashes.2,
+            "checkpoint_sha256": v.outcome.checkpoint_sha256, "verify_wall_ms": self.ops.now_ms().saturating_sub(v.started)}))?;
+        Ok(ours)
+    }
+
     /// Steps 1-3 of a join: unchanged boot artifacts, a unique LIVE quorum with our evidence, a source
     /// that did not move on after H. Changes nothing.
     #[allow(clippy::type_complexity)]
-    fn join_checks(&mut self, co: &crate::config::Coordination, h: u64)
+    fn join_checks(&mut self, co: &crate::config::Coordination, h: u64, ours_override: Option<serde_json::Value>)
         -> Result<(String, Option<String>, Vec<String>, crate::ops::ChainInfo, u64, bool, serde_json::Value), String> {
         let up = self.cfg.upstream.clone().expect("checked");
         let (manifest, genesis, chain_config) = upstream::boot_paths(&up, h);
@@ -2474,7 +2557,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Err(format!("join refused: the {what} ({}) changed since VERIFIED", path.display()));
             }
         }
-        let ours = crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"].clone();
+        let ours = ours_override.unwrap_or_else(|| crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"].clone());
         let status = self.fleet_status();
         let (bid, sid, members) = crate::fleet::join_view(status.as_ref(), co, &ours).map_err(|e| format!("join refused: {e}"))?;
         let info = self.ops.source_info().map_err(|e| format!("join refused: cannot read the source chain: {e}"))?;

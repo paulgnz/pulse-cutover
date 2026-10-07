@@ -236,7 +236,7 @@ EXAMPLES
   pulse-cutover report --paranoid --out /tmp/bundle.tar.gz";
 
 const HELP_JOIN: &str = "\
-pulse-cutover join --config ceremony-<event>.toml --event <event_id>
+pulse-cutover join --config ceremony-<event>.toml --event <event_id> [--reverify]
 
 rc.23. For a producer whose ceremony ended STRANDED (it stopped before its own chain creation and
 could not prove its peers had not ignited) or ABORTED, while a quorum of the event's roster went
@@ -250,11 +250,18 @@ H and the SAME snapshot sha256, fingerprints and migration genesis hash as this 
 node's source did not produce past its journaled pause head and carries no transaction after H (a
 source that resumed and took writes is an operator decision, not a join).
 
+--reverify (rc.25): for a producer whose own verification failed or never finished (it took the cut
+snapshot but has no VERIFIED evidence, e.g. its table compare broke). It re-runs the upstream
+verification on the journaled cut snapshot first and joins only if the snapshot sha256, the state
+fingerprints and the migration genesis hash ALL equal the LIVE quorum's. A failed re-verification
+changes nothing on either chain.
+
 From the `join` journal record on, a failure HALTS: it never resumes the old chain. A crash resumes
 with `pulse-cutover run`. Exit codes as `run`: 0 = LIVE.
 
 EXAMPLES
-  pulse-cutover join --config /var/lib/pulse-cutover/ceremony-ev-42.toml --event ev-42";
+  pulse-cutover join --config /var/lib/pulse-cutover/ceremony-ev-42.toml --event ev-42
+  pulse-cutover join --config /var/lib/pulse-cutover/ceremony-ev-42.toml --event ev-42 --reverify";
 
 fn help_for(cmd: &str) -> Option<&'static str> {
     match cmd {
@@ -471,7 +478,7 @@ fn cmd_join(args: &[String]) -> Result<(), String> {
         cfg.source.snapshot_timeout_secs).with_hook_timeout(cfg.hooks.timeout_secs).with_pgid_file_for(&cfg.journal_path);
     let (journal, recovered) = Journal::open(&cfg.journal_path)?;
     let mut machine = Machine::new(&cfg, &ops, journal, recovered);
-    let terminal = machine.join(&event)?;
+    let terminal = machine.join_with(&event, args.iter().any(|a| a == "--reverify"))?;
     println!("{terminal}");
     if terminal == state::State::Live { Ok(()) } else { Err(format!("join ended in {terminal}; see {}", cfg.journal_path.display())) }
 }

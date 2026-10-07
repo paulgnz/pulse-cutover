@@ -152,7 +152,10 @@ stateDiagram-v2
   (see below) or `pulse-cutover rollback`, which re-runs the guard (`--force-stranded --i-understand`
   records an operator's fleet-wide decision with the fleet view it overrides). The agent recognizes its
   own roster entry by its `[beacon] producer` and instance id (derived from the machine id and the token,
-  so the ceremony and its beacon agree). `await` refuses a producer-mode event without a roster.
+  so the ceremony and its beacon agree). `await` refuses a producer-mode event without a roster. Since rc.25
+  (fleet run c5) the guard also requires this node's OWN fresh, non-conflicted report for the event on the
+  relay: under a signed abort a silent member used to resume while the visible ones stranded (they could not
+  account for it). A roster without a `[beacon]`, or a beacon producer outside the roster, is a config warning.
 - **Join** (rc.23). `pulse-cutover join --event <id>` lets a STRANDED or ABORTED producer (upstream backend,
   producer mode) track and ignite the chain a LIVE quorum of the roster runs (a unique group: two groups with a
   quorum are a split), without creating one. From ABORTED it first re-runs `on_freeze` (on_abort reopened writes)
@@ -162,6 +165,11 @@ stateDiagram-v2
   carry a transaction after H. The `join` record is a point of no return (like `create_chain`); the run then
   continues at VERIFIED without a fleet gate or abort check (the fleet already committed; an abort is not
   honoured after ignition) and goes through ignition, lineage, post_ignite and the LIVE gate.
+  `join --reverify` (rc.25, fleet run c3a: a BP whose table compare broke had no route onto the LIVE chain) first
+  re-runs the upstream verification on the journaled cut snapshot (same pipeline, boot artifacts rebuilt), journals
+  a `reverified` record (which the beacon reports like VERIFIED evidence) and then requires all three of snapshot
+  sha256, fingerprints and migration genesis to equal the LIVE quorum's; a re-verification that fails, passes only
+  under a rehearsal compare override, or lacks any of the three refuses with nothing changed.
 - **Degraded after ignition** (rc.23, fleet runs r2–r6). With a coordinated event, a local symptom after
   ignition (a gap in the sustained-LIVE window, the head not past the cut within `quorum_timeout_secs`, a
   failing `post_ignite` / `on_live` hook) consults the fleet first: while a quorum of the roster reports the
@@ -322,6 +330,13 @@ highest published pause head (only when every paused member published one), or t
 member has paused and one is past chain creation (the relay keeps each member's first and highest source head from
 that point). A fixed bound (rc.23: cut + 360) cannot fit real finality lag: the 5-BP rehearsal paused correctly at
 cut + 377 and latched a false SPLIT. This is display evidence only, as above.
+
+rc.25 (fleet run c1): with quorum = N the verdict flapped LIVE↔DEGRADED whenever one beacon's target read timed out,
+because the beacon then also dropped its block after the cut. The beacon keeps that block id (it never changes on one
+chain) and reports `target.unread_for_ms`; mission control and the agent's live view count such a member on its chain
+for up to 60 s of failed reads (`UNREAD_GRACE_MS`), then drop it. After a halt on a fleet still short of quorum
+(rc.25 F2) degraded mode gives a lagging peer a bounded grace (`degraded_fleet_short`), counts HALTED members whose
+validators still run the chain, and an `unhalt` restarts the degraded patience.
 
 ## 6. v2 "shadow mirror" (sketch, not implemented)
 

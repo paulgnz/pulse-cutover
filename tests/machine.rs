@@ -4974,6 +4974,60 @@ fn rc23_join_tracks_the_live_quorums_chain_without_creating_one() {
     assert_eq!((s["state"].as_str(), s["joined"].as_bool()), (Some("LIVE"), Some(true)));
 }
 
+/// rc.25 F5 (rc.24 fleet run c3a): bp3's table compare broke, so its ceremony stopped before VERIFIED while the
+/// others went LIVE, and `join` refused ("never reached VERIFIED"): no supported route onto the LIVE chain. `join
+/// --reverify` re-runs the verification on its journaled cut snapshot and joins only on equal evidence.
+#[test]
+fn rc25_join_reverify_lets_a_node_whose_verification_failed_join_the_live_chain() {
+    // The evidence a node that verified this cut journals (the LIVE quorum's): a probe in its own directory.
+    let p = tempfile::tempdir().unwrap();
+    let pcfg = rc23_upstream_fleet(p.path());
+    let pops = upstream_ops(p.path());
+    pops.coord_down.set(true);
+    assert_eq!(run_machine(&pcfg, &pops), State::Stranded);
+    let good = pulse_cutover::beacon::journal_summary(&pcfg.journal_path)["evidence"].clone();
+
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_upstream_fleet(d.path());
+    stage_fake_upstream_tools(d.path(), 1); // the compare fails: no VERIFIED
+    let ops = upstream_ops(d.path());
+    ops.coord_down.set(true);
+    let st = run_machine(&cfg, &ops);
+    assert!(matches!(st, State::Stranded | State::Aborted), "{st:?}");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("upstream verification failed") && !text.contains(r#""to":"VERIFIED""#), "{text}");
+    ops.coord_down.set(false);
+    *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&good, &["bp2", "bp3", "bp4", "bp5"]));
+    let join = |reverify: bool| {
+        let (j, rec) = open_journal(&cfg.journal_path);
+        Machine::new(&cfg, &ops, j, rec).join_with("e1", reverify)
+    };
+    // Without --reverify: refused, with the way out named.
+    assert!(join(false).unwrap_err().contains("--reverify"));
+    // --reverify while the compare is still broken: refused, nothing changed on either chain.
+    let e = join(true).unwrap_err();
+    assert!(e.contains("re-verification failed") && e.contains("Nothing was changed"), "{e}");
+    assert_eq!(pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap().state, Some(st));
+    // --reverify against a LIVE quorum whose state differs: refused.
+    stage_fake_upstream_tools(d.path(), 0);
+    let mut other = good.clone();
+    other["fingerprints_digest"] = serde_json::json!("cd".repeat(32));
+    *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&other, &["bp2", "bp3", "bp4", "bp5"]));
+    assert!(join(true).unwrap_err().contains("fingerprints_digest"));
+    assert_eq!(pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap().state, Some(st), "refusals change nothing");
+    assert!(!std::fs::read_to_string(&cfg.journal_path).unwrap().contains(r#""side_effect":"join""#));
+    // Fixed compare, equal evidence: re-verified, joined, LIVE, never created a chain or resumed the old one.
+    *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&good, &["bp2", "bp3", "bp4", "bp5"]));
+    assert_eq!(join(true).unwrap(), State::Live);
+    assert!(!d.path().join("create-chain.calls").exists(), "a join never creates a chain");
+    assert!(ops.ignite_vars.borrow().iter().any(|(k, v)| k == "blockchain_id" && v == JOIN_BID));
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""reverified":true"#) && text.contains(r#""side_effect":"join""#));
+    let s = pulse_cutover::beacon::journal_summary(&cfg.journal_path);
+    assert_eq!(s["evidence"]["fingerprints_digest"], good["fingerprints_digest"], "the beacon reports the re-verified evidence");
+    assert_eq!(s["evidence"]["snapshot_sha256"], good["snapshot_sha256"]);
+}
+
 #[test]
 fn rc23_join_refuses_a_source_that_moved_on_after_h() {
     let d = tempfile::tempdir().unwrap();

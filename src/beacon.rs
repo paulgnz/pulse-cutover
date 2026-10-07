@@ -425,6 +425,23 @@ fn file_ident(m: &std::fs::Metadata) -> (u64, u64) {
     }
 }
 
+/// The fleet digest of a VERIFIED record's fingerprints (full 256-bit: a shortened one would let different state collide).
+pub fn fingerprints_digest(fingerprints: &Value) -> String {
+    hex::encode(Sha256::digest(serde_json::to_string(fingerprints).unwrap_or_default().as_bytes()))
+}
+
+/// The verified evidence of a VERIFIED transition (or a `reverified` record) — accumulate only.
+fn put_verified(ev: &mut serde_json::Map<String, Value>, d: &Value) {
+    for (k, src) in [("snapshot_sha256", "sha256"), ("boot_genesis_sha256", "boot_genesis_sha256")] {
+        if !d[src].is_null() {
+            ev.insert(k.into(), d[src].clone());
+        }
+    }
+    if d["fingerprints"].is_object() {
+        ev.insert("fingerprints_digest".into(), json!(fingerprints_digest(&d["fingerprints"])));
+    }
+}
+
 fn apply_line(acc: &mut Acc, v: &Value) {
     acc.seq = v["seq"].as_u64().unwrap_or(acc.seq);
     let d = &v["data"];
@@ -468,6 +485,11 @@ fn apply_line(acc: &mut Acc, v: &Value) {
     if d["rollback_requested"].as_bool() == Some(true) {
         acc.rollback_pending = true;
     }
+    // rc.25 F5: `join --reverify` re-ran the verification on this node's cut snapshot; its record carries the same
+    // evidence a VERIFIED transition does (and the fleet compares it before the join).
+    if d["reverified"].as_bool() == Some(true) {
+        put_verified(&mut acc.ev, d);
+    }
     if d["rollback_intent_cancelled"].as_bool() == Some(true) {
         acc.rollback_pending = false;
     }
@@ -510,15 +532,7 @@ fn apply_line(acc: &mut Acc, v: &Value) {
                     put(ev, "burnoff_transactions", &d["burnoff_transactions"]);
                     put(ev, "head_at_pause", &d["head_at_pause"]);
                 }
-                Some("VERIFIED") => {
-                    put(ev, "snapshot_sha256", &d["sha256"]);
-                    put(ev, "boot_genesis_sha256", &d["boot_genesis_sha256"]);
-                    if d["fingerprints"].is_object() {
-                        let canon = serde_json::to_string(&d["fingerprints"]).unwrap_or_default();
-                        // Full 256-bit digest: a shortened one would let different state collide.
-                        ev.insert("fingerprints_digest".into(), json!(hex::encode(Sha256::digest(canon.as_bytes()))));
-                    }
-                }
+                Some("VERIFIED") => put_verified(ev, d),
                 Some("IGNITED") => {
                     if let Some(c) = d["target_chain_id"].as_str() {
                         acc.target_chain_id = Some(c.to_string());
