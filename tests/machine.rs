@@ -4914,8 +4914,12 @@ fn rc23_resume_waits_for_its_own_verified_report_to_be_withdrawn_and_re_checks()
 
 /// An upstream (ignition-configured) ceremony in a 5-member roster (quorum 4); this node is bp1.
 fn rc23_upstream_fleet(dir: &std::path::Path) -> Config {
+    rc23_upstream_fleet_with(dir, "")
+}
+
+fn rc23_upstream_fleet_with(dir: &std::path::Path, extra_upstream: &str) -> Config {
     stage_fake_upstream_tools(dir, 0);
-    let _ = upstream_ignite_config(dir, "", "").unwrap();
+    let _ = upstream_ignite_config(dir, "", extra_upstream).unwrap();
     let path = dir.join("ceremony-upstream-ignite.toml");
     let mut text = format!("{}\non_halt = \"page-human\"\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nfleet_quorum = 4\nfleet_timeout_secs = 5\n",
         std::fs::read_to_string(&path).unwrap(), hex::encode(coord_key().verifying_key().to_bytes()));
@@ -5035,6 +5039,52 @@ fn rc25_join_reverify_lets_a_node_whose_verification_failed_join_the_live_chain(
     let s = pulse_cutover::beacon::journal_summary(&cfg.journal_path);
     assert_eq!(s["evidence"]["fingerprints_digest"], good["fingerprints_digest"], "the beacon reports the re-verified evidence");
     assert_eq!(s["evidence"]["snapshot_sha256"], good["snapshot_sha256"]);
+}
+
+/// rc.26 F7 (fleet run d1): on PulseVM v1.0.0 every node verifies under the rehearsal compare allowlist (#109), so a
+/// `--reverify` that refused the allowlist could never join a rehearsal. In a rehearsal it now joins when the LIVE
+/// quorum verified under the SAME allowed set, and refuses when the sets differ.
+#[test]
+fn rc26_join_reverify_accepts_the_same_rehearsal_compare_allowlist_as_the_live_quorum() {
+    const ALLOW: &str = r#"rehearsal_allow_compare_mismatch = ["contract_index_double", "global_property"]"#;
+    let failing = ["contract_index_double", "global_property"];
+    let p = tempfile::tempdir().unwrap();
+    let pcfg = rc23_upstream_fleet_with(p.path(), ALLOW);
+    fake_compare_failing(p.path(), &failing);
+    let pops = upstream_ops(p.path());
+    pops.coord_down.set(true);
+    assert_eq!(run_machine(&pcfg, &pops), State::Stranded);
+    let good = pulse_cutover::beacon::journal_summary(&pcfg.journal_path)["evidence"].clone();
+    assert!(good["compare_allowed_digest"].is_string(), "the LIVE quorum's evidence carries the allowed set: {good}");
+
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_upstream_fleet_with(d.path(), ALLOW);
+    stage_fake_upstream_tools(d.path(), 1); // broken (not an allowed table): no VERIFIED
+    let ops = upstream_ops(d.path());
+    ops.coord_down.set(true);
+    let st = run_machine(&cfg, &ops);
+    assert!(matches!(st, State::Stranded | State::Aborted), "{st:?}");
+    ops.coord_down.set(false);
+    stage_fake_upstream_tools(d.path(), 0);
+    fake_compare_failing(d.path(), &failing); // fixed: now only the known, allowed differences
+    let join = || {
+        let (j, rec) = open_journal(&cfg.journal_path);
+        Machine::new(&cfg, &ops, j, rec).join_with("e1", true)
+    };
+    // A quorum that verified WITHOUT the override (no allowed set in its evidence): a different verification, refused.
+    let mut clean = good.clone();
+    clean.as_object_mut().unwrap().remove("compare_allowed_digest");
+    *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&clean, &["bp2", "bp3", "bp4", "bp5"]));
+    assert!(join().unwrap_err().contains("compare_allowed_digest"));
+    assert!(!std::fs::read_to_string(&cfg.journal_path).unwrap().contains(r#""reverified":true"#));
+    // The same allowed set: joined, and the record says the override was used.
+    *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&good, &["bp2", "bp3", "bp4", "bp5"]));
+    assert_eq!(join().unwrap(), State::Live);
+    let e = journal_entries(&cfg);
+    let rec = e.iter().find(|v| v["data"]["reverified"].as_bool() == Some(true)).expect("reverified journaled");
+    assert!(rec["data"]["table_compare"].as_str().unwrap().starts_with("MISMATCH ALLOWED BY REHEARSAL OVERRIDE"));
+    assert_eq!(rec["data"]["compare_allowed_mismatch"], serde_json::json!(failing));
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"]["compare_allowed_digest"], good["compare_allowed_digest"]);
 }
 
 #[test]

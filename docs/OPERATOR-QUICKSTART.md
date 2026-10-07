@@ -90,6 +90,7 @@ from the event's signed roster and the beacons' reports (`fleet` in `GET /api/st
 | `LIVE` | at least `quorum` roster members are LIVE on **one** target chain, with the same first block after H | if your box is HALTED or STRANDED on that chain, recover onto it (`unhalt` + `run`, or `join`; see below) |
 | `DEGRADED` | a target chain may be running, but no quorum is LIVE on one chain yet | do not reopen writes by hand; wait for LIVE or for the coordinator |
 | `SPLIT` (red) | a roster member resumed the old chain after others started chain creation or ignition, the old chain's head moved after every member had paused and someone had started chain creation, or members report different target chains / different blocks after H / different blocks at one height | stop: do not reopen writes anywhere until the coordinator resolves it; the alarm names the BPs |
+| `STRANDED` (rc.26) | every reporting member stopped before chain creation and is sealed (STRANDED or ABORTED), at least one STRANDED | the coordinator decides: `pulse-cutover rollback` on each STRANDED box (it re-runs the resume guard), or `join` once a quorum is LIVE |
 | `ABORTED` | every reporting member aborted before chain creation | the old chain continues; wait for a new event |
 
 A `SPLIT` stays red (latched) for that event even if the reports that showed it change later. Only the

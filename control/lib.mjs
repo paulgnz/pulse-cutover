@@ -272,7 +272,7 @@ export const PROFILES = ['readiness', 'ceremony'];
 export const ROLES = ['producer', 'history', 'api', 'seed', 'query'];
 export const EVIDENCE_ALLOW = ['h', 'chain_id', 'freeze_at', 'cut_height', 'cut_block_id', 'burnoff_transactions', 'snapshot_sha256',
   'fingerprints_digest', 'target_head_id', 'write_gap_ms', 'state_diff_identical', 'state_digest', 'state_diff_b_head', 'lineage_at_cut',
-  'boot_genesis_sha256', 'head_at_pause'];
+  'boot_genesis_sha256', 'head_at_pause', 'compare_allowed_digest'];
 
 class Bad extends Error {}
 const bad = (path, what) => { throw new Bad(`${path}: ${what}`); };
@@ -453,6 +453,8 @@ export const silentAfterMs = (report) => Math.max(3 * (report?.interval_secs || 
 //   SPLIT     RED: a member resumed the old chain while another is past chain creation/ignition, the old chain moved
 //             past the complete pause-head bound or kept advancing once every member was paused (rc.24 movement
 //             rule), or members report different target chains / different blocks after the cut / at one height
+//   STRANDED  every reporting member is sealed (STRANDED or ABORTED, at least one STRANDED), nobody past creation:
+//             the fleet stopped and an operator decides (rollback re-runs the guard, or join a LIVE quorum) (rc.26)
 //   ABORTED   every reporting member aborted before chain creation (symmetric abort)
 //   PENDING   no member is past chain creation yet
 // It is display only (relay-reported, unsigned), never an authorization.
@@ -625,6 +627,10 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
   if (alarms.length) verdict = 'SPLIT';
   else if (quorum && liveChain && liveChain.members.length >= quorum && uniqueBest) verdict = 'LIVE';
   else if (past.length) verdict = 'DEGRADED';
+  // rc.26 (fleet run d3): every reporting member sealed (STRANDED, or ABORTED), at least one STRANDED, nobody past
+  // creation: the fleet stopped and waits for an operator decision (rollback or join); PENDING read as "nothing yet".
+  else if (members.some((m) => !m.missing) && members.filter((m) => !m.missing).every((m) => ['STRANDED', 'ABORTED'].includes(m.state))
+    && members.some((m) => m.state === 'STRANDED')) verdict = 'STRANDED';
   else if (members.length && members.filter((m) => !m.missing).every((m) => m.state === 'ABORTED') && members.some((m) => !m.missing)) verdict = 'ABORTED';
   else verdict = 'PENDING';
   const notLive = liveChain ? members.filter((m) => !liveChain.members.includes(m.producer)).map((m) => `${m.producer}: ${m.missing ? 'no report' : m.conflict ? 'identity conflict' : !m.fresh ? `silent (${m.state || '?'})` : m.state}`) : [];

@@ -26,3 +26,12 @@ test('a target unreadable past the grace drops out (DEGRADED), and an older beac
   assert.equal(fleetVerdict(ev, by(live({ head: null, after_cut_id: null }))).verdict, 'DEGRADED');
   assert.equal(fleetVerdict(ev, by(live({ head: null }))).verdict, 'DEGRADED', 'no head and no read age: not counted (as the agent)');
 });
+
+test('rc.26: an all-sealed fleet (STRANDED / ABORTED, nobody past creation) reads STRANDED, not PENDING', () => {
+  const sealed = (st) => ({ state: st, evidence: { h: H } });
+  const byS = (states) => Object.fromEntries(BPS.map((p, i) => [p, [{ report: { coord: { event_id: 'e1' }, ceremony: sealed(states[i]) }, silent: false, conflict: false }]]));
+  assert.equal(fleetVerdict(ev, byS(['STRANDED', 'STRANDED', 'STRANDED', 'STRANDED', 'STRANDED'])).verdict, 'STRANDED');
+  assert.equal(fleetVerdict(ev, byS(['STRANDED', 'ABORTED', 'ABORTED', 'ABORTED', 'ABORTED'])).verdict, 'STRANDED');
+  assert.equal(fleetVerdict(ev, byS(['ABORTED', 'ABORTED', 'ABORTED', 'ABORTED', 'ABORTED'])).verdict, 'ABORTED');
+  assert.equal(fleetVerdict(ev, byS(['STRANDED', 'FROZEN', 'ABORTED', 'ABORTED', 'ABORTED'])).verdict, 'PENDING', 'someone still in the ceremony');
+});

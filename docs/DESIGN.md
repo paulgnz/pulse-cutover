@@ -170,7 +170,9 @@ stateDiagram-v2
   past its pause head, then re-runs the upstream verification on the journaled cut snapshot (same pipeline, boot
   artifacts rebuilt) and requires all three of snapshot sha256, fingerprints and migration genesis to equal the LIVE
   quorum's. Only then is a `reverified` record journaled (the beacon reports it like VERIFIED evidence), just before
-  the `join` record. A re-verification that fails, passes only under a rehearsal compare override, lacks any of the
+  the `join` record. A re-verification that fails, passes under a rehearsal compare override outside a rehearsal ceremony (rc.26: in a
+  rehearsal it is accepted when the LIVE quorum verified under the same allowed set, `compare_allowed_digest` in the
+  beacon evidence, and the record carries the override label like VERIFIED does), lacks any of the
   three or does not match refuses with nothing changed on either chain and nothing journaled as evidence (only the
   node's verification work files were rewritten).
 - **Degraded after ignition** (rc.23, fleet runs r2–r6). With a coordinated event, a local symptom after

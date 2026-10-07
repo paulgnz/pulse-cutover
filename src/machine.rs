@@ -2556,14 +2556,22 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                                     (only this node's verification work files were rewritten)."));
             }
         };
-        if !v.outcome.compare_allowed_mismatch.is_empty() {
+        // rc.26 F7 (fleet run d1): on PulseVM v1.0.0 every node's VERIFIED needs the rehearsal compare allowlist (#109),
+        // so refusing it outright left a rehearsal with no route onto the LIVE chain. In a REHEARSAL ceremony it is
+        // accepted when the LIVE quorum verified under the SAME set (compare_allowed_digest is part of the evidence the
+        // join compares); outside one (and so always for XPR mainnet) it refuses.
+        let allowed = json!(v.outcome.compare_allowed_mismatch);
+        if !v.outcome.compare_allowed_mismatch.is_empty() && !self.cfg.ceremony.rehearsal {
             self.journal.evidence(self.state, json!({"reverify_failed": {"reason": "table compare mismatch allowed by a rehearsal override",
-                "allowed": v.outcome.compare_allowed_mismatch}}))?;
+                "allowed": allowed}}))?;
             self.boot_hashes = (None, None, None);
             return Err("join refused: the re-verification's table compare only passed under a rehearsal override \
-                        (compare_allowed_mismatch): not a verification to join with".into());
+                        (compare_allowed_mismatch) and this is not a rehearsal ceremony: not a verification to join with".into());
         }
-        let ours = v.fleet_evidence();
+        let mut ours = v.fleet_evidence();
+        if let Some(dg) = crate::beacon::compare_allowed_digest(&allowed) {
+            ours["compare_allowed_digest"] = json!(dg);
+        }
         if ["snapshot_sha256", "fingerprints_digest", "boot_genesis_sha256"].iter().any(|k| ours[*k].is_null()) {
             self.journal.evidence(self.state, json!({"reverify_failed": {"reason": "incomplete evidence", "evidence": ours}}))?;
             self.boot_hashes = (None, None, None);
@@ -2572,7 +2580,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         self.sha256 = Some(v.sha256.clone());
         // Journaled by the caller only once the LIVE quorum's evidence matched (review #3).
-        let record = json!({"reverified": true, "evidence": ours,
+        let record = json!({"reverified": true, "evidence": ours, "compare_allowed_mismatch": allowed,
+            "rehearsal_overrides": self.cfg.rehearsal_overrides(),
             "sha256": v.sha256, "size_bytes": v.file_size, "cut_height": v.cut_height, "cut_block_id": v.cut_block_id, "chain_id": v.chain_id,
             "fingerprints": v.outcome.state_root.as_ref().map(|r| json!({"upstream_state_root": r})), "state_root": v.outcome.state_root,
             "table_compare": v.table_compare, "boot": v.boot, "boot_manifest_sha256": v.boot_hashes.0,

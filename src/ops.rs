@@ -490,7 +490,10 @@ impl HttpOps {
             snapshot_timeout: Duration::from_secs(snapshot_timeout_secs),
             hook_timeout: Duration::from_secs(300),
             pgid_file: None,
+            // A short connect timeout (rc.26, fleet run d2): against a silently dropping firewall each relay read
+            // otherwise sat out the whole 15 s, so the resume guard's retries stranded ~3.4 min after the fleet timeout.
             agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(5))
                 .timeout(Duration::from_secs(15))
                 .build(),
         }

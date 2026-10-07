@@ -440,6 +440,21 @@ fn put_verified(ev: &mut serde_json::Map<String, Value>, d: &Value) {
     if d["fingerprints"].is_object() {
         ev.insert("fingerprints_digest".into(), json!(fingerprints_digest(&d["fingerprints"])));
     }
+    if let Some(dg) = compare_allowed_digest(&d["compare_allowed_mismatch"]) {
+        ev.insert("compare_allowed_digest".into(), json!(dg));
+    }
+}
+
+/// The digest of the tables a rehearsal verification allowed to mismatch (sorted, comma-joined), None when it allowed
+/// none (rc.26 F7: `join --reverify` may accept the same rehearsal override only when the LIVE quorum carries the same set).
+pub fn compare_allowed_digest(allowed: &Value) -> Option<String> {
+    let mut t: Vec<&str> = allowed.as_array()?.iter().filter_map(|v| v.as_str()).collect();
+    if t.is_empty() {
+        return None;
+    }
+    t.sort_unstable();
+    t.dedup();
+    Some(hex::encode(Sha256::digest(t.join(",").as_bytes())))
 }
 
 fn apply_line(acc: &mut Acc, v: &Value) {
@@ -888,6 +903,16 @@ pub fn run(cfg: &Config, once: bool) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn compare_allowed_digest_is_order_independent_and_absent_when_empty() {
+        let a = compare_allowed_digest(&json!(["global_property", "contract_index_double"]));
+        assert_eq!(a, compare_allowed_digest(&json!(["contract_index_double", "global_property", "global_property"])));
+        assert_eq!(a.as_deref().map(str::len), Some(64));
+        assert_ne!(a, compare_allowed_digest(&json!(["global_property"])));
+        assert_eq!(compare_allowed_digest(&json!([])), None);
+        assert_eq!(compare_allowed_digest(&Value::Null), None);
+    }
     use super::*;
 
     #[test]
