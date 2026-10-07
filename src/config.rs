@@ -1002,6 +1002,18 @@ impl Config {
                 self.ceremony.import_cpu_scale
             ));
         }
+        // rc.25 F6: the resume guard needs this node's own report visible on the relay. Without a beacon (or with a
+        // beacon under a name the roster does not list) peers never see it and every guarded abort strands.
+        if let Some(co) = self.coordination.as_ref().filter(|co| !co.roster.is_empty()) {
+            match self.beacon.as_ref() {
+                None => out.push("[coordination] has a roster but no [beacon]: peers cannot see this node, so it is never counted \
+                                  at the fleet gate and every guarded abort strands (the old chain is never resumed automatically)".into()),
+                Some(b) if !co.roster.iter().any(|m| m.producer == b.producer) => out.push(format!(
+                    "[beacon] producer {} is not in the event roster: this node's report never counts and every guarded abort strands",
+                    b.producer)),
+                _ => {}
+            }
+        }
         // Re-check #5: a roster entry for THIS producer that pins another instance id never matches this node:
         // its own report never counts at the gate and every guarded abort strands.
         if let (Some(co), Some(b)) = (self.coordination.as_ref(), self.beacon.as_ref()) {

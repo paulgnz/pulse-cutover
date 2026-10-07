@@ -2492,7 +2492,11 @@ fn hook_commands_are_killed_at_the_timeout() {
 fn roster_config(dir: &std::path::Path) -> Config {
     let base = std::fs::read_to_string({ coord_config(dir, 120, 0, 5); dir.join("ceremony-coord.toml") }).unwrap();
     let text = base.replace("fleet_quorum = 0", "fleet_quorum = 2\nreport_max_age_secs = 60")
-        + "\n[[coordination.roster]]\nproducer = \"bp1\"\ninstance_id = \"aa\"\n\n[[coordination.roster]]\nproducer = \"bp2\"\n";
+        + "\n[[coordination.roster]]\nproducer = \"bp1\"\ninstance_id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\n[[coordination.roster]]\nproducer = \"bp2\"\n";
+    // A beacon as bp1 whose persisted instance is the pinned "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" (rc.25 F6: the guard matches its own report).
+    std::fs::write(dir.join("beacon.token"), "tok\n").unwrap();
+    std::fs::write(dir.join("beacon.instance"), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n").unwrap();
+    let text = text + &format!("\n[beacon]\nurl = \"https://mc.example/api/report\"\nproducer = \"bp1\"\nnetwork = \"rehearsal\"\ntoken_file = \"{}/beacon.token\"\n", dir.display());
     load_toml(dir, "roster.toml", &text).unwrap()
 }
 
@@ -2513,7 +2517,7 @@ fn roster_fleet_gate_counts_only_fresh_roster_members() {
         *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
             {"name": "outsider1", "beacons": [{"age_ms": 1000, "report": rep("x1")}]},
             {"name": "outsider2", "beacons": [{"age_ms": 1000, "report": rep("x2")}]},
-            {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep(if good { "aa" } else { "zz" })}]},
+            {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep(if good { "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } else { "zz" })}]},
             {"name": "bp2", "beacons": [{"age_ms": if good { 1000 } else { 999_000 }, "report": rep("bb")}]},
         ]}]}));
         let st = run_machine(&cfg, &ops);
@@ -2545,7 +2549,7 @@ fn roster_members_count_once_and_only_for_this_event() {
     let cfg = roster_config(d.path());
     let ops = MockOps::new(d.path(), 110);
     *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
-        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": {"instance_id": "aa", "coord": {"event_id": "OTHER"},
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": {"instance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "coord": {"event_id": "OTHER"},
             "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}}}]},
         {"name": "bp2", "beacons": [{"age_ms": 1000, "report": {"instance_id": "bb", "coord": {"event_id": "e1"},
             "ceremony": {"state": "VERIFIED", "evidence": {}}}}]},
@@ -2683,7 +2687,7 @@ fn r3_unhalted_fleet_gated_retry_can_still_agree_and_reach_live() {
     let ours = pulse_cutover::beacon::journal_summary(&probe.path().join("journal.jsonl"))["evidence"].clone();
     let rep = |id: &str| serde_json::json!({"instance_id": id, "coord": {"event_id": "e1"}, "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}});
     let doc = serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
-        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aa")}]},
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}]},
         {"name": "bp2", "beacons": [{"age_ms": 1000, "report": rep("bb")}]}]}]});
     let d = tempfile::tempdir().unwrap();
     let cfg = roster_config(d.path());
@@ -2729,7 +2733,7 @@ fn r3_conflicted_reports_never_count_toward_the_fleet_gate() {
     let cfg = roster_config(d.path());
     let ops = MockOps::new(d.path(), 110);
     *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
-        {"name": "bp1", "beacons": [{"age_ms": 1000, "conflict": true, "report": rep("aa")}]},
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "conflict": true, "report": rep("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}]},
         {"name": "bp2", "beacons": [{"age_ms": 1000, "conflict": true, "report": rep("bb")}]}]}]}));
     // rc.23: and with conflicted members the fleet's state is unknown: STRANDED, the source is not resumed.
     assert_eq!(run_machine(&cfg, &ops), State::Stranded, "conflicted evidence must not satisfy the roster");
@@ -2740,7 +2744,7 @@ fn r3_conflicted_reports_never_count_toward_the_fleet_gate() {
     let cfg2 = coord_config(d2.path(), 120, 2, 5);
     let ops2 = MockOps::new(d2.path(), 110);
     *ops2.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
-        {"name": "bp1", "age_ms": 999_000, "report": rep("aa")},
+        {"name": "bp1", "age_ms": 999_000, "report": rep("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")},
         {"name": "bp2", "beacons": [{"age_ms": 1000, "conflict": true, "report": rep("bb")}]}]}]}));
     assert_eq!(run_machine(&cfg2, &ops2), State::Stranded, "a stale legacy report and a conflicted one are not a quorum of 2 (and not proof)");
 }
@@ -3136,6 +3140,23 @@ fn r4_recorded_hook_group_is_killed_for_real() {
 }
 
 #[test]
+fn rc25_a_roster_without_this_nodes_beacon_is_warned_about() {
+    // F6: the resume guard needs this node's own report on the relay; without a beacon (or under a name outside
+    // the roster) every guarded abort strands. The config says so up front.
+    let d = tempfile::tempdir().unwrap();
+    let base = std::fs::read_to_string({ coord_config(d.path(), 120, 0, 5); d.path().join("ceremony-coord.toml") }).unwrap();
+    let text = base.replace("fleet_quorum = 0", "fleet_quorum = 2") + "\n[[coordination.roster]]\nproducer = \"bp1\"\n\n[[coordination.roster]]\nproducer = \"bp2\"\n";
+    let no_beacon = load_toml(d.path(), "nb.toml", &text).unwrap();
+    assert!(no_beacon.warnings().iter().any(|w| w.contains("roster but no [beacon]")), "{:?}", no_beacon.warnings());
+    std::fs::write(d.path().join("beacon.token"), "tok\n").unwrap();
+    let beacon = |p: &str| format!("\n[beacon]\nurl = \"https://mc.example/api/report\"\nproducer = \"{p}\"\nnetwork = \"rehearsal\"\ntoken_file = \"{}/beacon.token\"\n", d.path().display());
+    let outsider = load_toml(d.path(), "out.toml", &(text.clone() + &beacon("bp9"))).unwrap();
+    assert!(outsider.warnings().iter().any(|w| w.contains("bp9 is not in the event roster")));
+    let member = load_toml(d.path(), "in.toml", &(text + &beacon("bp1"))).unwrap();
+    assert!(!member.warnings().iter().any(|w| w.contains("[beacon]")), "{:?}", member.warnings());
+}
+
+#[test]
 fn r4_fleet_gate_ignores_reports_with_failing_health_but_not_setup_checks() {
     // Review #5 residual: the gate counted reports whose health checks were failing.
     let probe = tempfile::tempdir().unwrap();
@@ -3150,16 +3171,17 @@ fn r4_fleet_gate_ignores_reports_with_failing_health_but_not_setup_checks() {
     let cfg = roster_config(d.path());
     let ops = MockOps::new(d.path(), 110);
     *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
-        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aa", sick.clone())}]},
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", sick.clone())}]},
         {"name": "bp2", "beacons": [{"age_ms": 1000, "report": rep("bb", setup_only.clone())}]}]}]}));
-    // rc.23: the gate fails (bp1 excluded), but both members agree at VERIFIED: they may create the chain, so
-    // this producer is STRANDED rather than resuming the old chain.
-    assert_eq!(run_machine(&cfg, &ops), State::Stranded, "bp1's failing health check excludes it: 1 of 2");
+    // The gate fails (bp1, this node, excluded: 1 of 2). rc.25 F6: the node now recognizes its own report (the
+    // fixture has a real beacon), so the guard sees bp2 alone still in the ceremony, below quorum 2: bp2 cannot
+    // create the chain without this node, and the abort resumes the old chain.
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted, "bp1's failing health check excludes it: 1 of 2");
     let d2 = tempfile::tempdir().unwrap();
     let cfg2 = roster_config(d2.path());
     let ops2 = MockOps::new(d2.path(), 110);
     *ops2.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
-        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aa", setup_only.clone())}]},
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", setup_only.clone())}]},
         {"name": "bp2", "beacons": [{"age_ms": 1000, "report": rep("bb", setup_only)}]}]}]}));
     assert_eq!(run_machine(&cfg2, &ops2), State::Live, "failing SETUP checks (hooks) do not exclude a report");
 }
@@ -3330,7 +3352,7 @@ fn r5_automatic_abort_after_staging_moves_its_own_snapshot_aside() {
     let d = tempfile::tempdir().unwrap();
     let cfg = roster_config(d.path());
     let ops = MockOps::new(d.path(), 110);
-    let rep = serde_json::json!({"instance_id": "aa", "checks": [], "coord": {"event_id": "e1"},
+    let rep = serde_json::json!({"instance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "checks": [], "coord": {"event_id": "e1"},
         "ceremony": {"state": "VERIFIED", "evidence": ours}});
     // rc.23: bp2 already aborted, so the quorum (2) is unreachable without this node: the guard passes, a real abort.
     let behind = serde_json::json!({"instance_id": "bb", "checks": [], "coord": {"event_id": "e1"}, "ceremony": {"state": "ABORTED"}});
@@ -3474,9 +3496,10 @@ fn r5_fleet_gate_journals_why_each_report_was_excluded() {
     let rep = |id: &str, checks: serde_json::Value| serde_json::json!({"instance_id": id, "checks": checks,
         "coord": {"event_id": "e1"}, "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}});
     *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
-        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aa", serde_json::json!([{"name": "disk_free", "ok": false, "detail": "2 GB free"}]))}]},
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", serde_json::json!([{"name": "disk_free", "ok": false, "detail": "2 GB free"}]))}]},
         {"name": "bp2", "beacons": [{"age_ms": 1000, "report": rep("bb", serde_json::json!([]))}]}]}]}));
-    assert_eq!(run_machine(&cfg, &ops), State::Stranded, "rc.23: two members agree at VERIFIED: not proof the fleet did not commit");
+    // rc.25 F6: this node knows its own report, so bp2 alone (quorum 2) cannot commit without it: a real abort.
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted, "bp2 alone is below quorum 2");
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(text.contains("fleet_gate_excluded") && text.contains("disk_free"), "per-report reason journaled: {text}");
 }
@@ -3540,7 +3563,7 @@ fn r6_steady_stale_report_is_journaled_once_and_non_roster_producers_are_not_nam
     let rep = |id: &str| serde_json::json!({"instance_id": id, "checks": [], "coord": {"event_id": "e1"},
         "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}});
     *ops.status_doc.borrow_mut() = Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
-        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aa")}]},
+        {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}]},
         {"name": "bp2", "beacons": [{"age_ms": 100000, "report": rep("bb")}]},
         {"name": "outsider", "beacons": [{"age_ms": 100000, "report": rep("zz")}]}]}]}));
     assert_eq!(run_machine(&cfg, &ops), State::Stranded, "quorum 2 never reached; bp2 stale = unknown (rc.23)");
@@ -4710,8 +4733,14 @@ fn rc23_fleet_config(dir: &std::path::Path) -> Config {
     load_toml(dir, "fleet.toml", &text).unwrap()
 }
 
+/// The relay view the node itself gets back: its own beacon (bp1) is always there unless a test lists bp1 itself,
+/// as a real beacon reports for the event (rc.25 F6: a node whose own report is not visible may not resume).
 fn rc23_status(members: &[(&str, serde_json::Value)]) -> serde_json::Value {
-    serde_json::json!({"networks": [{"id": "rehearsal", "producers": members.iter().map(|(n, c)| serde_json::json!({"name": n,
+    let mut all: Vec<(&str, serde_json::Value)> = members.to_vec();
+    if !all.iter().any(|(n, _)| *n == "bp1") {
+        all.insert(0, ("bp1", serde_json::json!({"state": "ARMED"})));
+    }
+    serde_json::json!({"networks": [{"id": "rehearsal", "producers": all.iter().map(|(n, c)| serde_json::json!({"name": n,
         "beacons": [{"age_ms": 1000, "report": {"coord": {"event_id": "e1"}, "ceremony": c}}]})).collect::<Vec<_>>()}]})
 }
 
@@ -4809,7 +4838,7 @@ fn rc23_signed_abort_resumes_only_with_every_member_accounted_for() {
     // A peer whose IGNITED entry was replaced by a new silent-instance report: the relay's high-water mark still
     // shows it past creation.
     let mut doc = peers(&[("bp2", "VERIFIED"), ("bp3", "VERIFIED"), ("bp4", "VERIFIED"), ("bp5", "VERIFIED")]);
-    doc["networks"][0]["producers"][0]["event_max"] = serde_json::json!({"e1": {"past_create": true, "state": "IGNITED"}});
+    doc["networks"][0]["producers"][1]["event_max"] = serde_json::json!({"e1": {"past_create": true, "state": "IGNITED"}});
     let (st, _, text) = run(doc);
     assert_eq!(st, State::Stranded);
     assert!(text.contains("high-water mark"), "{text}");
@@ -4872,9 +4901,10 @@ fn rc23_resume_waits_for_its_own_verified_report_to_be_withdrawn_and_re_checks()
     ops.burnoff_tx_per_block.set(1);
     // Self never shows as withdrawn (still VERIFIED): the wait runs the whole report_max_age_secs; the fleet view
     // the second pass sees is the scripted one after the first relay read.
-    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp1", serde_json::json!({"state": "VERIFIED"})),
+        ("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
         ("bp4", serde_json::json!({"state": "FROZEN"})), ("bp5", serde_json::json!({"state": "FROZEN"}))]));
-    *ops.status_doc_after.borrow_mut() = Some((3, rc23_status(&[("bp2", serde_json::json!({"state": "VERIFIED"})), ("bp3", serde_json::json!({"state": "VERIFIED"})),
+    *ops.status_doc_after.borrow_mut() = Some((3, rc23_status(&[("bp1", serde_json::json!({"state": "VERIFIED"})), ("bp2", serde_json::json!({"state": "VERIFIED"})), ("bp3", serde_json::json!({"state": "VERIFIED"})),
         ("bp4", serde_json::json!({"state": "VERIFIED"})), ("bp5", serde_json::json!({"state": "VERIFIED"}))])));
     assert_eq!(run_machine(&cfg, &ops), State::Stranded);
     assert_eq!(ops.resumes.get(), 0);

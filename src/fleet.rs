@@ -174,6 +174,14 @@ pub fn resume_guard(status: Option<&Value>, co: &Coordination, me: Option<(&str,
         return Err("the coordinator relay did not answer: whether peers started chain creation or ignition is unknown".into());
     };
     let all = members(status, co);
+    // rc.24 fleet run c5 (F6): this node's OWN report for the event must be visible and fresh on the relay before
+    // it may resume. Otherwise its peers cannot account for it (they strand, since it "may have ignited unseen")
+    // while it alone resumes: the one silent member deciding for everyone, backwards.
+    let mine: Vec<&MemberView> = all.iter().filter(|m| is_self(m, me)).collect();
+    if me.is_none() || mine.is_empty() || mine.iter().any(|m| m.missing || m.conflict || m.report.is_none()) {
+        return Err("own beacon not visible on the relay (this node's report for the event is missing, stale or identity-conflicted): \
+                    peers cannot account for this node, so it must not resume the old chain".into());
+    }
     let (mut seen, mut in_ceremony) = (vec![], vec![]);
     // First the strongest evidence: anyone ever reported past creation for this event.
     if let Some(m) = all.iter().filter(|m| !is_self(m, me)).find(|m| m.max_past.is_some()) {
@@ -362,6 +370,12 @@ mod tests {
         }
         json!({"coord": {"event_id": "e1"}, "ceremony": c})
     }
+    /// `status` plus this node's own (bp1) fresh report, which the resume guard requires (F6).
+    fn status_me(ps: &[(&str, Value, u64)]) -> Value {
+        let mut v: Vec<(&str, Value, u64)> = vec![("bp1", rep("ABORTED", json!({})), 1000)];
+        v.extend(ps.iter().cloned());
+        status(&v)
+    }
     fn status(ps: &[(&str, Value, u64)]) -> Value {
         json!({"networks": [{"id": "rehearsal", "producers": ps.iter().map(|(n, r, age)| json!({"name": n, "beacons": [{"age_ms": age, "report": r}]})).collect::<Vec<_>>()}]})
     }
@@ -371,32 +385,32 @@ mod tests {
         let me = Some(("bp1", "i"));
         // q = N (3 of 3): one peer's abort makes the quorum unreachable without me.
         let c = co(&["bp1", "bp2", "bp3"], 3);
-        let one_aborted = status(&[("bp2", rep("ABORTED", json!({})), 1000), ("bp3", rep("VERIFIED", json!({})), 1000)]);
+        let one_aborted = status_me(&[("bp2", rep("ABORTED", json!({})), 1000), ("bp3", rep("VERIFIED", json!({})), 1000)]);
         assert!(resume_guard(Some(&one_aborted), &c, me, false).is_ok());
         // Review #1: a LOCAL abort while peers are still before VERIFIED. With q < N (2 of 3) the two peers can
         // still reach quorum without me and ignite: the old behaviour resumed here (the common split).
         let c2 = co(&["bp1", "bp2", "bp3"], 2);
-        let early = status(&[("bp2", rep("FROZEN", json!({})), 1000), ("bp3", rep("ARMED", json!({})), 1000)]);
+        let early = status_me(&[("bp2", rep("FROZEN", json!({})), 1000), ("bp3", rep("ARMED", json!({})), 1000)]);
         assert!(resume_guard(Some(&early), &c2, me, false).unwrap_err().contains("can reach it without this node"));
         // ... and with q = N the same peers cannot (they need me): resume.
         assert!(resume_guard(Some(&early), &c, me, false).is_ok());
         // A minority that aborts alone strands; once enough peers aborted too, it may resume.
         let c5 = co(&["bp1", "bp2", "bp3", "bp4", "bp5"], 4);
-        let four_on = status(&[("bp2", rep("VERIFIED", json!({})), 1000), ("bp3", rep("VERIFIED", json!({})), 1000),
+        let four_on = status_me(&[("bp2", rep("VERIFIED", json!({})), 1000), ("bp3", rep("VERIFIED", json!({})), 1000),
             ("bp4", rep("SNAPSHOTTED", json!({})), 1000), ("bp5", rep("FROZEN", json!({})), 1000)]);
         assert!(resume_guard(Some(&four_on), &c5, me, false).is_err());
-        let two_off = status(&[("bp2", rep("VERIFIED", json!({})), 1000), ("bp3", rep("ABORTED", json!({})), 1000),
+        let two_off = status_me(&[("bp2", rep("VERIFIED", json!({})), 1000), ("bp3", rep("ABORTED", json!({})), 1000),
             ("bp4", rep("STRANDED", json!({})), 1000), ("bp5", rep("FROZEN", json!({})), 1000)]);
         assert!(resume_guard(Some(&two_off), &c5, me, false).is_ok());
         // Unknown is never "no": relay down, a peer past creation, stale, missing, no roster.
         assert!(resume_guard(None, &c, me, false).unwrap_err().contains("did not answer"));
-        let past = status(&[("bp2", rep("HALTED", json!({})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
+        let past = status_me(&[("bp2", rep("HALTED", json!({})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
         assert!(resume_guard(Some(&past), &c, me, false).unwrap_err().contains("bp2 is past"));
-        let creating = status(&[("bp2", rep("VERIFIED", json!({"create_started": true})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
+        let creating = status_me(&[("bp2", rep("VERIFIED", json!({"create_started": true})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
         assert!(resume_guard(Some(&creating), &c, me, false).unwrap_err().contains("bp2 is past"));
-        let stale = status(&[("bp2", rep("ABORTED", json!({})), 999_000), ("bp3", rep("ABORTED", json!({})), 1000)]);
+        let stale = status_me(&[("bp2", rep("ABORTED", json!({})), 999_000), ("bp3", rep("ABORTED", json!({})), 1000)]);
         assert!(resume_guard(Some(&stale), &c, me, false).unwrap_err().contains("stale"));
-        let missing = status(&[("bp2", rep("ABORTED", json!({})), 1000)]);
+        let missing = status_me(&[("bp2", rep("ABORTED", json!({})), 1000)]);
         assert!(resume_guard(Some(&missing), &c, me, false).unwrap_err().contains("bp3 has no report"));
         assert!(resume_guard(Some(&missing), &c, None, false).is_err(), "without knowing who we are, our own (missing) report blocks");
         assert!(resume_guard(Some(&one_aborted), &co(&[], 0), me, false).unwrap_err().contains("no roster"), "review #8");
@@ -409,10 +423,10 @@ mod tests {
     fn signed_abort_needs_every_member_accounted_for_and_honours_the_high_water_mark() {
         let me = Some(("bp1", "i"));
         let c = co(&["bp1", "bp2", "bp3", "bp4"], 3);
-        let three_missing = status(&[("bp2", rep("VERIFIED", json!({})), 1000)]);
+        let three_missing = status_me(&[("bp2", rep("VERIFIED", json!({})), 1000)]);
         assert!(resume_guard(Some(&three_missing), &c, me, true).unwrap_err().contains("no report"));
         assert!(resume_guard(None, &c, me, true).unwrap_err().contains("did not answer"));
-        let all = status(&[("bp2", rep("VERIFIED", json!({})), 1000), ("bp3", rep("FROZEN", json!({})), 999_000),
+        let all = status_me(&[("bp2", rep("VERIFIED", json!({})), 1000), ("bp3", rep("FROZEN", json!({})), 999_000),
             ("bp4", rep("VERIFIED", json!({})), 1000)]);
         assert!(resume_guard(Some(&all), &c, me, true).is_ok(), "stale accepted under a signed abort; quorum rule not applied");
         let mut replaced = all.clone();
@@ -462,6 +476,24 @@ mod tests {
         assert!(join_view(Some(&status(&live)), &c, &other).unwrap_err().contains("differs"));
     }
 
+    /// rc.24 fleet run c5 (F6): under a signed abort, the one member whose own beacon was silent resumed while
+    /// every visible member stranded waiting for it. Its own report must be visible and fresh first.
+    #[test]
+    fn a_node_whose_own_beacon_is_not_visible_strands_instead_of_resuming() {
+        let me = Some(("bp1", "i"));
+        let c = co(&["bp1", "bp2", "bp3"], 3);
+        let peers = [("bp2", rep("STRANDED", json!({})), 1000), ("bp3", rep("STRANDED", json!({})), 1000)];
+        // Own report missing (c5): strand, on both paths.
+        let without_me = status(&peers);
+        assert!(resume_guard(Some(&without_me), &c, me, true).unwrap_err().contains("own beacon not visible"));
+        assert!(resume_guard(Some(&without_me), &c, me, false).unwrap_err().contains("own beacon not visible"));
+        // Own report stale: strand.
+        let mut v = vec![("bp1", rep("ABORTED", json!({})), 999_000)]; v.extend(peers.iter().cloned());
+        assert!(resume_guard(Some(&status(&v)), &c, me, true).unwrap_err().contains("own beacon not visible"));
+        // Own report visible and fresh: the normal rules apply (here: signed abort, everyone accounted for).
+        assert!(resume_guard(Some(&status_me(&peers)), &c, me, true).is_ok());
+    }
+
     /// rc.24 fleet rehearsal: a stale journal (armed for another H) under the current event id is not evidence.
     #[test]
     fn a_journal_armed_for_another_h_is_not_this_events_evidence() {
@@ -469,17 +501,17 @@ mod tests {
         let c = co(&["bp1", "bp2", "bp3"], 2);
         let foreign = |st: &str| { let mut r = rep(st, json!({"source_resumed": true})); r["ceremony"]["evidence"]["h"] = json!(999); r };
         let mut ours = rep("VERIFIED", json!({})); ours["ceremony"]["evidence"]["h"] = json!(100);
-        let mut st = status(&[("bp2", foreign("ABORTED"), 1000), ("bp3", ours.clone(), 1000)]);
+        let mut st = status_me(&[("bp2", foreign("ABORTED"), 1000), ("bp3", ours.clone(), 1000)]);
         // Before: bp2's stale ABORTED journal counts it out of the ceremony and the guard lets bp1 resume.
         assert!(resume_guard(Some(&st), &c, me, false).is_ok());
         assert_eq!(drop_foreign_ceremonies(&mut st, "rehearsal", 100), 1);
-        assert!(st["networks"][0]["producers"][0]["beacons"][0]["report"]["ceremony"].is_null());
-        assert!(st["networks"][0]["producers"][1]["beacons"][0]["report"]["ceremony"].is_object(), "a journal for this H stays");
+        assert!(st["networks"][0]["producers"][1]["beacons"][0]["report"]["ceremony"].is_null());
+        assert!(st["networks"][0]["producers"][2]["beacons"][0]["report"]["ceremony"].is_object(), "a journal for this H stays");
         // After: bp2 has a report for the event but no known state: still in the ceremony, the quorum is reachable.
         assert!(resume_guard(Some(&st), &c, me, false).unwrap_err().contains("still in the ceremony"));
         // cut_height is used when the ARMED height is absent; another network is untouched.
         let mut r = rep("LIVE", json!({})); r["ceremony"]["evidence"]["cut_height"] = json!(7);
-        let mut st2 = status(&[("bp2", r, 1000)]);
+        let mut st2 = status_me(&[("bp2", r, 1000)]);
         assert_eq!(drop_foreign_ceremonies(&mut st2, "other", 100), 0);
         assert_eq!(drop_foreign_ceremonies(&mut st2, "rehearsal", 7), 0);
         assert_eq!(drop_foreign_ceremonies(&mut st2, "rehearsal", 100), 1);
