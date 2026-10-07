@@ -5019,12 +5019,14 @@ fn rc23_a_failing_post_ignite_hook_is_retried_while_the_fleet_is_live() {
 
 #[test]
 fn rc23_degraded_ends_in_a_halt_when_the_fleet_does_not_vouch_patience_runs_out_or_the_operator_decides() {
-    // Peers ignited but none shows a block after the cut: the fleet does not vouch for the chain → halt as before.
+    // Peers ignited but none shows a block after the cut: the fleet does not vouch for the chain → halt, after the
+    // short-of-quorum grace (rc.24 rehearsal fix: min(fleet_stall_secs, 120) s, journaled as degraded_fleet_short).
     let d = tempfile::tempdir().unwrap();
     let (cfg, ops) = rc23_degraded_rig_head(d.path(), "IGNITED", 900, 120);
-    *ops.flaky_hook.borrow_mut() = Some(("resume-traffic".into(), 99));
+    *ops.flaky_hook.borrow_mut() = Some(("resume-traffic".into(), u32::MAX));
     assert!(run_machine_result(&cfg, &ops).unwrap_err().starts_with("HALTED"));
-    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("the fleet view does not vouch"));
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("degraded_fleet_short") && text.contains("the fleet view does not vouch for the chain (120 s)"), "{text}");
     // A permanent stall with a live fleet: patience (30 s) runs out → halt.
     let d = tempfile::tempdir().unwrap();
     let (cfg, ops) = rc23_degraded_rig(d.path(), "LIVE", 30);
@@ -5227,4 +5229,48 @@ fn rc23_a_roster_pin_that_is_not_this_node_is_warned_about() {
     let ok = load_toml(d.path(), "fleet-pin-ok.toml", &std::fs::read_to_string(d.path().join("fleet.toml")).unwrap()
         .replacen("producer = \"bp1\"\n", &format!("producer = \"bp1\"\ninstance_id = \"{mine}\"\n"), 1)).unwrap();
     assert!(ok.warnings().iter().all(|w| !w.contains("pins instance")));
+}
+
+/// rc.24 fleet rehearsal (c2): after `unhalt`, a re-run starts a NEW degraded patience; it must not inherit the
+/// halted episode's start (the re-run halted at its first symptom with "patience exhausted").
+#[test]
+fn rc24_unhalt_restarts_degraded_patience() {
+    let d = tempfile::tempdir().unwrap();
+    let j = d.path().join("journal.jsonl");
+    let lines = [
+        r#"{"seq":0,"ts_ms":1,"ts":"t","kind":"transition","state":"IGNITED","data":{}}"#,
+        r#"{"seq":1,"ts_ms":2,"ts":"t","kind":"evidence","state":"IGNITED","data":{"degraded_since_ms":1000}}"#,
+        r#"{"seq":2,"ts_ms":3,"ts":"t","kind":"transition","state":"HALTED","data":{"halted_from":"IGNITED"}}"#,
+    ];
+    std::fs::write(&j, lines.join("\n") + "\n").unwrap();
+    assert_eq!(pulse_cutover::journal::Journal::replay(&j).unwrap().degraded_since_ms, Some(1000));
+    let mut more = lines.join("\n") + "\n";
+    more.push_str(r#"{"seq":3,"ts_ms":4,"ts":"t","kind":"evidence","state":"HALTED","data":{"unhalted_by":"root","returning_to":"IGNITED"}}"#);
+    more.push('\n');
+    std::fs::write(&j, &more).unwrap();
+    assert_eq!(pulse_cutover::journal::Journal::replay(&j).unwrap().degraded_since_ms, None, "patience restarts after unhalt");
+    more.push_str(r#"{"seq":4,"ts_ms":5,"ts":"t","kind":"evidence","state":"IGNITED","data":{"degraded_since_ms":9000}}"#);
+    more.push('\n');
+    std::fs::write(&j, &more).unwrap();
+    assert_eq!(pulse_cutover::journal::Journal::replay(&j).unwrap().degraded_since_ms, Some(9000));
+}
+
+/// rc.24 fleet rehearsal (c2/c3a, F2): a fleet view that is merely SHORT of a quorum (peers' nodes still at the cut)
+/// is given a grace instead of ending the degraded wait at once; when the peers catch up the ceremony goes LIVE.
+#[test]
+fn rc24_a_short_of_quorum_fleet_view_is_waited_out_within_the_grace() {
+    let d = tempfile::tempdir().unwrap();
+    let (cfg, ops) = rc23_degraded_rig_head(d.path(), "IGNITED", 900, 120);
+    *ops.flaky_hook.borrow_mut() = Some(("resume-traffic".into(), 2));
+    // Read 1 is the fleet gate; read 2 (the first degraded check) shows the peers at the cut (short of a quorum);
+    // from read 3 they show blocks past it.
+    let ours = ops.status_doc.borrow().clone().unwrap();
+    let mut caught_up = ours.clone();
+    for p in caught_up["networks"][0]["producers"].as_array_mut().unwrap() {
+        p["beacons"][0]["report"]["ceremony"]["target"]["head"] = serde_json::json!(200);
+    }
+    *ops.status_doc_after.borrow_mut() = Some((2, caught_up));
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("degraded_fleet_short") && !text.contains("HALTED"), "{text}");
 }

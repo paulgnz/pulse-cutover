@@ -99,6 +99,39 @@ pub fn members(status: &Value, co: &Coordination) -> Vec<MemberView> {
     }).collect()
 }
 
+/// rc.24 fleet rehearsal: a beacon pairs `await`'s coordination state (the event id) with whatever journal its
+/// config points at, so a reused run directory or a stale journal next to a newer event reported an OLD
+/// ceremony (e.g. ABORTED with the source resumed) under the current event id. A report whose journal was
+/// armed for another H (`ceremony.evidence.h`, else `evidence.cut_height`) is not evidence for this event:
+/// its ceremony is replaced by `null`, so the member reads as "no state" — still in the ceremony for the
+/// resume guard (more conservative), never LIVE / ABORTED / past creation. Returns how many were dropped.
+pub fn drop_foreign_ceremonies(status: &mut Value, network: &str, h: u64) -> usize {
+    let mut dropped = 0;
+    let Some(nets) = status["networks"].as_array_mut() else { return 0 };
+    for net in nets.iter_mut().filter(|n| n["id"].as_str() == Some(network)) {
+        let Some(prods) = net["producers"].as_array_mut() else { continue };
+        for p in prods.iter_mut() {
+            let mut fix = |r: &mut Value| {
+                let ev = &r["ceremony"]["evidence"];
+                let jh = ev["h"].as_u64().or_else(|| ev["cut_height"].as_u64());
+                if jh.is_some_and(|j| j != h) {
+                    r["ceremony"] = Value::Null;
+                    dropped += 1;
+                }
+            };
+            if let Some(bs) = p["beacons"].as_array_mut() {
+                for b in bs.iter_mut() {
+                    fix(&mut b["report"]);
+                }
+            }
+            if p["report"].is_object() {
+                fix(&mut p["report"]);
+            }
+        }
+    }
+    dropped
+}
+
 /// A report is past the point where resuming the old chain is safe: creation, a join or ignition
 /// started, or a state after it.
 pub fn past_create(report: &Value) -> bool {
@@ -193,6 +226,17 @@ pub struct LiveView {
     pub members: Vec<String>,
     pub after_cut_id: Option<String>,
     pub max_head: u64,
+    /// rc.25: the view rules the chain out (more than one chain/fork with a quorum, or this node on another
+    /// chain / a fork), as opposed to one that merely does not show a quorum yet (a peer still catching up, a
+    /// beacon that missed a slow target read, the relay not answering). A hard view ends a degraded wait at once;
+    /// a soft one gets a bounded grace (machine.rs degraded_continue).
+    pub hard: bool,
+}
+
+impl LiveView {
+    pub fn is_hard(&self) -> bool {
+        self.hard
+    }
 }
 
 /// After ignition: is a quorum of roster members (fresh reports for this event, state IGNITED,
@@ -201,7 +245,7 @@ pub struct LiveView {
 /// `our_after_cut` = this node's own block at cut + 1, if it has one (a different one = this node is
 /// on a fork: never healthy).
 pub fn live_view(status: Option<&Value>, co: &Coordination, cut: u64, our_bid: Option<&str>, our_after_cut: Option<&str>) -> LiveView {
-    let none = |why: &str| LiveView { healthy: false, why: why.into(), members: vec![], after_cut_id: None, max_head: 0 };
+    let none = |why: &str| LiveView { healthy: false, why: why.into(), members: vec![], after_cut_id: None, max_head: 0, hard: false };
     let Some(status) = status else { return none("the coordinator relay did not answer") };
     let q = quorum_of(co);
     if q == 0 {
@@ -211,7 +255,9 @@ pub fn live_view(status: Option<&Value>, co: &Coordination, cut: u64, our_bid: O
     for m in members(status, co) {
         let Some(r) = m.report else { continue };
         let c = &r["ceremony"];
-        if !matches!(c["state"].as_str(), Some("IGNITED" | "FLIPPED" | "LIVE")) {
+        // HALTED counts too (rc.24 fleet rehearsal c3a): a halted agent's validator still runs the target chain, and
+        // excluding it made one peer's halt shrink every other peer's view below quorum, so the halts cascaded.
+        if !matches!(c["state"].as_str(), Some("IGNITED" | "FLIPPED" | "LIVE" | "HALTED")) {
             continue;
         }
         let t = &c["target"];
@@ -232,12 +278,12 @@ pub fn live_view(status: Option<&Value>, co: &Coordination, cut: u64, our_bid: O
         return none("no roster member reports a target block after the cut");
     };
     if !unique {
-        return LiveView { healthy: false, members, after_cut_id: Some(first), max_head,
+        return LiveView { healthy: false, members, after_cut_id: Some(first), max_head, hard: true,
             why: "more than one target chain or fork has a quorum: split, not a decision".into() };
     }
     if let Some(ours) = our_after_cut {
         if !ours.eq_ignore_ascii_case(&first) {
-            return LiveView { healthy: false, members, after_cut_id: Some(first.clone()), max_head,
+            return LiveView { healthy: false, members, after_cut_id: Some(first.clone()), max_head, hard: true,
                 why: format!("this node's block after the cut ({}…) differs from the fleet's ({}…): another chain or a fork",
                     &ours[..12.min(ours.len())], &first[..12.min(first.len())]) };
         }
@@ -248,7 +294,7 @@ pub fn live_view(status: Option<&Value>, co: &Coordination, cut: u64, our_bid: O
     } else {
         format!("only {} member(s) on one target chain, quorum {q}", members.len())
     };
-    LiveView { healthy, why, members, after_cut_id: Some(first), max_head }
+    LiveView { healthy, why, members, after_cut_id: Some(first), max_head, hard: false }
 }
 
 /// The chain a `join` may track: a quorum of fresh members LIVE on one target chain (Metal blockchain
@@ -393,7 +439,11 @@ mod tests {
         assert_eq!(v.max_head, 107);
         assert!(!live_view(Some(&st), &c, 100, Some("Y"), None).healthy, "members on another chain do not count");
         assert!(!live_view(Some(&st), &c, 100, Some("X"), Some(&"b".repeat(64))).healthy, "this node on a fork");
-        assert!(!live_view(Some(&st), &co(&["bp1", "bp2", "bp3", "bp4"], 4), 100, Some("X"), None).healthy);
+        // rc.24 rehearsal fix: the HALTED bp4 still runs the chain and counts toward 4; a STRANDED one does not.
+        assert!(live_view(Some(&st), &co(&["bp1", "bp2", "bp3", "bp4"], 4), 100, Some("X"), None).healthy);
+        let mut stranded = st.clone();
+        stranded["networks"][0]["producers"][3]["beacons"][0]["report"]["ceremony"]["state"] = json!("STRANDED");
+        assert!(!live_view(Some(&stranded), &co(&["bp1", "bp2", "bp3", "bp4"], 4), 100, Some("X"), None).healthy);
         assert!(!live_view(None, &c, 100, Some("X"), None).healthy);
         assert!(!live_view(Some(&st), &c, 107, Some("X"), None).healthy, "heads must be past the cut");
     }
@@ -410,6 +460,46 @@ mod tests {
         assert!(join_view(Some(&status(&live[..3])), &c, &ours).unwrap_err().contains("quorum 4"));
         let other = json!({"snapshot_sha256": "bb", "fingerprints_digest": "ff"});
         assert!(join_view(Some(&status(&live)), &c, &other).unwrap_err().contains("differs"));
+    }
+
+    /// rc.24 fleet rehearsal: a stale journal (armed for another H) under the current event id is not evidence.
+    #[test]
+    fn a_journal_armed_for_another_h_is_not_this_events_evidence() {
+        let me = Some(("bp1", "i"));
+        let c = co(&["bp1", "bp2", "bp3"], 2);
+        let foreign = |st: &str| { let mut r = rep(st, json!({"source_resumed": true})); r["ceremony"]["evidence"]["h"] = json!(999); r };
+        let mut ours = rep("VERIFIED", json!({})); ours["ceremony"]["evidence"]["h"] = json!(100);
+        let mut st = status(&[("bp2", foreign("ABORTED"), 1000), ("bp3", ours.clone(), 1000)]);
+        // Before: bp2's stale ABORTED journal counts it out of the ceremony and the guard lets bp1 resume.
+        assert!(resume_guard(Some(&st), &c, me, false).is_ok());
+        assert_eq!(drop_foreign_ceremonies(&mut st, "rehearsal", 100), 1);
+        assert!(st["networks"][0]["producers"][0]["beacons"][0]["report"]["ceremony"].is_null());
+        assert!(st["networks"][0]["producers"][1]["beacons"][0]["report"]["ceremony"].is_object(), "a journal for this H stays");
+        // After: bp2 has a report for the event but no known state: still in the ceremony, the quorum is reachable.
+        assert!(resume_guard(Some(&st), &c, me, false).unwrap_err().contains("still in the ceremony"));
+        // cut_height is used when the ARMED height is absent; another network is untouched.
+        let mut r = rep("LIVE", json!({})); r["ceremony"]["evidence"]["cut_height"] = json!(7);
+        let mut st2 = status(&[("bp2", r, 1000)]);
+        assert_eq!(drop_foreign_ceremonies(&mut st2, "other", 100), 0);
+        assert_eq!(drop_foreign_ceremonies(&mut st2, "rehearsal", 7), 0);
+        assert_eq!(drop_foreign_ceremonies(&mut st2, "rehearsal", 100), 1);
+    }
+
+    /// rc.24 fleet rehearsal (c3a): a HALTED peer whose validator runs the chain still counts; a split is "hard".
+    #[test]
+    fn halted_members_on_the_chain_count_and_splits_are_hard() {
+        let c = co(&["bp1", "bp2", "bp3", "bp4"], 4);
+        let t = |head: u64, first: &str| json!({"target": {"blockchain_id": "X", "head": head, "after_cut_id": first}});
+        let a = "a".repeat(64);
+        let st = status(&[("bp1", rep("IGNITED", t(105, &a)), 1000), ("bp2", rep("HALTED", t(104, &a)), 1000),
+            ("bp3", rep("HALTED", t(103, &a)), 1000), ("bp4", rep("LIVE", t(105, &a)), 1000)]);
+        let v = live_view(Some(&st), &c, 100, Some("X"), None);
+        assert!(v.healthy, "{}", v.why);
+        let lag = status(&[("bp1", rep("IGNITED", t(105, &a)), 1000), ("bp2", rep("IGNITED", t(100, &a)), 1000)]);
+        let v = live_view(Some(&lag), &c, 100, Some("X"), None);
+        assert!(!v.healthy && !v.is_hard(), "a peer at the cut is not yet a quorum, but not a split: {}", v.why);
+        let v = live_view(Some(&st), &c, 100, Some("X"), Some(&"b".repeat(64)));
+        assert!(!v.healthy && v.is_hard(), "{}", v.why);
     }
 
     /// Review #9: two groups that each reach the quorum (different chains or forks) are a split, not a decision.

@@ -438,6 +438,10 @@ impl Journal {
             }
             if entry.data.get("unhalted_by").is_some() {
                 out.unhalted = true;
+                // rc.24 fleet rehearsal (c2): the patience of a degraded wait belongs to the episode that halted. After an
+                // operator's `unhalt` the re-run starts a new one; keeping the old start halted the re-run at its first
+                // symptom with "patience exhausted (900 s since the first symptom)".
+                out.degraded_since_ms = None;
             }
             if let Some(a) = entry.data.get("staged_artifact") {
                 out.staged_sha256 = a.get("sha256").and_then(|v| v.as_str()).map(str::to_string);

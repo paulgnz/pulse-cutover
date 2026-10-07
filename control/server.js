@@ -18,7 +18,7 @@ import { readFileSync, existsSync, watchFile, renameSync, mkdirSync, openSync, w
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isPublicIp, normIp, resolvePublic, limiter, safeRequest, probeProducerApi, safeJson, safeDecode, RE, UA, endpointId, endpointRef, reservedKey,
-  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, STATE_RANK } from './lib.mjs';
+  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, ceremonyFor, STATE_RANK } from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = +(process.env.PORT ?? 8787);
@@ -894,14 +894,16 @@ async function handle(req, res) {
     const conflict = byKey[key].conflict;
     // The per-event high-water mark (only raised; a new event id starts over).
     let em = null;
-    const evId = r.coord?.event_id, ce = r.ceremony;
+    const evId = r.coord?.event_id;
+    // Movement arming is judged with this report's own rank included (the other members' marks as stored) and
+    // the current coordinated event's roster when this report is for it.
+    const evNow = coord[r.network]?.event ? (() => { try { return JSON.parse(coord[r.network].event.payload); } catch { return null; } })() : null;
+    const evFor = evNow && evNow.event_id === evId ? evNow : {};
+    // A journal armed for another H is not this event's evidence (ceremonyFor): it never raises the event's mark.
+    const ce = ceremonyFor(r, evFor);
     if (evId && ce && (r.role || 'producer') === 'producer' && !reservedKey(evId)) {
       const mine = eventMax[r.network]?.[r.producer] || {};
       const cur = mine[evId];
-      // Movement arming is judged with this report's own rank included (the other members' marks as stored) and
-      // the current coordinated event's roster when this report is for it.
-      const evNow = coord[r.network]?.event ? (() => { try { return JSON.parse(coord[r.network].event.payload); } catch { return null; } })() : null;
-      const evFor = evNow && evNow.event_id === evId ? evNow : {};
       const marks = dict();
       for (const [p, m] of Object.entries(eventMax[r.network] || {})) if (m[evId]) marks[p] = m[evId];
       marks[r.producer] = nextEventMark(cur, ce, null, false, now) || cur;

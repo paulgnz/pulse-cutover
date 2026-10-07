@@ -526,6 +526,19 @@ export function nextEventMark(cur, ce, sourceHead, armed, now) {
     && (cur.src_first ?? null) === (next.src_first ?? null) && (cur.src_max ?? null) === (next.src_max ?? null);
   return same ? null : next;
 }
+/**
+ * The report's ceremony, but only when its journal belongs to this event (rc.24 fleet rehearsal): a beacon pairs the
+ * coordination state (`coord.event_id`, written by `await`) with whatever journal its config points at. A reused run
+ * directory, or a journal left from an earlier ceremony next to a newer (even completed) event, put an old ABORTED
+ * journal under the current event id and latched a false "resumed the old chain after peers ignited" SPLIT. A journal
+ * armed for another H (`evidence.h`, else `evidence.cut_height`) is not this event's evidence: treated as no ceremony.
+ */
+export function ceremonyFor(report, ev) {
+  const ce = report?.ceremony || null;
+  if (!ce || !ev || !Number.isInteger(ev.h)) return ce;
+  const jh = Number.isInteger(ce.evidence?.h) ? ce.evidence.h : ce.evidence?.cut_height;
+  return Number.isInteger(jh) && jh !== ev.h ? null : ce;
+}
 /** @param eventMax { producer: {past_create, state, rank?, src_first?, src_max?} } for THIS event — the relay's per-event high-water mark (an
  *  instance replacement cannot lower it). */
 export function fleetVerdict(ev, byProducer, eventMax = {}) {
@@ -538,7 +551,7 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
     const mine = (byProducer[producer] || []).filter((s) => s.report?.coord?.event_id === ev.event_id && (!pin || s.report.instance_id === pin));
     const usable = mine.filter((s) => !s.conflict);
     const s = usable.find((x) => !x.silent) || usable[0] || null;
-    const ce = s?.report?.ceremony || null;
+    const ce = ceremonyFor(s?.report, ev);
     const em = eventMax?.[producer];
     const markPast = !!em && em.past_create === true && (em.event_id === undefined || em.event_id === ev.event_id);
     return { producer, state: ce?.state || null, fresh: !!s && !s.silent, conflict: mine.length > 0 && !usable.length,

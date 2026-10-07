@@ -86,6 +86,8 @@ pub struct Machine<'a, O: ChainOps> {
     /// when it last moved, and the last journaled degraded note (journaled on change only).
     degraded_since_ms: Option<u64>,
     fleet_head: (u64, u64),
+    /// When the fleet view first stopped showing a quorum during a degraded wait (None = it shows one).
+    fleet_unhealthy_since: Option<u64>,
     degraded_note: String,
 }
 
@@ -254,6 +256,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             head_at_pause: recovered.head_at_pause,
             degraded_since_ms: recovered.degraded_since_ms,
             fleet_head: (0, 0),
+            fleet_unhealthy_since: None,
             degraded_note: String::new(),
         }
     }
@@ -1039,8 +1042,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let co = self.cfg.coordination.as_ref()?;
         let url = format!("{}/api/status", co.url.trim_end_matches('/'));
         for i in 0..5 {
-            if let Ok(Some(doc)) = self.ops.get_json(&url) {
+            if let Ok(Some(mut doc)) = self.ops.get_json(&url) {
                 if doc.is_object() {
+                    // A report whose journal was armed for another H is not evidence for this event (rc.24 fleet
+                    // rehearsal: a stale journal under the current event id).
+                    // Compared with the event's H as this journal resolved it at ARM (what the beacon reports as
+                    // `evidence.h`), not the cut height (an inexact rehearsal cut would drop every peer).
+                    if let Some(h) = self.resolved_h {
+                        crate::fleet::drop_foreign_ceremonies(&mut doc, &co.network, h);
+                    }
                     return Some(doc);
                 }
             }
@@ -2722,8 +2732,27 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let ours = self.ops.target_block_id(cut + 1).ok().flatten();
         let v = crate::fleet::live_view(status.as_ref(), &co, cut, self.target_blockchain_id.as_deref(), ours.as_deref());
         if !v.healthy {
-            return end(self, format!("the fleet view does not vouch for the chain: {}", v.why));
+            // rc.24 fleet rehearsal (c2): one peer's node still at the cut, or one beacon missing a slow target read,
+            // ended the wait at once and halted. A view that is merely short of a quorum gets the same grace as a
+            // stalled fleet head (`fleet_stall_secs`, at most 120 s); a split or this node on a fork never does.
+            let grace = co.fleet_stall_secs.min(120) * 1000;
+            if v.is_hard() || grace == 0 {
+                return end(self, format!("the fleet view does not vouch for the chain: {}", v.why));
+            }
+            let short_since = match self.fleet_unhealthy_since {
+                Some(t) => t,
+                None => {
+                    self.fleet_unhealthy_since = Some(now);
+                    self.journal.evidence(state, json!({"degraded_fleet_short": v.why, "grace_secs": grace / 1000}))?;
+                    now
+                }
+            };
+            if now.saturating_sub(short_since) > grace {
+                return end(self, format!("the fleet view does not vouch for the chain ({} s): {}", grace / 1000, v.why));
+            }
+            return Ok(true);
         }
+        self.fleet_unhealthy_since = None;
         if v.max_head > self.fleet_head.0 {
             self.fleet_head = (v.max_head, now);
         } else if self.fleet_head.1 == 0 {
