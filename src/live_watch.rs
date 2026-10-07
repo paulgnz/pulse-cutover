@@ -140,17 +140,34 @@ pub fn target_view(cfg: &Config, summary: &Value, agent: Option<&ureq::Agent>) -
         }
     }
     let cut = summary["evidence"]["cut_height"].as_u64();
-    if let (Some(cut), Some(head)) = (cut, out["head"].as_u64()) {
+    if let Some(cut) = cut {
         let mut g = AFTER_CUT.lock().unwrap_or_else(|p| p.into_inner());
         let cached = g.as_ref().filter(|(u, c, _)| u == &url && *c == cut).map(|(_, _, id)| id.clone());
-        let id = cached.or_else(|| (head > cut).then(|| fetch_block_id(agent, &url, cut + 1)).flatten());
+        // rc.25 F4: the first block after the cut never changes on one chain, so a failed head read still reports
+        // the cached id (with `unread_since_ms` below): one timed-out read no longer drops this member from the
+        // fleet's LIVE group (the verdict flapped LIVE↔DEGRADED with quorum = N).
+        let id = cached.or_else(|| out["head"].as_u64().filter(|h| *h > cut).and_then(|_| fetch_block_id(agent, &url, cut + 1)));
         if let Some(id) = &id {
             *g = Some((url.clone(), cut, id.clone()));
         }
         out["after_cut_id"] = json!(id);
     }
+    // How long the target's head has been unreadable (consecutive failures, ms since the first), so readers can
+    // tell a single timeout from a target that is down.
+    let mut u = UNREAD_SINCE.lock().unwrap_or_else(|p| p.into_inner());
+    if out["head"].is_null() {
+        let now = now_ms();
+        let since = *u.get_or_insert(now);
+        out["unread_since_ms"] = json!(since);
+        out["unread_for_ms"] = json!(now.saturating_sub(since));
+    } else {
+        *u = None;
+    }
     out
 }
+
+/// When the target's head first failed to read (consecutive failures), None once it answers.
+static UNREAD_SINCE: Mutex<Option<u64>> = Mutex::new(None);
 
 /// What one observer has seen of one target, across beacon cycles.
 #[derive(Debug, Clone, PartialEq)]

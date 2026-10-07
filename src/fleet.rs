@@ -247,6 +247,9 @@ impl LiveView {
     }
 }
 
+/// How long a member's target may be unreadable and still count on its chain (ms); mission control uses the same.
+pub const UNREAD_GRACE_MS: u64 = 60_000;
+
 /// After ignition: is a quorum of roster members (fresh reports for this event, state IGNITED,
 /// FLIPPED or LIVE) on the same target chain as this node, sharing one block after the cut, with a
 /// head past it? `our_bid` = this node's Metal blockchain id (members on another chain do not count);
@@ -269,10 +272,15 @@ pub fn live_view(status: Option<&Value>, co: &Coordination, cut: u64, our_bid: O
             continue;
         }
         let t = &c["target"];
-        let (Some(first), Some(head)) = (t["after_cut_id"].as_str(), t["head"].as_u64()) else { continue };
-        if head <= cut {
-            continue;
-        }
+        let Some(first) = t["after_cut_id"].as_str() else { continue };
+        // rc.25 F4: a failed head read keeps the member's (immutable) block after the cut for UNREAD_GRACE_MS: one
+        // timed-out read is not a member leaving the chain. Older beacons report no block after the cut then.
+        let head = match t["head"].as_u64() {
+            Some(h) if h <= cut => continue,
+            Some(h) => h,
+            None if t["unread_for_ms"].as_u64().is_some_and(|ms| ms <= UNREAD_GRACE_MS) => 0,
+            None => continue,
+        };
         if let (Some(ours), Some(theirs)) = (our_bid, t["blockchain_id"].as_str()) {
             if ours != theirs {
                 continue;
@@ -378,6 +386,22 @@ mod tests {
     }
     fn status(ps: &[(&str, Value, u64)]) -> Value {
         json!({"networks": [{"id": "rehearsal", "producers": ps.iter().map(|(n, r, age)| json!({"name": n, "beacons": [{"age_ms": age, "report": r}]})).collect::<Vec<_>>()}]})
+    }
+
+    #[test]
+    fn a_timed_out_head_read_keeps_a_member_on_its_chain_for_a_bounded_time() {
+        // rc.25 F4: quorum = N, one member's head read just failed (head null, cached block after the cut).
+        let c = co(&["bp1", "bp2", "bp3"], 3);
+        let live = |head: Value, unread: Option<u64>| {
+            let mut t = json!({"blockchain_id": "X", "head": head, "after_cut_id": "a".repeat(64)});
+            if let Some(ms) = unread { t["unread_for_ms"] = json!(ms); }
+            rep("LIVE", json!({"target": t}))
+        };
+        let view = |third: Value| live_view(Some(&status(&[("bp1", live(json!(130), None), 1000),
+            ("bp2", live(json!(131), None), 1000), ("bp3", third, 1000)])), &c, 120, Some("X"), None);
+        assert!(view(live(json!(null), Some(5_000))).healthy, "a single timeout keeps the quorum");
+        assert!(!view(live(json!(null), Some(UNREAD_GRACE_MS + 1))).healthy, "a target down for longer drops out");
+        assert!(!view(live(json!(null), None)).healthy, "no read age (older beacon): not counted");
     }
 
     #[test]

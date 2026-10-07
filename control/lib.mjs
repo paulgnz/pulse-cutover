@@ -325,7 +325,9 @@ function targetView(t) {
   const cb58 = (x, p) => str(x, p, { max: 64, nullable: true, re: /^[1-9A-HJ-NP-Za-km-z]{20,64}$/ });
   return { blockchain_id: cb58(t.blockchain_id, 'ceremony.target.blockchain_id'), subnet_id: cb58(t.subnet_id, 'ceremony.target.subnet_id'),
     chain_id: hex(t.chain_id, 'ceremony.target.chain_id'), head: int(t.head, 'ceremony.target.head'),
-    head_id: hex(t.head_id, 'ceremony.target.head_id'), after_cut_id: hex(t.after_cut_id, 'ceremony.target.after_cut_id') };
+    head_id: hex(t.head_id, 'ceremony.target.head_id'), after_cut_id: hex(t.after_cut_id, 'ceremony.target.after_cut_id'),
+    // rc.25 (F4): how long the head has been unreadable (consecutive failed reads); absent on older beacons.
+    unread_for_ms: int(t.unread_for_ms, 'ceremony.target.unread_for_ms') };
 }
 
 /**
@@ -468,6 +470,8 @@ export const pastCreate = (ce) => !!ce && ce.state !== 'ABORTED'
 /** Pause skew tolerated above the highest reported pause head, and head movement tolerated once every member is
  *  paused (late blocks absorbed after the pause), in blocks. */
 export const BURNOFF_TOLERANCE = 12;
+/** How long a LIVE member's target may be unreadable and still count toward the LIVE quorum (ms). */
+export const UNREAD_GRACE_MS = 60_000;
 // rc.24: there is no fixed burn-off bound any more. rc.23 fell back to cut + 360 when a beacon did not publish
 // head_at_pause, and the 5-BP rehearsal (rc.22 beacons) paused correctly at cut + 377 (DPoS finality lag + the
 // freeze lead + quiescence): a false latched SPLIT. Real XPR finality lag has no fixed bound, so the old-chain
@@ -603,7 +607,10 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
   for (const [h, ids] of Object.entries(atHeight)) if (ids.size > 1) alarms.push(`split: members report different blocks at height ${h}`);
   // LIVE quorum: fresh LIVE members on one chain with one common block after the cut.
   const groups = {};
-  for (const m of members.filter((x) => x.fresh && x.state === 'LIVE' && x.target?.after_cut_id)) {
+  // A member whose head read failed keeps its (immutable) block after the cut for UNREAD_GRACE_MS (rc.25 F4: one
+  // timed-out read flapped the verdict LIVE↔DEGRADED with quorum = N); a target unreadable for longer drops out.
+  const readable = (t) => t.head != null || !Number.isInteger(t.unread_for_ms) || t.unread_for_ms <= UNREAD_GRACE_MS;
+  for (const m of members.filter((x) => x.fresh && x.state === 'LIVE' && x.target?.after_cut_id && readable(x.target))) {
     const k = `${m.target.blockchain_id || m.target.chain_id || '?'}|${m.target.after_cut_id}`;
     (groups[k] ||= []).push(m.producer);
   }
