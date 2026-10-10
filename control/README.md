@@ -101,13 +101,15 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   for the event (no false SPLIT from a stale journal on a reused run directory). HALTED members count toward the
   agents' own live view (their validators keep running the chain) but not toward this LIVE group, so the board can
   show DEGRADED while agents wait as degraded rather than halting.
-- **Foreign-H evidence** (rc.27): a producer report under the current event id whose journal is for another H but past
-  chain creation is recorded durably in that producer's event mark (`event_max.<event>.foreign_past`: one observation
-  per H and instance, up to 64, then `foreign_overflow`) and shown as a warning; agents treat it as blocking a resume.
-  Marks are only kept for events the coordinator signed, and trimming never removes the current event's mark or one
-  with unresolved foreign evidence. After confirming THAT target is fenced, retire its observation (by its H) on the
-  mission-control host: `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-foreign?net=<net>&producer=<bp>&event=<event>&h=<H>'`
-  (`&instance=<id>` to narrow, `&overflow=1` for the overflow flag; loopback only, like clear-split). The others stay.
+- **Creation-evidence log** (rc.28): every accepted producer report past chain creation becomes an observation in that
+  producer's log (`creation_evidence` in `/api/status`: `{seq, obs: [{id, event_id, h, state, instance_id, target_bid,
+  after_cut_id, at}], overflow}`), whether or not its event is published, whatever its H. Persisted with the server
+  state, never trimmed, never changed by later reports; 128 observations per producer, then `overflow` (blocks).
+  Agents block a resume on any observation for their event; the board warns on another-H observations or overflow.
+  Marks (`event_max`) are progress bookkeeping only, kept for coordinator-signed events. After confirming THAT target is
+  fenced, retire exactly one observation on the mission-control host:
+  `curl -X POST 'http://127.0.0.1:8787/api/admin/retire-evidence?net=<net>&producer=<bp>&id=<id>'` (`&overflow=1` for the
+  flag; loopback only, like clear-split). rc.27 `foreign_past` records are migrated into the log on load.
   rc.23 state files (marks without these fields) load unchanged. A SPLIT is **latched** in the coordination store for that event and stays red, whatever the
   reports say later, until an operator clears it after the split is resolved. On the mission-control host itself:
   `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-split?net=<net>'` (use the port mission control listens on).

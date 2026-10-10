@@ -530,9 +530,6 @@ export function nextEventMark(cur, ce, sourceHead, armed, now) {
   const rank = Math.max(Number.isInteger(cur?.rank) ? cur.rank : 0, stateRank(ce?.state));
   const next = { past_create: !!(cur?.past_create || past), state: past ? (ce?.state || null) : (cur?.state ?? ce?.state ?? null),
     at: now, rank };
-  // Durable foreign-H past-creation evidence (rc.27) is carried over; only the operator clears it.
-  if (cur?.foreign_past) next.foreign_past = cur.foreign_past;
-  if (cur?.foreign_overflow === true) next.foreign_overflow = true;
   let srcFirst = Number.isInteger(cur?.src_first) ? cur.src_first : null, srcMax = Number.isInteger(cur?.src_max) ? cur.src_max : null;
   if (Number.isInteger(sourceHead) && (armed || srcFirst != null)) {
     if (srcFirst == null) srcFirst = sourceHead;
@@ -545,32 +542,32 @@ export function nextEventMark(cur, ce, sourceHead, armed, now) {
   return same ? null : next;
 }
 /**
- * rc.27 review: a report under this event id whose journal is for ANOTHER H but past chain creation/ignition (a stale
- * journal, or this event's config is the wrong one) is recorded DURABLY in the event's mark: `foreign_past` is a list of
- * distinct observations {state, h, instance_id, at} (one per H and instance), so a later report (another instance, a
- * fresh ABORTED, a second foreign H) never erases one. Only an operator retires an observation, by its H, on the
- * mission-control host after fencing that target (POST /api/admin/clear-foreign). Past FOREIGN_PAST_MAX observations the
- * mark keeps `foreign_overflow: true`, which blocks like an observation. Null = no change.
+ * rc.28: the creation-evidence log. Every ACCEPTED producer report whose ceremony is past chain creation / ignition is
+ * an observation, whatever its event (published or not) and H: {id, event_id, h, state, instance_id, target_bid,
+ * after_cut_id, at}. Observations are never trimmed or replaced by later reports (another instance, a fresh ABORTED,
+ * a new event); only an operator retires one, by its id, after fencing that target (POST /api/admin/retire-evidence).
+ * Past EVIDENCE_MAX per producer the log keeps `overflow: true`, which blocks like an observation. This replaces
+ * rc.27's per-event `foreign_past` marks (three review rounds found ways to lose them).
  */
-export const FOREIGN_PAST_MAX = 64;
-/** A mark's unresolved foreign observations (an rc.27-pre single object is read as a one-entry list). */
-export const foreignList = (m) => (Array.isArray(m?.foreign_past) ? m.foreign_past : m?.foreign_past && typeof m.foreign_past === 'object' ? [m.foreign_past] : []);
-/** Does this mark carry unresolved foreign-H past-creation evidence? */
-export const foreignUnresolved = (m) => foreignList(m).length > 0 || m?.foreign_overflow === true;
-export function foreignPastMark(cur, report, ev, now) {
+export const EVIDENCE_MAX = 128;
+const obsKey = (o) => [o.event_id, o.h, o.instance_id, o.target_bid, o.after_cut_id].map((x) => x ?? '').join('|');
+/** The next log for a producer after an accepted report (null = unchanged). */
+export function nextEvidence(cur, report, now) {
   const raw = report?.ceremony;
-  if (!raw || ceremonyFor(report, ev) || !pastCreate(raw)) return null;
-  const h = Number.isSafeInteger(raw.evidence?.h) ? raw.evidence.h : null, instance_id = report.instance_id || null;
-  const list = foreignList(cur);
-  if (list.some((o) => o.h === h && o.instance_id === instance_id)) return null;
-  const next = Object.assign({ past_create: false, state: null, at: now }, cur || {});
-  if (list.length >= FOREIGN_PAST_MAX) {
-    if (cur?.foreign_overflow === true) return null;
-    next.foreign_overflow = true;
-    return next;
-  }
-  next.foreign_past = [...list, { state: String(raw.state || 'past creation').slice(0, 16), h, instance_id, at: now }];
-  return next;
+  if (!raw || !pastCreate(raw)) return null;
+  const log = { seq: Number.isSafeInteger(cur?.seq) ? cur.seq : 0, obs: Array.isArray(cur?.obs) ? cur.obs : [], overflow: cur?.overflow === true };
+  const o = { event_id: typeof report.coord?.event_id === 'string' ? report.coord.event_id.slice(0, 64) : null,
+    h: Number.isSafeInteger(raw.evidence?.h) ? raw.evidence.h : null, state: String(raw.state || 'past creation').slice(0, 16),
+    instance_id: report.instance_id || null, target_bid: raw.target?.blockchain_id || null, after_cut_id: raw.target?.after_cut_id || null };
+  if (log.obs.some((x) => obsKey(x) === obsKey(o))) return null;
+  if (log.obs.length >= EVIDENCE_MAX) return log.overflow ? null : { ...log, overflow: true };
+  const id = log.seq + 1;
+  return { seq: id, obs: [...log.obs, { id, ...o, at: now }], overflow: log.overflow };
+}
+/** A producer's unresolved observations for one event (any H), and whether its log overflowed. */
+export function evidenceFor(log, eventId) {
+  const obs = (Array.isArray(log?.obs) ? log.obs : []).filter((o) => o && o.event_id === eventId);
+  return { obs, overflow: log?.overflow === true };
 }
 /**
  * The report's ceremony, but only when its journal belongs to this event (rc.24 fleet rehearsal): a beacon pairs the
@@ -588,7 +585,7 @@ export function ceremonyFor(report, ev) {
 }
 /** @param eventMax { producer: {past_create, state, rank?, src_first?, src_max?} } for THIS event — the relay's per-event high-water mark (an
  *  instance replacement cannot lower it). */
-export function fleetVerdict(ev, byProducer, eventMax = {}) {
+export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}) {
   if (!ev) return null;
   const roster = Array.isArray(ev.roster) && ev.roster.length ? ev.roster : null;
   const names = roster ? roster.map((m) => m.producer) : Object.keys(byProducer).filter((p) => (byProducer[p] || []).some((s) => s.report?.coord?.event_id === ev.event_id));
@@ -604,10 +601,15 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
     // rc.27 review (review blocker): ANY instance past creation counts (not only the freshest report), and a report for
     // another H that is past creation is surfaced: it may be a stale journal, or this event's config may be wrong.
     const anyPast = mine.some((x) => pastCreate(ceremonyFor(x.report, ev)));
+    // rc.28: the creation-evidence log (durable, every instance, every H): same-H observations are past creation;
+    // observations for another H (a stale journal or a wrong event config), and an overflowed log, are surfaced
+    // and never allow a clean ABORTED / STRANDED verdict.
+    const logged = evidenceFor(evidence?.[producer], ev.event_id);
+    const loggedPast = logged.obs.some((o) => o.h === null || o.h === ev.h);
     const foreignPast = mine.some((x) => !ceremonyFor(x.report, ev) && pastCreate(x.report?.ceremony))
-      || (foreignUnresolved(em) && (em.event_id === undefined || em.event_id === ev.event_id));
+      || logged.obs.some((o) => o.h !== null && Number.isInteger(ev.h) && o.h !== ev.h) || logged.overflow;
     return { producer, state: ce?.state || null, fresh: !!s && !s.silent, conflict: mine.length > 0 && !usable.length,
-      missing: !s, target: ce?.target || null, resumed: resumedOldChain(ce), past: pastCreate(ce) || markPast || anyPast, foreign_past: foreignPast,
+      missing: !s, target: ce?.target || null, resumed: resumedOldChain(ce), past: pastCreate(ce) || markPast || anyPast || loggedPast, foreign_past: foreignPast,
       degraded: ce?.degraded === true,
       joined: ce?.joined === true, source_head: s?.report?.source?.head ?? null, head_at_pause: ce?.evidence?.head_at_pause ?? null,
       // rc.27: the beacon's post-LIVE watch (idle beyond post_live_max_idle_secs with the workload probe failing).
@@ -674,7 +676,7 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
   // rc.27: protocol upgrade schedule warnings (not alarms: nothing has split YET, but it will at activation).
   const warnings = [];
   for (const m of members.filter((x) => x.foreign_past)) {
-    warnings.push(`${m.producer} reports a ceremony for ANOTHER H that is past chain creation: a stale journal or a wrong event config; agents treat it as blocking (no resume) — check before any rollback`);
+    warnings.push(`${m.producer} has creation evidence for ANOTHER H (or an overflowed evidence log): a stale journal or a wrong event config; agents treat it as blocking (no resume) — fence that target, then retire the observation by id`);
   }
   const onTarget = withTarget.filter((m) => m.target.protocol_upgrade_schedule_hash);
   const schedules = [...new Set(onTarget.map((m) => m.target.protocol_upgrade_schedule_hash))];

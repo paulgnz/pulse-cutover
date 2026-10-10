@@ -50,72 +50,86 @@ const fixture = () => JSON.parse(readFileSync(join(HERE, 'fixtures', 'rc5-report
 const net = async (base) => (await (await fetch(`${base}/api/status`)).json()).networks.find((n) => n.id === 'testnet');
 
 
-test('a past-creation report for another H is kept durably: an instance replacement does not erase it; only the operator clears it', async () => {
+// rc.28: the creation-evidence log. Each test reproduces a scenario an independent review used to make the relay lose
+// past-creation evidence (rc.27 rounds 1-3), end to end through the real server.
+const EVPOST = (base, payload) => fetch(`${base}/api/coord/testnet`, { method: 'POST', body: JSON.stringify(signed({ type: 'event', network: 'testnet',
+  chain_id: CHAIN, roster: BPS.map((producer) => ({ producer })), quorum: 5, ...payload })) });
+function reporter(base, startTs) {
+  let t = startTs;
+  return async (producer, event, ceremony, instance = 'a') => {
+    for (;;) {
+      const r = await fetch(`${base}/api/report`, { method: 'POST', headers: { authorization: `Bearer ${TOK[producer]}` },
+        body: JSON.stringify({ ...fixture(), producer, network: 'testnet', role: 'producer', instance_id: instance.repeat(32), ts: new Date(t += 3100).toISOString(),
+          source: { head: CUT, lib: CUT, chain_id: CHAIN }, coord: { event_id: event, h: CUT, accepted: true, armed: true },
+          ceremony: { ...fixture().ceremony, ...ceremony } }) });
+      if (r.status !== 429) return r;
+      await new Promise((ok) => setTimeout(ok, 3100));
+    }
+  };
+}
+const evlog = async (base, p = 'bpa') => (await net(base)).producers.find((x) => x.name === p).creation_evidence;
+const retire = (base, q) => fetch(`${base}/api/admin/retire-evidence?net=testnet&producer=bpa&${q}`, { method: 'POST' });
+
+test('rc.28: evidence survives instance replacement, a fresh ABORTED and a restart; only a local operator retires it, by id', async () => {
   const dir = setup();
   let { base, proc } = await start(dir);
-  assert.equal((await fetch(`${base}/api/coord/testnet`, { method: 'POST', body: JSON.stringify(signed({ type: 'event', network: 'testnet', chain_id: CHAIN,
-    event_id: 'ev-1', h: CUT, roster: BPS.map((producer) => ({ producer })), quorum: 5 })) })).status, 200);
-  const send = (producer, instance, ts, ceremony) => fetch(`${base}/api/report`, { method: 'POST', headers: { authorization: `Bearer ${TOK[producer]}` },
-    body: JSON.stringify({ ...fixture(), producer, network: 'testnet', role: 'producer', instance_id: instance.repeat(32), ts: new Date(ts).toISOString(),
-      source: { head: CUT, lib: CUT, chain_id: CHAIN }, coord: { event_id: 'ev-1', h: CUT, accepted: true, armed: true },
-      ceremony: { ...fixture().ceremony, ...ceremony } }) });
-  // The old instance reports LIVE for ANOTHER H (3 min ago: silent now), then a new instance of the same token reports ABORTED.
-  assert.equal((await send('bpa', 'a', Date.now() - 180e3, { state: 'LIVE', ignition_started: true, evidence: { h: CUT + 999 } })).status, 200);
-  for (const p of BPS.slice(1)) assert.equal((await send(p, 'c', Date.now() - 1000, { state: 'ABORTED', evidence: { h: CUT } })).status, 200);
-  assert.equal((await send('bpa', 'b', Date.now(), { state: 'ABORTED', evidence: { h: CUT } })).status, 200);
+  assert.equal((await EVPOST(base, { event_id: 'ev-1', h: CUT })).status, 200);
+  // The old instance reported ~4.5 min ago (silent now), the rest report recently: a real replacement.
+  assert.equal((await reporter(base, Date.now() - 270e3)('bpa', 'ev-1', { state: 'LIVE', ignition_started: true, evidence: { h: CUT + 999 } }, 'a')).status, 200);
+  const send = reporter(base, Date.now() - 60e3);
+  for (const p of BPS.slice(1)) assert.equal((await send(p, 'ev-1', { state: 'ABORTED', evidence: { h: CUT } }, 'c')).status, 200);
+  assert.equal((await send('bpa', 'ev-1', { state: 'ABORTED', evidence: { h: CUT } }, 'b')).status, 200);
   let n = await net(base);
-  const bpa = n.producers.find((p) => p.name === 'bpa');
-  assert.equal(bpa.event_max['ev-1'].foreign_past[0].state, 'LIVE', 'durable after the replacement');
-  assert.equal(bpa.event_max['ev-1'].foreign_past[0].h, CUT + 999);
+  assert.deepEqual(n.producers.find((p) => p.name === 'bpa').creation_evidence.obs.map((o) => [o.id, o.h, o.state]), [[1, CUT + 999, 'LIVE']]);
   assert.notEqual(n.fleet.verdict, 'ABORTED');
-  assert.ok(n.fleet.warnings.some((w) => w.startsWith('bpa reports a ceremony for ANOTHER H')), JSON.stringify(n.fleet));
-  // Survives a restart.
+  assert.ok(n.fleet.warnings.some((w) => w.startsWith('bpa has creation evidence for ANOTHER H')), JSON.stringify(n.fleet));
   await kill(proc);
   ({ base, proc } = await start(dir));
-  assert.equal((await net(base)).producers.find((p) => p.name === 'bpa').event_max['ev-1'].foreign_past[0].state, 'LIVE');
-  // A forwarded (proxied) request may not clear it; the local operator can.
-  assert.equal((await fetch(`${base}/api/admin/clear-foreign?net=testnet&producer=bpa&event=ev-1&h=${CUT + 999}`, { method: 'POST', headers: { 'x-real-ip': '1.2.3.4' } })).status, 403);
-  assert.equal((await fetch(`${base}/api/admin/clear-foreign?net=testnet&producer=bpa&event=ev-1`, { method: 'POST' })).status, 400, 'the observation must be named');
-  assert.equal((await fetch(`${base}/api/admin/clear-foreign?net=testnet&producer=bpa&event=ev-1&h=7`, { method: 'POST' })).status, 404);
-  assert.equal((await fetch(`${base}/api/admin/clear-foreign?net=testnet&producer=bpa&event=ev-1&h=${CUT + 999}`, { method: 'POST' })).status, 200);
+  assert.equal((await evlog(base)).obs.length, 1, 'persisted');
+  assert.equal((await retire(base, 'id=1').then((r) => r.status)), 200);
+  assert.equal((await fetch(`${base}/api/admin/retire-evidence?net=testnet&producer=bpa&id=1`, { method: 'POST', headers: { 'x-real-ip': '1.2.3.4' } })).status, 403);
+  assert.equal((await retire(base, 'h=999')).status, 400, 'by id only');
+  assert.equal((await retire(base, 'id=1')).status, 404, 'already retired');
   n = await net(base);
-  assert.equal(n.producers.find((p) => p.name === 'bpa').event_max['ev-1'].foreign_past, undefined);
+  assert.equal(n.producers.find((p) => p.name === 'bpa').creation_evidence.obs.length, 0);
   assert.equal(n.fleet.verdict, 'ABORTED');
   await kill(proc);
 });
 
-test('2nd review: unsigned event ids cannot evict a mark; every foreign observation is kept; a clear retires only the one named', async () => {
+test('rc.28: a report accepted BEFORE its event is published (or with the coordinator store lost) is still evidence', async () => {
   const dir = setup();
   let { base, proc } = await start(dir);
-  assert.equal((await fetch(`${base}/api/coord/testnet`, { method: 'POST', body: JSON.stringify(signed({ type: 'event', network: 'testnet', chain_id: CHAIN,
-    event_id: 'ev-1', h: CUT, roster: BPS.map((producer) => ({ producer })), quorum: 5 })) })).status, 200);
-  let t = Date.now() - 200e3;
-  const send = (event, ceremony, instance = 'a') => fetch(`${base}/api/report`, { method: 'POST', headers: { authorization: `Bearer ${TOK.bpa}` },
-    body: JSON.stringify({ ...fixture(), producer: 'bpa', network: 'testnet', role: 'producer', instance_id: instance.repeat(32), ts: new Date(t += 3100).toISOString(),
-      source: { head: CUT, lib: CUT, chain_id: CHAIN }, coord: { event_id: event, h: CUT, accepted: true, armed: true },
-      ceremony: { ...fixture().ceremony, ...ceremony } }) });
-  // Two foreign observations (H+999, then H+888), then an ABORTED for this H.
-  assert.equal((await send('ev-1', { state: 'LIVE', ignition_started: true, evidence: { h: CUT + 999 } })).status, 200);
-  assert.equal((await send('ev-1', { state: 'LIVE', ignition_started: true, evidence: { h: CUT + 888 } })).status, 200);
-  assert.equal((await send('ev-1', { state: 'ABORTED', evidence: { h: CUT } })).status, 200);
-  // 25 made-up event ids from the same token (rate limit: one report / 3 s per token; timestamps step 3.1 s).
-  for (let i = 0; i < 25; i++) {
-    const r = await send(`junk-${i}`, { state: 'ABORTED', evidence: { h: CUT } });
-    if (r.status === 429) { await new Promise((ok) => setTimeout(ok, 3100)); i--; continue; }
-    assert.equal(r.status, 200);
+  const send = reporter(base, Date.now() - 200e3);
+  assert.equal((await send('bpa', 'ev-1', { state: 'LIVE', ignition_started: true, evidence: { h: CUT } }, 'a')).status, 200);
+  assert.equal((await send('bpa', 'ev-1', { state: 'ABORTED', evidence: { h: CUT } }, 'a')).status, 200);
+  assert.equal((await EVPOST(base, { event_id: 'ev-1', h: CUT })).status, 200);
+  let lg = await evlog(base);
+  assert.deepEqual(lg.obs.map((o) => [o.event_id, o.h, o.state]), [['ev-1', CUT, 'LIVE']]);
+  const n = await net(base);
+  assert.equal(n.producers.find((p) => p.name === 'bpa').creation_evidence.obs[0].event_id, 'ev-1');
+  await kill(proc);
+});
+
+test('rc.28: an older event\'s ordinary creation evidence is not trimmed by newer signed events; observations are per target', async () => {
+  const dir = setup();
+  let { base, proc } = await start(dir);
+  assert.equal((await EVPOST(base, { event_id: 'ev-1', h: CUT })).status, 200);
+  const send = reporter(base, Date.now() - 250e3);
+  // Two different target chains at the same H from the same instance: two observations.
+  const tgt = (bid) => ({ blockchain_id: bid, subnet_id: null, chain_id: null, head: CUT + 2, head_id: null, after_cut_id: 'a1'.repeat(32) });
+  assert.equal((await send('bpa', 'ev-1', { state: 'LIVE', ignition_started: true, evidence: { h: CUT }, target: tgt('TargetChainAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA') })).status, 200);
+  assert.equal((await send('bpa', 'ev-1', { state: 'LIVE', ignition_started: true, evidence: { h: CUT }, target: tgt('TargetChainBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB') })).status, 200);
+  assert.equal((await send('bpa', 'ev-1', { state: 'ABORTED', evidence: { h: CUT } })).status, 200);
+  // Close ev-1, then 22 newer signed events with ordinary reports.
+  assert.equal((await fetch(`${base}/api/coord/testnet`, { method: 'POST', body: JSON.stringify(signed({ type: 'abort', network: 'testnet', event_id: 'ev-1' })) })).status, 200);
+  for (let i = 0; i < 22; i++) {
+    assert.equal((await EVPOST(base, { event_id: `ev-n${i}`, h: CUT + i + 1 })).status, 200);
+    assert.equal((await send('bpa', `ev-n${i}`, { state: 'ABORTED', evidence: { h: CUT + i + 1 } })).status, 200);
+    assert.equal((await fetch(`${base}/api/coord/testnet`, { method: 'POST', body: JSON.stringify(signed({ type: 'abort', network: 'testnet', event_id: `ev-n${i}` })) })).status, 200);
   }
-  let m = (await net(base)).producers.find((p) => p.name === 'bpa').event_max;
-  assert.deepEqual(m['ev-1'].foreign_past.map((o) => o.h), [CUT + 999, CUT + 888], 'both observations kept, the event mark not evicted');
-  assert.equal(Object.keys(m).filter((k) => k.startsWith('junk-')).length, 0, 'unsigned event ids get no marks');
-  // Restart, then retire one: the other still blocks.
   await kill(proc);
   ({ base, proc } = await start(dir));
-  const clear = (h) => fetch(`${base}/api/admin/clear-foreign?net=testnet&producer=bpa&event=ev-1&h=${h}`, { method: 'POST' });
-  const r1 = await (await clear(CUT + 999)).json();
-  assert.deepEqual(r1.remaining.map((o) => o.h), [CUT + 888]);
-  m = (await net(base)).producers.find((p) => p.name === 'bpa').event_max;
-  assert.deepEqual(m['ev-1'].foreign_past.map((o) => o.h), [CUT + 888]);
-  assert.equal((await clear(CUT + 888)).status, 200);
-  assert.equal((await net(base)).producers.find((p) => p.name === 'bpa').event_max['ev-1'].foreign_past, undefined);
+  const lg = await evlog(base);
+  assert.deepEqual(lg.obs.filter((o) => o.event_id === 'ev-1').map((o) => o.target_bid.slice(11, 12)), ['A', 'B']);
   await kill(proc);
 });

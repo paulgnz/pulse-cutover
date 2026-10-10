@@ -1,6 +1,6 @@
 [package]
 name = "pulse-cutover"
-version = "0.5.0-rc.27"
+version = "0.5.0-rc.28"
 edition = "2021"
 description = "Programmatic zero-read-downtime XPR -> PulseVM cutover ceremony agent"
 license = "MIT"

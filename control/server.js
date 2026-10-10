@@ -18,7 +18,7 @@ import { readFileSync, existsSync, watchFile, renameSync, mkdirSync, openSync, w
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isPublicIp, normIp, resolvePublic, limiter, safeRequest, probeProducerApi, safeJson, safeDecode, RE, UA, endpointId, endpointRef, reservedKey,
-  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, ceremonyFor, foreignPastMark, foreignList, foreignUnresolved, FOREIGN_PAST_MAX, STATE_RANK } from './lib.mjs';
+  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, ceremonyFor, nextEvidence, EVIDENCE_MAX, STATE_RANK } from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = +(process.env.PORT ?? 8787);
@@ -421,6 +421,9 @@ const lastTs = dict();
 // for the event (every member paused, someone past creation), the member's first and highest source head from that
 // point (`src_first`, `src_max`): the old chain moving after that is the r4 split, whatever the finality lag.
 const eventMax = dict();
+// rc.28: network id → producer → creation-evidence log {seq, obs: [{id, event_id, h, state, instance_id, target_bid,
+// after_cut_id, at}], overflow} (nextEvidence in lib.mjs). Persisted with the server state, never trimmed.
+const evidence = dict();
 const EVENT_MAX_KEEP = 20;
 const MAX_RANK = Math.max(...Object.values(STATE_RANK));
 const KEY_RE = /^[0-9a-f]{64}(:[0-9a-f]{32})?$/;
@@ -456,13 +459,42 @@ function loadServerState() {
               state: typeof x.state === 'string' ? x.state.slice(0, 16) : null, at: Number.isFinite(x.at) ? x.at : 0 };
             if (Number.isInteger(x.rank) && x.rank >= 0 && x.rank <= MAX_RANK) mark.rank = x.rank;
             if (height(x.src_first) && height(x.src_max) && x.src_max >= x.src_first) { mark.src_first = x.src_first; mark.src_max = x.src_max; }
-            const fl = foreignList(x).filter((f) => f && typeof f === 'object').slice(0, FOREIGN_PAST_MAX).map((f) => ({
-              state: typeof f.state === 'string' ? f.state.slice(0, 16) : 'past creation', h: height(f.h) ? f.h : null,
-              instance_id: typeof f.instance_id === 'string' && /^[0-9a-f]{32}$/.test(f.instance_id) ? f.instance_id : null, at: Number.isFinite(f.at) ? f.at : 0 }));
-            if (fl.length) mark.foreign_past = fl;
-            if (x.foreign_overflow === true) mark.foreign_overflow = true;
+            // rc.27 foreign_past records migrate into the rc.28 creation-evidence log (kept, never dropped).
+            const fl = Array.isArray(x.foreign_past) ? x.foreign_past : x.foreign_past && typeof x.foreign_past === 'object' ? [x.foreign_past] : [];
+            for (const f of fl.filter((f) => f && typeof f === 'object')) {
+              const log = ((evidence[netId] ||= dict())[prod] ||= { seq: 0, obs: [], overflow: false });
+              if (log.obs.length >= EVIDENCE_MAX) { log.overflow = true; continue; }
+              log.obs.push({ id: ++log.seq, event_id: eid, h: height(f.h) ? f.h : null, state: typeof f.state === 'string' ? f.state.slice(0, 16) : 'past creation',
+                instance_id: typeof f.instance_id === 'string' && /^[0-9a-f]{32}$/.test(f.instance_id) ? f.instance_id : null, target_bid: null, after_cut_id: null,
+                at: Number.isFinite(f.at) ? f.at : 0, migrated: 'rc.27 foreign_past' });
+            }
+            if (x.foreign_overflow === true) (((evidence[netId] ||= dict())[prod] ||= { seq: 0, obs: [], overflow: false }).overflow = true);
             ((eventMax[netId] ||= dict())[prod] ||= dict())[eid] = mark;
           }
+        }
+      }
+    }
+    if (j.evidence && typeof j.evidence === 'object') {
+      const height = (v) => Number.isSafeInteger(v) && v >= 0;
+      const idish = (v, re) => (typeof v === 'string' && re.test(v) ? v : null);
+      for (const [netId, prods] of Object.entries(j.evidence)) {
+        if (!RE.net.test(netId) || !prods || typeof prods !== 'object') continue;
+        for (const [prod, log] of Object.entries(prods)) {
+          if (!RE.producer.test(prod) || !log || typeof log !== 'object') continue;
+          const cur = ((evidence[netId] ||= dict())[prod] ||= { seq: 0, obs: [], overflow: false });
+          // An entry that does not parse is kept as an unknown-height observation: evidence is never dropped on load.
+          for (const o of (Array.isArray(log.obs) ? log.obs : [])) {
+            if (cur.obs.length >= EVIDENCE_MAX) { cur.overflow = true; break; }
+            const ok = o && typeof o === 'object';
+            cur.obs.push({ id: ok && Number.isSafeInteger(o.id) && o.id > 0 ? o.id : cur.seq + 1,
+              event_id: ok ? idish(o.event_id, /^[\w.:-]{1,64}$/) : null, h: ok && height(o.h) ? o.h : null,
+              state: ok && typeof o.state === 'string' ? o.state.slice(0, 16) : 'past creation',
+              instance_id: ok ? idish(o.instance_id, /^[0-9a-f]{32}$/) : null, target_bid: ok ? idish(o.target_bid, /^[1-9A-HJ-NP-Za-km-z]{20,64}$/) : null,
+              after_cut_id: ok ? idish(o.after_cut_id, /^[0-9a-f]{64}$/) : null, at: ok && Number.isFinite(o.at) ? o.at : 0 });
+            cur.seq = Math.max(cur.seq, cur.obs[cur.obs.length - 1].id);
+          }
+          cur.seq = Math.max(cur.seq, Number.isSafeInteger(log.seq) ? log.seq : 0);
+          if (log.overflow === true) cur.overflow = true;
         }
       }
     }
@@ -477,10 +509,12 @@ function loadServerState() {
 try { loadServerState(); }
 catch (e) { console.error(`servers: ${STATE_FILE} is unreadable or corrupt (${e.message}). Refusing to start: fix or restore it (deleting it forgets replay protection and identity conflicts).`); process.exit(3); }
 /** The whole server state with `override` = [netId, producer, byKey] swapped in (not yet live), as a plain object. */
-function serverSnapshot(override, lastOverride, emOverride) {
+function serverSnapshot(override, lastOverride, emOverride, evOverride) {
   const em = JSON.parse(JSON.stringify(eventMax));
   if (emOverride) (em[emOverride[0]] ||= {})[emOverride[1]] = emOverride[2]; // the producer's whole per-event map
-  const out = { v: 1, lastTs: { ...lastTs, ...(lastOverride || {}) }, nodes: {}, event_max: em };
+  const evd = JSON.parse(JSON.stringify(evidence));
+  if (evOverride) (evd[evOverride[0]] ||= {})[evOverride[1]] = evOverride[2]; // the producer's whole evidence log
+  const out = { v: 1, lastTs: { ...lastTs, ...(lastOverride || {}) }, nodes: {}, event_max: em, evidence: evd };
   const put = (netId, prod, byKey) => { const o = ((out.nodes[netId] ||= {})[prod] = {});
     for (const [k, e] of Object.entries(byKey)) o[k] = { report: e.report, received: e.received, first_seen: e.first_seen, instance_id: e.instance_id ?? null, conflict: !!e.conflict }; };
   for (const [netId, prods] of Object.entries(nodes)) for (const [prod, byKey] of Object.entries(prods)) {
@@ -490,21 +524,21 @@ function serverSnapshot(override, lastOverride, emOverride) {
 }
 /** Durably persist the state with the proposed change; true only if it is on disk. Nothing live changes here. */
 /**
- * Bound a producer's per-event marks (rc.27 review): the oldest marks go first, but never the mark just written, never
- * the network's current coordinated event, and never a mark with unresolved foreign-H evidence (only an operator
- * retires that). Marks are only created for events the coordinator signed (signedEvent), so a token cannot flood it.
+ * Bound a producer's per-event marks: the oldest go first, never the mark just written or the network's current
+ * coordinated event. Marks are only created for events the coordinator signed (signedEvent), so a token cannot flood
+ * them. They are progress/movement bookkeeping; the safety evidence lives in the never-trimmed creation-evidence log.
  */
 function trimMarks(next, netId, keepId) {
   const current = (() => { try { return JSON.parse(coord[netId]?.event?.payload || 'null')?.event_id; } catch { return null; } })();
-  const ids = Object.keys(next).filter((id) => id !== keepId && id !== current && !foreignUnresolved(next[id]))
+  const ids = Object.keys(next).filter((id) => id !== keepId && id !== current)
     .sort((a, b) => (next[a].at || 0) - (next[b].at || 0));
   while (Object.keys(next).length > EVENT_MAX_KEEP && ids.length) delete next[ids.shift()];
   return next;
 }
 /** Was this event id published (signed) by the network's coordinator? Only those get marks. */
 const signedEvent = (netId, evId) => !!coord[netId]?.used && own(coord[netId].used, evId);
-function commitServers(override, lastOverride, emOverride) {
-  try { atomicWrite(STATE_FILE, serverSnapshot(override, lastOverride, emOverride)); return true; }
+function commitServers(override, lastOverride, emOverride, evOverride) {
+  try { atomicWrite(STATE_FILE, serverSnapshot(override, lastOverride, emOverride, evOverride)); return true; }
   catch (e) { console.error(`servers: persist failed (${e.message}); change NOT accepted`); return false; }
 }
 /** One token = one machine: every entry of a token is in conflict while the token has more than one entry. */
@@ -602,7 +636,7 @@ function fleet(n) {
   }
   const marks = dict();
   for (const [p, m] of Object.entries(eventMax[n.id] || {})) if (m[ev.event_id]) marks[p] = m[ev.event_id];
-  const v = fleetVerdict(ev, byProducer, marks);
+  const v = fleetVerdict(ev, byProducer, marks, evidence[n.id] || {});
   // A SPLIT is LATCHED per event (review #6): it stays red until an operator clears it on the mission-control
   // host (POST /api/admin/clear-split?net=…), even if the reports that showed it change or go silent.
   const latch = c.split_latch && c.split_latch.event_id === ev.event_id ? c.split_latch : null;
@@ -656,7 +690,9 @@ function status() {
           silent: r ? beacons.some((b) => b.silent) : null, age_ms: age, report: r?.report || null, beacons,
           // rc.23: the relay's per-event high-water mark for this producer (read by the agents' resume guard).
           // {event_id: {past_create, state, at}} for the last event ids this producer reported.
-          event_max: eventMax[n.id]?.[name] || null };
+          event_max: eventMax[n.id]?.[name] || null,
+          // rc.28: the creation-evidence log (read by the agents' resume guard and the fleet verdict).
+          creation_evidence: evidence[n.id]?.[name] || null };
       }).sort((a, b) => (b.scheduled - a.scheduled) || ((a.rank || 999) - (b.rank || 999)) || a.name.localeCompare(b.name));
       return { id: n.id, name: n.name, label: n.label, priority: n.priority ?? 9, description: n.description || '',
         expected_chain_id: n.chain_id, metal: n.metal || null, event: n.event || null, chain: { ...c, schedule: undefined }, schedule: c.schedule || [],
@@ -851,35 +887,28 @@ async function handle(req, res) {
     pushEvent(netId, 'operator', 'cleared the latched fleet SPLIT');
     return send(res, 200, { ok: true });
   }
-  if (req.method === 'POST' && path === '/api/admin/clear-foreign') {
-    // Operator-only (rc.27): retire durable foreign-H past-creation evidence for one producer and event, AFTER checking
-    // that target is fenced (stopped / not tracked by that producer's validators). Agents treat it as blocking.
+  if (req.method === 'POST' && path === '/api/admin/retire-evidence') {
+    // Operator-only (rc.28): retire ONE creation-evidence observation by its id (or the overflow flag with
+    // overflow=1), AFTER checking that target is fenced (stopped / untracked). Every other observation keeps blocking.
     const sock = normIp(req.socket.remoteAddress);
     if (!(sock === '127.0.0.1' || sock === '::1') || req.headers['x-real-ip'] || req.headers['x-forwarded-for']) return send(res, 403, { error: 'local operator only' });
-    // One observation at a time, named by its H (and instance, when it has one): clearing can never discard evidence
-    // the operator did not name (rc.27 review). `overflow=1` clears the overflow flag only.
-    const netId = url.searchParams.get('net'), prod = url.searchParams.get('producer'), evId = url.searchParams.get('event');
-    const hq = url.searchParams.get('h'), iq = url.searchParams.get('instance'), ov = url.searchParams.get('overflow') === '1';
-    if (!RE.net.test(netId || '') || !RE.producer.test(prod || '') || !/^[\w.:-]{1,64}$/.test(evId || '')
-      || !(ov || /^\d{1,10}$/.test(hq || '') || hq === 'null') || (iq !== null && !/^[0-9a-f]{32}$/.test(iq))) {
-      return send(res, 400, { error: 'need ?net=&producer=&event=&h=<the observation\'s H>[&instance=<id>] (or &overflow=1)' });
+    const netId = url.searchParams.get('net'), prod = url.searchParams.get('producer'), idq = url.searchParams.get('id'), ov = url.searchParams.get('overflow') === '1';
+    if (!RE.net.test(netId || '') || !RE.producer.test(prod || '') || !(ov || /^\d{1,12}$/.test(idq || ''))) return send(res, 400, { error: 'need ?net=&producer=&id=<observation id> (or &overflow=1)' });
+    const log = evidence[netId]?.[prod];
+    if (!log) return send(res, 404, { error: 'no creation evidence for that producer' });
+    let next;
+    if (ov) {
+      if (!log.overflow) return send(res, 404, { error: 'the log has no overflow flag', observations: log.obs });
+      next = { ...log, overflow: false };
+    } else {
+      const id = Number(idq);
+      if (!log.obs.some((o) => o.id === id)) return send(res, 404, { error: 'no such observation id', observations: log.obs });
+      next = { ...log, obs: log.obs.filter((o) => o.id !== id) };
     }
-    const mine = eventMax[netId]?.[prod]; const m = mine?.[evId];
-    if (!m || !foreignUnresolved(m)) return send(res, 404, { error: 'no foreign evidence for that producer and event' });
-    const nm = { ...m };
-    let removed = 0;
-    if (ov) { if (nm.foreign_overflow) { delete nm.foreign_overflow; removed = 1; } } else {
-      const h = hq === 'null' ? null : Number(hq);
-      const keep = foreignList(m).filter((o) => !(o.h === h && (iq === null || o.instance_id === iq)));
-      removed = foreignList(m).length - keep.length;
-      if (keep.length) nm.foreign_past = keep; else delete nm.foreign_past;
-    }
-    if (!removed) return send(res, 404, { error: 'no such observation (check h / instance)', observations: foreignList(m), overflow: m.foreign_overflow === true });
-    const next = Object.assign(dict(), mine, { [evId]: nm });
-    if (!commitServers(null, null, [netId, prod, next])) return send(res, 503, { error: 'could not persist; nothing changed' });
-    eventMax[netId][prod] = next;
-    pushEvent(netId, 'operator', `retired ${ov ? 'the overflow flag' : `${removed} foreign-H observation(s) at H ${hq}`} for ${prod} (event ${evId}); ${foreignList(nm).length} remain`);
-    return send(res, 200, { ok: true, removed, remaining: foreignList(nm), overflow: nm.foreign_overflow === true });
+    if (!commitServers(null, null, null, [netId, prod, next])) return send(res, 503, { error: 'could not persist; nothing changed' });
+    evidence[netId][prod] = next;
+    pushEvent(netId, 'operator', `retired ${ov ? 'the overflow flag' : `creation evidence #${idq}`} for ${prod}; ${next.obs.length} observation(s) remain${next.overflow ? ' + overflow' : ''}`);
+    return send(res, 200, { ok: true, remaining: next.obs, overflow: next.overflow });
   }
   if (req.method === 'POST' && path === '/api/admin/clear-server') {
     // Operator-only, from the box itself: the reverse proxy always sets X-Real-IP, so a request that arrives on
@@ -965,13 +994,15 @@ async function handle(req, res) {
         em = trimMarks(Object.assign(dict(), mine, { [evId]: nm }), r.network, evId);
       }
     }
-    // rc.27 review: a past-creation report for ANOTHER H under this event id is kept durably (foreignPastMark).
-    if (evId && !ce && r.ceremony && (r.role || 'producer') === 'producer' && !reservedKey(evId) && signedEvent(r.network, evId)) {
-      const mine = em || eventMax[r.network]?.[r.producer] || {};
-      const fm = foreignPastMark(mine[evId], r, evFor, now);
-      if (fm) em = trimMarks(Object.assign(dict(), mine, { [evId]: fm }), r.network, evId);
+    // rc.28: every accepted past-creation report is an observation in the producer's creation-evidence log.
+    const evNext = (r.role || 'producer') === 'producer' ? nextEvidence(evidence[r.network]?.[r.producer], r, now) : null;
+    if (!commitServers([r.network, r.producer, byKey], { [key]: ts }, em ? [r.network, r.producer, em] : null, evNext ? [r.network, r.producer, evNext] : null)) return send(res, 503, { error: 'could not persist the report; not accepted, retry' });
+    if (evNext) {
+      (evidence[r.network] ||= dict())[r.producer] = evNext;
+      const added = evNext.obs[evNext.obs.length - 1];
+      if (added && added.at === now) pushEvent(r.network, r.producer, `creation evidence #${added.id}: ${added.state} for event ${added.event_id ?? '?'} at H ${added.h ?? '?'}${added.target_bid ? ` on ${added.target_bid.slice(0, 12)}…` : ''}`);
+      else if (evNext.overflow) pushEvent(r.network, r.producer, 'creation evidence log FULL: overflow flag set (blocks resumes until retired)');
     }
-    if (!commitServers([r.network, r.producer, byKey], { [key]: ts }, em ? [r.network, r.producer, em] : null)) return send(res, 503, { error: 'could not persist the report; not accepted, retry' });
     (nodes[r.network] ||= dict())[r.producer] = byKey;
     if (em) (eventMax[r.network] ||= dict())[r.producer] = em;
     lastTs[key] = ts;

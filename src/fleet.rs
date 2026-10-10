@@ -98,6 +98,19 @@ pub fn members(status: &Value, co: &Coordination) -> Vec<MemberView> {
                 Some(format!("{}; {} report(s) for another H ({}), relay record",
                     list.first().and_then(|o| o["state"].as_str()).unwrap_or("past creation"), list.len().max(1), hs.join(", ")))
             }));
+        // rc.28: the relay's creation-evidence log (never trimmed; every instance, every H, published event or not):
+        // any observation for THIS event, or an overflowed log, is past-creation evidence until an operator retires it.
+        let max_past = max_past.or_else(|| {
+            let log = entry.map(|p| &p["creation_evidence"])?;
+            let obs: Vec<&Value> = log["obs"].as_array().map(|a| a.iter()
+                .filter(|o| event.is_none_or(|e| o["event_id"].as_str() == Some(e))).collect()).unwrap_or_default();
+            if let Some(o) = obs.first() {
+                return Some(format!("{}; creation evidence #{} at H {}{}, relay log", o["state"].as_str().unwrap_or("past creation"),
+                    o["id"].as_u64().unwrap_or(0), o["h"].as_u64().map(|h| h.to_string()).unwrap_or_else(|| "?".into()),
+                    if obs.len() > 1 { format!(" (+{} more)", obs.len() - 1) } else { String::new() }));
+            }
+            (log["overflow"].as_bool() == Some(true)).then(|| "creation evidence log overflowed, relay log".to_string())
+        });
         let bs: Vec<_> = entry.map(|p| beacons(p)).unwrap_or_default().into_iter()
             .filter(|(r, _, _)| for_event(r))
             .filter(|(r, _, _)| instance_id.as_deref().is_none_or(|id| r["instance_id"].as_str() == Some(id)))
@@ -675,6 +688,25 @@ mod tests {
         assert!(resume_guard(Some(&st), &c, me, true).unwrap_err().contains("2 report(s) for another H (999, 888)"));
         st["networks"][0]["producers"][1]["event_max"] = json!({"e1": {"past_create": false, "state": null, "foreign_overflow": true}});
         assert!(resume_guard(Some(&st), &c, me, true).is_err());
+    }
+
+    /// rc.28: the relay's creation-evidence log blocks a resume for its event (any H), after every report was
+    /// replaced; observations for another event do not; an overflowed log blocks.
+    #[test]
+    fn the_relays_creation_evidence_log_blocks_its_event() {
+        let me = Some(("bp1", "i"));
+        let c = co(&["bp1", "bp2", "bp3"], 3);
+        let mut st = status_me(&[("bp2", rep("ABORTED", json!({})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
+        assert!(resume_guard(Some(&st), &c, me, true).is_ok());
+        st["networks"][0]["producers"][1]["creation_evidence"] = json!({"seq": 2, "overflow": false, "obs": [
+            {"id": 2, "event_id": "other", "h": 5, "state": "LIVE"}]});
+        assert!(resume_guard(Some(&st), &c, me, true).is_ok(), "another event's evidence is not this event's");
+        st["networks"][0]["producers"][1]["creation_evidence"]["obs"].as_array_mut().unwrap()
+            .push(json!({"id": 3, "event_id": "e1", "h": 999, "state": "IGNITED"}));
+        let e = resume_guard(Some(&st), &c, me, true).unwrap_err();
+        assert!(e.contains("bp2") && e.contains("creation evidence #3 at H 999"), "{e}");
+        st["networks"][0]["producers"][1]["creation_evidence"] = json!({"seq": 9, "overflow": true, "obs": []});
+        assert!(resume_guard(Some(&st), &c, me, true).unwrap_err().contains("overflowed"));
     }
 
     /// Review #2: another box reporting under this producer name (its own instance) does not stand in for this

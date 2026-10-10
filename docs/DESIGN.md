@@ -354,12 +354,16 @@ backend a peer without `protocol_schedule_hash` (an older agent) never agrees at
 (stricter than PulseVM, which allows future entries before activation), and `protocol_upgrade_margin_blocks = 0` allows
 an activation at H+1, the first new block. Past-creation evidence counts from ANY of a producer's instances, not only
 its freshest report; a report for another H that is past creation blocks a resume (agent) and is a warning on the
-board, never a clean ABORTED/STRANDED verdict. Mission control records such a report DURABLY in the event's mark
-(`foreign_past`): replacing the instance or a fresh ABORTED report does not erase it. Retiring it is an explicit
-operator act on the mission-control host, after checking that target is fenced: `POST /api/admin/clear-server` (an
-obsolete instance) and `POST /api/admin/clear-foreign?net=&producer=&event=&h=` (one named observation; every
-other observation keeps blocking; marks exist only for coordinator-signed events and are never trimmed while
-unresolved or current); until then a
+board, never a clean ABORTED/STRANDED verdict. rc.28: mission control keeps a **creation-evidence log** per producer
+(`creation_evidence` in `/api/status`): every accepted report past chain creation is an observation {id, event_id, H,
+state, instance, target chain, block after the cut}, whether or not its event is published and whatever its H. The
+log is persisted with the server state (independent of the coordinator store), never trimmed and never changed by
+later reports; at 128 observations per producer it sets `overflow`, which blocks like an observation. The agents'
+resume guard blocks on any observation for its event (any H) and on an overflowed log; the verdict treats a same-H
+observation as past creation and another-H ones or overflow as warnings that rule out a clean ABORTED/STRANDED.
+Retiring evidence is an explicit operator act on the mission-control host, after checking THAT target is fenced:
+`POST /api/admin/clear-server` (an obsolete instance) and `POST /api/admin/retire-evidence?net=&producer=&id=` (exactly
+one observation, by id; `&overflow=1` for the flag); every other observation keeps blocking. Until then a
 STRANDED agent stays sealed (or the operator records a fleet decision with `rollback --force-stranded`). The
 post-ignition protocol check uses the schedule VERIFIED journaled (entries, highest version, emptiness), never the
 file as it is now; a JSON-RPC error from getInfo is retried like a transport failure (5 reads, up to ~80 s with the

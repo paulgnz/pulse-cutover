@@ -82,5 +82,5 @@ test('rc.27 review: a past-creation report for another H (any instance) is warne
   byP.bp2 = [{ report: { coord: { event_id: 'e1' }, ceremony: foreign }, silent: false, conflict: false }, ...byP.bp2];
   const v = fleetVerdict(ev, byP);
   assert.notEqual(v.verdict, 'ABORTED');
-  assert.ok(v.warnings.some((w) => w.startsWith('bp2 reports a ceremony for ANOTHER H')), JSON.stringify(v.warnings));
+  assert.ok(v.warnings.some((w) => w.startsWith('bp2 has creation evidence for ANOTHER H')), JSON.stringify(v.warnings));
 });
