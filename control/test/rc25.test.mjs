@@ -62,6 +62,9 @@ test('rc.27: STALLED when a quorum of LIVE members report target_live failing; c
   const probeOnly = Object.fromEntries(BPS.map((p) => [p, [{ report: { coord: { event_id: 'e1' }, ceremony: live({}),
     checks: [{ name: 'target_live', ok: false, detail: 'producing · head 408832470 · last block 0 s ago · probe failed: not included within 3500 ms' }] }, silent: false, conflict: false }]]));
   assert.equal(fleetVerdict(ev, probeOnly).verdict, 'LIVE', 'fleet run g1: a probe failure on a producing chain is not STALLED');
+  const backwards = Object.fromEntries(BPS.map((p) => [p, [{ report: { coord: { event_id: 'e1' }, ceremony: live({}),
+    checks: [{ name: 'target_live', ok: false, detail: 'head went BACKWARDS: 121 after 122 (rollback, re-import or another chain)' }] }, silent: false, conflict: false }]]));
+  assert.equal(fleetVerdict(ev, backwards).verdict, 'STALLED', 'a head going backwards is a chain symptom');
 });
 
 test('rc.27: different protocol upgrade schedules or an unsupported next version are warned about', () => {

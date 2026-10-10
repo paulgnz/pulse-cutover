@@ -395,10 +395,11 @@ function atomicWrite(file, obj) {
   mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}`;
   const fd = openSync(tmp, 'w'); try { writeSync(fd, JSON.stringify(obj, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
-  renameSync(tmp, file);
-  // From here the new content IS the file: an error now leaves disk newer than memory (`afterRename`), unlike any error
-  // above (disk unchanged, safe to retry).
+  // From the rename on, an error may leave disk newer than memory (`afterRename`): POSIX does not promise an unchanged
+  // destination when rename itself fails with EIO, and ext4/XFS can change it before returning an error. Only errors
+  // above (writing the separate temporary file) leave the destination untouched and are safe to retry.
   try {
+    renameSync(tmp, file);
     // Test-only fault: fail AFTER the rename, once (the "committed despite the error" case). Never set in production.
     if (process.env.MC_TEST_FAIL_AFTER_RENAME === file && !atomicWrite.failed) { atomicWrite.failed = true; throw new Error('test fault after rename'); }
     // the rename itself is only durable once the directory entry is: fsync the directory too
@@ -702,8 +703,7 @@ function fleet(n) {
   }
   const marks = dict();
   for (const [p, m] of Object.entries(eventMax[n.id] || {})) if (m[ev.event_id]) marks[p] = m[ev.event_id];
-  const completed = (() => { try { return JSON.parse(coord[n.id]?.complete?.payload || 'null')?.event_id === ev.event_id; } catch { return false; } })();
-  const v = fleetVerdict(ev, byProducer, marks, evidence[n.id] || {}, { completed });
+  const v = fleetVerdict(ev, byProducer, marks, evidence[n.id] || {});
   // A SPLIT is LATCHED per event (review #6): it stays red until an operator clears it on the mission-control
   // host (POST /api/admin/clear-split?net=…), even if the reports that showed it change or go silent.
   const latch = c.split_latch && c.split_latch.event_id === ev.event_id ? c.split_latch : null;

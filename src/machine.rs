@@ -786,22 +786,22 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // Why a report does not count (journaled: an excluded producer costs quorum, and the
             // operator must be able to see why).
             let exclusion = |r: &serde_json::Value, age: Option<u64>, conflict: bool| -> Option<String> {
+                // Every applicable reason (review: an early return for conflict/staleness hid an evidence mismatch).
+                let mut reasons: Vec<String> = vec![];
                 if conflict {
-                    return Some("identity conflict (one token, two machines)".into());
+                    reasons.push("identity conflict (one token, two machines)".into());
                 }
                 if !age.map(|a| a <= max_age_ms).unwrap_or(false) {
                     // A reason CLASS, not the changing age: the record is journaled only when the set
                     // of (report, reason) changes, not on every poll of a steadily stale report.
-                    return Some(format!("stale report (older than {} s)", co.report_max_age_secs));
+                    reasons.push(format!("stale report (older than {} s)", co.report_max_age_secs));
                 }
                 let failing: Vec<String> = r["checks"].as_array().map(|cs| cs.iter()
                     .filter(|c| c["ok"].as_bool() == Some(false)
                         && !c["name"].as_str().map(|n| crate::beacon::SETUP_CHECKS.contains(&n)).unwrap_or(false))
                     .map(|c| c["name"].as_str().unwrap_or("?").to_string())
                     .collect()).unwrap_or_default();
-                // Every applicable reason (rc.28, fleet run g1b: a health failure hid the schedule mismatch an operator
-                // has to act on).
-                let mut reasons: Vec<String> = vec![];
+                // (rc.28, fleet run g1b: a health failure hid the schedule mismatch an operator has to act on.)
                 if !failing.is_empty() {
                     reasons.push(format!("failing health check(s): {}", failing.join("; ")));
                 }
