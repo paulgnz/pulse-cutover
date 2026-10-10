@@ -339,6 +339,15 @@ member has paused and one is past chain creation (the relay keeps each member's 
 that point). A fixed bound (rc.23: cut + 360) cannot fit real finality lag: the 5-BP rehearsal paused correctly at
 cut + 377 and latched a false SPLIT. This is display evidence only, as above.
 
+rc.27: the verdict is **STALLED** when a quorum of the LIVE members' beacons report `target_live` failing (fleet run
+f1 halted the target with a schedule change while the board kept showing LIVE), and `warnings` list members whose
+target loaded a different protocol upgrade schedule or cannot run the next scheduled protocol version. The agent side
+of the protocol schedule (`upstream.protocol_upgrades_file`): validated with PulseVM's rules and kept
+`protocol_upgrade_margin_blocks` clear of H at ARM and at verification, its canonical hash (PulseVM's `PVMUPG01`
+encoding) is VERIFIED evidence the fleet gate and `join` compare, it is installed as `upgrade.json` next to the
+chain config, and after ignition the target's `getInfo` must report the same hash and a `supported_protocol_version`
+at least the highest scheduled one, else the ceremony halts before IGNITED.
+
 rc.25 (fleet run c1): with quorum = N the verdict flapped LIVE↔DEGRADED whenever one beacon's target read timed out,
 because the beacon then also dropped its block after the cut. The beacon keeps that block id (it never changes on one
 chain) and reports `target.unread_for_ms`; mission control and the agent's live view count such a member on its chain

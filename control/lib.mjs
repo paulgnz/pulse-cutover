@@ -272,7 +272,7 @@ export const PROFILES = ['readiness', 'ceremony'];
 export const ROLES = ['producer', 'history', 'api', 'seed', 'query'];
 export const EVIDENCE_ALLOW = ['h', 'chain_id', 'freeze_at', 'cut_height', 'cut_block_id', 'burnoff_transactions', 'snapshot_sha256',
   'fingerprints_digest', 'target_head_id', 'write_gap_ms', 'state_diff_identical', 'state_digest', 'state_diff_b_head', 'lineage_at_cut',
-  'boot_genesis_sha256', 'head_at_pause', 'compare_allowed_digest'];
+  'boot_genesis_sha256', 'head_at_pause', 'compare_allowed_digest', 'protocol_schedule_hash'];
 
 class Bad extends Error {}
 const bad = (path, what) => { throw new Bad(`${path}: ${what}`); };
@@ -326,6 +326,14 @@ function targetView(t) {
   return { blockchain_id: cb58(t.blockchain_id, 'ceremony.target.blockchain_id'), subnet_id: cb58(t.subnet_id, 'ceremony.target.subnet_id'),
     chain_id: hex(t.chain_id, 'ceremony.target.chain_id'), head: int(t.head, 'ceremony.target.head'),
     head_id: hex(t.head_id, 'ceremony.target.head_id'), after_cut_id: hex(t.after_cut_id, 'ceremony.target.after_cut_id'),
+    // rc.27: the target's protocol fields (PulseVM getInfo); absent on older beacons.
+    protocol_upgrade_schedule_hash: hex(t.protocol_upgrade_schedule_hash, 'ceremony.target.protocol_upgrade_schedule_hash'),
+    protocol_version: int(t.protocol_version, 'ceremony.target.protocol_version', { max: 0xffffffff }),
+    supported_protocol_version: int(t.supported_protocol_version, 'ceremony.target.supported_protocol_version', { max: 0xffffffff }),
+    next_protocol_upgrade: t.next_protocol_upgrade == null ? null : (isObj(t.next_protocol_upgrade) ? {
+      protocol_version: int(t.next_protocol_upgrade.protocol_version, 'ceremony.target.next_protocol_upgrade.protocol_version', { max: 0xffffffff }),
+      activation_height: int(t.next_protocol_upgrade.activation_height, 'ceremony.target.next_protocol_upgrade.activation_height', { max: 0xffffffff }),
+    } : bad('ceremony.target.next_protocol_upgrade', 'must be an object')),
     // rc.25 (F4): how long the head has been unreadable (consecutive failed reads); absent on older beacons.
     unread_for_ms: int(t.unread_for_ms, 'ceremony.target.unread_for_ms') };
 }
@@ -455,6 +463,7 @@ export const silentAfterMs = (report) => Math.max(3 * (report?.interval_secs || 
 //             rule), or members report different target chains / different blocks after the cut / at one height
 //   STRANDED  every reporting member is sealed (STRANDED or ABORTED, at least one STRANDED), nobody past creation:
 //             the fleet stopped and an operator decides (rollback re-runs the guard, or join a LIVE quorum) (rc.26)
+//   STALLED   LIVE, but a quorum of the LIVE members' beacons report the post-LIVE watch failing (rc.27)
 //   ABORTED   every reporting member aborted before chain creation (symmetric abort)
 //   PENDING   no member is past chain creation yet
 // It is display only (relay-reported, unsigned), never an authorization.
@@ -564,6 +573,8 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
     return { producer, state: ce?.state || null, fresh: !!s && !s.silent, conflict: mine.length > 0 && !usable.length,
       missing: !s, target: ce?.target || null, resumed: resumedOldChain(ce), past: pastCreate(ce) || markPast, degraded: ce?.degraded === true,
       joined: ce?.joined === true, source_head: s?.report?.source?.head ?? null, head_at_pause: ce?.evidence?.head_at_pause ?? null,
+      // rc.27: the beacon's post-LIVE watch (idle beyond post_live_max_idle_secs with the workload probe failing).
+      target_live: (s?.report?.checks || []).find((c) => c?.name === 'target_live') || null,
       cut: ce?.evidence?.cut_height ?? null };
   });
   const alarms = [];
@@ -623,9 +634,27 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
   // Review #9: LIVE only for a UNIQUE group reaching the quorum (two groups each with a quorum is a split).
   const uniqueBest = !ranked[1] || !quorum || ranked[1][1].length < quorum;
   const liveChain = best ? { chain: best[0].split('|')[0], after_cut_id: best[0].split('|')[1], members: best[1] } : null;
+  // rc.27: protocol upgrade schedule warnings (not alarms: nothing has split YET, but it will at activation).
+  const warnings = [];
+  const onTarget = withTarget.filter((m) => m.target.protocol_upgrade_schedule_hash);
+  const schedules = [...new Set(onTarget.map((m) => m.target.protocol_upgrade_schedule_hash))];
+  if (schedules.length > 1) warnings.push(`members loaded different protocol upgrade schedules: the chain splits at the next activation (${schedules.map((h) => `${h.slice(0, 12)}…: ${onTarget.filter((m) => m.target.protocol_upgrade_schedule_hash === h).map((m) => m.producer).join(', ')}`).join(' | ')})`);
+  for (const m of onTarget) {
+    const next = m.target.next_protocol_upgrade;
+    if (next && Number.isInteger(m.target.supported_protocol_version) && m.target.supported_protocol_version < next.protocol_version) {
+      warnings.push(`${m.producer}'s PulseVM supports protocol ${m.target.supported_protocol_version} but version ${next.protocol_version} activates at height ${next.activation_height}: it stops there unless upgraded`);
+    }
+  }
   let verdict;
   if (alarms.length) verdict = 'SPLIT';
-  else if (quorum && liveChain && liveChain.members.length >= quorum && uniqueBest) verdict = 'LIVE';
+  else if (quorum && liveChain && liveChain.members.length >= quorum && uniqueBest) {
+    // rc.27 (fleet run f1): the verdict stayed LIVE on a chain that had stopped building. A quorum of the LIVE
+    // members' beacons reporting the post-LIVE watch failing (no block beyond post_live_max_idle_secs AND the
+    // workload probe failing) is STALLED. It clears by itself when the watch passes again.
+    const stalled = members.filter((m) => liveChain.members.includes(m.producer) && m.fresh && m.target_live?.ok === false);
+    verdict = stalled.length >= quorum ? 'STALLED' : 'LIVE';
+    if (verdict === 'STALLED') warnings.push(`target chain stalled: ${stalled.map((m) => `${m.producer}: ${m.target_live.detail || 'target_live failing'}`).join('; ')}`);
+  }
   else if (past.length) verdict = 'DEGRADED';
   // rc.26 (fleet run d3): every reporting member sealed (STRANDED, or ABORTED), at least one STRANDED, nobody past
   // creation: the fleet stopped and waits for an operator decision (rollback or join); PENDING read as "nothing yet".
@@ -636,7 +665,7 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
   else verdict = 'PENDING';
   const unaccounted = members.filter((m) => m.missing || !m.fresh).map((m) => `${m.producer}: ${m.missing ? 'no report' : `silent (${m.state || '?'})`}`);
   const notLive = !liveChain && verdict !== 'SPLIT' ? unaccounted : liveChain ? members.filter((m) => !liveChain.members.includes(m.producer)).map((m) => `${m.producer}: ${m.missing ? 'no report' : m.conflict ? 'identity conflict' : !m.fresh ? `silent (${m.state || '?'})` : m.state}`) : [];
-  return { event_id: ev.event_id, h: ev.h ?? null, roster: roster ? roster.length : null, quorum, verdict, alarms,
+  return { event_id: ev.event_id, h: ev.h ?? null, roster: roster ? roster.length : null, quorum, verdict, alarms, warnings,
     live_chain: liveChain, not_live: notLive,
     detail: !roster ? 'no roster in the event: LIVE needs a roster and quorum' : null,
     members: members.map(({ producer, state, fresh, missing, conflict, resumed, past: p, degraded, joined, target }) =>

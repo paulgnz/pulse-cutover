@@ -141,6 +141,7 @@ section{margin-top:26px}
 .fleet.DEGRADED,.fleet.PENDING{border-color:rgba(251,191,36,.35)}.fleet.DEGRADED b.v,.fleet.PENDING b.v{color:var(--warn)}
 .fleet.ABORTED b.v{color:var(--muted)}
 .fleet.STRANDED{border-color:rgba(251,191,36,.35)}.fleet.STRANDED b.v{color:var(--warn)}
+.fleet.STALLED{border-color:rgba(251,113,133,.45)}.fleet.STALLED b.v{color:var(--bad)}
 .fleet.SPLIT{border-color:var(--bad);background:rgba(251,113,133,.12);color:#fecdd3}.fleet.SPLIT b.v{color:var(--bad)}
 .fleet ul{margin:6px 0 0 18px;padding:0}
 .checks{display:flex;gap:3px;margin-top:12px;height:6px}
@@ -727,8 +728,9 @@ function render() {
     const what = { LIVE: `${fv.live_chain?.members.length}/${fv.roster} roster members LIVE on one target chain (quorum ${fv.quorum}; common block after H ${esc((fv.live_chain?.after_cut_id || '').slice(0, 12))}…)`,
       DEGRADED: 'a target chain may be running, but no quorum is LIVE on one chain yet', PENDING: 'no roster member has started chain creation or ignition',
       ABORTED: 'every reporting roster member aborted before chain creation',
+      STALLED: 'a quorum is LIVE on one chain but it stopped building blocks while the workload probe fails: the new chain is not taking transactions',
       STRANDED: 'the fleet stopped before chain creation and is sealed (source paused, writes frozen): an operator decides — `pulse-cutover rollback` (re-runs the guard) or `join` a LIVE quorum', SPLIT: 'FLEET SPLIT: do not reopen writes anywhere until resolved' }[fv.verdict] || '';
-    const items = [...fv.alarms, ...(fv.verdict !== 'SPLIT' ? fv.not_live : [])];
+    const items = [...fv.alarms, ...(fv.warnings || []), ...(fv.verdict !== 'SPLIT' ? fv.not_live : [])];
     const html = `<b class="v">FLEET ${esc(fv.verdict)}</b>${esc(fv.event_id)} · ${what}${fv.detail ? ` · ${esc(fv.detail)}` : ''}${items.length ? `<ul>${items.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}`;
     fb.className = `fleet ${fv.verdict}`; fb.hidden = false; if (fb.dataset.sig !== html) { fb.innerHTML = html; fb.dataset.sig = html; }
   }

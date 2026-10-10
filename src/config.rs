@@ -568,6 +568,17 @@ pub struct Upstream {
     /// table (or a failure that names no table) still aborts. Refused for XPR mainnet.
     #[serde(default)]
     pub rehearsal_allow_compare_mismatch: Vec<String>,
+    /// rc.27: the PulseVM protocol upgrade schedule for the NEW chain (the coordinator's file, the same
+    /// on every validator; PulseVM `docs/protocol-features.md`: `{"protocol_upgrades": [{"protocol_version",
+    /// "activation_height"}]}`). Validated with PulseVM's rules, installed as `<chain_config_dir>/<blockchain
+    /// id>/upgrade.json`, its canonical hash compared at the fleet gate and against the target's `getInfo`.
+    /// Unset = the empty schedule (protocol version 1 forever), which has a hash too.
+    #[serde(default)]
+    pub protocol_upgrades_file: Option<PathBuf>,
+    /// rc.27: no scheduled activation may fall within this many blocks after the cut height H (an
+    /// activation right at the cut would switch consensus rules while the fleet is still igniting).
+    #[serde(default = "default_protocol_upgrade_margin")]
+    pub protocol_upgrade_margin_blocks: u64,
     /// Ignition from the checkpoint: the operator's base migration genesis (JSON object with
     /// `initial_timestamp`, `initial_key`, `initial_configuration`; the coordinator's file, the
     /// same on every validator). The agent writes `migration-genesis-<h>.json` = this +
@@ -760,6 +771,10 @@ fn default_live_sustain() -> u64 {
 fn default_live_max_gap() -> u64 {
     20
 }
+fn default_protocol_upgrade_margin() -> u64 {
+    100_000
+}
+
 fn default_post_live_max_idle() -> u64 {
     60
 }

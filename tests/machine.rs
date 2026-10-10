@@ -148,6 +148,8 @@ struct MockOps {
     /// Block ids are REAL Antelope ids of packable blocks (built from the stage-2 fixture block
     /// re-numbered to each height), so the upstream full-block anchor can be checked end to end.
     real_blocks: Cell<bool>,
+    /// rc.27: what the target's getInfo reports as protocol fields (None = an older PulseVM without them).
+    target_protocol: RefCell<Option<serde_json::Value>>,
     /// source_block (full get_block) calls fail.
     source_block_fails: Cell<bool>,
     /// Placeholder values bound via bind_target, and the ones in force when ignite ran.
@@ -241,6 +243,7 @@ impl MockOps {
             chain_id: RefCell::new(hex::encode(CHAIN_ID)),
             target_chain_id: RefCell::new(None),
             real_blocks: Cell::new(false),
+            target_protocol: RefCell::new(None),
             source_block_fails: Cell::new(false),
             bound: RefCell::new(Vec::new()),
             ignite_vars: RefCell::new(Vec::new()),
@@ -296,6 +299,10 @@ impl ChainOps for MockOps {
 
     fn source_block_id(&self, block_num: u64) -> Result<(String, String), String> {
         Ok((self.block_id(block_num), "2024-01-01T00:00:00.000".into()))
+    }
+
+    fn target_protocol(&self) -> Result<Option<serde_json::Value>, String> {
+        Ok(self.target_protocol.borrow().clone())
     }
 
     fn source_block(&self, block_num: u64, _rpc_url: Option<&str>) -> Result<serde_json::Value, String> {
@@ -3804,6 +3811,67 @@ fn journal_entries(cfg: &Config) -> Vec<serde_json::Value> {
 
 fn transition<'a>(entries: &'a [serde_json::Value], state: &str) -> Option<&'a serde_json::Value> {
     entries.iter().find(|v| v["kind"] == "transition" && v["state"] == state)
+}
+
+/// rc.27: the new chain's protocol upgrade schedule. Validated and kept clear of the cut at ARM, hashed into the VERIFIED
+/// evidence the fleet compares, installed as upgrade.json next to the chain config, and checked against what the running
+/// target reports; a target with another schedule (or one too old for it) halts before IGNITED.
+#[test]
+fn rc27_protocol_upgrade_schedule_is_validated_installed_and_checked_on_the_target() {
+    const FAR: &str = r#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":1000000}]}"#;
+    let sched = pulse_cutover::upstream::ProtocolSchedule::parse(FAR.as_bytes()).unwrap();
+    let setup = |json: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        stage_fake_upstream_tools(dir.path(), 0);
+        std::fs::write(dir.path().join("upgrade.json"), json).unwrap();
+        let cfg = upstream_ignite_config(dir.path(), "", &format!("protocol_upgrades_file = \"{}/upgrade.json\"", dir.path().display())).unwrap();
+        (dir, cfg)
+    };
+    // Matching target: LIVE, schedule installed, hash in VERIFIED evidence, target check verified.
+    let (dir, cfg) = setup(FAR);
+    let ops = upstream_ops(dir.path());
+    *ops.target_protocol.borrow_mut() = Some(serde_json::json!({"protocol_version": 1, "supported_protocol_version": 2,
+        "protocol_upgrade_schedule_hash": sched.hash, "next_protocol_upgrade": {"protocol_version": 2, "activation_height": 1000000}}));
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let e = journal_entries(&cfg);
+    assert_eq!(transition(&e, "VERIFIED").unwrap()["data"]["protocol_schedule_hash"], serde_json::json!(sched.hash));
+    assert_eq!(transition(&e, "IGNITED").unwrap()["data"]["protocol_check"]["verified"], serde_json::json!(true));
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"]["protocol_schedule_hash"], serde_json::json!(sched.hash));
+    let installed = std::fs::read_dir(dir.path().join("chain-configs")).unwrap().filter_map(|d| d.ok())
+        .map(|d| d.path().join("upgrade.json")).find(|p| p.exists()).expect("upgrade.json installed next to config.json");
+    assert_eq!(pulse_cutover::upstream::ProtocolSchedule::load(Some(&installed)).unwrap(), sched);
+
+    // A target that loaded another schedule: halted after ignition started, never LIVE.
+    let (dir, cfg) = setup(FAR);
+    let ops = upstream_ops(dir.path());
+    *ops.target_protocol.borrow_mut() = Some(serde_json::json!({"protocol_version": 1, "supported_protocol_version": 2,
+        "protocol_upgrade_schedule_hash": pulse_cutover::upstream::ProtocolSchedule::empty().hash, "next_protocol_upgrade": null}));
+    assert!(run_machine_result(&cfg, &ops).unwrap_err().contains("protocol upgrade schedule or supported version does not match"));
+    assert!(transition(&journal_entries(&cfg), "IGNITED").is_none() && transition(&journal_entries(&cfg), "HALTED").is_some());
+
+    // A target binary too old for the scheduled version: halted too.
+    let (dir, cfg) = setup(FAR);
+    let ops = upstream_ops(dir.path());
+    *ops.target_protocol.borrow_mut() = Some(serde_json::json!({"protocol_version": 1, "supported_protocol_version": 1,
+        "protocol_upgrade_schedule_hash": sched.hash, "next_protocol_upgrade": {"protocol_version": 2, "activation_height": 1000000}}));
+    assert!(run_machine_result(&cfg, &ops).unwrap_err().contains("does not match"));
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("cannot execute the scheduled protocol version"));
+
+    // An activation too close to the cut (H = 120, default margin 100,000): refused before anything freezes.
+    let (dir, cfg) = setup(r#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":5000}]}"#);
+    let ops = upstream_ops(dir.path());
+    let st = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("protocol upgrade schedule") && text.contains("within 100000 blocks"), "{st:?} {text}");
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "freeze-writes"), "refused before the freeze");
+    assert!(transition(&journal_entries(&cfg), "FROZEN").is_none());
+
+    // An invalid schedule (typo) is refused the same way.
+    let (dir, cfg) = setup(r#"{"protocol_upgrades":[{"protocol_version":2,"activation_heigth":1000000}]}"#);
+    let ops = upstream_ops(dir.path());
+    let _ = run_machine_result(&cfg, &ops);
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("unknown field"));
+    assert!(transition(&journal_entries(&cfg), "FROZEN").is_none());
 }
 
 #[test]

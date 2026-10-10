@@ -365,7 +365,7 @@ pub fn join_view(status: Option<&Value>, co: &Coordination, ours: &Value) -> Res
         if e.1.is_none() {
             e.1 = t["subnet_id"].as_str().map(str::to_string);
         }
-        for k in ["snapshot_sha256", "fingerprints_digest", "boot_genesis_sha256", "compare_allowed_digest"] {
+        for k in ["snapshot_sha256", "fingerprints_digest", "boot_genesis_sha256", "compare_allowed_digest", "protocol_schedule_hash"] {
             let (mine, theirs) = (&ours[k], &c["evidence"][k]);
             if !mine.is_null() && mine != theirs {
                 e.2.push(format!("{}: {k} {} ≠ ours", m.producer, theirs.as_str().map(|s| format!("{}…", &s[..12.min(s.len())])).unwrap_or_else(|| "missing".into())));

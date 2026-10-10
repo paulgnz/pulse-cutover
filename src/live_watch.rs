@@ -135,6 +135,17 @@ pub fn target_view(cfg: &Config, summary: &Value, agent: Option<&ureq::Agent>) -
         out["head"] = json!(r["head_block_num"].as_u64().or_else(|| r["head_block_num"].as_str()?.parse().ok()));
         let hex64 = |x: &Value| x.as_str().map(|s| s.to_ascii_lowercase()).filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()));
         out["head_id"] = json!(hex64(&r["head_block_id"]));
+        // rc.27: the protocol fields (mission control compares schedules and supported versions across the fleet).
+        if let Some(h) = hex64(&r["protocol_upgrade_schedule_hash"]) {
+            out["protocol_upgrade_schedule_hash"] = json!(h);
+            out["protocol_version"] = json!(r["protocol_version"].as_u64());
+            out["supported_protocol_version"] = json!(r["supported_protocol_version"].as_u64());
+            let n = &r["next_protocol_upgrade"];
+            out["next_protocol_upgrade"] = match (n["protocol_version"].as_u64(), n["activation_height"].as_u64()) {
+                (Some(v), Some(a)) => json!({"protocol_version": v, "activation_height": a}),
+                _ => Value::Null,
+            };
+        }
         if out["chain_id"].is_null() {
             out["chain_id"] = json!(hex64(&r["chain_id"]));
         }

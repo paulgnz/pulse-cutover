@@ -47,3 +47,26 @@ test('rc.26 review M3: STRANDED needs every member present and fresh; otherwise 
   byP.bp5[0].silent = false;
   assert.equal(fleetVerdict(ev, byP).verdict, 'STRANDED');
 });
+
+test('rc.27: STALLED when a quorum of LIVE members report target_live failing; clears when it passes', () => {
+  const by2 = (failing, extra = {}) => Object.fromEntries(BPS.map((p, i) => [p, [{ report: { coord: { event_id: 'e1' }, ceremony: live(extra[p] || {}),
+    checks: [{ name: 'target_live', ok: i >= failing, detail: i < failing ? 'no new block for 300 s; probe failed: tx not included' : 'ok' }] }, silent: false, conflict: false }]]));
+  const v = fleetVerdict(ev, by2(5));
+  assert.equal(v.verdict, 'STALLED');
+  assert.ok(v.warnings.some((w) => w.startsWith('target chain stalled')));
+  assert.equal(fleetVerdict(ev, by2(4)).verdict, 'LIVE', 'below quorum (5): still LIVE');
+  assert.equal(fleetVerdict(ev, by2(0)).verdict, 'LIVE');
+});
+
+test('rc.27: different protocol upgrade schedules or an unsupported next version are warned about', () => {
+  const A = 'a1'.repeat(32), B = 'b2'.repeat(32);
+  const byS = (hashOf, sup = 2) => Object.fromEntries(BPS.map((p) => [p, [{ report: { coord: { event_id: 'e1' },
+    ceremony: live({ protocol_upgrade_schedule_hash: hashOf(p), supported_protocol_version: p === 'bp5' ? sup : 2, next_protocol_upgrade: { protocol_version: 2, activation_height: 5000 } }) }, silent: false, conflict: false }]]));
+  const same = fleetVerdict(ev, byS(() => A));
+  assert.equal(same.verdict, 'LIVE');
+  assert.deepEqual(same.warnings, []);
+  const split = fleetVerdict(ev, byS((p) => (p === 'bp2' ? B : A)));
+  assert.ok(split.warnings.some((w) => w.includes('different protocol upgrade schedules') && w.includes('bp2')), JSON.stringify(split.warnings));
+  const old = fleetVerdict(ev, byS(() => A, 1));
+  assert.ok(old.warnings.some((w) => w.startsWith("bp5's PulseVM supports protocol 1")));
+});

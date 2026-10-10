@@ -432,7 +432,8 @@ pub fn fingerprints_digest(fingerprints: &Value) -> String {
 
 /// The verified evidence of a VERIFIED transition (or a `reverified` record) — accumulate only.
 fn put_verified(ev: &mut serde_json::Map<String, Value>, d: &Value) {
-    for (k, src) in [("snapshot_sha256", "sha256"), ("boot_genesis_sha256", "boot_genesis_sha256")] {
+    for (k, src) in [("snapshot_sha256", "sha256"), ("boot_genesis_sha256", "boot_genesis_sha256"),
+                     ("protocol_schedule_hash", "protocol_schedule_hash")] {
         if !d[src].is_null() {
             ev.insert(k.into(), d[src].clone());
         }

@@ -110,6 +110,13 @@ fingerprint_bin = "/root/pulsevm/target/release/examples/xpr_state_fingerprint"
 # regression in crates/pulsevm_chaindb/src/history.rs). The compare still runs, its full
 # output is journaled, and any OTHER failing table still aborts.
 rehearsal_allow_compare_mismatch = ["contract_index_double", "global_property"]
+# rc.27: the NEW chain's PulseVM protocol upgrade schedule (the coordinator's file, identical on every
+# validator; PulseVM docs/protocol-features.md). Validated with PulseVM's rules at ARM, kept at least
+# protocol_upgrade_margin_blocks (default 100000) clear of the cut, hashed into the fleet evidence,
+# installed as <chain_config_dir>/<blockchain id>/upgrade.json, and checked against the target's getInfo
+# after ignition (another schedule, or a binary that cannot run its highest version, HALTS).
+# Unset = empty schedule (protocol version 1).
+# protocol_upgrades_file = "/etc/pulse-cutover/upgrade.json"
 # Base migration genesis: initial_timestamp, initial_key, initial_configuration. The agent
 # adds migration_checkpoint_sha256 and writes migration-genesis-<cut>.json.
 genesis_base = "/root/stage2/genesis-base.json"

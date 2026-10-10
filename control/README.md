@@ -86,7 +86,7 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-server?net=<net>&producer=<acct>&sid=<sid>'`. Accepted only on
   loopback without `X-Real-IP`/`X-Forwarded-For`, i.e. never through the public proxy (which always sets X-Real-IP).
 - **Fleet verdict and the latched SPLIT** (rc.23): `/api/status` carries `fleet` per network for the current event
-  (LIVE / DEGRADED / SPLIT / STRANDED / ABORTED / PENDING, see `fleetVerdict` in `lib.mjs`) and, per producer, `event_max`: the
+  (LIVE / STALLED / DEGRADED / SPLIT / STRANDED / ABORTED / PENDING, plus `warnings`, see `fleetVerdict` in `lib.mjs`) and, per producer, `event_max`: the
   highest stage each producer reported per event id (only raised, kept across restarts in `servers.json`; the agents'
   resume guard reads it). rc.24 adds to each mark the highest state rank seen (`rank`) and, once the movement rule is
   armed for the event (every roster member ≥ SNAPSHOTTED and one past chain creation; or every *reporting* member ≥

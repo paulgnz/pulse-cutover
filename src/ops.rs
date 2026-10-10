@@ -54,6 +54,12 @@ pub trait ChainOps {
     fn target_block_id(&self, _height: u64) -> Result<Option<String>, String> {
         Ok(None)
     }
+    /// rc.27: the target's protocol fields from `pulsevm.getInfo` (`protocol_version`,
+    /// `supported_protocol_version`, `protocol_upgrade_schedule_hash`, `next_protocol_upgrade`). Ok(None) when
+    /// the target does not report them (or cannot be read).
+    fn target_protocol(&self) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
     /// The block id at `height` as the PUBLIC endpoint serves it (`/v1/chain/get_block`). Ok(None)
     /// when it cannot show it.
     fn public_block_id(&self, _public_url: &str, _height: u64) -> Result<Option<String>, String> {
@@ -644,6 +650,17 @@ impl ChainOps for HttpOps {
             None,
         )
         .map(|_| ())
+    }
+
+    fn target_protocol(&self) -> Result<Option<Value>, String> {
+        let body = json!({"jsonrpc": "2.0", "method": "pulsevm.getInfo", "params": {}, "id": 1});
+        let Some(url) = self.target_url() else { return Ok(None) };
+        Ok(self.post(&url, Some(body), None).ok().and_then(|v| {
+            let r = v.get("result").cloned().unwrap_or(v);
+            r.get("protocol_upgrade_schedule_hash")?.as_str()?;
+            Some(json!({"protocol_version": r["protocol_version"], "supported_protocol_version": r["supported_protocol_version"],
+                "protocol_upgrade_schedule_hash": r["protocol_upgrade_schedule_hash"], "next_protocol_upgrade": r["next_protocol_upgrade"]}))
+        }))
     }
 
     fn target_info(&self) -> Result<Option<ChainInfo>, String> {

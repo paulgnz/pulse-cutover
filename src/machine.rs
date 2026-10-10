@@ -211,6 +211,8 @@ struct UpstreamVerified {
     cut_block_id: String,
     chain_id: String,
     started: u64,
+    /// rc.27: the new chain's protocol upgrade schedule (validated against the cut).
+    protocol: upstream::ProtocolSchedule,
 }
 
 impl UpstreamVerified {
@@ -218,7 +220,8 @@ impl UpstreamVerified {
     fn fleet_evidence(&self) -> serde_json::Value {
         let fingerprints = self.outcome.state_root.as_ref().map(|r| json!({"upstream_state_root": r}));
         json!({"snapshot_sha256": self.sha256, "boot_genesis_sha256": self.boot_hashes.1,
-            "fingerprints_digest": fingerprints.map(|f| crate::beacon::fingerprints_digest(&f))})
+            "fingerprints_digest": fingerprints.map(|f| crate::beacon::fingerprints_digest(&f)),
+            "protocol_schedule_hash": self.protocol.hash})
     }
 }
 
@@ -499,6 +502,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 )),
             }
         }
+        // rc.27: the new chain's protocol upgrade schedule must be valid and keep every activation clear of the
+        // cut (checked again at verification, where its hash becomes evidence).
+        if let Some(up) = self.cfg.upstream.as_ref().filter(|_| pre_verify) {
+            match upstream::ProtocolSchedule::load(up.protocol_upgrades_file.as_deref())
+                .and_then(|s| s.check_against_cut(h, up.protocol_upgrade_margin_blocks)) {
+                Ok(()) => {}
+                Err(e) => problems.push(format!("protocol upgrade schedule: {e}")),
+            }
+        }
         // Producer signing key vs the key the source registers (stage-2 run 1 halt). Checked
         // again before ignition, against the state at the cut.
         let mut producer_key_ok = None;
@@ -734,6 +746,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     && c["aborting"].as_bool() != Some(true)
                     && same("snapshot_sha256")
                     && same("fingerprints_digest")
+                    // rc.27: one protocol upgrade schedule for the new chain (a different one splits it at activation).
+                    && (ours["protocol_schedule_hash"].is_null() || same("protocol_schedule_hash"))
                     && event_ok
             };
             let producers = match self.ops.get_json(&status_url) {
@@ -1125,6 +1139,60 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             self.ops.sleep_ms(2000);
         }
+    }
+
+    /// rc.27: compare the target's `getInfo` protocol fields with this event's schedule. Ok(Ok(note)) = matches or
+    /// not reported (an older PulseVM; noted), Ok(Err(detail)) = mismatch.
+    fn target_protocol_problem(&mut self) -> Result<Result<serde_json::Value, serde_json::Value>, String> {
+        let Some(up) = self.cfg.upstream.as_ref() else { return Ok(Ok(json!("not applicable (no upstream backend)"))) };
+        let sched = match upstream::ProtocolSchedule::load(up.protocol_upgrades_file.as_deref()) {
+            Ok(s) => s,
+            Err(e) => return Ok(Err(json!({"error": e}))),
+        };
+        let Some(t) = self.ops.target_protocol()? else {
+            return Ok(Ok(json!("UNVERIFIED: the target does not report protocol fields")));
+        };
+        let theirs = t["protocol_upgrade_schedule_hash"].as_str().unwrap_or("");
+        let supported = t["supported_protocol_version"].as_u64().unwrap_or(0);
+        if !theirs.eq_ignore_ascii_case(&sched.hash) {
+            return Ok(Err(json!({"expected_schedule_hash": sched.hash, "target": t,
+                "fix": format!("the validator loaded another upgrade.json than this event's (expected {} entries)", sched.entries.len())})));
+        }
+        if supported < sched.max_version() as u64 {
+            return Ok(Err(json!({"max_scheduled_version": sched.max_version(), "target": t,
+                "fix": "this PulseVM binary cannot execute the scheduled protocol version: upgrade it before the activation height"})));
+        }
+        Ok(Ok(json!({"schedule_hash": sched.hash, "supported_protocol_version": supported, "verified": true})))
+    }
+
+    /// rc.27: install the new chain's protocol upgrade schedule as `<chain_config_dir>/<bid>/upgrade.json` (MetalGo
+    /// hands it to PulseVM as upgrade_bytes). The file must still hash to what VERIFIED journaled (the fleet
+    /// compared that); an empty schedule installs nothing, and refuses a stale upgrade.json already there.
+    fn install_protocol_schedule(&mut self, dir: &std::path::Path, bid: &str) -> Result<Result<(), serde_json::Value>, String> {
+        let Some(up) = self.cfg.upstream.as_ref() else { return Ok(Ok(())) };
+        let want = crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"]["protocol_schedule_hash"].as_str().map(str::to_string);
+        let sched = match upstream::ProtocolSchedule::load(up.protocol_upgrades_file.as_deref()) {
+            Ok(s) => s,
+            Err(e) => return Ok(Err(json!({"error": e}))),
+        };
+        if want.as_deref().is_some_and(|w| w != sched.hash) {
+            return Ok(Err(json!({"error": "upstream.protocol_upgrades_file changed since VERIFIED", "verified": want, "now": sched.hash})));
+        }
+        let dest = dir.join(bid).join("upgrade.json");
+        if sched.entries.is_empty() {
+            if dest.exists() {
+                return Ok(Err(json!({"error": format!("{} exists but this event's schedule is empty: remove it", dest.display())})));
+            }
+            self.journal.evidence(self.state, json!({"protocol_schedule_installed": "empty (protocol version 1)", "hash": sched.hash}))?;
+            return Ok(Ok(()));
+        }
+        let bytes = serde_json::to_vec_pretty(&sched.to_json()).expect("json");
+        if let Err(e) = std::fs::write(&dest, &bytes) {
+            return Ok(Err(json!({"error": format!("write {}: {e}", dest.display())})));
+        }
+        self.journal.evidence(self.state, json!({"protocol_schedule_installed": dest.display().to_string(), "hash": sched.hash,
+            "protocol_upgrades": sched.to_json()["protocol_upgrades"]}))?;
+        Ok(Ok(()))
     }
 
     /// May the old chain be resumed? Ok(Ok(())) after journaling why; Ok(Err(why)) = no (fleet::resume_guard).
@@ -1895,6 +1963,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(Err(("upstream verification failed".into(), json!({"error": e}))));
             }
         };
+        // rc.27: the protocol upgrade schedule the new chain will run under (its hash is fleet evidence).
+        let protocol = match upstream::ProtocolSchedule::load(up.protocol_upgrades_file.as_deref())
+            .and_then(|s| s.check_against_cut(cut_height, up.protocol_upgrade_margin_blocks).map(|_| s)) {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(("protocol upgrade schedule refused".into(), json!({"error": e})))),
+        };
         // Advisory stubbed-intrinsic scan of the actual cut (read-only audit
         // over the deployed code objects; backend-independent).
         self.advisory_scan(&path, stage)?;
@@ -1961,7 +2035,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 outcome.compare_allowed_mismatch.join(", ")
             ),
         };
-        Ok(Ok(UpstreamVerified { sha256, file_size, outcome, boot, boot_hashes, table_compare, cut_height, cut_block_id, chain_id, started }))
+        Ok(Ok(UpstreamVerified { sha256, file_size, outcome, boot, boot_hashes, table_compare, cut_height, cut_block_id, chain_id, started, protocol }))
     }
 
     fn step_snapshotted_upstream(&mut self) -> Result<(), String> {
@@ -1972,7 +2046,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(());
             }
         };
-        let UpstreamVerified { sha256, file_size, outcome, boot, boot_hashes, table_compare, cut_height, cut_block_id, chain_id, started } = v;
+        let UpstreamVerified { sha256, file_size, outcome, boot, boot_hashes, table_compare, cut_height, cut_block_id, chain_id, started, protocol } = v;
         if self.coordinator_aborted(true) {
             let event_id = self.cfg.coordination.as_ref().and_then(|c| c.event_id.clone());
             self.abort(
@@ -2009,6 +2083,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "checkpoint_revision": outcome.checkpoint_revision,
                 "table_compare": table_compare,
                 "state_root": outcome.state_root,
+                "protocol_schedule_hash": protocol.hash,
+                "protocol_upgrades": protocol.to_json()["protocol_upgrades"],
                 "verify_wall_ms": self.ops.now_ms().saturating_sub(started),
             }),
         )?;
@@ -2390,6 +2466,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             match installed {
                 Ok(h) if Some(&h) == self.boot_hashes.2.as_ref() => {
                     self.journal.evidence(State::Verified, json!({"chain_config_installed": dest.display().to_string(), "sha256": h}))?;
+                    if let Err(e) = self.install_protocol_schedule(&dir, &bid)? {
+                        self.abort("could not install the protocol upgrade schedule for the target", e)?;
+                        return Ok(false);
+                    }
                 }
                 other => {
                     self.abort("could not install the chain config for the target", json!({
@@ -2588,6 +2668,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.sha256 = Some(v.sha256.clone());
         // Journaled by the caller only once the LIVE quorum's evidence matched (review #3).
         let record = json!({"reverified": true, "evidence": ours, "compare_allowed_mismatch": allowed,
+            "protocol_schedule_hash": v.protocol.hash, "protocol_upgrades": v.protocol.to_json()["protocol_upgrades"],
             "rehearsal_overrides": self.cfg.rehearsal_overrides(),
             "sha256": v.sha256, "size_bytes": v.file_size, "cut_height": v.cut_height, "cut_block_id": v.cut_block_id, "chain_id": v.chain_id,
             "fingerprints": v.outcome.state_root.as_ref().map(|r| json!({"upstream_state_root": r})), "state_root": v.outcome.state_root,
@@ -2816,6 +2897,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             None => "UNVERIFIED (require_lineage_check = false)",
         };
+        // rc.27: the running target must have loaded THIS event's protocol schedule and support its highest version
+        // (a validator with another schedule, or an older binary, splits or stops the chain at activation).
+        let protocol_check = match self.target_protocol_problem()? {
+            Ok(v) => v,
+            Err(detail) => {
+                self.abort("the target's protocol upgrade schedule or supported version does not match this event", detail)?;
+                return Ok(());
+            }
+        };
         self.reached_ignited = true;
         self.state = State::Ignited;
         self.journal.transition(
@@ -2828,6 +2918,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "cut_height": cut_height,
                 "target_block_id_at_cut": target_id_at_cut,
                 "lineage_at_cut": lineage,
+                "protocol_check": protocol_check,
                 "ignite_wall_ms": self.ops.now_ms().saturating_sub(started),
             }),
         )?;

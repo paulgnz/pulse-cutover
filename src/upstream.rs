@@ -602,6 +602,105 @@ pub const REQUIRED_COMPARE_TABLES: &[&str] = &[
 /// Tables whose v1.0.0 compare failure has a KNOWN, recognisable signature (the SHiP serializer
 /// defects reported upstream). Only these may be named in `rehearsal_allow_compare_mismatch`, and
 /// a failure is allowed only when it matches the signature (see `known_compare_difference`).
+/// A PulseVM protocol upgrade schedule (rc.27), validated with PulseVM's own rules
+/// (`docs/protocol-features.md` §4.1) and its canonical hash (§7): SHA-256 of `PVMUPG01`, the entry count
+/// (u32 LE), then each `(protocol_version u32 LE, activation_height u32 LE)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolSchedule {
+    pub entries: Vec<(u32, u32)>,
+    pub hash: String,
+}
+
+impl ProtocolSchedule {
+    pub fn empty() -> Self {
+        Self::from_entries(vec![])
+    }
+
+    fn from_entries(entries: Vec<(u32, u32)>) -> Self {
+        let mut buf = b"PVMUPG01".to_vec();
+        buf.extend((entries.len() as u32).to_le_bytes());
+        for (v, h) in &entries {
+            buf.extend(v.to_le_bytes());
+            buf.extend(h.to_le_bytes());
+        }
+        let hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&buf));
+        ProtocolSchedule { entries, hash }
+    }
+
+    /// Parse `upgrade.json` bytes exactly as PulseVM does: empty/whitespace or `{}` = empty; unknown fields,
+    /// heights 0/1, non-increasing heights or versions, a first version ≤ 1, more than 1,024 entries: rejected.
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(Self::empty());
+        }
+        let v: Value = serde_json::from_slice(bytes).map_err(|e| format!("protocol upgrade schedule is not JSON: {e}"))?;
+        let root = v.as_object().ok_or("protocol upgrade schedule must be a JSON object")?;
+        if let Some(k) = root.keys().find(|k| k.as_str() != "protocol_upgrades") {
+            return Err(format!("protocol upgrade schedule: unknown field {k:?}"));
+        }
+        let list = match root.get("protocol_upgrades") {
+            None => return Ok(Self::empty()),
+            Some(l) => l.as_array().ok_or("protocol_upgrades must be an array")?,
+        };
+        if list.len() > 1024 {
+            return Err("protocol upgrade schedule: more than 1,024 entries".into());
+        }
+        let mut entries: Vec<(u32, u32)> = vec![];
+        for (i, e) in list.iter().enumerate() {
+            let o = e.as_object().ok_or_else(|| format!("protocol_upgrades[{i}] must be an object"))?;
+            if let Some(k) = o.keys().find(|k| !matches!(k.as_str(), "protocol_version" | "activation_height")) {
+                return Err(format!("protocol_upgrades[{i}]: unknown field {k:?}"));
+            }
+            let field = |k: &str| o.get(k).and_then(|x| x.as_u64()).filter(|x| *x <= u32::MAX as u64).map(|x| x as u32)
+                .ok_or_else(|| format!("protocol_upgrades[{i}].{k} must be an integer in u32 range"));
+            let (ver, height) = (field("protocol_version")?, field("activation_height")?);
+            if height <= 1 {
+                return Err(format!("protocol_upgrades[{i}]: activation height {height} (0 and 1 are rejected)"));
+            }
+            match entries.last() {
+                None if ver <= 1 => return Err(format!("protocol_upgrades[0]: first protocol version {ver} must be > 1")),
+                Some((pv, ph)) if ver <= *pv || height <= *ph => {
+                    return Err(format!("protocol_upgrades[{i}]: versions and heights must strictly increase"))
+                }
+                _ => {}
+            }
+            entries.push((ver, height));
+        }
+        Ok(Self::from_entries(entries))
+    }
+
+    pub fn load(path: Option<&Path>) -> Result<Self, String> {
+        match path {
+            None => Ok(Self::empty()),
+            Some(p) => Self::parse(&std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?)
+                .map_err(|e| format!("{}: {e}", p.display())),
+        }
+    }
+
+    /// The highest scheduled protocol version (1 when empty).
+    pub fn max_version(&self) -> u32 {
+        self.entries.last().map(|(v, _)| *v).unwrap_or(1)
+    }
+
+    /// Err when an activation falls in (`cut`, `cut + margin`]: the rules would switch while the fleet ignites.
+    /// An activation at or below the cut is refused too: a new chain imported at H has no history to activate in.
+    pub fn check_against_cut(&self, cut: u64, margin: u64) -> Result<(), String> {
+        for (v, h) in &self.entries {
+            if (*h as u64) <= cut.saturating_add(margin) {
+                return Err(format!("protocol upgrade to version {v} at height {h} is within {margin} blocks of (or before) \
+                    the cut height {cut}: move it later, or set upstream.protocol_upgrade_margin_blocks"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The schedule as PulseVM's `upgrade.json` (canonical field order).
+    pub fn to_json(&self) -> Value {
+        json!({"protocol_upgrades": self.entries.iter()
+            .map(|(v, h)| json!({"protocol_version": v, "activation_height": h})).collect::<Vec<_>>()})
+    }
+}
+
 pub const KNOWN_COMPARE_DIFFERENCES: &[&str] = &["contract_index_double", "global_property"];
 
 /// Required tables with no matching line in `output`, excluding `failing` ones.
@@ -1052,6 +1151,39 @@ pub fn parse_create_chain_output(out: &str) -> Result<(String, Option<String>), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_schedule_hash_matches_pulsevm_and_rules_match_its_validator() {
+        // PulseVM docs/protocol-features.md §7: the example hash is of §4's two-entry schedule.
+        let two = ProtocolSchedule::parse(br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":1000000},
+            {"protocol_version":3,"activation_height":1500000}]}"#).unwrap();
+        assert_eq!(two.hash, "e73c3b500964300ce82280695d0608e80d9b50602531b560e9ec33e04e09e914");
+        assert_eq!(two.max_version(), 3);
+        let s = ProtocolSchedule::parse(br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":1000000}]}"#).unwrap();
+        assert_eq!((s.max_version(), ProtocolSchedule::parse(b"  ").unwrap()), (2, ProtocolSchedule::empty()));
+        assert_eq!(ProtocolSchedule::parse(b"{}").unwrap(), ProtocolSchedule::empty());
+        assert_eq!(ProtocolSchedule::parse(br#"{"protocol_upgrades":[]}"#).unwrap(), ProtocolSchedule::empty());
+        for bad in [
+            &br#"{"protocol_upgrades":[{"protocol_version":2,"activation_heigth":1000000}]}"#[..],
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":1}]}"#,
+            br#"{"protocol_upgrades":[{"protocol_version":1,"activation_height":10}]}"#,
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":10},{"protocol_version":3,"activation_height":10}]}"#,
+            br#"{"protocol_upgrades":[{"protocol_version":3,"activation_height":10},{"protocol_version":2,"activation_height":20}]}"#,
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":-5}]}"#,
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":5000000000}]}"#,
+            br#"{"upgrades":[]}"#,
+        ] {
+            assert!(ProtocolSchedule::parse(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+        // Gaps in versions are accepted (PulseVM rule).
+        assert!(ProtocolSchedule::parse(br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":10},{"protocol_version":5,"activation_height":20}]}"#).is_ok());
+        // Against the cut: anything at or before H + margin is refused.
+        assert!(s.check_against_cut(800_000, 100_000).is_ok());
+        assert!(s.check_against_cut(900_000, 100_000).unwrap_err().contains("within 100000 blocks"));
+        assert!(s.check_against_cut(2_000_000, 0).is_err(), "an activation before the cut is refused");
+        assert!(ProtocolSchedule::empty().check_against_cut(1, 1_000_000).is_ok());
+        assert_eq!(ProtocolSchedule::parse(s.to_json().to_string().as_bytes()).unwrap(), s);
+    }
 
     #[test]
     fn manifest_env_parses_key_values() {
