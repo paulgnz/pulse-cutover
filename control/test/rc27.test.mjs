@@ -221,3 +221,22 @@ test('rc.28 verification: after a write that committed despite an error, /api/st
   assert.deepEqual((await evlog(base)).obs.map((o) => o.state), ['LIVE'], 'restart reloads the evidence');
   await kill(proc);
 });
+
+test('rc.28 verification: a coordination write that committed despite an error (a signed ABORT) refuses every /api read until restart', async () => {
+  const dir = setup();
+  const coordFile = join(dir, 'state', 'coord.json');
+  let { base, proc } = await start(dir);
+  assert.equal((await EVPOST(base, { event_id: 'ev-1', h: CUT })).status, 200);
+  await kill(proc);
+  ({ base, proc } = await start(dir, { MC_TEST_FAIL_AFTER_RENAME: coordFile }));
+  const ab = await fetch(`${base}/api/coord/testnet`, { method: 'POST', body: JSON.stringify(signed({ type: 'abort', network: 'testnet', event_id: 'ev-1' })) });
+  assert.equal(ab.status, 503);
+  assert.match(readFileSync(coordFile, 'utf8'), /"abort"/, 'the abort reached disk');
+  for (const p of ['/api/coord/testnet', '/api/status', '/api/node/testnet/bpa/x']) assert.equal((await fetch(`${base}${p}`)).status, 503, p);
+  assert.equal((await fetch(`${base}/healthz`)).status, 503);
+  await kill(proc);
+  ({ base, proc } = await start(dir));
+  const c = await (await fetch(`${base}/api/coord/testnet`)).json();
+  assert.ok(JSON.stringify(c).includes('abort'), 'restart serves the abort');
+  await kill(proc);
+});

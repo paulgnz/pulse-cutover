@@ -396,16 +396,31 @@ function atomicWrite(file, obj) {
   const tmp = `${file}.tmp-${process.pid}`;
   const fd = openSync(tmp, 'w'); try { writeSync(fd, JSON.stringify(obj, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(tmp, file);
-  // Test-only fault: fail AFTER the rename, once (the "committed despite the error" case). Never set in production.
-  if (process.env.MC_TEST_FAIL_AFTER_RENAME === file && !atomicWrite.failed) { atomicWrite.failed = true; throw new Error('test fault after rename'); }
-  // the rename itself is only durable once the directory entry is: fsync the directory too
-  const dfd = openSync(dirname(file), 'r');
-  try { fsyncSync(dfd); } catch (e) { if (!['EINVAL', 'ENOTSUP', 'EISDIR'].includes(e.code)) throw e; } finally { closeSync(dfd); }
+  // From here the new content IS the file: an error now leaves disk newer than memory (`afterRename`), unlike any error
+  // above (disk unchanged, safe to retry).
+  try {
+    // Test-only fault: fail AFTER the rename, once (the "committed despite the error" case). Never set in production.
+    if (process.env.MC_TEST_FAIL_AFTER_RENAME === file && !atomicWrite.failed) { atomicWrite.failed = true; throw new Error('test fault after rename'); }
+    // the rename itself is only durable once the directory entry is: fsync the directory too
+    const dfd = openSync(dirname(file), 'r');
+    try { fsyncSync(dfd); } catch (e) { if (!['EINVAL', 'ENOTSUP', 'EISDIR'].includes(e.code)) throw e; } finally { closeSync(dfd); }
+  } catch (e) { e.afterRename = true; throw e; }
 }
+// rc.28 review: set when a state write (servers or coordination) failed AFTER its rename (it committed anyway, so memory
+// is older than disk). Every /api/* request is refused (503) until a restart reloads both files. A failure before the
+// rename changed nothing on disk and is simply retried.
+let stateUncertain = false;
 /** Persist `next` as the whole coordination state; returns true only if it is durably on disk. */
 function commitCoord(next) {
+  // Same latch as the server state (rc.28 verification): a coordination write that failed may still have committed
+  // (a signed ABORT on disk, ARM in memory). Nothing is served or changed from memory until a restart reloads it.
+  if (stateUncertain) { console.error('coord: state uncertain after a failed write; restart mission control to reload it'); return false; }
   try { atomicWrite(COORD_FILE, next); coord = next; return true; }
-  catch (e) { console.error(`coord: persist failed (${e.message}); change NOT accepted`); return false; }
+  catch (e) {
+    if (e.afterRename) stateUncertain = true;
+    console.error(`coord: persist failed (${e.message}); change NOT accepted${e.afterRename ? '; it may be on disk: every API refused until restart' : ''}`);
+    return false;
+  }
 }
 
 // Server state = the replay watermark (last accepted report timestamp per server key) + every server entry
@@ -583,11 +598,14 @@ const signedEvent = (netId, evId) => !!coord[netId]?.used && own(coord[netId].us
 // rc.28 review: a failed write may still have committed (e.g. the directory fsync failed AFTER the rename); memory may
 // now be older than the file. Every later mutation is refused until a restart reloads the file, so stale memory can
 // never overwrite recorded evidence.
-let serverStateUncertain = false;
 function commitServers(override, lastOverride, emOverride, evOverride) {
-  if (serverStateUncertain) { console.error('servers: state uncertain after a failed write; restart mission control to reload it'); return false; }
+  if (stateUncertain) { console.error('servers: state uncertain after a failed write; restart mission control to reload it'); return false; }
   try { atomicWrite(STATE_FILE, serverSnapshot(override, lastOverride, emOverride, evOverride)); return true; }
-  catch (e) { serverStateUncertain = true; console.error(`servers: persist failed (${e.message}); change NOT accepted; further changes refused until restart`); return false; }
+  catch (e) {
+    if (e.afterRename) stateUncertain = true;
+    console.error(`servers: persist failed (${e.message}); change NOT accepted${e.afterRename ? '; it may be on disk: every API refused until restart' : ''}`);
+    return false;
+  }
 }
 /** One token = one machine: every entry of a token is in conflict while the token has more than one entry. */
 function recomputeConflicts(byKey, tok) {
@@ -794,14 +812,16 @@ function callerIp(req) {
 async function handle(req, res) {
   let url; try { url = new URL(req.url, 'http://x'); } catch { return send(res, 400, { error: 'bad url' }); }
   const path = url.pathname;
-  // rc.28 verification: after a failed write the in-memory view may be OLDER than the file (a commit that went through
-  // despite the error). Agents decide resumes from this document, so it is not served until a restart reloads the file.
-  if (req.method === 'GET' && path === '/api/status') return serverStateUncertain
-    ? send(res, 503, { error: 'server state uncertain after a failed write: restart mission control (it reloads the state file)' })
-    : send(res, 200, status());
+  // rc.28 verification: after a failed write the in-memory view may be OLDER than the files (a commit that went
+  // through despite the error). Agents decide resumes and arming from these documents: nothing under /api is served
+  // or changed until a restart reloads them (agents read 503 as "the relay did not answer" and refuse).
+  if (stateUncertain && path.startsWith('/api/')) {
+    return send(res, 503, { error: 'mission control state uncertain after a failed write: restart mission control (it reloads its state files)' });
+  }
+  if (req.method === 'GET' && path === '/api/status') return send(res, 200, status());
   if (req.method === 'GET' && path === '/healthz') {
     // rc.28 review: a failed state write leaves the relay refusing changes until restarted; say so to monitors.
-    return serverStateUncertain ? send(res, 503, { ok: false, error: 'server state uncertain after a failed write: restart mission control (it reloads the state file)' })
+    return stateUncertain ? send(res, 503, { ok: false, error: 'server state uncertain after a failed write: restart mission control (it reloads the state file)' })
       : send(res, 200, { ok: true });
   }
   if (req.method === 'GET' && (path === '/favicon.ico' || path === '/favicon.svg')) {
@@ -1065,7 +1085,7 @@ async function handle(req, res) {
     }
     // rc.28: every accepted past-creation report is an observation in the producer's creation-evidence log.
     const evNext = (r.role || 'producer') === 'producer' ? nextEvidence(evidence[r.network]?.[r.producer], r, now) : null;
-    if (!commitServers([r.network, r.producer, byKey], { [key]: ts }, em ? [r.network, r.producer, em] : null, evNext ? [r.network, r.producer, evNext] : null)) return send(res, 503, { error: serverStateUncertain ? 'server state uncertain after a failed write: not accepted; mission control must be restarted' : 'could not persist the report; not accepted, retry' });
+    if (!commitServers([r.network, r.producer, byKey], { [key]: ts }, em ? [r.network, r.producer, em] : null, evNext ? [r.network, r.producer, evNext] : null)) return send(res, 503, { error: stateUncertain ? 'server state uncertain after a failed write: not accepted; mission control must be restarted' : 'could not persist the report; not accepted, retry' });
     if (evNext) {
       (evidence[r.network] ||= dict())[r.producer] = evNext;
       const added = evNext.obs[evNext.obs.length - 1];
