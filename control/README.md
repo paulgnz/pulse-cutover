@@ -101,6 +101,11 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   for the event (no false SPLIT from a stale journal on a reused run directory). HALTED members count toward the
   agents' own live view (their validators keep running the chain) but not toward this LIVE group, so the board can
   show DEGRADED while agents wait as degraded rather than halting.
+- **Foreign-H evidence** (rc.27): a producer report under the current event id whose journal is for another H but past
+  chain creation is recorded durably in that producer's event mark (`event_max.<event>.foreign_past`) and shown as a
+  warning; agents treat it as blocking a resume. After confirming that target is fenced, clear it on the
+  mission-control host: `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-foreign?net=<net>&producer=<bp>&event=<event>'`
+  (loopback only, like clear-split).
   rc.23 state files (marks without these fields) load unchanged. A SPLIT is **latched** in the coordination store for that event and stays red, whatever the
   reports say later, until an operator clears it after the split is resolved. On the mission-control host itself:
   `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-split?net=<net>'` (use the port mission control listens on).

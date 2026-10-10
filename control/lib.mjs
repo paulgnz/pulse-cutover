@@ -530,6 +530,8 @@ export function nextEventMark(cur, ce, sourceHead, armed, now) {
   const rank = Math.max(Number.isInteger(cur?.rank) ? cur.rank : 0, stateRank(ce?.state));
   const next = { past_create: !!(cur?.past_create || past), state: past ? (ce?.state || null) : (cur?.state ?? ce?.state ?? null),
     at: now, rank };
+  // Durable foreign-H past-creation evidence (rc.27) is carried over; only the operator clears it.
+  if (cur?.foreign_past) next.foreign_past = cur.foreign_past;
   let srcFirst = Number.isInteger(cur?.src_first) ? cur.src_first : null, srcMax = Number.isInteger(cur?.src_max) ? cur.src_max : null;
   if (Number.isInteger(sourceHead) && (armed || srcFirst != null)) {
     if (srcFirst == null) srcFirst = sourceHead;
@@ -540,6 +542,19 @@ export function nextEventMark(cur, ce, sourceHead, armed, now) {
   const same = cur.past_create === next.past_create && cur.state === next.state && cur.rank === next.rank
     && (cur.src_first ?? null) === (next.src_first ?? null) && (cur.src_max ?? null) === (next.src_max ?? null);
   return same ? null : next;
+}
+/**
+ * rc.27 review: a report under this event id whose journal is for ANOTHER H but past chain creation/ignition (a stale
+ * journal, or this event's config is the wrong one) is recorded DURABLY in the event's mark (`foreign_past`): a later
+ * replacement report (another instance, a fresh ABORTED) must not erase it. Only an operator clears it, on the
+ * mission-control host, after checking that target is fenced (POST /api/admin/clear-foreign). Null = no change.
+ */
+export function foreignPastMark(cur, report, ev, now) {
+  const raw = report?.ceremony;
+  if (!raw || ceremonyFor(report, ev) || !pastCreate(raw) || cur?.foreign_past) return null;
+  return Object.assign({ past_create: false, state: null, at: now }, cur || {}, {
+    foreign_past: { state: String(raw.state || 'past creation').slice(0, 16), h: Number.isSafeInteger(raw.evidence?.h) ? raw.evidence.h : null,
+      instance_id: report.instance_id || null, at: now } });
 }
 /**
  * The report's ceremony, but only when its journal belongs to this event (rc.24 fleet rehearsal): a beacon pairs the
@@ -573,7 +588,8 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
     // rc.27 review (review blocker): ANY instance past creation counts (not only the freshest report), and a report for
     // another H that is past creation is surfaced: it may be a stale journal, or this event's config may be wrong.
     const anyPast = mine.some((x) => pastCreate(ceremonyFor(x.report, ev)));
-    const foreignPast = mine.some((x) => !ceremonyFor(x.report, ev) && pastCreate(x.report?.ceremony));
+    const foreignPast = mine.some((x) => !ceremonyFor(x.report, ev) && pastCreate(x.report?.ceremony))
+      || (!!em?.foreign_past && (em.event_id === undefined || em.event_id === ev.event_id));
     return { producer, state: ce?.state || null, fresh: !!s && !s.silent, conflict: mine.length > 0 && !usable.length,
       missing: !s, target: ce?.target || null, resumed: resumedOldChain(ce), past: pastCreate(ce) || markPast || anyPast, foreign_past: foreignPast,
       degraded: ce?.degraded === true,

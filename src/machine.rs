@@ -199,6 +199,24 @@ fn journaled_join_ids(path: &std::path::Path) -> Option<(String, Option<String>)
         })
 }
 
+/// The protocol upgrade schedule as VERIFIED (or an accepted `reverified` record) journaled it: the latest record
+/// carrying both `protocol_upgrades` and `protocol_schedule_hash`, rebuilt and re-hashed (rc.27 review: the schedule's
+/// maximum version and empty-schedule exception come from what the fleet compared, never from a file that can change).
+/// None = no such record (a journal from an older agent).
+fn journaled_protocol_schedule(path: &std::path::Path) -> Option<Result<upstream::ProtocolSchedule, String>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().rev().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).find_map(|v| {
+        let d = &v["data"];
+        let (Some(list), Some(hash)) = (d["protocol_upgrades"].as_array(), d["protocol_schedule_hash"].as_str()) else { return None };
+        let rebuilt = upstream::ProtocolSchedule::parse(json!({"protocol_upgrades": list}).to_string().as_bytes());
+        Some(match rebuilt {
+            Ok(s) if s.hash == hash => Ok(s),
+            Ok(s) => Err(format!("journaled protocol schedule does not match its journaled hash ({} != {hash})", s.hash)),
+            Err(e) => Err(format!("journaled protocol schedule is invalid: {e}")),
+        })
+    })
+}
+
 /// What the upstream verification produced (SNAPSHOTTED→VERIFIED and `join --reverify` share it, rc.25 F5).
 struct UpstreamVerified {
     sha256: String,
@@ -1167,13 +1185,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             Some(up) if self.cfg.ceremony.import_backend == ImportBackend::Upstream => up,
             _ => return Ok(Ok(json!("not applicable (not the upstream backend)"))),
         };
-        let sched = match upstream::ProtocolSchedule::load(up.protocol_upgrades_file.as_deref()) {
-            Ok(s) => s,
-            Err(e) => return Ok(Err(json!({"error": e}))),
+        // What the fleet compared (VERIFIED evidence) is authoritative: hash, entries, maximum version, emptiness. The
+        // file on disk is only noted if it changed since.
+        let sched = match journaled_protocol_schedule(&self.cfg.journal_path) {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => return Ok(Err(json!({"error": e}))),
+            None => return Ok(Err(json!({"error": "no protocol upgrade schedule journaled at VERIFIED (a journal from an agent before rc.27)"}))),
         };
-        // Review LOW-2: what the fleet compared (VERIFIED evidence) is authoritative, not the file now on disk.
-        let want = crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"]["protocol_schedule_hash"].as_str()
-            .map(str::to_string).unwrap_or_else(|| sched.hash.clone());
+        let _ = up;
+        let want = sched.hash.clone();
         // Review HIGH-1: a transport failure is retried, then unknown; a getInfo WITHOUT the protocol fields means a
         // binary older than protocol schedules, which cannot run any scheduled version > 1.
         let mut reported = None;
@@ -1220,17 +1240,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             Some(up) if self.cfg.ceremony.import_backend == ImportBackend::Upstream => up,
             _ => return Ok(Ok(())),
         };
-        let want = crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"]["protocol_schedule_hash"].as_str().map(str::to_string);
-        let sched = match upstream::ProtocolSchedule::load(up.protocol_upgrades_file.as_deref()) {
-            Ok(s) => s,
+        let sched = match journaled_protocol_schedule(&self.cfg.journal_path) {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => return Ok(Err(json!({"error": e}))),
+            None => return Ok(Err(json!({"error": "no protocol upgrade schedule journaled at VERIFIED (a journal from an agent before rc.27): \
+                                          the fleet never compared this node's schedule"}))),
+        };
+        // The file must still be what was verified (an edit after VERIFIED is refused, not silently installed).
+        match upstream::ProtocolSchedule::load(up.protocol_upgrades_file.as_deref()) {
+            Ok(now) if now.hash == sched.hash => {}
+            Ok(now) => return Ok(Err(json!({"error": "upstream.protocol_upgrades_file changed since VERIFIED", "verified": sched.hash, "now": now.hash}))),
             Err(e) => return Ok(Err(json!({"error": e}))),
-        };
-        let Some(want) = want else {
-            return Ok(Err(json!({"error": "no protocol upgrade schedule hash journaled at VERIFIED (a journal from an agent before rc.27): \
-                                  the fleet never compared this node's schedule"})));
-        };
-        if want != sched.hash {
-            return Ok(Err(json!({"error": "upstream.protocol_upgrades_file changed since VERIFIED", "verified": want, "now": sched.hash})));
         }
         let dest = dir.join(bid).join("upgrade.json");
         if sched.entries.is_empty() {

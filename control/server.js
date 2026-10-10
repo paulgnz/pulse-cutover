@@ -18,7 +18,7 @@ import { readFileSync, existsSync, watchFile, renameSync, mkdirSync, openSync, w
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isPublicIp, normIp, resolvePublic, limiter, safeRequest, probeProducerApi, safeJson, safeDecode, RE, UA, endpointId, endpointRef, reservedKey,
-  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, ceremonyFor, STATE_RANK } from './lib.mjs';
+  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, ceremonyFor, foreignPastMark, STATE_RANK } from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = +(process.env.PORT ?? 8787);
@@ -456,6 +456,11 @@ function loadServerState() {
               state: typeof x.state === 'string' ? x.state.slice(0, 16) : null, at: Number.isFinite(x.at) ? x.at : 0 };
             if (Number.isInteger(x.rank) && x.rank >= 0 && x.rank <= MAX_RANK) mark.rank = x.rank;
             if (height(x.src_first) && height(x.src_max) && x.src_max >= x.src_first) { mark.src_first = x.src_first; mark.src_max = x.src_max; }
+            if (x.foreign_past && typeof x.foreign_past === 'object') {
+              const f = x.foreign_past;
+              mark.foreign_past = { state: typeof f.state === 'string' ? f.state.slice(0, 16) : 'past creation', h: height(f.h) ? f.h : null,
+                instance_id: typeof f.instance_id === 'string' && /^[0-9a-f]{32}$/.test(f.instance_id) ? f.instance_id : null, at: Number.isFinite(f.at) ? f.at : 0 };
+            }
             ((eventMax[netId] ||= dict())[prod] ||= dict())[eid] = mark;
           }
         }
@@ -832,6 +837,21 @@ async function handle(req, res) {
     pushEvent(netId, 'operator', 'cleared the latched fleet SPLIT');
     return send(res, 200, { ok: true });
   }
+  if (req.method === 'POST' && path === '/api/admin/clear-foreign') {
+    // Operator-only (rc.27): retire durable foreign-H past-creation evidence for one producer and event, AFTER checking
+    // that target is fenced (stopped / not tracked by that producer's validators). Agents treat it as blocking.
+    const sock = normIp(req.socket.remoteAddress);
+    if (!(sock === '127.0.0.1' || sock === '::1') || req.headers['x-real-ip'] || req.headers['x-forwarded-for']) return send(res, 403, { error: 'local operator only' });
+    const netId = url.searchParams.get('net'), prod = url.searchParams.get('producer'), evId = url.searchParams.get('event');
+    if (!RE.net.test(netId || '') || !RE.producer.test(prod || '') || !/^[\w.:-]{1,64}$/.test(evId || '')) return send(res, 400, { error: 'need ?net=&producer=&event=' });
+    const mine = eventMax[netId]?.[prod];
+    if (!mine?.[evId]?.foreign_past) return send(res, 404, { error: 'no foreign evidence for that producer and event' });
+    const next = Object.assign(dict(), mine, { [evId]: { ...mine[evId] } }); delete next[evId].foreign_past;
+    if (!commitServers(null, null, [netId, prod, next])) return send(res, 503, { error: 'could not persist; nothing changed' });
+    eventMax[netId][prod] = next;
+    pushEvent(netId, 'operator', `cleared foreign-H past-creation evidence for ${prod} (event ${evId})`);
+    return send(res, 200, { ok: true });
+  }
   if (req.method === 'POST' && path === '/api/admin/clear-server') {
     // Operator-only, from the box itself: the reverse proxy always sets X-Real-IP, so a request that arrives on
     // loopback WITHOUT it came from a local shell (curl on the mission-control host), never from the internet.
@@ -917,6 +937,17 @@ async function handle(req, res) {
         // Bound the map: drop the oldest event ids, never the one just written.
         const ids = Object.keys(next).sort((a, b) => (next[a].at || 0) - (next[b].at || 0));
         while (ids.length > EVENT_MAX_KEEP) delete next[ids.shift()];
+        em = next;
+      }
+    }
+    // rc.27 review: a past-creation report for ANOTHER H under this event id is kept durably (foreignPastMark).
+    if (evId && !ce && r.ceremony && (r.role || 'producer') === 'producer' && !reservedKey(evId)) {
+      const mine = em || eventMax[r.network]?.[r.producer] || {};
+      const fm = foreignPastMark(mine[evId], r, evFor, now);
+      if (fm) {
+        const next = Object.assign(dict(), mine, { [evId]: fm });
+        const ids = Object.keys(next).sort((a, b) => (next[a].at || 0) - (next[b].at || 0));
+        while (ids.length > EVENT_MAX_KEEP) { const id = ids.shift(); if (id !== evId) delete next[id]; }
         em = next;
       }
     }

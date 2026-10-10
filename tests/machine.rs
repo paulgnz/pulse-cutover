@@ -150,6 +150,8 @@ struct MockOps {
     real_blocks: Cell<bool>,
     /// rc.27: what the target's getInfo reports as protocol fields (None = an older PulseVM without them).
     target_protocol: RefCell<Option<serde_json::Value>>,
+    /// rc.27 review: write (path, contents) right before answering target_protocol (an edit after install).
+    target_protocol_edit: RefCell<Option<(std::path::PathBuf, String)>>,
     /// source_block (full get_block) calls fail.
     source_block_fails: Cell<bool>,
     /// Placeholder values bound via bind_target, and the ones in force when ignite ran.
@@ -244,6 +246,7 @@ impl MockOps {
             target_chain_id: RefCell::new(None),
             real_blocks: Cell::new(false),
             target_protocol: RefCell::new(None),
+            target_protocol_edit: RefCell::new(None),
             source_block_fails: Cell::new(false),
             bound: RefCell::new(Vec::new()),
             ignite_vars: RefCell::new(Vec::new()),
@@ -302,6 +305,9 @@ impl ChainOps for MockOps {
     }
 
     fn target_protocol(&self) -> Result<Option<serde_json::Value>, String> {
+        if let Some((p, text)) = self.target_protocol_edit.borrow().as_ref() {
+            std::fs::write(p, text).unwrap();
+        }
         Ok(self.target_protocol.borrow().clone())
     }
 
@@ -3857,6 +3863,20 @@ fn rc27_protocol_upgrade_schedule_is_validated_installed_and_checked_on_the_targ
     assert!(run_machine_result(&cfg, &ops).unwrap_err().contains("does not match"));
     assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("cannot execute the scheduled protocol version"));
 
+    // 2nd review: the schedule is what VERIFIED journaled. Emptying the file after install neither lowers the required
+    // version (a target supporting only 1 still halts) nor enables the empty-schedule exception for missing fields.
+    for (supported, report) in [(1, true), (2, false)] {
+        let (dir, cfg) = setup(FAR);
+        let ops = upstream_ops(dir.path());
+        *ops.target_protocol_edit.borrow_mut() = Some((dir.path().join("upgrade.json"), "{}".into()));
+        if report {
+            *ops.target_protocol.borrow_mut() = Some(serde_json::json!({"protocol_version": 1, "supported_protocol_version": supported,
+                "protocol_upgrade_schedule_hash": sched.hash, "next_protocol_upgrade": {"protocol_version": 2, "activation_height": 1000000}}));
+        }
+        assert!(run_machine_result(&cfg, &ops).is_err(), "supported {supported}, fields reported {report}: must halt");
+        assert!(transition(&journal_entries(&cfg), "IGNITED").is_none());
+    }
+
     // Review HIGH-1: a target that does not report protocol fields (an older PulseVM) cannot run a scheduled v2: halt.
     let (dir, cfg) = setup(FAR);
     let ops = upstream_ops(dir.path());
@@ -3909,6 +3929,28 @@ fn rc27_join_refuses_a_legacy_verified_journal_without_a_schedule_hash() {
     let (j, rec) = open_journal(&cfg.journal_path);
     assert_eq!(Machine::new(&cfg, &ops, j, rec).join_with("e1", true).unwrap(), State::Live);
     assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"]["protocol_schedule_hash"], good["protocol_schedule_hash"]);
+}
+
+/// rc.27 2nd review: a JSON-RPC error from getInfo is a failed read (retried), not "a binary without protocol fields";
+/// a 64-hex hash is required to count as reported.
+#[test]
+fn rc27_target_protocol_read_distinguishes_rpc_errors_from_missing_fields() {
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n2 = n.clone();
+    let (url, _) = stub_http(move |_, _| {
+        let i = n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match i {
+            0 => (200, r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"temporary backend unavailable"}}"#.into()),
+            1 => (200, r#"{"jsonrpc":"2.0","id":1,"result":{"head_block_num":5,"protocol_upgrade_schedule_hash":""}}"#.into()),
+            _ => (200, format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"protocol_version":1,"supported_protocol_version":2,"protocol_upgrade_schedule_hash":"{}","next_protocol_upgrade":null}}}}"#, "AB".repeat(32))),
+        }
+    });
+    let ops = pulse_cutover::ops::HttpOps::new("http://127.0.0.1:1", "http://127.0.0.1:1", &url, "true", 5);
+    assert!(ops.target_protocol().unwrap_err().contains("temporary backend unavailable"), "an RPC error is an Err (retried)");
+    assert_eq!(ops.target_protocol().unwrap(), None, "a non-hash sentinel is 'not reported'");
+    let v = ops.target_protocol().unwrap().unwrap();
+    assert_eq!(v["protocol_upgrade_schedule_hash"], serde_json::json!("ab".repeat(32)));
+    assert_eq!(v["supported_protocol_version"], serde_json::json!(2));
 }
 
 #[test]

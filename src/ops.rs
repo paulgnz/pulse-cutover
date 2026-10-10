@@ -656,6 +656,10 @@ impl ChainOps for HttpOps {
         let body = json!({"jsonrpc": "2.0", "method": "pulsevm.getInfo", "params": {}, "id": 1});
         let Some(url) = self.target_url() else { return Err("no target RPC url".into()) };
         let v = self.post(&url, Some(body), None)?;
+        // A JSON-RPC error is a failed read (retried by the caller), not "a binary without protocol fields" (rc.27 review).
+        if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
+            return Err(format!("pulsevm.getInfo returned an error: {e}"));
+        }
         let r = v.get("result").cloned().unwrap_or(v);
         // Only a 64-hex hash counts as reported (a "" / 0 sentinel from a default response is "not reported").
         let hash = r["protocol_upgrade_schedule_hash"].as_str()

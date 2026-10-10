@@ -81,7 +81,11 @@ pub fn members(status: &Value, co: &Coordination) -> Vec<MemberView> {
             _ => None,
         });
         let max_past = mark.filter(|m| m["past_create"].as_bool() == Some(true))
-            .map(|m| format!("{}; relay high-water mark", m["state"].as_str().unwrap_or("past creation")));
+            .map(|m| format!("{}; relay high-water mark", m["state"].as_str().unwrap_or("past creation")))
+            // rc.27 review: the relay's DURABLE record of a past-creation report for another H (it survives the report
+            // being replaced; only an operator clears it after fencing that target).
+            .or_else(|| mark.and_then(|m| m["foreign_past"]["state"].as_str())
+                .map(|st| format!("{st}; a report for another H, relay record")));
         let bs: Vec<_> = entry.map(|p| beacons(p)).unwrap_or_default().into_iter()
             .filter(|(r, _, _)| for_event(r))
             .filter(|(r, _, _)| instance_id.as_deref().is_none_or(|id| r["instance_id"].as_str() == Some(id)))
@@ -639,6 +643,20 @@ mod tests {
         let mut st2 = st2;
         st2["networks"][0]["producers"][1]["beacons"].as_array_mut().unwrap().push(json!({"age_ms": 1000, "report": rep("ABORTED", json!({}))}));
         assert!(resume_guard(Some(&st2), &c, me, true).unwrap_err().contains("bp2 was reported past chain creation"));
+    }
+
+    /// rc.27 review: the relay's durable foreign-H record blocks a resume even after the report itself was replaced
+    /// by a fresh ABORTED one (the relay-replacement scenario).
+    #[test]
+    fn the_relays_durable_foreign_record_blocks_after_the_report_is_replaced() {
+        let me = Some(("bp1", "i"));
+        let c = co(&["bp1", "bp2", "bp3"], 3);
+        let mut st = status_me(&[("bp2", rep("ABORTED", json!({})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
+        assert!(resume_guard(Some(&st), &c, me, true).is_ok());
+        st["networks"][0]["producers"][1]["event_max"] = json!({"e1": {"past_create": false, "state": null,
+            "foreign_past": {"state": "LIVE", "h": 999, "instance_id": null, "at": 1}}});
+        let e = resume_guard(Some(&st), &c, me, true).unwrap_err();
+        assert!(e.contains("bp2") && e.contains("relay record"), "{e}");
     }
 
     /// Review #2: another box reporting under this producer name (its own instance) does not stand in for this

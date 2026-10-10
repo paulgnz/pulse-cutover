@@ -354,7 +354,14 @@ backend a peer without `protocol_schedule_hash` (an older agent) never agrees at
 (stricter than PulseVM, which allows future entries before activation), and `protocol_upgrade_margin_blocks = 0` allows
 an activation at H+1, the first new block. Past-creation evidence counts from ANY of a producer's instances, not only
 its freshest report; a report for another H that is past creation blocks a resume (agent) and is a warning on the
-board, never a clean ABORTED/STRANDED verdict.
+board, never a clean ABORTED/STRANDED verdict. Mission control records such a report DURABLY in the event's mark
+(`foreign_past`): replacing the instance or a fresh ABORTED report does not erase it. Retiring it is an explicit
+operator act on the mission-control host, after checking that target is fenced: `POST /api/admin/clear-server` (an
+obsolete instance) and `POST /api/admin/clear-foreign?net=&producer=&event=` (the durable record); until then a
+STRANDED agent stays sealed (or the operator records a fleet decision with `rollback --force-stranded`). The
+post-ignition protocol check uses the schedule VERIFIED journaled (entries, highest version, emptiness), never the
+file as it is now; a JSON-RPC error from getInfo is retried like a transport failure (5 reads, up to ~80 s with the
+client timeouts) before the ceremony halts.
 
 rc.25 (fleet run c1): with quorum = N the verdict flapped LIVE↔DEGRADED whenever one beacon's target read timed out,
 because the beacon then also dropped its block after the cut. The beacon keeps that block id (it never changes on one
