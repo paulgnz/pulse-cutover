@@ -396,6 +396,8 @@ function atomicWrite(file, obj) {
   const tmp = `${file}.tmp-${process.pid}`;
   const fd = openSync(tmp, 'w'); try { writeSync(fd, JSON.stringify(obj, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(tmp, file);
+  // Test-only fault: fail AFTER the rename, once (the "committed despite the error" case). Never set in production.
+  if (process.env.MC_TEST_FAIL_AFTER_RENAME === file && !atomicWrite.failed) { atomicWrite.failed = true; throw new Error('test fault after rename'); }
   // the rename itself is only durable once the directory entry is: fsync the directory too
   const dfd = openSync(dirname(file), 'r');
   try { fsyncSync(dfd); } catch (e) { if (!['EINVAL', 'ENOTSUP', 'EISDIR'].includes(e.code)) throw e; } finally { closeSync(dfd); }
@@ -791,7 +793,11 @@ function callerIp(req) {
 async function handle(req, res) {
   let url; try { url = new URL(req.url, 'http://x'); } catch { return send(res, 400, { error: 'bad url' }); }
   const path = url.pathname;
-  if (req.method === 'GET' && path === '/api/status') return send(res, 200, status());
+  // rc.28 verification: after a failed write the in-memory view may be OLDER than the file (a commit that went through
+  // despite the error). Agents decide resumes from this document, so it is not served until a restart reloads the file.
+  if (req.method === 'GET' && path === '/api/status') return serverStateUncertain
+    ? send(res, 503, { error: 'server state uncertain after a failed write: restart mission control (it reloads the state file)' })
+    : send(res, 200, status());
   if (req.method === 'GET' && path === '/healthz') {
     // rc.28 review: a failed state write leaves the relay refusing changes until restarted; say so to monitors.
     return serverStateUncertain ? send(res, 503, { ok: false, error: 'server state uncertain after a failed write: restart mission control (it reloads the state file)' })

@@ -33,8 +33,8 @@ function setup() {
   mkdirSync(join(dir, 'state'));
   return dir;
 }
-function start(dir) {
-  const proc = spawn(process.execPath, [join(HERE, '..', 'server.js')], { env: { ...process.env, PORT: '0', MC_OFFLINE: '1',
+function start(dir, extraEnv = {}) {
+  const proc = spawn(process.execPath, [join(HERE, '..', 'server.js')], { env: { ...process.env, ...extraEnv, PORT: '0', MC_OFFLINE: '1',
     NETWORKS: join(dir, 'networks.json'), TOKENS: join(dir, 'tokens.json'), COORD_FILE: join(dir, 'state', 'coord.json') } });
   procs.push(proc);
   return new Promise((ok, ko) => {
@@ -197,5 +197,27 @@ test('rc.28 verification: rc.27 agents see the whole blocking set under the CURR
   const em = (p) => n.producers.find((x) => x.name === p).event_max;
   assert.ok(em('bpa')['ev-1'].foreign_past.some((o) => o.h === CUT), 'same-H observation of ev-0 projected into ev-1');
   assert.ok(em('bpb')['ev-1'].foreign_past.some((o) => o.h === CUT + 999), 'unattributed observation projected into ev-1');
+  await kill(proc);
+});
+
+test('rc.28 verification: after a write that committed despite an error, /api/status is NOT served (503) until restart; then the evidence is there', async () => {
+  const dir = setup();
+  const stateFile = join(dir, 'state', 'servers.json');
+  // The first report write succeeds (event + bpb); the fault hits the write of bpa's LIVE report, after the rename.
+  let { base, proc } = await start(dir);
+  assert.equal((await EVPOST(base, { event_id: 'ev-1', h: CUT })).status, 200);
+  await kill(proc);
+  ({ base, proc } = await start(dir, { MC_TEST_FAIL_AFTER_RENAME: stateFile }));
+  const send = reporter(base, Date.now() - 60e3);
+  const r = await send('bpa', 'ev-1', { state: 'LIVE', ignition_started: true, evidence: { h: CUT } });
+  assert.equal(r.status, 503);
+  assert.match(readFileSync(stateFile, 'utf8'), /"state": "LIVE"/, 'the write went through to disk');
+  assert.equal((await fetch(`${base}/api/status`)).status, 503, 'the stale view is not served');
+  assert.equal((await fetch(`${base}/healthz`)).status, 503);
+  assert.equal((await send('bpa', 'ev-1', { state: 'ABORTED', evidence: { h: CUT } })).status, 503, 'no further changes');
+  await kill(proc);
+  ({ base, proc } = await start(dir));
+  assert.equal((await fetch(`${base}/api/status`)).status, 200);
+  assert.deepEqual((await evlog(base)).obs.map((o) => o.state), ['LIVE'], 'restart reloads the evidence');
   await kill(proc);
 });
