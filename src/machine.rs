@@ -504,7 +504,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         // rc.27: the new chain's protocol upgrade schedule must be valid and keep every activation clear of the
         // cut (checked again at verification, where its hash becomes evidence).
-        if let Some(up) = self.cfg.upstream.as_ref().filter(|_| pre_verify) {
+        if let Some(up) = self.cfg.upstream.as_ref().filter(|_| pre_verify && self.cfg.ceremony.import_backend == ImportBackend::Upstream) {
             match upstream::ProtocolSchedule::load(up.protocol_upgrades_file.as_deref())
                 .and_then(|s| s.check_against_cut(h, up.protocol_upgrade_margin_blocks)) {
                 Ok(()) => {}
@@ -732,6 +732,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(true);
             }
             let event_id = co.event_id.clone();
+            let upstream_backend = self.cfg.ceremony.import_backend == ImportBackend::Upstream;
             let agrees = |r: &serde_json::Value| {
                 let c = &r["ceremony"];
                 // Absent evidence never "agrees" (null == null must not count), and with an event
@@ -747,7 +748,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     && same("snapshot_sha256")
                     && same("fingerprints_digest")
                     // rc.27: one protocol upgrade schedule for the new chain (a different one splits it at activation).
-                    && (ours["protocol_schedule_hash"].is_null() || same("protocol_schedule_hash"))
+                    // Only the fork backend has no schedule; on the upstream backend a missing hash (a journal from an
+                    // older agent) never agrees (rc.27 review: missing evidence is not agreement).
+                    && (if upstream_backend { same("protocol_schedule_hash") } else { true })
                     && event_ok
             };
             let producers = match self.ops.get_json(&status_url) {
@@ -778,7 +781,23 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         && !c["name"].as_str().map(|n| crate::beacon::SETUP_CHECKS.contains(&n)).unwrap_or(false))
                     .map(|c| c["name"].as_str().unwrap_or("?").to_string())
                     .collect()).unwrap_or_default();
-                (!failing.is_empty()).then(|| format!("failing health check(s): {}", failing.join("; ")))
+                if !failing.is_empty() {
+                    return Some(format!("failing health check(s): {}", failing.join("; ")));
+                }
+                // rc.27 review HIGH-2: a verified report for this event whose evidence differs names the key (a peer on
+                // an older agent has no protocol_schedule_hash: that costs quorum, and the operator must see why).
+                let c = &r["ceremony"];
+                let this_event = event_id.as_deref().is_none_or(|id| r["coord"]["event_id"].as_str() == Some(id));
+                if this_event && matches!(c["state"].as_str(), Some("VERIFIED" | "IGNITED" | "FLIPPED" | "LIVE")) {
+                    let diff: Vec<String> = ["snapshot_sha256", "fingerprints_digest", "protocol_schedule_hash"].into_iter()
+                        .filter(|k| !ours[*k].is_null() && c["evidence"][*k] != ours[*k])
+                        .map(|k| if c["evidence"][k].is_null() { format!("{k} missing (the peer's agent may predate this release)") } else { k.to_string() })
+                        .collect();
+                    if !diff.is_empty() {
+                        return Some(format!("evidence differs from ours: {}", diff.join(", ")));
+                    }
+                }
+                None
             };
             let mut excluded: Vec<serde_json::Value> = vec![];
             for p in &producers {
@@ -1144,38 +1163,73 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// rc.27: compare the target's `getInfo` protocol fields with this event's schedule. Ok(Ok(note)) = matches or
     /// not reported (an older PulseVM; noted), Ok(Err(detail)) = mismatch.
     fn target_protocol_problem(&mut self) -> Result<Result<serde_json::Value, serde_json::Value>, String> {
-        let Some(up) = self.cfg.upstream.as_ref() else { return Ok(Ok(json!("not applicable (no upstream backend)"))) };
+        let up = match self.cfg.upstream.as_ref() {
+            Some(up) if self.cfg.ceremony.import_backend == ImportBackend::Upstream => up,
+            _ => return Ok(Ok(json!("not applicable (not the upstream backend)"))),
+        };
         let sched = match upstream::ProtocolSchedule::load(up.protocol_upgrades_file.as_deref()) {
             Ok(s) => s,
             Err(e) => return Ok(Err(json!({"error": e}))),
         };
-        let Some(t) = self.ops.target_protocol()? else {
-            return Ok(Ok(json!("UNVERIFIED: the target does not report protocol fields")));
+        // Review LOW-2: what the fleet compared (VERIFIED evidence) is authoritative, not the file now on disk.
+        let want = crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"]["protocol_schedule_hash"].as_str()
+            .map(str::to_string).unwrap_or_else(|| sched.hash.clone());
+        // Review HIGH-1: a transport failure is retried, then unknown; a getInfo WITHOUT the protocol fields means a
+        // binary older than protocol schedules, which cannot run any scheduled version > 1.
+        let mut reported = None;
+        let mut last_err = None;
+        for i in 0..5 {
+            match self.ops.target_protocol() {
+                Ok(v) => { reported = Some(v); break; }
+                Err(e) => last_err = Some(e),
+            }
+            if i < 4 {
+                self.ops.sleep_ms(2000);
+            }
+        }
+        let t = match reported {
+            Some(Some(t)) => t,
+            Some(None) if sched.max_version() <= 1 => {
+                return Ok(Ok(json!("UNVERIFIED: the target does not report protocol fields (empty schedule: nothing to activate)")));
+            }
+            Some(None) => return Ok(Err(json!({"max_scheduled_version": sched.max_version(),
+                "fix": "the target's PulseVM does not report protocol fields, so it predates protocol schedules and cannot run the scheduled version: upgrade it"}))),
+            None if sched.max_version() <= 1 => {
+                return Ok(Ok(json!({"UNVERIFIED": "the target's getInfo could not be read", "error": last_err})));
+            }
+            None => return Ok(Err(json!({"error": last_err, "fix": "the target's getInfo could not be read: its protocol schedule is unknown"}))),
         };
         let theirs = t["protocol_upgrade_schedule_hash"].as_str().unwrap_or("");
         let supported = t["supported_protocol_version"].as_u64().unwrap_or(0);
-        if !theirs.eq_ignore_ascii_case(&sched.hash) {
-            return Ok(Err(json!({"expected_schedule_hash": sched.hash, "target": t,
+        if !theirs.eq_ignore_ascii_case(&want) {
+            return Ok(Err(json!({"expected_schedule_hash": want, "target": t,
                 "fix": format!("the validator loaded another upgrade.json than this event's (expected {} entries)", sched.entries.len())})));
         }
         if supported < sched.max_version() as u64 {
             return Ok(Err(json!({"max_scheduled_version": sched.max_version(), "target": t,
                 "fix": "this PulseVM binary cannot execute the scheduled protocol version: upgrade it before the activation height"})));
         }
-        Ok(Ok(json!({"schedule_hash": sched.hash, "supported_protocol_version": supported, "verified": true})))
+        Ok(Ok(json!({"schedule_hash": want, "supported_protocol_version": supported, "verified": true})))
     }
 
     /// rc.27: install the new chain's protocol upgrade schedule as `<chain_config_dir>/<bid>/upgrade.json` (MetalGo
     /// hands it to PulseVM as upgrade_bytes). The file must still hash to what VERIFIED journaled (the fleet
     /// compared that); an empty schedule installs nothing, and refuses a stale upgrade.json already there.
     fn install_protocol_schedule(&mut self, dir: &std::path::Path, bid: &str) -> Result<Result<(), serde_json::Value>, String> {
-        let Some(up) = self.cfg.upstream.as_ref() else { return Ok(Ok(())) };
+        let up = match self.cfg.upstream.as_ref() {
+            Some(up) if self.cfg.ceremony.import_backend == ImportBackend::Upstream => up,
+            _ => return Ok(Ok(())),
+        };
         let want = crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"]["protocol_schedule_hash"].as_str().map(str::to_string);
         let sched = match upstream::ProtocolSchedule::load(up.protocol_upgrades_file.as_deref()) {
             Ok(s) => s,
             Err(e) => return Ok(Err(json!({"error": e}))),
         };
-        if want.as_deref().is_some_and(|w| w != sched.hash) {
+        let Some(want) = want else {
+            return Ok(Err(json!({"error": "no protocol upgrade schedule hash journaled at VERIFIED (a journal from an agent before rc.27): \
+                                  the fleet never compared this node's schedule"})));
+        };
+        if want != sched.hash {
             return Ok(Err(json!({"error": "upstream.protocol_upgrades_file changed since VERIFIED", "verified": want, "now": sched.hash})));
         }
         let dest = dir.join(bid).join("upgrade.json");
@@ -1187,7 +1241,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(Ok(()));
         }
         let bytes = serde_json::to_vec_pretty(&sched.to_json()).expect("json");
-        if let Err(e) = std::fs::write(&dest, &bytes) {
+        // Atomic (review LOW-3): a crash mid-write must not leave a truncated schedule for metalgo to load.
+        let tmp = dest.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &dest)) {
             return Ok(Err(json!({"error": format!("write {}: {e}", dest.display())})));
         }
         self.journal.evidence(self.state, json!({"protocol_schedule_installed": dest.display().to_string(), "hash": sched.hash,
@@ -2529,6 +2585,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Err("this node already started its own ignition or chain creation: not a join (operator decision)".into());
         }
         let verified = self.sha256.is_some() && self.boot_hashes.0.is_some() && self.boot_hashes.1.is_some() && self.boot_hashes.2.is_some();
+        // rc.27 review (review #3): a VERIFIED journal from an agent before rc.27 carries no protocol schedule hash, so it
+        // cannot prove the same schedule as the LIVE quorum: it must re-verify (which records one) before joining.
+        let legacy = verified && crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"]["protocol_schedule_hash"].is_null();
+        if legacy && !reverify {
+            return Err("join refused: this ceremony VERIFIED with an agent before rc.27 (no protocol upgrade schedule hash \
+                        journaled), so it cannot prove the LIVE quorum's schedule: run `join --reverify`".into());
+        }
+        let verified = verified && !legacy;
         let (mut ours_override, mut reverified) = (None, None);
         if verified && reverify {
             // rc.25 review #3: a re-verification rewrites the boot artifacts in place; on a node that verified they
@@ -2694,7 +2758,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         let ours = ours_override.unwrap_or_else(|| crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"].clone());
         // Review LOW-1: the comparison only checks keys WE have; every one of the three that bind the state must be ours.
-        if let Some(k) = ["snapshot_sha256", "fingerprints_digest", "boot_genesis_sha256"].into_iter().find(|k| ours[*k].is_null()) {
+        if let Some(k) = ["snapshot_sha256", "fingerprints_digest", "boot_genesis_sha256", "protocol_schedule_hash"].into_iter().find(|k| ours[*k].is_null()) {
             return Err(format!("join refused: this node's verified evidence lacks {k}: the LIVE quorum's state cannot be matched"));
         }
         let status = self.fleet_status();

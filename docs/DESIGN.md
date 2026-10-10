@@ -346,7 +346,15 @@ of the protocol schedule (`upstream.protocol_upgrades_file`): validated with Pul
 `protocol_upgrade_margin_blocks` clear of H at ARM and at verification, its canonical hash (PulseVM's `PVMUPG01`
 encoding) is VERIFIED evidence the fleet gate and `join` compare, it is installed as `upgrade.json` next to the
 chain config, and after ignition the target's `getInfo` must report the same hash and a `supported_protocol_version`
-at least the highest scheduled one, else the ceremony halts before IGNITED.
+at least the highest scheduled one, else the ceremony halts before IGNITED (a target that does not report the fields,
+or cannot be read, halts too when any version > 1 is scheduled). rc.27 is a fleet-wide upgrade: on the upstream
+backend a peer without `protocol_schedule_hash` (an older agent) never agrees at the gate, and the gate journals
+"evidence differs from ours: protocol_schedule_hash missing" for it; a VERIFIED journal from an older agent must use
+`join --reverify`. The schedule may not schedule a version above the pinned PulseVM's `supported_protocol_version`
+(stricter than PulseVM, which allows future entries before activation), and `protocol_upgrade_margin_blocks = 0` allows
+an activation at H+1, the first new block. Past-creation evidence counts from ANY of a producer's instances, not only
+its freshest report; a report for another H that is past creation blocks a resume (agent) and is a warning on the
+board, never a clean ABORTED/STRANDED verdict.
 
 rc.25 (fleet run c1): with quorum = N the verdict flapped LIVE↔DEGRADED whenever one beacon's target read timed out,
 because the beacon then also dropped its block after the cut. The beacon keeps that block id (it never changes on one

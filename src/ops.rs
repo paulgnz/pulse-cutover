@@ -654,13 +654,14 @@ impl ChainOps for HttpOps {
 
     fn target_protocol(&self) -> Result<Option<Value>, String> {
         let body = json!({"jsonrpc": "2.0", "method": "pulsevm.getInfo", "params": {}, "id": 1});
-        let Some(url) = self.target_url() else { return Ok(None) };
-        Ok(self.post(&url, Some(body), None).ok().and_then(|v| {
-            let r = v.get("result").cloned().unwrap_or(v);
-            r.get("protocol_upgrade_schedule_hash")?.as_str()?;
-            Some(json!({"protocol_version": r["protocol_version"], "supported_protocol_version": r["supported_protocol_version"],
-                "protocol_upgrade_schedule_hash": r["protocol_upgrade_schedule_hash"], "next_protocol_upgrade": r["next_protocol_upgrade"]}))
-        }))
+        let Some(url) = self.target_url() else { return Err("no target RPC url".into()) };
+        let v = self.post(&url, Some(body), None)?;
+        let r = v.get("result").cloned().unwrap_or(v);
+        // Only a 64-hex hash counts as reported (a "" / 0 sentinel from a default response is "not reported").
+        let hash = r["protocol_upgrade_schedule_hash"].as_str()
+            .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()));
+        Ok(hash.map(|h| json!({"protocol_version": r["protocol_version"], "supported_protocol_version": r["supported_protocol_version"],
+            "protocol_upgrade_schedule_hash": h.to_ascii_lowercase(), "next_protocol_upgrade": r["next_protocol_upgrade"]})))
     }
 
     fn target_info(&self) -> Result<Option<ChainInfo>, String> {

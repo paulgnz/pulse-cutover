@@ -56,6 +56,9 @@ test('rc.27: STALLED when a quorum of LIVE members report target_live failing; c
   assert.ok(v.warnings.some((w) => w.startsWith('target chain stalled')));
   assert.equal(fleetVerdict(ev, by2(4)).verdict, 'LIVE', 'below quorum (5): still LIVE');
   assert.equal(fleetVerdict(ev, by2(0)).verdict, 'LIVE');
+  const local = Object.fromEntries(BPS.map((p) => [p, [{ report: { coord: { event_id: 'e1' }, ceremony: live({}),
+    checks: [{ name: 'target_live', ok: false, detail: 'skipped (collection time budget exhausted)' }] }, silent: false, conflict: false }]]));
+  assert.equal(fleetVerdict(ev, local).verdict, 'LIVE', 'a beacon-local skip is not a stalled chain');
 });
 
 test('rc.27: different protocol upgrade schedules or an unsupported next version are warned about', () => {
@@ -69,4 +72,15 @@ test('rc.27: different protocol upgrade schedules or an unsupported next version
   assert.ok(split.warnings.some((w) => w.includes('different protocol upgrade schedules') && w.includes('bp2')), JSON.stringify(split.warnings));
   const old = fleetVerdict(ev, byS(() => A, 1));
   assert.ok(old.warnings.some((w) => w.startsWith("bp5's PulseVM supports protocol 1")));
+});
+
+test('rc.27 review: a past-creation report for another H (any instance) is warned about and blocks a sealed verdict', () => {
+  const sealed = { state: 'ABORTED', evidence: { h: H }, source_resumed: true };
+  const foreign = { state: 'LIVE', ignition_started: true, evidence: { h: H + 999 } };
+  const byP = Object.fromEntries(BPS.map((p) => [p, [{ report: { coord: { event_id: 'e1' }, ceremony: sealed }, silent: false, conflict: false }]]));
+  assert.equal(fleetVerdict(ev, byP).verdict, 'ABORTED');
+  byP.bp2 = [{ report: { coord: { event_id: 'e1' }, ceremony: foreign }, silent: false, conflict: false }, ...byP.bp2];
+  const v = fleetVerdict(ev, byP);
+  assert.notEqual(v.verdict, 'ABORTED');
+  assert.ok(v.warnings.some((w) => w.startsWith('bp2 reports a ceremony for ANOTHER H')), JSON.stringify(v.warnings));
 });

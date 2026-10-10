@@ -81,11 +81,20 @@ pub fn members(status: &Value, co: &Coordination) -> Vec<MemberView> {
             _ => None,
         });
         let max_past = mark.filter(|m| m["past_create"].as_bool() == Some(true))
-            .map(|m| m["state"].as_str().unwrap_or("past creation").to_string());
+            .map(|m| format!("{}; relay high-water mark", m["state"].as_str().unwrap_or("past creation")));
         let bs: Vec<_> = entry.map(|p| beacons(p)).unwrap_or_default().into_iter()
             .filter(|(r, _, _)| for_event(r))
             .filter(|(r, _, _)| instance_id.as_deref().is_none_or(|id| r["instance_id"].as_str() == Some(id)))
             .collect();
+        // rc.27 review (review blocker): a blocking fact from ANY of this producer's instances counts, not only from
+        // the freshest report: another instance's newer ABORTED must not hide a past-creation report (same H, or a
+        // `foreign_past_create` kept from a report for another H).
+        let max_past = max_past.or_else(|| bs.iter().find_map(|(r, _, _)| {
+            if let Some(st) = r["foreign_past_create"].as_str() {
+                return Some(format!("{st}; a report for another H"));
+            }
+            past_create(r).then(|| format!("{}; a beacon report", r["ceremony"]["state"].as_str().unwrap_or("past creation")))
+        }));
         let usable: Vec<_> = bs.iter().filter(|(_, _, c)| !c).collect();
         let fresh = usable.iter().filter(|(_, age, _)| age.is_some_and(|a| a <= max_age)).min_by_key(|(_, age, _)| age.unwrap_or(u64::MAX));
         let last = usable.iter().min_by_key(|(_, age, _)| age.unwrap_or(u64::MAX)).map(|(r, _, _)| r.clone());
@@ -214,7 +223,7 @@ pub fn resume_guard(status: Option<&Value>, co: &Coordination, me: Option<(&str,
     }
     // First the strongest evidence: anyone ever reported past creation for this event.
     if let Some(m) = all.iter().filter(|m| !is_self(m, me)).find(|m| m.max_past.is_some()) {
-        return Err(format!("{} was reported past chain creation or ignition for this event ({}; relay high-water mark)",
+        return Err(format!("{} was reported past chain creation or ignition for this event ({})",
             m.producer, m.max_past.as_deref().unwrap_or("?")));
     }
     for m in all.iter().filter(|m| !is_self(m, me)) {
@@ -385,6 +394,8 @@ pub fn join_view(status: Option<&Value>, co: &Coordination, ours: &Value) -> Res
         let hint = if mismatches.iter().any(|m| m.contains("compare_allowed_digest missing")) {
             " (compare_allowed_digest missing: the LIVE members' beacons or the relay may predate rc.26, which a rehearsal \
              join under the compare allowlist needs)"
+        } else if mismatches.iter().any(|m| m.contains("protocol_schedule_hash missing")) {
+            " (protocol_schedule_hash missing: the LIVE members' beacons or the relay may predate rc.27)"
         } else { "" };
         return Err(format!("the LIVE members' evidence differs from this node's: {}{hint}", mismatches.join("; ")));
     }
@@ -462,9 +473,9 @@ mod tests {
         // Unknown is never "no": relay down, a peer past creation, stale, missing, no roster.
         assert!(resume_guard(None, &c, me, false).unwrap_err().contains("did not answer"));
         let past = status_me(&[("bp2", rep("HALTED", json!({})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
-        assert!(resume_guard(Some(&past), &c, me, false).unwrap_err().contains("bp2 is past"));
+        assert!(resume_guard(Some(&past), &c, me, false).unwrap_err().contains("bp2 was reported past chain creation"), "any-instance rule (rc.27 review)");
         let creating = status_me(&[("bp2", rep("VERIFIED", json!({"create_started": true})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
-        assert!(resume_guard(Some(&creating), &c, me, false).unwrap_err().contains("bp2 is past"));
+        assert!(resume_guard(Some(&creating), &c, me, false).unwrap_err().contains("bp2 was reported past chain creation"), "any-instance rule (rc.27 review)");
         let stale = status_me(&[("bp2", rep("ABORTED", json!({})), 999_000), ("bp3", rep("ABORTED", json!({})), 1000)]);
         assert!(resume_guard(Some(&stale), &c, me, false).unwrap_err().contains("stale"));
         let missing = status_me(&[("bp2", rep("ABORTED", json!({})), 1000)]);
@@ -606,6 +617,28 @@ mod tests {
         let e = resume_guard(Some(&st), &c, me, false).unwrap_err();
         assert!(e.contains("bp2 reports a ceremony for another H that is past chain creation"), "{e}");
         assert!(resume_guard(Some(&st), &c, me, true).is_err(), "a signed abort does not override it either");
+    }
+
+    /// rc.27 review (review blocker): an unpinned member with two instances, one LIVE for another H (kept as
+    /// foreign_past_create) and one fresher ABORTED for this H: the fresher report must not hide the blocker.
+    #[test]
+    fn a_fresher_instance_does_not_hide_another_instances_past_creation() {
+        let me = Some(("bp1", "i"));
+        let c = co(&["bp1", "bp2", "bp3"], 3);
+        let mut foreign_live = rep("LIVE", json!({"ignition_started": true})); foreign_live["ceremony"]["evidence"]["h"] = json!(999);
+        let mut aborted = rep("ABORTED", json!({})); aborted["ceremony"]["evidence"]["h"] = json!(100);
+        let mut st = json!({"networks": [{"id": "rehearsal", "producers": [
+            {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("ABORTED", json!({}))}]},
+            {"name": "bp2", "beacons": [{"age_ms": 5000, "report": foreign_live}, {"age_ms": 1000, "report": aborted}]},
+            {"name": "bp3", "beacons": [{"age_ms": 1000, "report": rep("ABORTED", json!({}))}]}]}]});
+        assert_eq!(drop_foreign_ceremonies(&mut st, "rehearsal", 100), 1);
+        let e = resume_guard(Some(&st), &c, me, true).unwrap_err();
+        assert!(e.contains("bp2") && e.contains("another H"), "{e}");
+        // Same H, older instance past creation, newer instance ABORTED: also blocks.
+        let st2 = status_me(&[("bp2", rep("IGNITED", json!({})), 9000), ("bp3", rep("ABORTED", json!({})), 1000)]);
+        let mut st2 = st2;
+        st2["networks"][0]["producers"][1]["beacons"].as_array_mut().unwrap().push(json!({"age_ms": 1000, "report": rep("ABORTED", json!({}))}));
+        assert!(resume_guard(Some(&st2), &c, me, true).unwrap_err().contains("bp2 was reported past chain creation"));
     }
 
     /// Review #2: another box reporting under this producer name (its own instance) does not stand in for this

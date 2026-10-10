@@ -633,27 +633,27 @@ impl ProtocolSchedule {
         if bytes.iter().all(|b| b.is_ascii_whitespace()) {
             return Ok(Self::empty());
         }
-        let v: Value = serde_json::from_slice(bytes).map_err(|e| format!("protocol upgrade schedule is not JSON: {e}"))?;
-        let root = v.as_object().ok_or("protocol upgrade schedule must be a JSON object")?;
-        if let Some(k) = root.keys().find(|k| k.as_str() != "protocol_upgrades") {
-            return Err(format!("protocol upgrade schedule: unknown field {k:?}"));
+        // The same typed shape PulseVM deserializes into (unknown AND duplicate fields rejected, u32 bounds, an
+        // explicit null list rejected), rc.27 review: a Value parse silently kept the last duplicate key.
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Root {
+            #[serde(default)]
+            protocol_upgrades: Vec<Entry>,
         }
-        let list = match root.get("protocol_upgrades") {
-            None => return Ok(Self::empty()),
-            Some(l) => l.as_array().ok_or("protocol_upgrades must be an array")?,
-        };
-        if list.len() > 1024 {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Entry {
+            protocol_version: u32,
+            activation_height: u32,
+        }
+        let root: Root = serde_json::from_slice(bytes).map_err(|e| format!("protocol upgrade schedule: {e}"))?;
+        if root.protocol_upgrades.len() > 1024 {
             return Err("protocol upgrade schedule: more than 1,024 entries".into());
         }
         let mut entries: Vec<(u32, u32)> = vec![];
-        for (i, e) in list.iter().enumerate() {
-            let o = e.as_object().ok_or_else(|| format!("protocol_upgrades[{i}] must be an object"))?;
-            if let Some(k) = o.keys().find(|k| !matches!(k.as_str(), "protocol_version" | "activation_height")) {
-                return Err(format!("protocol_upgrades[{i}]: unknown field {k:?}"));
-            }
-            let field = |k: &str| o.get(k).and_then(|x| x.as_u64()).filter(|x| *x <= u32::MAX as u64).map(|x| x as u32)
-                .ok_or_else(|| format!("protocol_upgrades[{i}].{k} must be an integer in u32 range"));
-            let (ver, height) = (field("protocol_version")?, field("activation_height")?);
+        for (i, e) in root.protocol_upgrades.iter().enumerate() {
+            let (ver, height) = (e.protocol_version, e.activation_height);
             if height <= 1 {
                 return Err(format!("protocol_upgrades[{i}]: activation height {height} (0 and 1 are rejected)"));
             }
@@ -1172,6 +1172,10 @@ mod tests {
             br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":-5}]}"#,
             br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":5000000000}]}"#,
             br#"{"upgrades":[]}"#,
+            br#"{"protocol_upgrades":null}"#,
+            br#"{"protocol_upgrades":[{"protocol_version":2,"protocol_version":3,"activation_height":10}]}"#,
+            br#"{"protocol_upgrades":[],"protocol_upgrades":[]}"#,
+            br#"{"protocol_upgrades":[{"protocol_version":2.5,"activation_height":10}]}"#,
         ] {
             assert!(ProtocolSchedule::parse(bad).is_err(), "{}", String::from_utf8_lossy(bad));
         }

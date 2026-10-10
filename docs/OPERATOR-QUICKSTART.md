@@ -90,6 +90,10 @@ from the event's signed roster and the beacons' reports (`fleet` in `GET /api/st
 | `LIVE` | at least `quorum` roster members are LIVE on **one** target chain, with the same first block after H | if your box is HALTED or STRANDED on that chain, recover onto it (`unhalt` + `run`, or `join`; see below) |
 | `DEGRADED` | a target chain may be running, but no quorum is LIVE on one chain yet | do not reopen writes by hand; wait for LIVE or for the coordinator |
 | `SPLIT` (red) | a roster member resumed the old chain after others started chain creation or ignition, the old chain's head moved after every member had paused and someone had started chain creation, or members report different target chains / different blocks after H / different blocks at one height | stop: do not reopen writes anywhere until the coordinator resolves it; the alarm names the BPs |
+Upgrading to rc.27 is fleet-wide: every BP of an event must run it (an older agent's report has no protocol
+schedule hash and never counts at an rc.27 gate). A STRANDED/ABORTED journal from an older agent joins with
+`join --reverify`.
+
 | `STALLED` (rc.27, red) | a quorum is LIVE on one chain, but a quorum of those BPs' beacons report the post-LIVE watch failing (no new block beyond `post_live_max_idle_secs` and the workload probe failing) | the new chain is not taking transactions: check validators and the `target_live` detail; it clears by itself when blocks resume |
 | `STRANDED` (rc.26) | every reporting member stopped before chain creation and is sealed (STRANDED or ABORTED), at least one STRANDED | the coordinator decides: `pulse-cutover rollback` on each STRANDED box (it re-runs the resume guard), or `join` once a quorum is LIVE |
 | `ABORTED` | every reporting member aborted before chain creation | the old chain continues; wait for a new event |

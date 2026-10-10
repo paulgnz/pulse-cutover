@@ -570,8 +570,13 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
     const ce = ceremonyFor(s?.report, ev);
     const em = eventMax?.[producer];
     const markPast = !!em && em.past_create === true && (em.event_id === undefined || em.event_id === ev.event_id);
+    // rc.27 review (review blocker): ANY instance past creation counts (not only the freshest report), and a report for
+    // another H that is past creation is surfaced: it may be a stale journal, or this event's config may be wrong.
+    const anyPast = mine.some((x) => pastCreate(ceremonyFor(x.report, ev)));
+    const foreignPast = mine.some((x) => !ceremonyFor(x.report, ev) && pastCreate(x.report?.ceremony));
     return { producer, state: ce?.state || null, fresh: !!s && !s.silent, conflict: mine.length > 0 && !usable.length,
-      missing: !s, target: ce?.target || null, resumed: resumedOldChain(ce), past: pastCreate(ce) || markPast, degraded: ce?.degraded === true,
+      missing: !s, target: ce?.target || null, resumed: resumedOldChain(ce), past: pastCreate(ce) || markPast || anyPast, foreign_past: foreignPast,
+      degraded: ce?.degraded === true,
       joined: ce?.joined === true, source_head: s?.report?.source?.head ?? null, head_at_pause: ce?.evidence?.head_at_pause ?? null,
       // rc.27: the beacon's post-LIVE watch (idle beyond post_live_max_idle_secs with the workload probe failing).
       target_live: (s?.report?.checks || []).find((c) => c?.name === 'target_live') || null,
@@ -636,6 +641,9 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
   const liveChain = best ? { chain: best[0].split('|')[0], after_cut_id: best[0].split('|')[1], members: best[1] } : null;
   // rc.27: protocol upgrade schedule warnings (not alarms: nothing has split YET, but it will at activation).
   const warnings = [];
+  for (const m of members.filter((x) => x.foreign_past)) {
+    warnings.push(`${m.producer} reports a ceremony for ANOTHER H that is past chain creation: a stale journal or a wrong event config; agents treat it as blocking (no resume) — check before any rollback`);
+  }
   const onTarget = withTarget.filter((m) => m.target.protocol_upgrade_schedule_hash);
   const schedules = [...new Set(onTarget.map((m) => m.target.protocol_upgrade_schedule_hash))];
   if (schedules.length > 1) warnings.push(`members loaded different protocol upgrade schedules: the chain splits at the next activation (${schedules.map((h) => `${h.slice(0, 12)}…: ${onTarget.filter((m) => m.target.protocol_upgrade_schedule_hash === h).map((m) => m.producer).join(', ')}`).join(' | ')})`);
@@ -651,7 +659,10 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
     // rc.27 (fleet run f1): the verdict stayed LIVE on a chain that had stopped building. A quorum of the LIVE
     // members' beacons reporting the post-LIVE watch failing (no block beyond post_live_max_idle_secs AND the
     // workload probe failing) is STALLED. It clears by itself when the watch passes again.
-    const stalled = members.filter((m) => liveChain.members.includes(m.producer) && m.fresh && m.target_live?.ok === false);
+    // A beacon-LOCAL failure (its collection budget ran out, or it cannot find the target RPC) is not evidence the
+    // chain stopped (rc.27 review).
+    const localOnly = (d) => /^(skipped|target RPC unknown)/.test(d || '');
+    const stalled = members.filter((m) => liveChain.members.includes(m.producer) && m.fresh && m.target_live?.ok === false && !localOnly(m.target_live.detail));
     verdict = stalled.length >= quorum ? 'STALLED' : 'LIVE';
     if (verdict === 'STALLED') warnings.push(`target chain stalled: ${stalled.map((m) => `${m.producer}: ${m.target_live.detail || 'target_live failing'}`).join('; ')}`);
   }
@@ -659,9 +670,9 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
   // rc.26 (fleet run d3): every reporting member sealed (STRANDED, or ABORTED), at least one STRANDED, nobody past
   // creation: the fleet stopped and waits for an operator decision (rollback or join); PENDING read as "nothing yet".
   // Review M3: a fleet-wide claim needs every member present and fresh; otherwise PENDING with who is unaccounted for.
-  else if (members.length && members.every((m) => !m.missing && m.fresh && ['STRANDED', 'ABORTED'].includes(m.state))
+  else if (members.length && !members.some((m) => m.foreign_past) && members.every((m) => !m.missing && m.fresh && ['STRANDED', 'ABORTED'].includes(m.state))
     && members.some((m) => m.state === 'STRANDED')) verdict = 'STRANDED';
-  else if (members.length && members.filter((m) => !m.missing).every((m) => m.state === 'ABORTED') && members.some((m) => !m.missing)) verdict = 'ABORTED';
+  else if (members.length && !members.some((m) => m.foreign_past) && members.filter((m) => !m.missing).every((m) => m.state === 'ABORTED') && members.some((m) => !m.missing)) verdict = 'ABORTED';
   else verdict = 'PENDING';
   const unaccounted = members.filter((m) => m.missing || !m.fresh).map((m) => `${m.producer}: ${m.missing ? 'no report' : `silent (${m.state || '?'})`}`);
   const notLive = !liveChain && verdict !== 'SPLIT' ? unaccounted : liveChain ? members.filter((m) => !liveChain.members.includes(m.producer)).map((m) => `${m.producer}: ${m.missing ? 'no report' : m.conflict ? 'identity conflict' : !m.fresh ? `silent (${m.state || '?'})` : m.state}`) : [];

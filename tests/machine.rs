@@ -3857,6 +3857,12 @@ fn rc27_protocol_upgrade_schedule_is_validated_installed_and_checked_on_the_targ
     assert!(run_machine_result(&cfg, &ops).unwrap_err().contains("does not match"));
     assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("cannot execute the scheduled protocol version"));
 
+    // Review HIGH-1: a target that does not report protocol fields (an older PulseVM) cannot run a scheduled v2: halt.
+    let (dir, cfg) = setup(FAR);
+    let ops = upstream_ops(dir.path());
+    assert!(run_machine_result(&cfg, &ops).unwrap_err().contains("does not match"));
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("predates protocol schedules"));
+
     // An activation too close to the cut (H = 120, default margin 100,000): refused before anything freezes.
     let (dir, cfg) = setup(r#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":5000}]}"#);
     let ops = upstream_ops(dir.path());
@@ -3872,6 +3878,37 @@ fn rc27_protocol_upgrade_schedule_is_validated_installed_and_checked_on_the_targ
     let _ = run_machine_result(&cfg, &ops);
     assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("unknown field"));
     assert!(transition(&journal_entries(&cfg), "FROZEN").is_none());
+}
+
+/// rc.27 review (review #3): a VERIFIED journal written before rc.27 has no protocol schedule hash; a plain join must
+/// not treat that as agreement with the LIVE quorum's schedule.
+#[test]
+fn rc27_join_refuses_a_legacy_verified_journal_without_a_schedule_hash() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_upstream_fleet(d.path());
+    let ops = upstream_ops(d.path());
+    ops.coord_down.set(true);
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    let good = pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"].clone();
+    assert!(good["protocol_schedule_hash"].is_string());
+    // Rewrite the journal as an rc.26 agent would have written it: same records, no protocol_schedule_hash.
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let legacy: Vec<String> = text.lines().map(|l| {
+        let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+        if let Some(o) = v["data"].as_object_mut() { o.remove("protocol_schedule_hash"); }
+        serde_json::to_string(&v).unwrap()
+    }).collect();
+    std::fs::write(&cfg.journal_path, legacy.join("\n") + "\n").unwrap();
+    assert!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"]["protocol_schedule_hash"].is_null());
+    ops.coord_down.set(false);
+    *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&good, &["bp2", "bp3", "bp4", "bp5"]));
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let e = Machine::new(&cfg, &ops, j, rec).join_with("e1", false).unwrap_err();
+    assert!(e.contains("before rc.27") && e.contains("--reverify"), "{e}");
+    // --reverify records the schedule hash (after the quorum matched) and joins.
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert_eq!(Machine::new(&cfg, &ops, j, rec).join_with("e1", true).unwrap(), State::Live);
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"]["protocol_schedule_hash"], good["protocol_schedule_hash"]);
 }
 
 #[test]
@@ -4860,17 +4897,17 @@ fn rc23_a_peer_past_creation_strands_and_force_stranded_is_an_operator_override(
         ("bp3", serde_json::json!({"state": "VERIFIED"})), ("bp4", serde_json::json!({"state": "VERIFIED"})), ("bp5", serde_json::json!({"state": "VERIFIED"}))]));
     assert_eq!(run_machine(&cfg, &ops), State::Stranded);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
-    assert!(text.contains("bp2 is past chain creation or ignition (IGNITED)"), "{text}");
+    assert!(text.contains("bp2 was reported past chain creation or ignition for this event (IGNITED; a beacon report)"), "{text}");
     assert_eq!(ops.resumes.get(), 0);
     let (j, rec) = open_journal(&cfg.journal_path);
-    assert!(Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).unwrap_err().contains("bp2 is past"));
+    assert!(Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).unwrap_err().contains("bp2 was reported past chain creation"));
     let (j, rec) = open_journal(&cfg.journal_path);
     let out = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, true).unwrap();
     assert_eq!(out.state, State::Aborted);
     assert_eq!(ops.resumes.get(), 1, "--force-stranded: the operator's fleet-wide decision resumes the old chain");
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(text.contains("overridden by the operator (--force-stranded --i-understand)") && text.contains("overridden_fleet_view")
-        && text.contains("bp2 is past"), "review #10: the overridden view is journaled");
+        && text.contains("bp2 was reported past chain creation"), "review #10: the overridden view is journaled");
 }
 
 #[test]
@@ -4902,7 +4939,7 @@ fn rc23_signed_abort_resumes_only_with_every_member_accounted_for() {
     // A peer past creation.
     let (st, _, text) = run(peers(&[("bp2", "HALTED"), ("bp3", "VERIFIED"), ("bp4", "VERIFIED"), ("bp5", "VERIFIED")]));
     assert_eq!(st, State::Stranded);
-    assert!(text.contains("bp2 is past chain creation"), "{text}");
+    assert!(text.contains("bp2 was reported past chain creation"), "{text}");
     // A peer whose IGNITED entry was replaced by a new silent-instance report: the relay's high-water mark still
     // shows it past creation.
     let mut doc = peers(&[("bp2", "VERIFIED"), ("bp3", "VERIFIED"), ("bp4", "VERIFIED"), ("bp5", "VERIFIED")]);
@@ -5394,7 +5431,7 @@ fn rc23_second_guard_pass_waits_a_beacon_cycle_and_sees_a_late_create_started() 
     assert_eq!(ops.resumes.get(), 0);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(text.contains(r#""settle_before_second_guard_ms":10000"#), "{text}");
-    assert!(text.contains("bp4 is past chain creation"), "{text}");
+    assert!(text.contains("bp4 was reported past chain creation"), "{text}");
     assert!(ops.now.get() - t0 >= 10_000, "the settle really waited (mock clock)");
 }
 
