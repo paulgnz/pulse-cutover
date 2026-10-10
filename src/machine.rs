@@ -1124,6 +1124,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     // `evidence.h`), not the cut height (an inexact rehearsal cut would drop every peer).
                     if let Some(h) = self.resolved_h {
                         crate::fleet::drop_foreign_ceremonies(&mut doc, &co.network, h);
+                        crate::fleet::annotate_evidence(&mut doc, &co.network, co.event_id.as_deref(), h);
                     }
                     return Some(doc);
                 }

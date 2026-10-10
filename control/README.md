@@ -109,7 +109,13 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   Marks (`event_max`) are progress bookkeeping only, kept for coordinator-signed events. After confirming THAT target is
   fenced, retire exactly one observation on the mission-control host:
   `curl -X POST 'http://127.0.0.1:8787/api/admin/retire-evidence?net=<net>&producer=<bp>&id=<id>'` (`&overflow=1` for the
-  flag; loopback only, like clear-split). rc.27 `foreign_past` records are migrated into the log on load.
+  flag; loopback only, like clear-split). What blocks an event: its own observations (any H), any event's observations
+  at the SAME H (an unfenced earlier target at this cut), and unattributed ones (no event id: quarantined, block every
+  event). Logged = past state, or creation / ignition / a join started, also on an ABORTED report. Retiring the last
+  observation of an event also clears that event's `past_create` mark (the log is authoritative). On the first rc.28
+  start, rc.27 `foreign_past` records and ordinary `past_create` marks are migrated into the log; a malformed evidence
+  log refuses startup; after a failed state write every later change is refused until a restart. `event_max` in
+  `/api/status` also carries a derived `foreign_past` per event for rc.27 agents.
   rc.23 state files (marks without these fields) load unchanged. A SPLIT is **latched** in the coordination store for that event and stays red, whatever the
   reports say later, until an operator clears it after the split is resolved. On the mission-control host itself:
   `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-split?net=<net>'` (use the port mission control listens on).

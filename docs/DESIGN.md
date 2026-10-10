@@ -363,7 +363,10 @@ resume guard blocks on any observation for its event (any H) and on an overflowe
 observation as past creation and another-H ones or overflow as warnings that rule out a clean ABORTED/STRANDED.
 Retiring evidence is an explicit operator act on the mission-control host, after checking THAT target is fenced:
 `POST /api/admin/clear-server` (an obsolete instance) and `POST /api/admin/retire-evidence?net=&producer=&id=` (exactly
-one observation, by id; `&overflow=1` for the flag); every other observation keeps blocking. Until then a
+one observation, by id; `&overflow=1` for the flag); every other observation keeps blocking. Observations at this
+event's H from another event, and unattributed ones (no event id, quarantined), block too; a report that is ABORTED
+after creation / ignition / a join started is logged; retiring an event's last observation clears its `past_create`
+mark; a malformed log refuses startup, and after a failed write the relay refuses changes until restarted. Until then a
 STRANDED agent stays sealed (or the operator records a fleet decision with `rollback --force-stranded`). The
 post-ignition protocol check uses the schedule VERIFIED journaled (entries, highest version, emptiness), never the
 file as it is now; a JSON-RPC error from getInfo is retried like a transport failure (5 reads, up to ~80 s with the

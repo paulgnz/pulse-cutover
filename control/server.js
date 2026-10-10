@@ -459,8 +459,9 @@ function loadServerState() {
               state: typeof x.state === 'string' ? x.state.slice(0, 16) : null, at: Number.isFinite(x.at) ? x.at : 0 };
             if (Number.isInteger(x.rank) && x.rank >= 0 && x.rank <= MAX_RANK) mark.rank = x.rank;
             if (height(x.src_first) && height(x.src_max) && x.src_max >= x.src_first) { mark.src_first = x.src_first; mark.src_max = x.src_max; }
-            // rc.27 foreign_past records migrate into the rc.28 creation-evidence log (kept, never dropped).
-            const fl = Array.isArray(x.foreign_past) ? x.foreign_past : x.foreign_past && typeof x.foreign_past === 'object' ? [x.foreign_past] : [];
+            // rc.27 foreign_past records migrate into the rc.28 creation-evidence log (kept, never dropped); only on the
+            // first rc.28 start (no evidence log in the file yet).
+            const fl = j.evidence !== undefined ? [] : Array.isArray(x.foreign_past) ? x.foreign_past : x.foreign_past && typeof x.foreign_past === 'object' ? [x.foreign_past] : [];
             for (const f of fl.filter((f) => f && typeof f === 'object')) {
               const log = ((evidence[netId] ||= dict())[prod] ||= { seq: 0, obs: [], overflow: false });
               if (log.obs.length >= EVIDENCE_MAX) { log.overflow = true; continue; }
@@ -468,33 +469,49 @@ function loadServerState() {
                 instance_id: typeof f.instance_id === 'string' && /^[0-9a-f]{32}$/.test(f.instance_id) ? f.instance_id : null, target_bid: null, after_cut_id: null,
                 at: Number.isFinite(f.at) ? f.at : 0, migrated: 'rc.27 foreign_past' });
             }
-            if (x.foreign_overflow === true) (((evidence[netId] ||= dict())[prod] ||= { seq: 0, obs: [], overflow: false }).overflow = true);
+            if (j.evidence === undefined && x.foreign_overflow === true) (((evidence[netId] ||= dict())[prod] ||= { seq: 0, obs: [], overflow: false }).overflow = true);
             ((eventMax[netId] ||= dict())[prod] ||= dict())[eid] = mark;
           }
         }
       }
     }
-    if (j.evidence && typeof j.evidence === 'object') {
-      const height = (v) => Number.isSafeInteger(v) && v >= 0;
-      const idish = (v, re) => (typeof v === 'string' && re.test(v) ? v : null);
+    if (j.evidence !== undefined) {
+      // Strict (rc.28 review): an evidence container or observation that does not parse refuses startup rather than
+      // loading as "no evidence"; ids must be unique positive integers.
+      const height = (v) => v === null || (Number.isSafeInteger(v) && v >= 0);
+      const opt = (v, re) => v === null || v === undefined || (typeof v === 'string' && re.test(v));
+      if (!j.evidence || typeof j.evidence !== 'object' || Array.isArray(j.evidence)) throw new Error('evidence: not an object');
       for (const [netId, prods] of Object.entries(j.evidence)) {
-        if (!RE.net.test(netId) || !prods || typeof prods !== 'object') continue;
+        if (!RE.net.test(netId) || !prods || typeof prods !== 'object' || Array.isArray(prods)) throw new Error(`evidence.${netId}`);
         for (const [prod, log] of Object.entries(prods)) {
-          if (!RE.producer.test(prod) || !log || typeof log !== 'object') continue;
-          const cur = ((evidence[netId] ||= dict())[prod] ||= { seq: 0, obs: [], overflow: false });
-          // An entry that does not parse is kept as an unknown-height observation: evidence is never dropped on load.
-          for (const o of (Array.isArray(log.obs) ? log.obs : [])) {
-            if (cur.obs.length >= EVIDENCE_MAX) { cur.overflow = true; break; }
-            const ok = o && typeof o === 'object';
-            cur.obs.push({ id: ok && Number.isSafeInteger(o.id) && o.id > 0 ? o.id : cur.seq + 1,
-              event_id: ok ? idish(o.event_id, /^[\w.:-]{1,64}$/) : null, h: ok && height(o.h) ? o.h : null,
-              state: ok && typeof o.state === 'string' ? o.state.slice(0, 16) : 'past creation',
-              instance_id: ok ? idish(o.instance_id, /^[0-9a-f]{32}$/) : null, target_bid: ok ? idish(o.target_bid, /^[1-9A-HJ-NP-Za-km-z]{20,64}$/) : null,
-              after_cut_id: ok ? idish(o.after_cut_id, /^[0-9a-f]{64}$/) : null, at: ok && Number.isFinite(o.at) ? o.at : 0 });
-            cur.seq = Math.max(cur.seq, cur.obs[cur.obs.length - 1].id);
-          }
-          cur.seq = Math.max(cur.seq, Number.isSafeInteger(log.seq) ? log.seq : 0);
-          if (log.overflow === true) cur.overflow = true;
+          const where = `evidence.${netId}.${prod}`;
+          if (!RE.producer.test(prod) || !log || typeof log !== 'object' || !Array.isArray(log.obs) || !Number.isSafeInteger(log.seq)
+            || typeof log.overflow !== 'boolean' || log.obs.length > EVIDENCE_MAX) throw new Error(where);
+          const ids = new Set();
+          const obs = log.obs.map((o, i) => {
+            if (!o || typeof o !== 'object' || !Number.isSafeInteger(o.id) || o.id < 1 || o.id > log.seq || ids.has(o.id)
+              || !opt(o.event_id, /^[\w.:-]{1,64}$/) || !height(o.h ?? null) || typeof o.state !== 'string'
+              || !opt(o.instance_id, /^[0-9a-f]{32}$/) || !opt(o.target_bid, /^[1-9A-HJ-NP-Za-km-z]{20,64}$/)
+              || !opt(o.after_cut_id, /^[0-9a-f]{64}$/)) throw new Error(`${where}.obs[${i}]`);
+            ids.add(o.id);
+            return { id: o.id, event_id: o.event_id ?? null, h: o.h ?? null, state: o.state.slice(0, 16), instance_id: o.instance_id ?? null,
+              target_bid: o.target_bid ?? null, after_cut_id: o.after_cut_id ?? null, at: Number.isFinite(o.at) ? o.at : 0,
+              ...(typeof o.migrated === 'string' ? { migrated: o.migrated.slice(0, 40) } : {}) };
+          });
+          ((evidence[netId] ||= dict())[prod] = { seq: log.seq, obs, overflow: log.overflow });
+        }
+      }
+    } else {
+      // (2) First rc.28 start on an rc.27 state file: every ordinary past_create mark becomes an observation too
+      // (event kept, H and target unknown), so trimming a mark can no longer erase creation evidence. Runs only when
+      // the file has no evidence log yet, and the next save writes one: repeat-safe.
+      for (const [netId, prods] of Object.entries(eventMax)) for (const [prod, marks] of Object.entries(prods)) {
+        for (const [eid, m] of Object.entries(marks)) {
+          if (m.past_create !== true) continue;
+          const log = ((evidence[netId] ||= dict())[prod] ||= { seq: 0, obs: [], overflow: false });
+          if (log.obs.length >= EVIDENCE_MAX) { log.overflow = true; continue; }
+          log.obs.push({ id: ++log.seq, event_id: eid, h: null, state: m.state || 'past creation', instance_id: null, target_bid: null,
+            after_cut_id: null, at: m.at || 0, migrated: 'rc.27 past_create mark' });
         }
       }
     }
@@ -535,11 +552,33 @@ function trimMarks(next, netId, keepId) {
   while (Object.keys(next).length > EVENT_MAX_KEEP && ids.length) delete next[ids.shift()];
   return next;
 }
+/**
+ * rc.27 agents read durable foreign evidence only from `event_max.<event>.foreign_past` (a non-empty list blocks). The
+ * status output derives it from the creation-evidence log, every observation of an event as a block for that event,
+ * so an rc.27 agent under an rc.28 relay keeps its durable block. Output only; nothing is stored in the marks.
+ */
+function compatMarks(marks, log) {
+  if (!log?.obs?.length && !log?.overflow) return marks || null;
+  const out = dict();
+  for (const [id, m] of Object.entries(marks || {})) out[id] = { ...m };
+  for (const o of log.obs || []) {
+    if (!o.event_id) continue;
+    const m = (out[o.event_id] ||= { past_create: false, state: null, at: o.at || 0 });
+    (m.foreign_past ||= []).push({ state: o.state, h: o.h, instance_id: o.instance_id, at: o.at });
+  }
+  if (log.overflow) for (const m of Object.values(out)) m.foreign_overflow = true;
+  return out;
+}
 /** Was this event id published (signed) by the network's coordinator? Only those get marks. */
 const signedEvent = (netId, evId) => !!coord[netId]?.used && own(coord[netId].used, evId);
+// rc.28 review: a failed write may still have committed (e.g. the directory fsync failed AFTER the rename); memory may
+// now be older than the file. Every later mutation is refused until a restart reloads the file, so stale memory can
+// never overwrite recorded evidence.
+let serverStateUncertain = false;
 function commitServers(override, lastOverride, emOverride, evOverride) {
+  if (serverStateUncertain) { console.error('servers: state uncertain after a failed write; restart mission control to reload it'); return false; }
   try { atomicWrite(STATE_FILE, serverSnapshot(override, lastOverride, emOverride, evOverride)); return true; }
-  catch (e) { console.error(`servers: persist failed (${e.message}); change NOT accepted`); return false; }
+  catch (e) { serverStateUncertain = true; console.error(`servers: persist failed (${e.message}); change NOT accepted; further changes refused until restart`); return false; }
 }
 /** One token = one machine: every entry of a token is in conflict while the token has more than one entry. */
 function recomputeConflicts(byKey, tok) {
@@ -665,7 +704,9 @@ function status() {
       const c = chain[n.id] || {};
       const reported = nodes[n.id] || {};
       const reg = registry[n.id]?.producers || {};
-      const names = [...new Set([...Object.keys(reg), ...(c.schedule || []), ...Object.keys(reported)])];
+      // rc.28: a producer with creation evidence or marks is listed even when it no longer reports (its evidence is shown).
+      const names = [...new Set([...Object.keys(reg), ...(c.schedule || []), ...Object.keys(reported),
+        ...Object.keys(evidence[n.id] || {}), ...Object.keys(eventMax[n.id] || {})])];
       const geo = n.geo || {};
       let serversAll = 0, serversLive = 0, serversReady = 0, serversConflict = 0; const states = {};
       const producers = names.map((name) => {
@@ -690,7 +731,7 @@ function status() {
           silent: r ? beacons.some((b) => b.silent) : null, age_ms: age, report: r?.report || null, beacons,
           // rc.23: the relay's per-event high-water mark for this producer (read by the agents' resume guard).
           // {event_id: {past_create, state, at}} for the last event ids this producer reported.
-          event_max: eventMax[n.id]?.[name] || null,
+          event_max: compatMarks(eventMax[n.id]?.[name], evidence[n.id]?.[name]),
           // rc.28: the creation-evidence log (read by the agents' resume guard and the fleet verdict).
           creation_evidence: evidence[n.id]?.[name] || null };
       }).sort((a, b) => (b.scheduled - a.scheduled) || ((a.rank || 999) - (b.rank || 999)) || a.name.localeCompare(b.name));
@@ -896,17 +937,26 @@ async function handle(req, res) {
     if (!RE.net.test(netId || '') || !RE.producer.test(prod || '') || !(ov || /^\d{1,12}$/.test(idq || ''))) return send(res, 400, { error: 'need ?net=&producer=&id=<observation id> (or &overflow=1)' });
     const log = evidence[netId]?.[prod];
     if (!log) return send(res, 404, { error: 'no creation evidence for that producer' });
-    let next;
+    let next, retiredEvent = null;
     if (ov) {
       if (!log.overflow) return send(res, 404, { error: 'the log has no overflow flag', observations: log.obs });
       next = { ...log, overflow: false };
     } else {
       const id = Number(idq);
-      if (!log.obs.some((o) => o.id === id)) return send(res, 404, { error: 'no such observation id', observations: log.obs });
+      const hits = log.obs.filter((o) => o.id === id);
+      if (hits.length !== 1) return send(res, hits.length ? 409 : 404, { error: hits.length ? 'ambiguous observation id' : 'no such observation id', observations: log.obs });
       next = { ...log, obs: log.obs.filter((o) => o.id !== id) };
+      retiredEvent = hits[0].event_id;
     }
-    if (!commitServers(null, null, null, [netId, prod, next])) return send(res, 503, { error: 'could not persist; nothing changed' });
+    // The log is authoritative for creation evidence (review): when the last observation of an event is retired, that
+    // event's mark stops saying past creation (rank and movement fields stay: they are progress, not creation evidence).
+    let em = null;
+    if (retiredEvent && !next.obs.some((o) => o.event_id === retiredEvent) && eventMax[netId]?.[prod]?.[retiredEvent]?.past_create) {
+      em = Object.assign(dict(), eventMax[netId][prod], { [retiredEvent]: { ...eventMax[netId][prod][retiredEvent], past_create: false } });
+    }
+    if (!commitServers(null, null, em ? [netId, prod, em] : null, [netId, prod, next])) return send(res, 503, { error: 'could not persist; nothing changed' });
     evidence[netId][prod] = next;
+    if (em) eventMax[netId][prod] = em;
     pushEvent(netId, 'operator', `retired ${ov ? 'the overflow flag' : `creation evidence #${idq}`} for ${prod}; ${next.obs.length} observation(s) remain${next.overflow ? ' + overflow' : ''}`);
     return send(res, 200, { ok: true, remaining: next.obs, overflow: next.overflow });
   }

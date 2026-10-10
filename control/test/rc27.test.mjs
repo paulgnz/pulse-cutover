@@ -133,3 +133,49 @@ test('rc.28: an older event\'s ordinary creation evidence is not trimmed by newe
   assert.deepEqual(lg.obs.filter((o) => o.event_id === 'ev-1').map((o) => o.target_bid.slice(11, 12)), ['A', 'B']);
   await kill(proc);
 });
+
+test('rc.28 review: ABORTED with ignition started is logged; an unattributed report is quarantined; retiring the last observation clears the event mark', async () => {
+  const dir = setup();
+  let { base, proc } = await start(dir);
+  assert.equal((await EVPOST(base, { event_id: 'ev-1', h: CUT })).status, 200);
+  const send = reporter(base, Date.now() - 120e3);
+  // A forced rollback after ignition: the only report is ABORTED + ignition_started.
+  assert.equal((await send('bpa', 'ev-1', { state: 'ABORTED', ignition_started: true, forced_rollback: true, evidence: { h: CUT } })).status, 200);
+  let lg = await evlog(base);
+  assert.deepEqual(lg.obs.map((o) => [o.id, o.state, o.event_id]), [[1, 'ABORTED', 'ev-1']]);
+  // An unattributed LIVE report (no coord): kept, and it blocks a clean verdict for ev-1.
+  const r = await fetch(`${base}/api/report`, { method: 'POST', headers: { authorization: `Bearer ${TOK.bpb}` },
+    body: JSON.stringify({ ...fixture(), producer: 'bpb', network: 'testnet', role: 'producer', instance_id: 'b'.repeat(32), ts: new Date(Date.now() - 1000).toISOString(),
+      source: { head: CUT, lib: CUT, chain_id: CHAIN }, coord: null, ceremony: { ...fixture().ceremony, state: 'LIVE', ignition_started: true, evidence: { h: CUT + 5 } } }) });
+  assert.equal(r.status, 200);
+  assert.equal((await evlog(base, 'bpb')).obs[0].event_id, null);
+  let n = await net(base);
+  assert.notEqual(n.fleet.verdict, 'ABORTED');
+  // bpa: retiring its only ev-1 observation also clears ev-1's past_create mark (the log is authoritative).
+  const mark0 = n.producers.find((p) => p.name === 'bpa').event_max['ev-1'];
+  assert.equal(mark0.past_create, false, 'ABORTED+ignition is not a past state for the mark (pastCreate), only for the log');
+  assert.equal((await retire(base, 'id=1')).status, 200);
+  await kill(proc);
+});
+
+test('rc.28 review: a legacy rc.27 file migrates ordinary past_create marks; malformed or duplicate-id evidence refuses startup', async () => {
+  const dir = setup();
+  writeFileSync(join(dir, 'state', 'servers.json'), JSON.stringify({ v: 1, lastTs: {}, nodes: {}, event_max: { testnet: {
+    bpa: { 'ev-1': { past_create: true, state: 'LIVE', at: 5 } } } } }));
+  let { base, proc } = await start(dir);
+  assert.equal((await EVPOST(base, { event_id: 'ev-2', h: CUT })).status, 200); // a roster, so bpa is listed
+  const lg = await evlog(base);
+  assert.deepEqual(lg.obs.map((o) => [o.event_id, o.h, o.state, o.migrated]), [['ev-1', null, 'LIVE', 'rc.27 past_create mark']]);
+  await kill(proc);
+  ({ base, proc } = await start(dir));
+  assert.equal((await evlog(base)).obs.length, 1, 'repeat-safe: not migrated twice');
+  await kill(proc);
+  const bad = (evidence) => { const d = setup(); writeFileSync(join(d, 'state', 'servers.json'), JSON.stringify({ v: 1, lastTs: {}, nodes: {}, event_max: {}, evidence })); return d; };
+  for (const ev of [
+    { testnet: { bpa: { seq: 1, obs: { x: 1 }, overflow: false } } },
+    { testnet: { bpa: { seq: 1, obs: [null], overflow: false } } },
+    { testnet: { bpa: { seq: 2, obs: [{ id: 1, event_id: 'ev-1', h: 1, state: 'LIVE' }, { id: 1, event_id: 'ev-1', h: 2, state: 'LIVE' }], overflow: false } } },
+  ]) {
+    await assert.rejects(start(bad(ev)), /exited 3|Refusing to start/, JSON.stringify(ev));
+  }
+});

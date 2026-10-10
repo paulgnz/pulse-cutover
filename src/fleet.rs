@@ -102,8 +102,13 @@ pub fn members(status: &Value, co: &Coordination) -> Vec<MemberView> {
         // any observation for THIS event, or an overflowed log, is past-creation evidence until an operator retires it.
         let max_past = max_past.or_else(|| {
             let log = entry.map(|p| &p["creation_evidence"])?;
-            let obs: Vec<&Value> = log["obs"].as_array().map(|a| a.iter()
-                .filter(|o| event.is_none_or(|e| o["event_id"].as_str() == Some(e))).collect()).unwrap_or_default();
+            // `blocking` (set by annotate_evidence with this event's H) when present: same event, same H, or no event
+            // at the same/unknown H. Otherwise this event's observations.
+            let obs: Vec<&Value> = match log["blocking"].as_array() {
+                Some(b) => b.iter().collect(),
+                None => log["obs"].as_array().map(|a| a.iter()
+                    .filter(|o| o["event_id"].is_null() || event.is_none_or(|e| o["event_id"].as_str() == Some(e))).collect()).unwrap_or_default(),
+            };
             if let Some(o) = obs.first() {
                 return Some(format!("{}; creation evidence #{} at H {}{}, relay log", o["state"].as_str().unwrap_or("past creation"),
                     o["id"].as_u64().unwrap_or(0), o["h"].as_u64().map(|h| h.to_string()).unwrap_or_else(|| "?".into()),
@@ -176,6 +181,26 @@ pub fn drop_foreign_ceremonies(status: &mut Value, network: &str, h: u64) -> usi
         }
     }
     dropped
+}
+
+/// rc.28 review: which of each producer's creation-evidence observations block a resume for (`event`, `h`): this
+/// event's (any H), any event's at the SAME H (an unfenced target from an aborted earlier event at this cut competes
+/// with this one), and those without an event id at the same or an unknown H. Written as `creation_evidence.blocking`.
+pub fn annotate_evidence(status: &mut Value, network: &str, event: Option<&str>, h: u64) {
+    let Some(nets) = status["networks"].as_array_mut() else { return };
+    for net in nets.iter_mut().filter(|n| n["id"].as_str() == Some(network)) {
+        let Some(prods) = net["producers"].as_array_mut() else { continue };
+        for p in prods.iter_mut() {
+            let log = &mut p["creation_evidence"];
+            let Some(obs) = log["obs"].as_array() else { continue };
+            let blocking: Vec<Value> = obs.iter().filter(|o| {
+                let (oe, oh) = (o["event_id"].as_str(), o["h"].as_u64());
+                // Unattributed (no event id) is quarantined: blocks every event until retired (rc.28 review).
+                (event.is_some() && oe == event) || oh == Some(h) || oe.is_none()
+            }).cloned().collect();
+            log["blocking"] = Value::Array(blocking);
+        }
+    }
 }
 
 /// A report is past the point where resuming the old chain is safe: creation, a join or ignition
@@ -707,6 +732,25 @@ mod tests {
         assert!(e.contains("bp2") && e.contains("creation evidence #3 at H 999"), "{e}");
         st["networks"][0]["producers"][1]["creation_evidence"] = json!({"seq": 9, "overflow": true, "obs": []});
         assert!(resume_guard(Some(&st), &c, me, true).unwrap_err().contains("overflowed"));
+    }
+
+    /// rc.28 review: an observation from ANOTHER event at the same H blocks (an unfenced earlier target at this cut);
+    /// one at another H for another event does not; a null-event one at the same or unknown H does.
+    #[test]
+    fn evidence_at_the_same_h_blocks_across_events() {
+        let me = Some(("bp1", "i"));
+        let c = co(&["bp1", "bp2", "bp3"], 3);
+        let base = status_me(&[("bp2", rep("ABORTED", json!({})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
+        let with = |obs: Value| {
+            let mut st = base.clone();
+            st["networks"][0]["producers"][1]["creation_evidence"] = json!({"seq": 1, "overflow": false, "obs": [obs]});
+            annotate_evidence(&mut st, "rehearsal", Some("e1"), 100);
+            st
+        };
+        assert!(resume_guard(Some(&with(json!({"id": 1, "event_id": "ev-0", "h": 100, "state": "IGNITED"}))), &c, me, true).is_err());
+        assert!(resume_guard(Some(&with(json!({"id": 1, "event_id": "ev-0", "h": 50, "state": "IGNITED"}))), &c, me, true).is_ok());
+        assert!(resume_guard(Some(&with(json!({"id": 1, "event_id": null, "h": null, "state": "LIVE"}))), &c, me, true).is_err());
+        assert!(resume_guard(Some(&with(json!({"id": 1, "event_id": null, "h": 50, "state": "LIVE"}))), &c, me, true).is_err(), "unattributed: quarantined");
     }
 
     /// Review #2: another box reporting under this producer name (its own instance) does not stand in for this

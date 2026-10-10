@@ -552,21 +552,35 @@ export function nextEventMark(cur, ce, sourceHead, armed, now) {
 export const EVIDENCE_MAX = 128;
 const obsKey = (o) => [o.event_id, o.h, o.instance_id, o.target_bid, o.after_cut_id].map((x) => x ?? '').join('|');
 /** The next log for a producer after an accepted report (null = unchanged). */
+/** The agents' definition of creation evidence (src/fleet.rs past_create): a past state, or creation / ignition / a
+ *  join started, INCLUDING on an ABORTED report (a failed or force-rolled-back creation may have left a target). */
+export const creationEvidence = (ce) => !!ce && (PAST.includes(ce.state) || ce.create_started === true || ce.ignition_started === true
+  || ce.joined === true || ce.forced_rollback === true);
 export function nextEvidence(cur, report, now) {
   const raw = report?.ceremony;
-  if (!raw || !pastCreate(raw)) return null;
+  if (!raw || !creationEvidence(raw)) return null;
   const log = { seq: Number.isSafeInteger(cur?.seq) ? cur.seq : 0, obs: Array.isArray(cur?.obs) ? cur.obs : [], overflow: cur?.overflow === true };
   const o = { event_id: typeof report.coord?.event_id === 'string' ? report.coord.event_id.slice(0, 64) : null,
     h: Number.isSafeInteger(raw.evidence?.h) ? raw.evidence.h : null, state: String(raw.state || 'past creation').slice(0, 16),
     instance_id: report.instance_id || null, target_bid: raw.target?.blockchain_id || null, after_cut_id: raw.target?.after_cut_id || null };
   if (log.obs.some((x) => obsKey(x) === obsKey(o))) return null;
+  // The same ceremony before its target was readable (no target fields) and after: one observation, completed in place.
+  const early = log.obs.findIndex((x) => x.event_id === o.event_id && x.h === o.h && x.instance_id === o.instance_id && !x.target_bid && !x.after_cut_id);
+  if (early >= 0 && (o.target_bid || o.after_cut_id)) {
+    const obs = log.obs.slice(); obs[early] = { ...obs[early], target_bid: o.target_bid, after_cut_id: o.after_cut_id };
+    return { ...log, obs };
+  }
   if (log.obs.length >= EVIDENCE_MAX) return log.overflow ? null : { ...log, overflow: true };
   const id = log.seq + 1;
   return { seq: id, obs: [...log.obs, { id, ...o, at: now }], overflow: log.overflow };
 }
 /** A producer's unresolved observations for one event (any H), and whether its log overflowed. */
-export function evidenceFor(log, eventId) {
-  const obs = (Array.isArray(log?.obs) ? log.obs : []).filter((o) => o && o.event_id === eventId);
+export function evidenceFor(log, eventId, h = null) {
+  // This event's observations, any event's at the SAME H, and unattributed ones (the agents' rule, src/fleet.rs
+  // annotate_evidence).
+  // Unattributed observations (no event id) are quarantined: they block every event until retired (review).
+  const obs = (Array.isArray(log?.obs) ? log.obs : []).filter((o) => o && (o.event_id === eventId
+    || (Number.isInteger(h) && o.h === h) || o.event_id === null || o.event_id === undefined));
   return { obs, overflow: log?.overflow === true };
 }
 /**
@@ -604,7 +618,7 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}) {
     // rc.28: the creation-evidence log (durable, every instance, every H): same-H observations are past creation;
     // observations for another H (a stale journal or a wrong event config), and an overflowed log, are surfaced
     // and never allow a clean ABORTED / STRANDED verdict.
-    const logged = evidenceFor(evidence?.[producer], ev.event_id);
+    const logged = evidenceFor(evidence?.[producer], ev.event_id, Number.isInteger(ev.h) ? ev.h : null);
     const loggedPast = logged.obs.some((o) => o.h === null || o.h === ev.h);
     const foreignPast = mine.some((x) => !ceremonyFor(x.report, ev) && pastCreate(x.report?.ceremony))
       || logged.obs.some((o) => o.h !== null && Number.isInteger(ev.h) && o.h !== ev.h) || logged.overflow;
