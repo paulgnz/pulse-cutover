@@ -532,6 +532,7 @@ export function nextEventMark(cur, ce, sourceHead, armed, now) {
     at: now, rank };
   // Durable foreign-H past-creation evidence (rc.27) is carried over; only the operator clears it.
   if (cur?.foreign_past) next.foreign_past = cur.foreign_past;
+  if (cur?.foreign_overflow === true) next.foreign_overflow = true;
   let srcFirst = Number.isInteger(cur?.src_first) ? cur.src_first : null, srcMax = Number.isInteger(cur?.src_max) ? cur.src_max : null;
   if (Number.isInteger(sourceHead) && (armed || srcFirst != null)) {
     if (srcFirst == null) srcFirst = sourceHead;
@@ -545,16 +546,31 @@ export function nextEventMark(cur, ce, sourceHead, armed, now) {
 }
 /**
  * rc.27 review: a report under this event id whose journal is for ANOTHER H but past chain creation/ignition (a stale
- * journal, or this event's config is the wrong one) is recorded DURABLY in the event's mark (`foreign_past`): a later
- * replacement report (another instance, a fresh ABORTED) must not erase it. Only an operator clears it, on the
- * mission-control host, after checking that target is fenced (POST /api/admin/clear-foreign). Null = no change.
+ * journal, or this event's config is the wrong one) is recorded DURABLY in the event's mark: `foreign_past` is a list of
+ * distinct observations {state, h, instance_id, at} (one per H and instance), so a later report (another instance, a
+ * fresh ABORTED, a second foreign H) never erases one. Only an operator retires an observation, by its H, on the
+ * mission-control host after fencing that target (POST /api/admin/clear-foreign). Past FOREIGN_PAST_MAX observations the
+ * mark keeps `foreign_overflow: true`, which blocks like an observation. Null = no change.
  */
+export const FOREIGN_PAST_MAX = 64;
+/** A mark's unresolved foreign observations (an rc.27-pre single object is read as a one-entry list). */
+export const foreignList = (m) => (Array.isArray(m?.foreign_past) ? m.foreign_past : m?.foreign_past && typeof m.foreign_past === 'object' ? [m.foreign_past] : []);
+/** Does this mark carry unresolved foreign-H past-creation evidence? */
+export const foreignUnresolved = (m) => foreignList(m).length > 0 || m?.foreign_overflow === true;
 export function foreignPastMark(cur, report, ev, now) {
   const raw = report?.ceremony;
-  if (!raw || ceremonyFor(report, ev) || !pastCreate(raw) || cur?.foreign_past) return null;
-  return Object.assign({ past_create: false, state: null, at: now }, cur || {}, {
-    foreign_past: { state: String(raw.state || 'past creation').slice(0, 16), h: Number.isSafeInteger(raw.evidence?.h) ? raw.evidence.h : null,
-      instance_id: report.instance_id || null, at: now } });
+  if (!raw || ceremonyFor(report, ev) || !pastCreate(raw)) return null;
+  const h = Number.isSafeInteger(raw.evidence?.h) ? raw.evidence.h : null, instance_id = report.instance_id || null;
+  const list = foreignList(cur);
+  if (list.some((o) => o.h === h && o.instance_id === instance_id)) return null;
+  const next = Object.assign({ past_create: false, state: null, at: now }, cur || {});
+  if (list.length >= FOREIGN_PAST_MAX) {
+    if (cur?.foreign_overflow === true) return null;
+    next.foreign_overflow = true;
+    return next;
+  }
+  next.foreign_past = [...list, { state: String(raw.state || 'past creation').slice(0, 16), h, instance_id, at: now }];
+  return next;
 }
 /**
  * The report's ceremony, but only when its journal belongs to this event (rc.24 fleet rehearsal): a beacon pairs the
@@ -589,7 +605,7 @@ export function fleetVerdict(ev, byProducer, eventMax = {}) {
     // another H that is past creation is surfaced: it may be a stale journal, or this event's config may be wrong.
     const anyPast = mine.some((x) => pastCreate(ceremonyFor(x.report, ev)));
     const foreignPast = mine.some((x) => !ceremonyFor(x.report, ev) && pastCreate(x.report?.ceremony))
-      || (!!em?.foreign_past && (em.event_id === undefined || em.event_id === ev.event_id));
+      || (foreignUnresolved(em) && (em.event_id === undefined || em.event_id === ev.event_id));
     return { producer, state: ce?.state || null, fresh: !!s && !s.silent, conflict: mine.length > 0 && !usable.length,
       missing: !s, target: ce?.target || null, resumed: resumedOldChain(ce), past: pastCreate(ce) || markPast || anyPast, foreign_past: foreignPast,
       degraded: ce?.degraded === true,

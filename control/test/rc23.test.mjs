@@ -196,6 +196,9 @@ test('r4 with the resumer SILENT before it aborted: the old chain advancing past
 test('re-check #1: the per-event high-water mark cannot be reset by an event-id bounce, and survives a restart', async () => {
   const dir = setup();
   let { base, proc } = await start(dir);
+  // rc.27: marks exist only for events the coordinator signed.
+  assert.equal((await postC(base, signed({ type: 'event', network: 'testnet', chain_id: CHAIN, event_id: 'ev-1', h: 1000,
+    roster: BPS.map((producer) => ({ producer })), quorum: 4 }))).status, 200);
   let t = Date.now() - 60e3;
   const send = (event, state, extra = {}) => postR(base, { ...fixture(), producer: 'bpa', network: 'testnet', role: 'producer', ts: new Date(t += 1000).toISOString(),
     source: { head: 1001, lib: 1000, chain_id: CHAIN }, coord: { event_id: event, h: 1000, accepted: true, armed: true },
@@ -208,7 +211,7 @@ test('re-check #1: the per-event high-water mark cannot be reset by an event-id 
   let m = await mark();
   assert.equal(m['ev-1'].past_create, true, 'ev-1 stays past creation');
   assert.equal(m['ev-1'].state, 'HALTED');
-  assert.equal(m['ev-x'].past_create, false, 'the other event has its own mark');
+  assert.equal(m['ev-x'], undefined, 'rc.27: an event id the coordinator never signed gets no mark (no flooding)');
   await kill(proc);
   ({ base, proc } = await start(dir));
   m = await mark();

@@ -18,7 +18,7 @@ import { readFileSync, existsSync, watchFile, renameSync, mkdirSync, openSync, w
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isPublicIp, normIp, resolvePublic, limiter, safeRequest, probeProducerApi, safeJson, safeDecode, RE, UA, endpointId, endpointRef, reservedKey,
-  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, ceremonyFor, foreignPastMark, STATE_RANK } from './lib.mjs';
+  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, ceremonyFor, foreignPastMark, foreignList, foreignUnresolved, FOREIGN_PAST_MAX, STATE_RANK } from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = +(process.env.PORT ?? 8787);
@@ -456,11 +456,11 @@ function loadServerState() {
               state: typeof x.state === 'string' ? x.state.slice(0, 16) : null, at: Number.isFinite(x.at) ? x.at : 0 };
             if (Number.isInteger(x.rank) && x.rank >= 0 && x.rank <= MAX_RANK) mark.rank = x.rank;
             if (height(x.src_first) && height(x.src_max) && x.src_max >= x.src_first) { mark.src_first = x.src_first; mark.src_max = x.src_max; }
-            if (x.foreign_past && typeof x.foreign_past === 'object') {
-              const f = x.foreign_past;
-              mark.foreign_past = { state: typeof f.state === 'string' ? f.state.slice(0, 16) : 'past creation', h: height(f.h) ? f.h : null,
-                instance_id: typeof f.instance_id === 'string' && /^[0-9a-f]{32}$/.test(f.instance_id) ? f.instance_id : null, at: Number.isFinite(f.at) ? f.at : 0 };
-            }
+            const fl = foreignList(x).filter((f) => f && typeof f === 'object').slice(0, FOREIGN_PAST_MAX).map((f) => ({
+              state: typeof f.state === 'string' ? f.state.slice(0, 16) : 'past creation', h: height(f.h) ? f.h : null,
+              instance_id: typeof f.instance_id === 'string' && /^[0-9a-f]{32}$/.test(f.instance_id) ? f.instance_id : null, at: Number.isFinite(f.at) ? f.at : 0 }));
+            if (fl.length) mark.foreign_past = fl;
+            if (x.foreign_overflow === true) mark.foreign_overflow = true;
             ((eventMax[netId] ||= dict())[prod] ||= dict())[eid] = mark;
           }
         }
@@ -489,6 +489,20 @@ function serverSnapshot(override, lastOverride, emOverride) {
   return out;
 }
 /** Durably persist the state with the proposed change; true only if it is on disk. Nothing live changes here. */
+/**
+ * Bound a producer's per-event marks (rc.27 review): the oldest marks go first, but never the mark just written, never
+ * the network's current coordinated event, and never a mark with unresolved foreign-H evidence (only an operator
+ * retires that). Marks are only created for events the coordinator signed (signedEvent), so a token cannot flood it.
+ */
+function trimMarks(next, netId, keepId) {
+  const current = (() => { try { return JSON.parse(coord[netId]?.event?.payload || 'null')?.event_id; } catch { return null; } })();
+  const ids = Object.keys(next).filter((id) => id !== keepId && id !== current && !foreignUnresolved(next[id]))
+    .sort((a, b) => (next[a].at || 0) - (next[b].at || 0));
+  while (Object.keys(next).length > EVENT_MAX_KEEP && ids.length) delete next[ids.shift()];
+  return next;
+}
+/** Was this event id published (signed) by the network's coordinator? Only those get marks. */
+const signedEvent = (netId, evId) => !!coord[netId]?.used && own(coord[netId].used, evId);
 function commitServers(override, lastOverride, emOverride) {
   try { atomicWrite(STATE_FILE, serverSnapshot(override, lastOverride, emOverride)); return true; }
   catch (e) { console.error(`servers: persist failed (${e.message}); change NOT accepted`); return false; }
@@ -842,15 +856,30 @@ async function handle(req, res) {
     // that target is fenced (stopped / not tracked by that producer's validators). Agents treat it as blocking.
     const sock = normIp(req.socket.remoteAddress);
     if (!(sock === '127.0.0.1' || sock === '::1') || req.headers['x-real-ip'] || req.headers['x-forwarded-for']) return send(res, 403, { error: 'local operator only' });
+    // One observation at a time, named by its H (and instance, when it has one): clearing can never discard evidence
+    // the operator did not name (rc.27 review). `overflow=1` clears the overflow flag only.
     const netId = url.searchParams.get('net'), prod = url.searchParams.get('producer'), evId = url.searchParams.get('event');
-    if (!RE.net.test(netId || '') || !RE.producer.test(prod || '') || !/^[\w.:-]{1,64}$/.test(evId || '')) return send(res, 400, { error: 'need ?net=&producer=&event=' });
-    const mine = eventMax[netId]?.[prod];
-    if (!mine?.[evId]?.foreign_past) return send(res, 404, { error: 'no foreign evidence for that producer and event' });
-    const next = Object.assign(dict(), mine, { [evId]: { ...mine[evId] } }); delete next[evId].foreign_past;
+    const hq = url.searchParams.get('h'), iq = url.searchParams.get('instance'), ov = url.searchParams.get('overflow') === '1';
+    if (!RE.net.test(netId || '') || !RE.producer.test(prod || '') || !/^[\w.:-]{1,64}$/.test(evId || '')
+      || !(ov || /^\d{1,10}$/.test(hq || '') || hq === 'null') || (iq !== null && !/^[0-9a-f]{32}$/.test(iq))) {
+      return send(res, 400, { error: 'need ?net=&producer=&event=&h=<the observation\'s H>[&instance=<id>] (or &overflow=1)' });
+    }
+    const mine = eventMax[netId]?.[prod]; const m = mine?.[evId];
+    if (!m || !foreignUnresolved(m)) return send(res, 404, { error: 'no foreign evidence for that producer and event' });
+    const nm = { ...m };
+    let removed = 0;
+    if (ov) { if (nm.foreign_overflow) { delete nm.foreign_overflow; removed = 1; } } else {
+      const h = hq === 'null' ? null : Number(hq);
+      const keep = foreignList(m).filter((o) => !(o.h === h && (iq === null || o.instance_id === iq)));
+      removed = foreignList(m).length - keep.length;
+      if (keep.length) nm.foreign_past = keep; else delete nm.foreign_past;
+    }
+    if (!removed) return send(res, 404, { error: 'no such observation (check h / instance)', observations: foreignList(m), overflow: m.foreign_overflow === true });
+    const next = Object.assign(dict(), mine, { [evId]: nm });
     if (!commitServers(null, null, [netId, prod, next])) return send(res, 503, { error: 'could not persist; nothing changed' });
     eventMax[netId][prod] = next;
-    pushEvent(netId, 'operator', `cleared foreign-H past-creation evidence for ${prod} (event ${evId})`);
-    return send(res, 200, { ok: true });
+    pushEvent(netId, 'operator', `retired ${ov ? 'the overflow flag' : `${removed} foreign-H observation(s) at H ${hq}`} for ${prod} (event ${evId}); ${foreignList(nm).length} remain`);
+    return send(res, 200, { ok: true, removed, remaining: foreignList(nm), overflow: nm.foreign_overflow === true });
   }
   if (req.method === 'POST' && path === '/api/admin/clear-server') {
     // Operator-only, from the box itself: the reverse proxy always sets X-Real-IP, so a request that arrives on
@@ -921,7 +950,7 @@ async function handle(req, res) {
     const evFor = evNow && evNow.event_id === evId ? evNow : {};
     // A journal armed for another H is not this event's evidence (ceremonyFor): it never raises the event's mark.
     const ce = ceremonyFor(r, evFor);
-    if (evId && ce && (r.role || 'producer') === 'producer' && !reservedKey(evId)) {
+    if (evId && ce && (r.role || 'producer') === 'producer' && !reservedKey(evId) && signedEvent(r.network, evId)) {
       const mine = eventMax[r.network]?.[r.producer] || {};
       const cur = mine[evId];
       const marks = dict();
@@ -933,23 +962,14 @@ async function handle(req, res) {
       }
       const nm = nextEventMark(cur, ce, Number.isSafeInteger(r.source?.head) ? r.source.head : null, movementArmed(evFor, marks, fresh), now);
       if (nm) {
-        const next = Object.assign(dict(), mine, { [evId]: nm });
-        // Bound the map: drop the oldest event ids, never the one just written.
-        const ids = Object.keys(next).sort((a, b) => (next[a].at || 0) - (next[b].at || 0));
-        while (ids.length > EVENT_MAX_KEEP) delete next[ids.shift()];
-        em = next;
+        em = trimMarks(Object.assign(dict(), mine, { [evId]: nm }), r.network, evId);
       }
     }
     // rc.27 review: a past-creation report for ANOTHER H under this event id is kept durably (foreignPastMark).
-    if (evId && !ce && r.ceremony && (r.role || 'producer') === 'producer' && !reservedKey(evId)) {
+    if (evId && !ce && r.ceremony && (r.role || 'producer') === 'producer' && !reservedKey(evId) && signedEvent(r.network, evId)) {
       const mine = em || eventMax[r.network]?.[r.producer] || {};
       const fm = foreignPastMark(mine[evId], r, evFor, now);
-      if (fm) {
-        const next = Object.assign(dict(), mine, { [evId]: fm });
-        const ids = Object.keys(next).sort((a, b) => (next[a].at || 0) - (next[b].at || 0));
-        while (ids.length > EVENT_MAX_KEEP) { const id = ids.shift(); if (id !== evId) delete next[id]; }
-        em = next;
-      }
+      if (fm) em = trimMarks(Object.assign(dict(), mine, { [evId]: fm }), r.network, evId);
     }
     if (!commitServers([r.network, r.producer, byKey], { [key]: ts }, em ? [r.network, r.producer, em] : null)) return send(res, 503, { error: 'could not persist the report; not accepted, retry' });
     (nodes[r.network] ||= dict())[r.producer] = byKey;

@@ -65,19 +65,57 @@ test('a past-creation report for another H is kept durably: an instance replacem
   assert.equal((await send('bpa', 'b', Date.now(), { state: 'ABORTED', evidence: { h: CUT } })).status, 200);
   let n = await net(base);
   const bpa = n.producers.find((p) => p.name === 'bpa');
-  assert.equal(bpa.event_max['ev-1'].foreign_past.state, 'LIVE', 'durable after the replacement');
-  assert.equal(bpa.event_max['ev-1'].foreign_past.h, CUT + 999);
+  assert.equal(bpa.event_max['ev-1'].foreign_past[0].state, 'LIVE', 'durable after the replacement');
+  assert.equal(bpa.event_max['ev-1'].foreign_past[0].h, CUT + 999);
   assert.notEqual(n.fleet.verdict, 'ABORTED');
   assert.ok(n.fleet.warnings.some((w) => w.startsWith('bpa reports a ceremony for ANOTHER H')), JSON.stringify(n.fleet));
   // Survives a restart.
   await kill(proc);
   ({ base, proc } = await start(dir));
-  assert.equal((await net(base)).producers.find((p) => p.name === 'bpa').event_max['ev-1'].foreign_past.state, 'LIVE');
+  assert.equal((await net(base)).producers.find((p) => p.name === 'bpa').event_max['ev-1'].foreign_past[0].state, 'LIVE');
   // A forwarded (proxied) request may not clear it; the local operator can.
-  assert.equal((await fetch(`${base}/api/admin/clear-foreign?net=testnet&producer=bpa&event=ev-1`, { method: 'POST', headers: { 'x-real-ip': '1.2.3.4' } })).status, 403);
-  assert.equal((await fetch(`${base}/api/admin/clear-foreign?net=testnet&producer=bpa&event=ev-1`, { method: 'POST' })).status, 200);
+  assert.equal((await fetch(`${base}/api/admin/clear-foreign?net=testnet&producer=bpa&event=ev-1&h=${CUT + 999}`, { method: 'POST', headers: { 'x-real-ip': '1.2.3.4' } })).status, 403);
+  assert.equal((await fetch(`${base}/api/admin/clear-foreign?net=testnet&producer=bpa&event=ev-1`, { method: 'POST' })).status, 400, 'the observation must be named');
+  assert.equal((await fetch(`${base}/api/admin/clear-foreign?net=testnet&producer=bpa&event=ev-1&h=7`, { method: 'POST' })).status, 404);
+  assert.equal((await fetch(`${base}/api/admin/clear-foreign?net=testnet&producer=bpa&event=ev-1&h=${CUT + 999}`, { method: 'POST' })).status, 200);
   n = await net(base);
   assert.equal(n.producers.find((p) => p.name === 'bpa').event_max['ev-1'].foreign_past, undefined);
   assert.equal(n.fleet.verdict, 'ABORTED');
+  await kill(proc);
+});
+
+test('2nd review: unsigned event ids cannot evict a mark; every foreign observation is kept; a clear retires only the one named', async () => {
+  const dir = setup();
+  let { base, proc } = await start(dir);
+  assert.equal((await fetch(`${base}/api/coord/testnet`, { method: 'POST', body: JSON.stringify(signed({ type: 'event', network: 'testnet', chain_id: CHAIN,
+    event_id: 'ev-1', h: CUT, roster: BPS.map((producer) => ({ producer })), quorum: 5 })) })).status, 200);
+  let t = Date.now() - 200e3;
+  const send = (event, ceremony, instance = 'a') => fetch(`${base}/api/report`, { method: 'POST', headers: { authorization: `Bearer ${TOK.bpa}` },
+    body: JSON.stringify({ ...fixture(), producer: 'bpa', network: 'testnet', role: 'producer', instance_id: instance.repeat(32), ts: new Date(t += 3100).toISOString(),
+      source: { head: CUT, lib: CUT, chain_id: CHAIN }, coord: { event_id: event, h: CUT, accepted: true, armed: true },
+      ceremony: { ...fixture().ceremony, ...ceremony } }) });
+  // Two foreign observations (H+999, then H+888), then an ABORTED for this H.
+  assert.equal((await send('ev-1', { state: 'LIVE', ignition_started: true, evidence: { h: CUT + 999 } })).status, 200);
+  assert.equal((await send('ev-1', { state: 'LIVE', ignition_started: true, evidence: { h: CUT + 888 } })).status, 200);
+  assert.equal((await send('ev-1', { state: 'ABORTED', evidence: { h: CUT } })).status, 200);
+  // 25 made-up event ids from the same token (rate limit: one report / 3 s per token; timestamps step 3.1 s).
+  for (let i = 0; i < 25; i++) {
+    const r = await send(`junk-${i}`, { state: 'ABORTED', evidence: { h: CUT } });
+    if (r.status === 429) { await new Promise((ok) => setTimeout(ok, 3100)); i--; continue; }
+    assert.equal(r.status, 200);
+  }
+  let m = (await net(base)).producers.find((p) => p.name === 'bpa').event_max;
+  assert.deepEqual(m['ev-1'].foreign_past.map((o) => o.h), [CUT + 999, CUT + 888], 'both observations kept, the event mark not evicted');
+  assert.equal(Object.keys(m).filter((k) => k.startsWith('junk-')).length, 0, 'unsigned event ids get no marks');
+  // Restart, then retire one: the other still blocks.
+  await kill(proc);
+  ({ base, proc } = await start(dir));
+  const clear = (h) => fetch(`${base}/api/admin/clear-foreign?net=testnet&producer=bpa&event=ev-1&h=${h}`, { method: 'POST' });
+  const r1 = await (await clear(CUT + 999)).json();
+  assert.deepEqual(r1.remaining.map((o) => o.h), [CUT + 888]);
+  m = (await net(base)).producers.find((p) => p.name === 'bpa').event_max;
+  assert.deepEqual(m['ev-1'].foreign_past.map((o) => o.h), [CUT + 888]);
+  assert.equal((await clear(CUT + 888)).status, 200);
+  assert.equal((await net(base)).producers.find((p) => p.name === 'bpa').event_max['ev-1'].foreign_past, undefined);
   await kill(proc);
 });

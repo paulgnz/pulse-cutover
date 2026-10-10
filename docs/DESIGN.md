@@ -357,7 +357,9 @@ its freshest report; a report for another H that is past creation blocks a resum
 board, never a clean ABORTED/STRANDED verdict. Mission control records such a report DURABLY in the event's mark
 (`foreign_past`): replacing the instance or a fresh ABORTED report does not erase it. Retiring it is an explicit
 operator act on the mission-control host, after checking that target is fenced: `POST /api/admin/clear-server` (an
-obsolete instance) and `POST /api/admin/clear-foreign?net=&producer=&event=` (the durable record); until then a
+obsolete instance) and `POST /api/admin/clear-foreign?net=&producer=&event=&h=` (one named observation; every
+other observation keeps blocking; marks exist only for coordinator-signed events and are never trimmed while
+unresolved or current); until then a
 STRANDED agent stays sealed (or the operator records a fleet decision with `rollback --force-stranded`). The
 post-ignition protocol check uses the schedule VERIFIED journaled (entries, highest version, emptiness), never the
 file as it is now; a JSON-RPC error from getInfo is retried like a transport failure (5 reads, up to ~80 s with the

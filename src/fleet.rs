@@ -84,8 +84,20 @@ pub fn members(status: &Value, co: &Coordination) -> Vec<MemberView> {
             .map(|m| format!("{}; relay high-water mark", m["state"].as_str().unwrap_or("past creation")))
             // rc.27 review: the relay's DURABLE record of a past-creation report for another H (it survives the report
             // being replaced; only an operator clears it after fencing that target).
-            .or_else(|| mark.and_then(|m| m["foreign_past"]["state"].as_str())
-                .map(|st| format!("{st}; a report for another H, relay record")));
+            .or_else(|| mark.and_then(|m| {
+                // A list of observations (rc.27; an older single object is read as one), or the overflow flag.
+                let list: Vec<&Value> = match &m["foreign_past"] {
+                    Value::Array(a) => a.iter().collect(),
+                    o @ Value::Object(_) => vec![o],
+                    _ => vec![],
+                };
+                if list.is_empty() && m["foreign_overflow"].as_bool() != Some(true) {
+                    return None;
+                }
+                let hs: Vec<String> = list.iter().map(|o| o["h"].as_u64().map(|h| h.to_string()).unwrap_or_else(|| "?".into())).collect();
+                Some(format!("{}; {} report(s) for another H ({}), relay record",
+                    list.first().and_then(|o| o["state"].as_str()).unwrap_or("past creation"), list.len().max(1), hs.join(", ")))
+            }));
         let bs: Vec<_> = entry.map(|p| beacons(p)).unwrap_or_default().into_iter()
             .filter(|(r, _, _)| for_event(r))
             .filter(|(r, _, _)| instance_id.as_deref().is_none_or(|id| r["instance_id"].as_str() == Some(id)))
@@ -657,6 +669,12 @@ mod tests {
             "foreign_past": {"state": "LIVE", "h": 999, "instance_id": null, "at": 1}}});
         let e = resume_guard(Some(&st), &c, me, true).unwrap_err();
         assert!(e.contains("bp2") && e.contains("relay record"), "{e}");
+        // The list shape (several observations) and the overflow flag block too.
+        st["networks"][0]["producers"][1]["event_max"] = json!({"e1": {"past_create": false, "state": null,
+            "foreign_past": [{"state": "LIVE", "h": 999, "instance_id": null, "at": 1}, {"state": "IGNITED", "h": 888, "instance_id": null, "at": 2}]}});
+        assert!(resume_guard(Some(&st), &c, me, true).unwrap_err().contains("2 report(s) for another H (999, 888)"));
+        st["networks"][0]["producers"][1]["event_max"] = json!({"e1": {"past_create": false, "state": null, "foreign_overflow": true}});
+        assert!(resume_guard(Some(&st), &c, me, true).is_err());
     }
 
     /// Review #2: another box reporting under this producer name (its own instance) does not stand in for this
