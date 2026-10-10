@@ -601,7 +601,7 @@ export function ceremonyFor(report, ev) {
 }
 /** @param eventMax { producer: {past_create, state, rank?, src_first?, src_max?} } for THIS event — the relay's per-event high-water mark (an
  *  instance replacement cannot lower it). */
-export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}) {
+export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}, opts = {}) {
   if (!ev) return null;
   const roster = Array.isArray(ev.roster) && ev.roster.length ? ev.roster : null;
   const names = roster ? roster.map((m) => m.producer) : Object.keys(byProducer).filter((p) => (byProducer[p] || []).some((s) => s.report?.coord?.event_id === ev.event_id));
@@ -637,7 +637,9 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}) {
   // member's source head, so it fires even when the BP that resumed is silent (r4: it had lost the relay, and the
   // others' nodeos followed its fork).
   const cut = ev.h ?? members.find((m) => m.cut != null)?.cut ?? null;
-  if (cut != null) {
+  // rc.28 (fleet run g1, R4): an event the coordinator closed as COMPLETE has retired its old chain; old-chain movement
+  // after that (a rehearsal resetting its sources, beacons still carrying the event) is not a split of that event.
+  if (cut != null && !opts.completed) {
     // The bound is the highest reported pause head, and only when it is COMPLETE: every member that reached
     // SNAPSHOTTED (it reports a cut height) also reported its pause head. Plus a small tolerance for pause skew.
     // Incomplete (an older beacon without head_at_pause): no bound at all (rc.24; a fixed cut + N is wrong for
@@ -655,7 +657,7 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}) {
   // paused (movementArmed: all members ≥ SNAPSHOTTED and someone past creation). From there the head only moves if
   // a producer resumed the old chain (r4), whatever the finality lag was. Judged from the high-water mark, so it
   // holds when the resumer itself is silent and after the heads look normal again.
-  const moved = names.map((p) => [p, eventMax?.[p]]).filter(([, em]) => em && (em.event_id === undefined || em.event_id === ev.event_id)
+  const moved = opts.completed ? [] : names.map((p) => [p, eventMax?.[p]]).filter(([, em]) => em && (em.event_id === undefined || em.event_id === ev.event_id)
     && Number.isInteger(em.src_first) && Number.isInteger(em.src_max) && em.src_max - em.src_first > BURNOFF_TOLERANCE);
   if (moved.length) {
     alarms.push(`split: the old chain is still advancing after chain creation (${moved.map(([p, em]) => `${p} source head ${em.src_first}→${em.src_max}`).join(', ')})`);
@@ -711,8 +713,11 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}) {
     // workload probe failing) is STALLED. It clears by itself when the watch passes again.
     // A beacon-LOCAL failure (its collection budget ran out, or it cannot find the target RPC) is not evidence the
     // chain stopped (rc.27 review).
-    const localOnly = (d) => /^(skipped|target RPC unknown)/.test(d || '');
-    const stalled = members.filter((m) => liveChain.members.includes(m.producer) && m.fresh && m.target_live?.ok === false && !localOnly(m.target_live.detail));
+    // Only a CHAIN symptom counts (rc.28, fleet run g1: a failing workload probe on a producing chain made a healthy
+    // fleet STALLED): "no new block …", "target RPC not answering", an identity change. Not a beacon-local skip, and
+    // not a probe failure while the head moves ("producing …" / "head … · no block yet since LIVE" within the idle window).
+    const chainSymptom = (d) => !/^(skipped|target RPC unknown|producing|head )/.test(d || '');
+    const stalled = members.filter((m) => liveChain.members.includes(m.producer) && m.fresh && m.target_live?.ok === false && chainSymptom(m.target_live.detail));
     verdict = stalled.length >= quorum ? 'STALLED' : 'LIVE';
     if (verdict === 'STALLED') warnings.push(`target chain stalled: ${stalled.map((m) => `${m.producer}: ${m.target_live.detail || 'target_live failing'}`).join('; ')}`);
   }

@@ -799,8 +799,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         && !c["name"].as_str().map(|n| crate::beacon::SETUP_CHECKS.contains(&n)).unwrap_or(false))
                     .map(|c| c["name"].as_str().unwrap_or("?").to_string())
                     .collect()).unwrap_or_default();
+                // Every applicable reason (rc.28, fleet run g1b: a health failure hid the schedule mismatch an operator
+                // has to act on).
+                let mut reasons: Vec<String> = vec![];
                 if !failing.is_empty() {
-                    return Some(format!("failing health check(s): {}", failing.join("; ")));
+                    reasons.push(format!("failing health check(s): {}", failing.join("; ")));
                 }
                 // rc.27 review HIGH-2: a verified report for this event whose evidence differs names the key (a peer on
                 // an older agent has no protocol_schedule_hash: that costs quorum, and the operator must see why).
@@ -812,10 +815,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         .map(|k| if c["evidence"][k].is_null() { format!("{k} missing (the peer's agent may predate this release)") } else { k.to_string() })
                         .collect();
                     if !diff.is_empty() {
-                        return Some(format!("evidence differs from ours: {}", diff.join(", ")));
+                        reasons.push(format!("evidence differs from ours: {}", diff.join(", ")));
                     }
                 }
-                None
+                (!reasons.is_empty()).then(|| reasons.join("; "))
             };
             let mut excluded: Vec<serde_json::Value> = vec![];
             for p in &producers {

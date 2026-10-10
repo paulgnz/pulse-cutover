@@ -684,7 +684,8 @@ function fleet(n) {
   }
   const marks = dict();
   for (const [p, m] of Object.entries(eventMax[n.id] || {})) if (m[ev.event_id]) marks[p] = m[ev.event_id];
-  const v = fleetVerdict(ev, byProducer, marks, evidence[n.id] || {});
+  const completed = (() => { try { return JSON.parse(coord[n.id]?.complete?.payload || 'null')?.event_id === ev.event_id; } catch { return false; } })();
+  const v = fleetVerdict(ev, byProducer, marks, evidence[n.id] || {}, { completed });
   // A SPLIT is LATCHED per event (review #6): it stays red until an operator clears it on the mission-control
   // host (POST /api/admin/clear-split?net=…), even if the reports that showed it change or go silent.
   const latch = c.split_latch && c.split_latch.event_id === ev.event_id ? c.split_latch : null;

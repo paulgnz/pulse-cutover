@@ -59,6 +59,9 @@ test('rc.27: STALLED when a quorum of LIVE members report target_live failing; c
   const local = Object.fromEntries(BPS.map((p) => [p, [{ report: { coord: { event_id: 'e1' }, ceremony: live({}),
     checks: [{ name: 'target_live', ok: false, detail: 'skipped (collection time budget exhausted)' }] }, silent: false, conflict: false }]]));
   assert.equal(fleetVerdict(ev, local).verdict, 'LIVE', 'a beacon-local skip is not a stalled chain');
+  const probeOnly = Object.fromEntries(BPS.map((p) => [p, [{ report: { coord: { event_id: 'e1' }, ceremony: live({}),
+    checks: [{ name: 'target_live', ok: false, detail: 'producing · head 408832470 · last block 0 s ago · probe failed: not included within 3500 ms' }] }, silent: false, conflict: false }]]));
+  assert.equal(fleetVerdict(ev, probeOnly).verdict, 'LIVE', 'fleet run g1: a probe failure on a producing chain is not STALLED');
 });
 
 test('rc.27: different protocol upgrade schedules or an unsupported next version are warned about', () => {

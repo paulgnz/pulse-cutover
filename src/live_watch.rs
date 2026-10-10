@@ -235,11 +235,20 @@ fn probe(cfg: &Config, vars: &[(String, String)]) -> Option<(bool, String)> {
             // "`cmd` exited exit status: N: <stderr> <stdout>": report the probe's own words.
             let re = regex::Regex::new(r"^`[\s\S]*?` exited [^:]*: \d+: ").expect("static regex");
             let why = re.replace(&e, "");
-            (false, format!("probe failed: {}", crate::beacon::sanitize_short(why.trim())))
+            (false, format!("probe failed: {}", crate::beacon::sanitize_short(probe_reason(why.trim()))))
         }
     };
     *g = Some((Instant::now(), ok, d.clone()));
     Some((ok, d))
+}
+
+/// The line of a failed probe's output that says why (rc.28, fleet run g1): runtime warnings (Node's
+/// ExperimentalWarning and its --trace-warnings hint) are not the reason; the last remaining line is.
+fn probe_reason(out: &str) -> &str {
+    out.lines().map(str::trim)
+        .filter(|l| !l.is_empty() && !l.contains("ExperimentalWarning") && !l.contains("--trace-warnings")
+            && !l.starts_with("(node:") && !l.starts_with("(Use `node"))
+        .last().unwrap_or(out)
 }
 
 /// The `target_live` check for a journal whose state is LIVE (`summary` = beacon journal
@@ -308,6 +317,13 @@ pub fn check(cfg: &Config, summary: &Value, agent: Option<&ureq::Agent>, with_pr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_probe_failure_reports_its_reason_not_runtime_warnings() {
+        let out = "(node:123) ExperimentalWarning: CommonJS module is loading ES Module\n(Use `node --trace-warnings ...` to show where the warning was created)\nprobe transfer abc acknowledged but NOT included within 3500 ms";
+        assert_eq!(probe_reason(out), "probe transfer abc acknowledged but NOT included within 3500 ms");
+        assert_eq!(probe_reason("exit 2"), "exit 2");
+    }
 
     const LIVE: u64 = 1_790_000_000_000;
 

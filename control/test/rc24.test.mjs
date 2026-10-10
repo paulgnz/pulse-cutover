@@ -221,3 +221,14 @@ test('rc.28 verification: an ABORTED report after creation started arms the old-
   const moved = Object.values(marks).filter((m) => Number.isInteger(m.src_first) && m.src_max - m.src_first > 12);
   assert.ok(moved.length > 0, JSON.stringify(marks));
 });
+
+test('rc.28 (fleet run g1, R4): old-chain movement is not judged for an event closed as COMPLETE', () => {
+  const seq = [];
+  for (const p of BPS) seq.push([p, ce('SNAPSHOTTED', { evidence: { cut_height: CUT } }), PAUSE]);
+  for (const p of BPS) seq.push([p, PASTCE('LIVE'), PAUSE]);
+  for (const p of BPS) seq.push([p, PASTCE('LIVE'), PAUSE + 500]);
+  const marks = relay(seq);
+  const byP = Object.fromEntries(BPS.map((p) => [p, one(PASTCE('LIVE'), PAUSE + 500)]));
+  assert.equal(fleetVerdict(ev(), byP, marks).verdict, 'SPLIT', 'an open event: movement after creation is a split');
+  assert.notEqual(fleetVerdict(ev(), byP, marks, {}, { completed: true }).verdict, 'SPLIT', 'a completed event: not judged');
+});
