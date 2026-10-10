@@ -210,3 +210,14 @@ test('(e) an rc.23 state file (marks without rank/src fields, and the first sing
   assert.equal(mk('bpc').rank, undefined); assert.equal(mk('bpc').src_first, undefined);
   await kill(proc);
 });
+
+test('rc.28 verification: an ABORTED report after creation started arms the old-chain movement rule', () => {
+  const seq = [];
+  for (const p of BPS) seq.push([p, ce('SNAPSHOTTED', { evidence: { cut_height: CUT } }), 500]);
+  seq.push(['bpa', ce('ABORTED', { create_started: true, evidence: { cut_height: CUT } }), 500]);
+  for (const p of BPS) seq.push([p, ce('ABORTED', { evidence: { cut_height: CUT } }), 520]);
+  const marks = relay(seq);
+  assert.equal(marks.bpa.past_create, true, 'creation evidence on an ABORTED report');
+  const moved = Object.values(marks).filter((m) => Number.isInteger(m.src_first) && m.src_max - m.src_first > 12);
+  assert.ok(moved.length > 0, JSON.stringify(marks));
+});

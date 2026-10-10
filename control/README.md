@@ -115,7 +115,10 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   observation of an event also clears that event's `past_create` mark (the log is authoritative). On the first rc.28
   start, rc.27 `foreign_past` records and ordinary `past_create` marks are migrated into the log; a malformed evidence
   log refuses startup; after a failed state write every later change is refused until a restart. `event_max` in
-  `/api/status` also carries a derived `foreign_past` per event for rc.27 agents.
+  `/api/status` also carries a derived `foreign_past` per event for rc.27 agents (the current event's includes the whole
+  rc.28 blocking set). Upgrade every agent to rc.28 before arming an event all the same. A beacon still pointed at an
+  old journal (including a readiness beacon) keeps re-creating its observation: repoint or stop it BEFORE retiring.
+  After a failed state write `/healthz` returns 503 and every change is refused until mission control is restarted.
   rc.23 state files (marks without these fields) load unchanged. A SPLIT is **latched** in the coordination store for that event and stays red, whatever the
   reports say later, until an operator clears it after the split is resolved. On the mission-control host itself:
   `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-split?net=<net>'` (use the port mission control listens on).

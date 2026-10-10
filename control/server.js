@@ -557,16 +557,23 @@ function trimMarks(next, netId, keepId) {
  * status output derives it from the creation-evidence log, every observation of an event as a block for that event,
  * so an rc.27 agent under an rc.28 relay keeps its durable block. Output only; nothing is stored in the marks.
  */
-function compatMarks(marks, log) {
+function compatMarks(marks, log, current) {
   if (!log?.obs?.length && !log?.overflow) return marks || null;
   const out = dict();
   for (const [id, m] of Object.entries(marks || {})) out[id] = { ...m };
+  const put = (eid, o) => { const m = (out[eid] ||= { past_create: false, state: null, at: o.at || 0 });
+    (m.foreign_past ||= []).push({ state: o.state, h: o.h, instance_id: o.instance_id, at: o.at }); };
   for (const o of log.obs || []) {
-    if (!o.event_id) continue;
-    const m = (out[o.event_id] ||= { past_create: false, state: null, at: o.at || 0 });
-    (m.foreign_past ||= []).push({ state: o.state, h: o.h, instance_id: o.instance_id, at: o.at });
+    if (o.event_id) put(o.event_id, o);
+    // The current event gets the whole rc.28 blocking set (review): same-H observations of other events and
+    // unattributed ones, which an rc.27 agent would otherwise not see under its event id.
+    if (current?.event_id && o.event_id !== current.event_id
+      && (!o.event_id || (Number.isInteger(current.h) && o.h === current.h))) put(current.event_id, o);
   }
-  if (log.overflow) for (const m of Object.values(out)) m.foreign_overflow = true;
+  if (log.overflow) {
+    if (current?.event_id) out[current.event_id] ||= { past_create: false, state: null, at: 0 };
+    for (const m of Object.values(out)) m.foreign_overflow = true;
+  }
   return out;
 }
 /** Was this event id published (signed) by the network's coordinator? Only those get marks. */
@@ -705,6 +712,7 @@ function status() {
       const reported = nodes[n.id] || {};
       const reg = registry[n.id]?.producers || {};
       // rc.28: a producer with creation evidence or marks is listed even when it no longer reports (its evidence is shown).
+      const currentEv = (() => { try { return JSON.parse(coord[n.id]?.event?.payload || 'null'); } catch { return null; } })();
       const names = [...new Set([...Object.keys(reg), ...(c.schedule || []), ...Object.keys(reported),
         ...Object.keys(evidence[n.id] || {}), ...Object.keys(eventMax[n.id] || {})])];
       const geo = n.geo || {};
@@ -731,7 +739,7 @@ function status() {
           silent: r ? beacons.some((b) => b.silent) : null, age_ms: age, report: r?.report || null, beacons,
           // rc.23: the relay's per-event high-water mark for this producer (read by the agents' resume guard).
           // {event_id: {past_create, state, at}} for the last event ids this producer reported.
-          event_max: compatMarks(eventMax[n.id]?.[name], evidence[n.id]?.[name]),
+          event_max: compatMarks(eventMax[n.id]?.[name], evidence[n.id]?.[name], currentEv),
           // rc.28: the creation-evidence log (read by the agents' resume guard and the fleet verdict).
           creation_evidence: evidence[n.id]?.[name] || null };
       }).sort((a, b) => (b.scheduled - a.scheduled) || ((a.rank || 999) - (b.rank || 999)) || a.name.localeCompare(b.name));
@@ -784,7 +792,11 @@ async function handle(req, res) {
   let url; try { url = new URL(req.url, 'http://x'); } catch { return send(res, 400, { error: 'bad url' }); }
   const path = url.pathname;
   if (req.method === 'GET' && path === '/api/status') return send(res, 200, status());
-  if (req.method === 'GET' && path === '/healthz') return send(res, 200, { ok: true });
+  if (req.method === 'GET' && path === '/healthz') {
+    // rc.28 review: a failed state write leaves the relay refusing changes until restarted; say so to monitors.
+    return serverStateUncertain ? send(res, 503, { ok: false, error: 'server state uncertain after a failed write: restart mission control (it reloads the state file)' })
+      : send(res, 200, { ok: true });
+  }
   if (req.method === 'GET' && (path === '/favicon.ico' || path === '/favicon.svg')) {
     res.writeHead(200, { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400' });
     return res.end('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f5a524"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs><rect width="64" height="64" rx="16" fill="url(#g)"/><rect x="14" y="14" width="36" height="36" rx="9" fill="#070a16"/><rect x="31" y="12" width="3" height="40" rx="1.5" fill="url(#g)"/></svg>');
@@ -1046,7 +1058,7 @@ async function handle(req, res) {
     }
     // rc.28: every accepted past-creation report is an observation in the producer's creation-evidence log.
     const evNext = (r.role || 'producer') === 'producer' ? nextEvidence(evidence[r.network]?.[r.producer], r, now) : null;
-    if (!commitServers([r.network, r.producer, byKey], { [key]: ts }, em ? [r.network, r.producer, em] : null, evNext ? [r.network, r.producer, evNext] : null)) return send(res, 503, { error: 'could not persist the report; not accepted, retry' });
+    if (!commitServers([r.network, r.producer, byKey], { [key]: ts }, em ? [r.network, r.producer, em] : null, evNext ? [r.network, r.producer, evNext] : null)) return send(res, 503, { error: serverStateUncertain ? 'server state uncertain after a failed write: not accepted; mission control must be restarted' : 'could not persist the report; not accepted, retry' });
     if (evNext) {
       (evidence[r.network] ||= dict())[r.producer] = evNext;
       const added = evNext.obs[evNext.obs.length - 1];

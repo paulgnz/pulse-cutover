@@ -526,7 +526,9 @@ export function movementArmed(ev, marks, fresh) {
  * @returns the new mark, or null when nothing changed
  */
 export function nextEventMark(cur, ce, sourceHead, armed, now) {
-  const past = pastCreate(ce);
+  // The agents' definition (creationEvidence): an ABORTED report after creation / ignition started also counts, so the
+  // old-chain movement rule arms on it (rc.28 review).
+  const past = creationEvidence(ce);
   const rank = Math.max(Number.isInteger(cur?.rank) ? cur.rank : 0, stateRank(ce?.state));
   const next = { past_create: !!(cur?.past_create || past), state: past ? (ce?.state || null) : (cur?.state ?? ce?.state ?? null),
     at: now, rank };

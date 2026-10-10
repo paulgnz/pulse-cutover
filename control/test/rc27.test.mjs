@@ -153,8 +153,9 @@ test('rc.28 review: ABORTED with ignition started is logged; an unattributed rep
   assert.notEqual(n.fleet.verdict, 'ABORTED');
   // bpa: retiring its only ev-1 observation also clears ev-1's past_create mark (the log is authoritative).
   const mark0 = n.producers.find((p) => p.name === 'bpa').event_max['ev-1'];
-  assert.equal(mark0.past_create, false, 'ABORTED+ignition is not a past state for the mark (pastCreate), only for the log');
+  assert.equal(mark0.past_create, true, 'ABORTED after ignition is creation evidence for the mark too (movement arms)');
   assert.equal((await retire(base, 'id=1')).status, 200);
+  assert.equal((await net(base)).producers.find((p) => p.name === 'bpa').event_max['ev-1'].past_create, false, 'retiring the last observation clears the mark');
   await kill(proc);
 });
 
@@ -178,4 +179,23 @@ test('rc.28 review: a legacy rc.27 file migrates ordinary past_create marks; mal
   ]) {
     await assert.rejects(start(bad(ev)), /exited 3|Refusing to start/, JSON.stringify(ev));
   }
+});
+
+test('rc.28 verification: rc.27 agents see the whole blocking set under the CURRENT event (same-H of another event, unattributed)', async () => {
+  const dir = setup();
+  let { base, proc } = await start(dir);
+  assert.equal((await EVPOST(base, { event_id: 'ev-0', h: CUT })).status, 200);
+  const send = reporter(base, Date.now() - 150e3);
+  assert.equal((await send('bpa', 'ev-0', { state: 'LIVE', ignition_started: true, evidence: { h: CUT } })).status, 200);
+  assert.equal((await fetch(`${base}/api/coord/testnet`, { method: 'POST', body: JSON.stringify(signed({ type: 'abort', network: 'testnet', event_id: 'ev-0' })) })).status, 200);
+  assert.equal((await EVPOST(base, { event_id: 'ev-1', h: CUT })).status, 200);
+  const r = await fetch(`${base}/api/report`, { method: 'POST', headers: { authorization: `Bearer ${TOK.bpb}` },
+    body: JSON.stringify({ ...fixture(), producer: 'bpb', network: 'testnet', role: 'producer', instance_id: 'b'.repeat(32), ts: new Date(Date.now() - 1000).toISOString(),
+      source: { head: CUT, lib: CUT, chain_id: CHAIN }, coord: null, ceremony: { ...fixture().ceremony, state: 'LIVE', create_started: true, evidence: { h: CUT + 999 } } }) });
+  assert.equal(r.status, 200);
+  const n = await net(base);
+  const em = (p) => n.producers.find((x) => x.name === p).event_max;
+  assert.ok(em('bpa')['ev-1'].foreign_past.some((o) => o.h === CUT), 'same-H observation of ev-0 projected into ev-1');
+  assert.ok(em('bpb')['ev-1'].foreign_past.some((o) => o.h === CUT + 999), 'unattributed observation projected into ev-1');
+  await kill(proc);
 });
