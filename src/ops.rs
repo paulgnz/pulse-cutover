@@ -48,6 +48,16 @@ pub trait ChainOps {
     fn unschedule_snapshot(&self, _height: u64) -> Result<bool, String> {
         Ok(false)
     }
+    /// r30 round 2: schedule a single-block snapshot at `height` and return the producer API's
+    /// `snapshot_request_id` when it reports one, so the caller can later remove exactly that request.
+    fn schedule_snapshot_request(&self, height: u64) -> Result<Option<u64>, String> {
+        self.schedule_snapshot(height).map(|_| None)
+    }
+    /// Remove the pending snapshot request `id`, and only it. Ok(true) when it was pending and removed, Ok(false)
+    /// when no request with that id is pending (or this ChainOps cannot unschedule).
+    fn unschedule_snapshot_request(&self, _id: u64) -> Result<bool, String> {
+        Ok(false)
+    }
     /// getInfo against the target pulsevm chain; Ok(None) while unreachable
     /// (still bootstrapping / chain not yet initialized).
     fn target_info(&self) -> Result<Option<ChainInfo>, String>;
@@ -675,6 +685,31 @@ impl ChainOps for HttpOps {
             None,
         )
         .map(|_| ())
+    }
+
+    fn schedule_snapshot_request(&self, height: u64) -> Result<Option<u64>, String> {
+        let r = self.post(
+            &format!("{}/v1/producer/schedule_snapshot", self.producer_api),
+            Some(json!({"start_block_num": height, "end_block_num": height})),
+            None,
+        )?;
+        Ok(r["snapshot_request_id"].as_u64())
+    }
+
+    fn unschedule_snapshot_request(&self, id: u64) -> Result<bool, String> {
+        let reqs = self.post(&format!("{}/v1/producer/get_snapshot_requests", self.producer_api), Some(json!({})), None)?;
+        let pending = reqs["snapshot_requests"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|r| r["snapshot_request_id"].as_u64() == Some(id)));
+        if !pending {
+            return Ok(false);
+        }
+        self.post(
+            &format!("{}/v1/producer/unschedule_snapshot", self.producer_api),
+            Some(json!({"snapshot_request_id": id})),
+            None,
+        )?;
+        Ok(true)
     }
 
     fn unschedule_snapshot(&self, height: u64) -> Result<bool, String> {

@@ -268,20 +268,25 @@ script it names) references a hook, a source/target stop or start command, a cha
 or a flip command.
 
 Refused when: the config is not import_backend = \"upstream\" with compare_bin and snapshot.dir; the
-ceremony journal is in progress, sealed, unfinished or LIVE, or its lock is held; another drill is running;
-the drill directory overlaps snapshot.staged_path, the journal, upstream.work_dir or snapshot.dir (symlinks
-resolved); H < head + 20; a drill at H already ran. The other way round, a fresh ceremony refuses to ARM while a drill is RUNNING.
+ceremony journal is in progress, sealed, unfinished or LIVE, or its lock is held; another drill is running
+(the drill directory has its own lock too); any path the drill writes (the whole drill directory, latest.json,
+the journal lock) overlaps snapshot.staged_path, the journal, upstream.work_dir or snapshot.dir (symlinks
+resolved); a conversion command cannot be read unambiguously or reaches a hook, stop or chain command (also
+through a script it names); H < head + 20; a drill at H already ran. The other way round, a fresh ceremony refuses to ARM while a drill is RUNNING.
 
 What it costs: CPU, RAM and disk (on XPR mainnet state the conversion took 9.6 min and 13.7 GB RAM,
 2026-10-13), and nodeos writes the snapshot at H synchronously, which on a producing node can cost blocks
 in its own round. Prefer a non-producing node with the same snapshot directory, or an H outside your
 production round. The multi-GB work files are deleted at the end (the evidence is kept) unless
 --keep-work. nodeos's snapshot file stays in snapshot.dir (yours to remove). A drill that fails or is
-cancelled before H is final removes its pending snapshot request (Leap producer API unschedule_snapshot).
+cancelled before H is final removes its pending snapshot request by the request id it recorded (never by
+height: a ceremony may hold a request at the same height).
 
 --cancel: asks the running drill to stop (it checks while waiting for H and between and during pipeline
-steps), waits up to 60 s, then stops the pipeline tool's process group; if the drill process is gone it
-removes the pending snapshot request and marks the drill FAILED (cancelled).
+steps), waits up to 60 s, then stops the pipeline tool's process group and checks it is gone (if not: a
+cancel INCOMPLETE, non-zero exit, the drill stays RUNNING). If the drill process is gone it takes the
+drill's locks, refuses next to a ceremony in progress, removes only the recorded snapshot request and marks
+the drill FAILED (cancelled).
 
 Exit codes: 0 = evidence complete and the compare matched; 5 = evidence complete, the compare did NOT
 match (the finding a drill exists to surface; the fingerprint is still reported); 1 = the drill failed.";

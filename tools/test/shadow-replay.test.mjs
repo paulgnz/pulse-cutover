@@ -60,6 +60,23 @@ test('extractBlockIds reads /v1 and native receipt shapes', () => {
   assert.equal(native.get(ID2), 'executed');
 });
 
+test('round 2: a receipt without a status is unknown, never a match', () => {
+  // Review (Codex r30-2 #10): a shadow receipt carrying only the transaction id used to default to "executed" and
+  // matched an executed mainnet transaction although its outcome was unknown.
+  const ids = extractBlockIds({ transactions: [{ trx: 'ab'.repeat(32) }] });
+  assert.equal(ids.get('ab'.repeat(32)), 'unknown');
+  const tx = { replayable: true, status: 'executed' };
+  const r = compareOutcome(tx, { accepted: true, included: true, included_status: 'unknown' });
+  assert.equal(r.result, 'unknown');
+  assert.equal(r.category, 'shadow_status_unknown');
+  assert.equal(compareOutcome(tx, { accepted: true, included: true, included_status: null }).result, 'unknown');
+  // A mainnet receipt without a status is unknown too, whatever the shadow did.
+  assert.equal(compareOutcome({ replayable: true, status: 'unknown' }, { accepted: true, included: true, included_status: 'executed' }).result, 'unknown');
+  const sum = summarise([{ replayable: true, status: 'executed', compare: r }]);
+  assert.equal(sum.result.unknown, 1);
+  assert.equal(sum.result.match, undefined);
+});
+
 test('classifyError buckets the usual rejections', () => {
   assert.equal(classifyError('expired_tx_exception: Expired Transaction'), 'expired');
   assert.equal(classifyError('invalid_ref_block_exception: Transaction\'s reference block did not match'), 'tapos');

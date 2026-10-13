@@ -139,9 +139,10 @@ pub struct DrillOptions {
 pub struct DrillGuard<'a, O: ChainOps> {
     inner: &'a O,
     pub violations: RefCell<Vec<String>>,
-    /// The one height this drill scheduled (or, for `--cancel` of a dead drill, was allowed to clean up):
-    /// the only snapshot request the guard lets it unschedule.
-    scheduled: RefCell<Option<u64>>,
+    /// The one snapshot request this drill scheduled: its height and the producer API's request id (or, for
+    /// `--cancel` of a dead drill, the recorded request it was allowed to clean up). The guard only ever removes a
+    /// request by this id, never by height (r30 round 2: a ceremony may hold a request at the same height).
+    scheduled: RefCell<Option<(u64, Option<u64>)>>,
 }
 
 impl<'a, O: ChainOps> DrillGuard<'a, O> {
@@ -149,9 +150,14 @@ impl<'a, O: ChainOps> DrillGuard<'a, O> {
         DrillGuard { inner, violations: RefCell::new(vec![]), scheduled: RefCell::new(None) }
     }
 
-    /// `--cancel` of a drill whose process died: allow unscheduling exactly that drill's height.
-    pub fn allow_unschedule(&self, h: u64) {
-        *self.scheduled.borrow_mut() = Some(h);
+    /// `--cancel` of a drill whose process died: allow removing exactly the request that drill recorded.
+    pub fn allow_unschedule_request(&self, h: u64, id: u64) {
+        *self.scheduled.borrow_mut() = Some((h, Some(id)));
+    }
+
+    /// The request this guard scheduled (or was allowed to clean up): (height, request id).
+    pub fn scheduled_request(&self) -> Option<(u64, Option<u64>)> {
+        *self.scheduled.borrow()
     }
 
     fn refuse<T>(&self, what: &str) -> Result<T, String> {
@@ -183,15 +189,22 @@ impl<O: ChainOps> ChainOps for DrillGuard<'_, O> {
         self.refuse("create_snapshot (a drill only uses the snapshot scheduled at exactly H)")
     }
     fn schedule_snapshot(&self, height: u64) -> Result<(), String> {
-        self.inner.schedule_snapshot(height)?;
-        *self.scheduled.borrow_mut() = Some(height);
-        Ok(())
+        self.schedule_snapshot_request(height).map(|_| ())
+    }
+    fn schedule_snapshot_request(&self, height: u64) -> Result<Option<u64>, String> {
+        let id = self.inner.schedule_snapshot_request(height)?;
+        *self.scheduled.borrow_mut() = Some((height, id));
+        Ok(id)
     }
     fn unschedule_snapshot(&self, height: u64) -> Result<bool, String> {
-        if *self.scheduled.borrow() != Some(height) {
-            return self.refuse(&format!("unschedule_snapshot({height}) of a request this drill did not schedule"));
+        // By height it could remove someone else's request at the same height (a ceremony's): never.
+        self.refuse(&format!("unschedule_snapshot({height}) by height (a drill only removes its own request, by id)"))
+    }
+    fn unschedule_snapshot_request(&self, id: u64) -> Result<bool, String> {
+        if !matches!(*self.scheduled.borrow(), Some((_, Some(mine))) if mine == id) {
+            return self.refuse(&format!("unschedule_snapshot_request({id}) of a request this drill did not schedule"));
         }
-        self.inner.unschedule_snapshot(height)
+        self.inner.unschedule_snapshot_request(id)
     }
     fn target_info(&self) -> Result<Option<ChainInfo>, String> {
         self.refuse("target_info")
@@ -294,26 +307,115 @@ fn side_effect_commands(cfg: &Config) -> Vec<(&'static str, String)> {
     out.into_iter().filter_map(|(k, v)| v.map(|v| (k, v.trim().to_string()))).filter(|(_, v)| !v.is_empty()).collect()
 }
 
+/// The words of a shell command as the shell would split them: on whitespace and the control operators
+/// `; & | ( ) < >` and newlines, with single and double quotes and backslashes resolved (r30 round 2: a plain
+/// whitespace split read `sh /opt/export.sh; …` as the file `/opt/export.sh;` and missed the wrapper). Err when the
+/// command cannot be read unambiguously: an unterminated quote, a trailing backslash, or command substitution
+/// (`$(…)`, backticks), whose result no static check can know.
+pub fn shell_words(cmd: &str) -> Result<Vec<String>, String> {
+    let mut words = vec![];
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut it = cmd.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            c if c.is_whitespace() || ";&|()<>".contains(c) => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            '\'' => {
+                in_word = true;
+                loop {
+                    match it.next() {
+                        Some('\'') => break,
+                        Some(ch) => cur.push(ch),
+                        None => return Err(format!("unterminated single quote in `{cmd}`")),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match it.next() {
+                        Some('"') => break,
+                        Some('\\') => match it.next() {
+                            Some(ch) if "$`\"\\\n".contains(ch) => cur.push(ch),
+                            Some(ch) => {
+                                cur.push('\\');
+                                cur.push(ch);
+                            }
+                            None => return Err(format!("unterminated double quote in `{cmd}`")),
+                        },
+                        Some('`') => return Err(format!("command substitution (backticks) in `{cmd}`")),
+                        Some('$') if it.peek() == Some(&'(') => return Err(format!("command substitution `$(…)` in `{cmd}`")),
+                        Some(ch) => cur.push(ch),
+                        None => return Err(format!("unterminated double quote in `{cmd}`")),
+                    }
+                }
+            }
+            '\\' => match it.next() {
+                Some(ch) => {
+                    in_word = true;
+                    cur.push(ch);
+                }
+                None => return Err(format!("trailing backslash in `{cmd}`")),
+            },
+            '`' => return Err(format!("command substitution (backticks) in `{cmd}`")),
+            '$' if it.peek() == Some(&'(') => return Err(format!("command substitution `$(…)` in `{cmd}`")),
+            ch => {
+                in_word = true;
+                cur.push(ch);
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    Ok(words)
+}
+
+/// `shell_words`, also splitting every word that is itself a script (`bash -c '… && /x/y.sh …'`), to a fixed
+/// depth. Err as `shell_words`.
+fn all_shell_words(cmd: &str) -> Result<Vec<String>, String> {
+    fn go(cmd: &str, depth: u8, out: &mut Vec<String>) -> Result<(), String> {
+        for w in shell_words(cmd)? {
+            if depth < 3 && w.chars().any(|c| c.is_whitespace() || ";&|".contains(c)) {
+                go(&w, depth + 1, out)?;
+            }
+            out.push(w);
+        }
+        Ok(())
+    }
+    let mut out = vec![];
+    go(cmd, 0, &mut out)?;
+    Ok(out)
+}
+
 /// What to look for in the conversion commands: the whole command, and every path-like word of it that is not a
 /// generic interpreter or wrapper (a script `/root/hooks/on-freeze.sh` is specific; `/bin/sh` is not).
 fn command_needles(cmd: &str) -> Vec<String> {
     const GENERIC: &[&str] = &["sh", "bash", "dash", "zsh", "env", "sudo", "nohup", "setsid", "timeout", "docker",
         "python", "python3", "node", "perl", "exec", "systemd-run"];
     let mut n = vec![cmd.to_string()];
-    for w in cmd.split_whitespace() {
-        let w = w.trim_matches(|c| c == '\'' || c == '"' || c == ';' || c == '&' || c == '|' || c == '(' || c == ')');
-        let base = w.rsplit('/').next().unwrap_or(w);
-        if w.contains('/') && w.len() >= 4 && !w.contains('{') && !GENERIC.contains(&base) {
-            n.push(w.to_string());
+    let words = all_shell_words(cmd).unwrap_or_else(|_| cmd.split_whitespace().map(str::to_string).collect());
+    for w in words {
+        let base = w.rsplit('/').next().unwrap_or(&w);
+        if w.contains('/') && w.len() >= 4 && !w.contains('{') && !w.chars().any(char::is_whitespace) && !GENERIC.contains(&base) {
+            n.push(w.clone());
         }
     }
     n
 }
 
 /// The conversion commands a drill runs, as text: the configured strings, plus the contents of any small text
-/// script they name (a wrapper like `import.sh` that itself calls a hook is caught too).
-fn pipeline_texts(cfg: &Config) -> Vec<(String, String)> {
-    let Some(up) = &cfg.upstream else { return vec![] };
+/// script they name (a wrapper like `import.sh` that itself calls a hook is caught too), and the scripts those
+/// name in turn. Commands are split as the shell splits them; a command that cannot be read unambiguously, or a
+/// script path that depends on a variable, is a problem (the drill refuses rather than guess).
+fn pipeline_texts(cfg: &Config) -> (Vec<(String, String)>, Vec<String>) {
+    let mut problems = vec![];
+    let Some(up) = &cfg.upstream else { return (vec![], problems) };
     let mut cmds: Vec<(String, String)> = vec![
         ("upstream.export_cmd".into(), up.export_cmd.clone()),
         ("upstream.import_bin".into(), up.import_bin.display().to_string()),
@@ -323,31 +425,49 @@ fn pipeline_texts(cfg: &Config) -> Vec<(String, String)> {
         cmds.push(("upstream.compare_bin".into(), c.display().to_string()));
     }
     let mut out = cmds.clone();
-    for (k, c) in &cmds {
-        for w in c.split_whitespace() {
-            let w = w.trim_matches(|c| c == '\'' || c == '"');
-            let path = Path::new(w);
-            if !w.starts_with('/') && !w.starts_with('.') {
+    // (where, text, is_configured_command): configured commands must tokenize; script bodies are read loosely.
+    let mut queue: Vec<(String, String, bool, u8)> = cmds.iter().map(|(k, c)| (k.clone(), c.clone(), true, 0)).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some((k, text, configured, depth)) = queue.pop() {
+        let words = match all_shell_words(&text) {
+            Ok(w) => w,
+            Err(e) if configured => {
+                problems.push(format!("{k} cannot be read unambiguously ({e}): a drill only runs conversion commands it can check"));
                 continue;
             }
+            // A script body may use shell syntax the static reader does not follow: scan its whitespace words.
+            Err(_) => text.split_whitespace().map(|w| w.trim_matches(|c| "'\";&|()<>".contains(c)).to_string()).collect(),
+        };
+        for w in words {
+            if !w.starts_with('/') && !w.starts_with('.') && !w.starts_with('$') {
+                continue;
+            }
+            if w.contains('$') && w.contains('/') && configured {
+                problems.push(format!("{k} names `{w}`, a path that depends on a variable: a drill cannot check it"));
+                continue;
+            }
+            let path = Path::new(&w);
             let Ok(meta) = std::fs::metadata(path) else { continue };
-            if !meta.is_file() || meta.len() > 256 * 1024 {
+            if !meta.is_file() || meta.len() > 256 * 1024 || !seen.insert(canonical(path)) {
                 continue;
             }
-            if let Ok(text) = std::fs::read_to_string(path) {
-                out.push((format!("{k} (script {w})"), text));
+            if let Ok(body) = std::fs::read_to_string(path) {
+                out.push((format!("{k} (script {w})"), body.clone()));
+                if depth < 2 {
+                    queue.push((format!("{k} (script {w})"), body, false, depth + 1));
+                }
             }
         }
     }
-    out
+    (out, problems)
 }
 
 /// r30 review (a): the guard cannot sandbox shell. A drill runs the configured conversion commands as they are;
 /// it refuses when any of them (or a small script it names) references a configured side-effect command.
 fn pipeline_side_effect_problems(cfg: &Config) -> Vec<String> {
     let effects = side_effect_commands(cfg);
-    let mut p = vec![];
-    for (where_, text) in pipeline_texts(cfg) {
+    let (texts, mut p) = pipeline_texts(cfg);
+    for (where_, text) in texts {
         for (key, cmd) in &effects {
             if let Some(n) = command_needles(cmd).into_iter().find(|n| text.contains(n.as_str())) {
                 p.push(format!(
@@ -385,26 +505,38 @@ fn canonical(p: &Path) -> PathBuf {
     }
 }
 
-/// r30 review (c): the drill's directory (`<journal dir>/drill/<H>`, work files deleted at the end) must not
-/// overlap, even through a symlink, the ceremony's staged snapshot, journal, work dir or nodeos's snapshot dir.
-pub fn path_overlap_problems(cfg: &Config, h: u64) -> Vec<String> {
-    let drill = canonical(&drill_dir(cfg, h));
+/// The drill root's own lock file (`<journal dir>/drill/drill.lock`): one drill per drill root, whatever journal
+/// file name a config uses (r30 round 2: two configs sharing a journal directory share `drill/latest.json`).
+pub fn root_lock_base(cfg: &Config) -> PathBuf {
+    drill_root(cfg).join("drill")
+}
+
+/// r30 review (c), round 2: EVERY path a drill writes must not overlap, even through a symlink, the ceremony's
+/// staged snapshot, journal, work dir or nodeos's snapshot dir: the whole drill root (each drill's work files,
+/// which are rewritten and deleted, `latest.json` and its temp file, the cancel and lock files) and the journal's
+/// lock file the drill takes. Checked before the drill creates anything.
+pub fn path_overlap_problems(cfg: &Config, _h: u64) -> Vec<String> {
+    let drill = canonical(&drill_root(cfg));
+    let journal_lock = canonical(Path::new(&format!("{}.lock", cfg.journal_path.display())));
     let overlaps = |other: &Path| {
         let o = canonical(other);
-        o.starts_with(&drill) || drill.starts_with(&o)
+        o.starts_with(&drill) || drill.starts_with(&o) || o == journal_lock
     };
     let mut p = vec![];
     let mut check = |name: &str, path: &Path| {
         if overlaps(path) {
             p.push(format!(
-                "{name} {} overlaps the drill's directory {} (whose work files are rewritten and deleted): refused",
+                "{name} {} overlaps the drill's files under {} (work files rewritten and deleted, latest.json, lock and \
+                 cancel files) or the journal lock it takes: refused",
                 path.display(),
                 drill.display()
             ));
         }
     };
     check("snapshot.staged_path", &cfg.snapshot.staged_path);
-    check("journal_path", &cfg.journal_path);
+    if canonical(&cfg.journal_path).starts_with(&drill) {
+        check("journal_path", &cfg.journal_path);
+    }
     if let Some(up) = &cfg.upstream {
         check("upstream.work_dir", &up.work_dir);
     }
@@ -501,10 +633,19 @@ fn run_guarded<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillO
     if !problems.is_empty() {
         return Err(format!("this config cannot run a readiness drill: {}", problems.join("; ")));
     }
+    // Every path the drill will write is checked before it creates anything (lock files included).
+    let overlap = path_overlap_problems(cfg, opts.height);
+    if !overlap.is_empty() {
+        return Err(overlap.join("; "));
+    }
     // r30 review (b): the ceremony's own exclusive journal lock, held for the whole drill: a ceremony (or another
     // drill) cannot start on this journal while it runs, and the state check below cannot race one starting.
     let _lock = Journal::lock(&cfg.journal_path)
         .map_err(|e| format!("a readiness drill needs this journal's lock: {e}"))?;
+    // Round 2: and the drill root's own lock, so configs that share a journal directory (and so `latest.json`) but
+    // name different journal files cannot run two drills at once.
+    let _root_lock = Journal::lock(&root_lock_base(cfg))
+        .map_err(|e| format!("a readiness drill needs the drill directory's lock (another drill is running): {e}"))?;
     if let Some(why) = ceremony_conflict(cfg)? {
         return Err(why);
     }
@@ -522,10 +663,6 @@ fn run_guarded<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillO
         }
     }
     let dir = drill_dir(cfg, h);
-    let overlap = path_overlap_problems(cfg, h);
-    if !overlap.is_empty() {
-        return Err(overlap.join("; "));
-    }
     if dir.exists() {
         return Err(format!(
             "a drill at H = {h} already ran here ({}); every drill height is used once",
@@ -592,18 +729,24 @@ fn run_guarded<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillO
 /// After a failure or cancel: if this drill's snapshot request at H may still be pending (H not final yet, or the
 /// chain cannot be read), remove it so nodeos does not write a snapshot nobody will use. Recorded either way.
 fn unschedule_if_pending<O: ChainOps>(ops: &DrillGuard<'_, O>, h: u64, log: &mut DrillLog) {
-    if *ops.scheduled.borrow() != Some(h) {
-        return; // never scheduled (failed before), nothing to clean up
+    let Some((sh, id)) = ops.scheduled_request() else { return }; // never scheduled (failed before)
+    if sh != h {
+        return;
     }
     let lib = ops.source_info().map(|i| i.last_irreversible_block_num).ok();
     if lib.is_some_and(|l| l >= h) {
         let _ = log.record(ops.now_ms(), "snapshot_request", json!({"unscheduled": false, "why": "H is final: nodeos already wrote it"}));
         return;
     }
-    let rec = match ops.unschedule_snapshot(h) {
-        Ok(true) => json!({"unscheduled": true}),
-        Ok(false) => json!({"unscheduled": false, "why": "no pending request at H (or the producer API cannot unschedule)"}),
-        Err(e) => json!({"unscheduled": false, "error": e}),
+    let Some(id) = id else {
+        let _ = log.record(ops.now_ms(), "snapshot_request", json!({"unscheduled": false,
+            "why": "the producer API reported no request id: a drill never removes a request by height (a ceremony may hold one at the same height); remove it by hand if it is still pending"}));
+        return;
+    };
+    let rec = match ops.unschedule_snapshot_request(id) {
+        Ok(true) => json!({"unscheduled": true, "snapshot_request_id": id}),
+        Ok(false) => json!({"unscheduled": false, "snapshot_request_id": id, "why": "that request is no longer pending (or the producer API cannot unschedule)"}),
+        Err(e) => json!({"unscheduled": false, "snapshot_request_id": id, "error": e}),
     };
     let _ = log.record(ops.now_ms(), "snapshot_request", rec);
 }
@@ -623,9 +766,10 @@ fn drive<O: ChainOps>(
     const CANCELLED: &str = "cancelled by `pulse-cutover drill --cancel`";
 
     // 1. Schedule the snapshot at exactly H (the same producer-API call the ceremony makes at ARM).
-    ops.schedule_snapshot(h).map_err(|e| format!("schedule_snapshot({h}) failed: {e}"))?;
-    log.record(ops.now_ms(), "snapshot_scheduled", json!({"h": h}))?;
-    log.publish(json!({"stage": "waiting_for_h"}))?;
+    let request_id = ops.schedule_snapshot_request(h).map_err(|e| format!("schedule_snapshot({h}) failed: {e}"))?;
+    // The request id is persisted so `--cancel` of a dead drill removes exactly this request, never by height.
+    log.record(ops.now_ms(), "snapshot_scheduled", json!({"h": h, "snapshot_request_id": request_id}))?;
+    log.publish(json!({"stage": "waiting_for_h", "snapshot_request_id": request_id}))?;
 
     // 2. Wait for H to be produced and then final. The chain keeps running: nothing is frozen.
     let head_now = ops.source_info()?.head_block_num;
@@ -802,12 +946,16 @@ fn wait_until_not_running(cfg: &Config, wait: std::time::Duration) -> bool {
 /// `pulse-cutover drill --cancel`: stop this box's running drill and record why.
 ///
 /// 1. Write the cancel file the drill polls (while waiting for H, and as the pipeline's cancel check, which
-///    stops the running tool). A live drill then fails itself, unschedules its pending snapshot request and
+///    stops the running tool). A live drill then fails itself, removes its own pending snapshot request and
 ///    publishes FAILED.
 /// 2. If it has not stopped within `wait`, or its process is gone, stop the pipeline tool's recorded process
-///    group (start-time checked; pgid 0 and 1 are never signalled).
-/// 3. If no drill process is left to finish its own record, unschedule its snapshot request (only that drill's
-///    H) and mark it FAILED here.
+///    group (start-time checked; pgid 0 and 1 are never signalled), and verify the group is gone. If it is not,
+///    the cancel is INCOMPLETE: nothing is marked finished (the record stays RUNNING, so a ceremony's ARM still
+///    sees live work) and the command fails.
+/// 3. If no drill process is left to finish its own record, take the same locks a drill takes (the journal's and
+///    the drill root's: a ceremony or another drill holding them refuses the cancel), refuse when a ceremony is in
+///    progress, then remove ONLY the snapshot request id that drill recorded (never by height: a ceremony may
+///    hold a request at the same height), and mark it FAILED.
 pub fn cancel<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> Result<String, String> {
     let (h, live_pid) = match activity(cfg) {
         DrillActivity::Idle => return Ok("no readiness drill is running on this box".into()),
@@ -818,11 +966,13 @@ pub fn cancel<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> 
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     std::fs::write(cancel_path(cfg, h), format!("{}\n", ops.now_ms()))
         .map_err(|e| format!("write {}: {e}", cancel_path(cfg, h).display()))?;
-    let view = std::fs::read_to_string(latest_path(cfg)).ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({"kind": DRILL_KIND, "drill": true, "h": h}));
-    let mut log = DrillLog { path: dir.join("drill.jsonl"), latest: latest_path(cfg), view };
+    let read_view = || {
+        std::fs::read_to_string(latest_path(cfg)).ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({"kind": DRILL_KIND, "drill": true, "h": h}))
+    };
+    let mut log = DrillLog { path: dir.join("drill.jsonl"), latest: latest_path(cfg), view: read_view() };
     log.record(ops.now_ms(), "cancel_requested", json!({"pid": live_pid}))?;
 
     if live_pid.is_some() && wait_until_not_running(cfg, wait) {
@@ -838,15 +988,43 @@ pub fn cancel<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> 
     if live_pid.is_some() && wait_until_not_running(cfg, wait) {
         return Ok(format!("readiness drill at H = {h} cancelled after stopping its pipeline ({killed_s})"));
     }
+    // Round 2: success only when the pipeline group is verified gone. A failed kill, or a group still alive, is
+    // an incomplete cancel: the record stays RUNNING (a ceremony's ARM keeps refusing) and the command fails.
+    let group_left = crate::ops::live_recorded_group(&pgid_file(cfg, h));
+    if killed.is_err() || group_left.is_some() {
+        log.record(ops.now_ms(), "cancel_incomplete", json!({"result": killed_s, "live_group": group_left}))?;
+        return Err(format!(
+            "cancel INCOMPLETE for the readiness drill at H = {h}: its pipeline process group is still alive ({killed_s}{}); \
+             it was not marked cancelled. Stop it by hand, then run `pulse-cutover drill --cancel` again",
+            group_left.map_or(String::new(), |g| format!(", group {g}"))
+        ));
+    }
     if let DrillActivity::Running { pid: Some(p), .. } = activity(cfg) {
         return Err(format!(
             "the drill process {p} is still running after the cancel request ({killed_s}); check it by hand"
         ));
     }
-    // Nobody is left to finish the drill's record.
+    // Nobody is left to finish the drill's record. Take the locks a drill takes: a ceremony or another drill that
+    // holds them now refuses this cleanup; then refuse next to a ceremony in progress.
+    let _lock = Journal::lock(&cfg.journal_path)
+        .map_err(|e| format!("cancel refused: a ceremony or a drill holds this journal ({e})"))?;
+    let _root_lock = Journal::lock(&root_lock_base(cfg))
+        .map_err(|e| format!("cancel refused: another readiness drill holds the drill directory ({e})"))?;
+    if let Some(why) = ceremony_conflict(cfg)? {
+        return Err(format!("cancel refused, nothing changed: {why}"));
+    }
+    log.view = read_view();
     let guard = DrillGuard::new(ops);
-    guard.allow_unschedule(h);
-    unschedule_if_pending(&guard, h, &mut log);
+    match log.view["snapshot_request_id"].as_u64() {
+        Some(id) => {
+            guard.allow_unschedule_request(h, id);
+            unschedule_if_pending(&guard, h, &mut log);
+        }
+        None => {
+            log.record(ops.now_ms(), "snapshot_request", json!({"unscheduled": false,
+                "why": "the drill recorded no snapshot request id: a request is never removed by height alone"}))?;
+        }
+    }
     let now = ops.now_ms();
     log.record(now, "cancelled", json!({"by": "pulse-cutover drill --cancel", "drill_process": "not running"}))?;
     log.publish(json!({"state": "FAILED",

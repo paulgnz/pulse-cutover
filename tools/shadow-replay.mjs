@@ -97,7 +97,8 @@ export function extractBlockIds(block) {
     if (typeof trx === 'string') id = trx;
     else if (trx && typeof trx.id === 'string') id = trx.id;
     else if (trx && typeof trx.packed_trx === 'string') { try { id = packedTrxId(trx.packed_trx, trx.compression); } catch { id = null; } }
-    if (id) ids.set(id.toLowerCase(), statusName(r.status ?? 'executed'));
+    // A receipt without a status is UNKNOWN, never assumed executed (r30 round-2 review: a bare id matched).
+    if (id) ids.set(id.toLowerCase(), statusName(r.status));
   }
   return ids;
 }
@@ -171,6 +172,8 @@ export function compareOutcome(tx, shadow) {
   if (!tx.replayable) return { result: 'skipped', category: tx.reason === 'deferred' ? 'deferred' : 'not_replayable' };
   if (!shadow) return { result: 'not_sent', category: 'not_sent' };
   const status = String(tx.status);
+  // An outcome nobody knows is neither a match nor a mismatch: it is reported as unknown and never counted as a match.
+  if (status === 'unknown') return { result: 'unknown', category: 'mainnet_status_unknown' };
   if (shadow.rejected) {
     const category = classifyError(shadow.error);
     if (REJECTION_MATCHES[status]?.has(category)) return { result: 'match', category };
@@ -178,6 +181,9 @@ export function compareOutcome(tx, shadow) {
     return { result: 'mismatch', category: `mainnet_${status}_vs_rejected_${category}` };
   }
   if (!shadow.included) return { result: 'mismatch', category: 'missing' };
+  if (shadow.included_status == null || String(shadow.included_status) === 'unknown') {
+    return { result: 'unknown', category: 'shadow_status_unknown' };
+  }
   const same = shadow.included_status === status;
   return { result: same ? 'match' : 'mismatch', category: same ? 'match' : `status_${status}_vs_${shadow.included_status}` };
 }
