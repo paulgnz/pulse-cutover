@@ -611,6 +611,13 @@ fn run_shell_inner(cmd: &str, timeout: Duration, pgid_file: Option<&Path>, cance
     run_command_inner(command, cmd, timeout, pgid_file, cancel, false)
 }
 
+/// The whole environment a strict argument-vector run gets (r30 round 5).
+pub const ARGV_ENV: &[(&str, &str)] = &[
+    ("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+    ("HOME", "/nonexistent"),
+    ("LC_ALL", "C"),
+];
+
 /// Run a program by argument vector (no shell) in its own process group, STRICT (the readiness drill, r30 round 4):
 /// its record is written as a fresh inode and is only removed once `ps` positively shows the whole group gone; a
 /// group that survives the kill, or cannot be inspected, keeps its record and makes the run fail as INCOMPLETE, so
@@ -623,6 +630,10 @@ pub fn run_argv_cancellable_strict(argv: &[String], timeout: Duration, pgid_file
     }
     let mut command = std::process::Command::new(prog);
     command.args(args);
+    // r30 round 5: a cleared environment. Nothing inherited can redirect what runs or where it talks: no PATH
+    // lookup of a different binary (the drill runs every program by absolute path anyway), no `DOCKER_HOST` /
+    // `DOCKER_CONTEXT` / `DOCKER_CONFIG` picking another daemon, no `LD_PRELOAD`.
+    command.env_clear().envs(ARGV_ENV.iter().copied());
     let display = argv.iter().map(|a| format!("'{a}'")).collect::<Vec<_>>().join(" ");
     run_command_inner(command, &display, timeout, pgid_file, Some(cancel), true)
 }
@@ -1445,6 +1456,26 @@ mod group_kill_tests {
         let argv: Vec<String> = ["true"].iter().map(|s| s.to_string()).collect();
         run_argv_cancellable_strict(&argv, Duration::from_secs(10), Some(&rec), &mut || false).unwrap();
         assert_eq!(std::fs::read_to_string(&protected).unwrap(), "JOURNAL");
+    }
+
+    /// r30 round 5 (reviewer F1): a strict argument-vector run (the drill's only way to run anything) gets a cleared
+    /// environment: nothing inherited (`DOCKER_HOST`, `DOCKER_CONTEXT`, `LD_PRELOAD`, a PATH that prefers another
+    /// `docker`) reaches the program.
+    #[test]
+    fn r5_strict_runs_get_a_cleared_environment() {
+        std::env::set_var("DOCKER_HOST", "tcp://remote.example:2375");
+        std::env::set_var("DOCKER_CONTEXT", "elsewhere");
+        let env_bin = ["/usr/bin/env", "/bin/env"].into_iter().find(|p| Path::new(p).exists()).unwrap();
+        let out = run_argv_cancellable_strict(&[env_bin.to_string()], Duration::from_secs(10), None, &mut || false)
+            .unwrap().unwrap();
+        std::env::remove_var("DOCKER_HOST");
+        std::env::remove_var("DOCKER_CONTEXT");
+        assert!(!out.contains("DOCKER_"), "{out}");
+        let mut lines: Vec<&str> = out.lines().collect();
+        lines.sort_unstable();
+        let mut want: Vec<String> = ARGV_ENV.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        want.sort();
+        assert_eq!(lines, want.iter().map(String::as_str).collect::<Vec<_>>());
     }
 
     #[test]

@@ -519,7 +519,22 @@ export function projectDrill(d) {
     timings_ms: tOut,
     error: d.error == null ? null : (typeof d.error === 'string' && d.error.length <= 400 ? redact(d.error, 120) : bad('drill.error', 'must be a string ≤ 400')),
     finished_ts_ms: int(d.finished_ts_ms, 'drill.finished_ts_ms'),
+    tools: projectDrillTools(d.tools),
   };
+}
+
+/** r30 round 5: the content pins of the programs a drill ran (and their digest). Only known keys, 64 lowercase hex. */
+export const DRILL_TOOL_KEYS = ['docker_bin_sha256', 'import_bin_sha256', 'compare_bin_sha256', 'fingerprint_bin_sha256',
+  'export_image_digest', 'tools_digest'];
+function projectDrillTools(t) {
+  if (t === undefined || t === null) return null;
+  if (!isObj(t)) bad('drill.tools', 'must be an object');
+  const out = {};
+  for (const k of DRILL_TOOL_KEYS) {
+    if (t[k] == null) continue;
+    out[k] = str(t[k], `drill.tools.${k}`, { max: 64, re: /^[0-9a-f]{64}$/ });
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 /**
@@ -538,10 +553,14 @@ export function drillComparison(reports) {
   return [...byH.entries()].sort((a, b) => b[0] - a[0]).slice(0, 5).map(([h, rows]) => {
     // r30 review (e): a DONE drill counts toward agreement only with complete evidence (block id at H, snapshot
     // hash and fingerprint digest); one that lacks any is listed as incomplete and blocks `agree`.
-    const complete = (d) => d.state === 'DONE' && !!d.block_id_at_h && !!d.snapshot_sha256 && !!d.fingerprints_digest;
+    // r30 round 5: and the content pins of the programs it ran (tools_digest): producers that ran different tools are
+    // not in agreement, whatever their state roots say.
+    const complete = (d) => d.state === 'DONE' && !!d.block_id_at_h && !!d.snapshot_sha256 && !!d.fingerprints_digest
+      && !!d.tools?.tools_digest;
+    const value = (d, key) => key === 'tools_digest' ? d.tools?.tools_digest : d[key];
     const group = (key) => {
       const g = {};
-      for (const { producer, d } of rows) if (complete(d)) (g[d[key]] ||= []).push(producer);
+      for (const { producer, d } of rows) if (complete(d)) (g[value(d, key)] ||= []).push(producer);
       return Object.entries(g).map(([value, producers]) => ({ value, producers }));
     };
     const done = rows.filter((r) => r.d.state === 'DONE');
@@ -552,9 +571,10 @@ export function drillComparison(reports) {
       running: rows.filter((r) => r.d.state === 'RUNNING').map((r) => r.producer),
       failed: rows.filter((r) => r.d.state === 'FAILED').map((r) => ({ producer: r.producer, error: r.d.error })),
       block_id_at_h: group('block_id_at_h'), snapshot_sha256: group('snapshot_sha256'), fingerprints_digest: roots,
-      compare: group('compare'),
-      // Identical state on every producer that finished, and at least two of them.
-      agree: done.length >= 2 && incomplete.length === 0 && roots.length === 1 && group('block_id_at_h').length === 1,
+      compare: group('compare'), tools_digest: group('tools_digest'),
+      // Identical state from identical tools on every producer that finished, and at least two of them.
+      agree: done.length >= 2 && incomplete.length === 0 && roots.length === 1 && group('block_id_at_h').length === 1
+        && group('tools_digest').length === 1,
       timings: rows.map((r) => ({ producer: r.producer, ...r.d.timings_ms })),
     };
   });
