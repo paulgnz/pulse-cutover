@@ -4313,12 +4313,20 @@ fn upstream_production_config(dir: &std::path::Path) -> Result<Config, String> {
 
 /// The production upstream config, coordinated the way a mainnet ceremony must be (RISK-REGISTER D-10): a signed
 /// event (id + hash), a roster of bp1 (this node, with its beacon) and bp2, quorum 2.
+/// A mainnet-shaped signed event (D-10): it binds the chain, H, roster and quorum the ceremony runs with.
+fn mainnet_event(h: u64) -> serde_json::Value {
+    signed(serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "chain_id": MAINNET, "h": h,
+        "roster": [{"producer": "bp1"}, {"producer": "bp2"}], "quorum": 2}))
+}
+
+/// The coordinated mainnet config and the signed event the mock relay must serve for it (set it on the ops).
 fn upstream_mainnet_coordinated_config(dir: &std::path::Path) -> Config {
-    let _ = upstream_production_config(dir).unwrap();
+    let h = upstream_production_config(dir).unwrap().ceremony.freeze_height;
     std::fs::write(dir.join("beacon.token"), "tok\n").unwrap();
+    let ev_hash = pulse_cutover::coord::payload_hash(&mainnet_event(h)).unwrap();
     let text = std::fs::read_to_string(dir.join("ceremony-upstream-ignite.toml")).unwrap()
         + &format!("\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nevent_hash = \"{}\"\nfleet_quorum = 2\nfleet_timeout_secs = 5\nreport_max_age_secs = 60\n",
-            hex::encode(coord_key().verifying_key().to_bytes()), mock_event_hash())
+            hex::encode(coord_key().verifying_key().to_bytes()), ev_hash)
         + "\n[[coordination.roster]]\nproducer = \"bp1\"\n\n[[coordination.roster]]\nproducer = \"bp2\"\n"
         + &format!("\n[beacon]\nurl = \"https://mc.example/api/report\"\nproducer = \"bp1\"\nnetwork = \"rehearsal\"\ntoken_file = \"{}/beacon.token\"\n", dir.display());
     load_toml(dir, "mainnet-coord.toml", &text).unwrap()
@@ -4334,6 +4342,7 @@ fn upstream_ignite_is_refused_for_mainnet_while_gaps_remain() {
     let ops = upstream_ops(dir.path());
     ops.schedule_ok.set(true);
     *ops.chain_id.borrow_mut() = MAINNET.into();
+    *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"event": mainnet_event(cfg.ceremony.freeze_height)}));
     *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp1", serde_json::json!({"state": "VERIFIED", "aborting": true})),
         ("bp2", serde_json::json!({"state": "ABORTED"}))]));
     assert_eq!(run_machine(&cfg, &ops), State::Aborted);
@@ -4343,6 +4352,7 @@ fn upstream_ignite_is_refused_for_mainnet_while_gaps_remain() {
     assert!(text.contains("#106") && text.contains("#107") && text.contains("#113"), "every open mainnet blocker is named");
     assert!(!dir.path().join("create-chain.calls").exists(), "no chain created");
     assert_eq!(ops.resumes.get(), 1);
+    assert!(text.contains("mainnet_event_verified"), "the signed event was authenticated and bound at ARM");
 }
 
 /// RISK-REGISTER D-10: an XPR MAINNET ceremony without signed coordination is refused, at load when chain_id is
@@ -4393,6 +4403,88 @@ fn d10_mainnet_producer_ceremony_must_be_coordinated() {
     ops.schedule_ok.set(true);
     let _ = run_machine_result(&cfg, &ops);
     assert!(transition(&journal_entries(&cfg), "FROZEN").is_some(), "testnet: the rule does not apply");
+}
+
+/// RISK-REGISTER D-10 (Codex review): field presence is not authorization. At a fresh mainnet ARM the relay must
+/// serve the signed event the config was derived from, and the payload must bind this chain, H, roster and quorum;
+/// every mismatch, a bad signature, another payload under the same id, and a relay that does not answer refuse
+/// before anything freezes.
+#[test]
+fn d10_mainnet_arm_authenticates_and_binds_the_signed_event() {
+    let other_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let forged = |payload: serde_json::Value| {
+        use ed25519_dalek::Signer;
+        let p = payload.to_string();
+        serde_json::json!({"payload": p, "sig": hex::encode(other_key.sign(p.as_bytes()).to_bytes()),
+            "key": hex::encode(other_key.verifying_key().to_bytes())})
+    };
+    // (what the relay serves, the expected refusal) — None = the relay is down.
+    let cases: Vec<(&str, Option<serde_json::Value>, &str)> = vec![
+        ("wrong chain", Some(serde_json::json!({"event": signed(serde_json::json!({"type": "event", "network": "rehearsal",
+            "event_id": "e1", "chain_id": "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd", "h": 0,
+            "roster": [{"producer": "bp1"}, {"producer": "bp2"}], "quorum": 2}))})), "event_hash differs"),
+        ("relay down", None, "did not answer"),
+        ("no event", Some(serde_json::json!({})), "does not serve a signed event"),
+        ("bad signature", Some(serde_json::json!({"event": forged(serde_json::json!({"type": "event"}))})), "does not verify"),
+    ];
+    for (name, doc, needle) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        stage_fake_upstream_tools(dir.path(), 0);
+        let cfg = upstream_mainnet_coordinated_config(dir.path());
+        let ops = upstream_ops(dir.path());
+        ops.schedule_ok.set(true);
+        *ops.chain_id.borrow_mut() = MAINNET.into();
+        match doc {
+            Some(d) => *ops.coord_doc.borrow_mut() = Some(d),
+            None => ops.coord_down.set(true),
+        }
+        assert!(run_machine_result(&cfg, &ops).is_err(), "{name}");
+        let e = journal_entries(&cfg);
+        assert!(transition(&e, "FROZEN").is_none(), "{name}: nothing froze");
+        let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+        assert!(text.contains("XPR MAINNET signed event") && text.contains(needle), "{name}: {text}");
+        assert!(!text.contains("mainnet_event_verified"), "{name}");
+    }
+
+    // Binding mismatches on an authentic payload whose hash the config carries: the config is re-derived per case so
+    // the hash check passes and the binding check is what refuses.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_mainnet_coordinated_config(dir.path());
+    let h = cfg.ceremony.freeze_height;
+    let ev = |chain: Option<&str>, hh: Option<u64>, roster: serde_json::Value, quorum: u64| {
+        let mut p = serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "roster": roster, "quorum": quorum});
+        if let Some(c) = chain { p["chain_id"] = serde_json::json!(c); }
+        if let Some(x) = hh { p["h"] = serde_json::json!(x); }
+        signed(p)
+    };
+    let two = serde_json::json!([{"producer": "bp1"}, {"producer": "bp2"}]);
+    for (name, msg, needle) in [
+        ("good", ev(Some(MAINNET), Some(h), two.clone(), 2), ""),
+        ("other chain", ev(Some("71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"), Some(h), two.clone(), 2), "is for chain_id"),
+        ("no chain", ev(None, Some(h), two.clone(), 2), "names no chain_id"),
+        ("other H", ev(Some(MAINNET), Some(h + 1), two.clone(), 2), "is not ceremony.freeze_height"),
+        ("no H", ev(Some(MAINNET), None, two.clone(), 2), "names no H"),
+        ("other roster", ev(Some(MAINNET), Some(h), serde_json::json!([{"producer": "bp1"}, {"producer": "bp9"}]), 2), "roster differs"),
+        ("other quorum", ev(Some(MAINNET), Some(h), two.clone(), 1), "quorum 1 is not"),
+    ] {
+        let mut c = cfg.clone();
+        c.coordination.as_mut().unwrap().event_hash = pulse_cutover::coord::payload_hash(&msg);
+        let doc = serde_json::json!({"event": msg});
+        let p = pulse_cutover::coord::mainnet_event_problems(Some(&doc), &c, MAINNET);
+        if needle.is_empty() {
+            assert!(p.is_empty(), "{name}: {p:?}");
+        } else {
+            assert!(p.iter().any(|x| x.contains(needle)), "{name}: {p:?}");
+        }
+    }
+    // The network the event was signed for must be this node's coordination network.
+    let mut c = cfg.clone();
+    let msg = signed(serde_json::json!({"type": "event", "network": "testnet", "event_id": "e1", "chain_id": MAINNET, "h": h,
+        "roster": two, "quorum": 2}));
+    c.coordination.as_mut().unwrap().event_hash = pulse_cutover::coord::payload_hash(&msg);
+    let p = pulse_cutover::coord::mainnet_event_problems(Some(&serde_json::json!({"event": msg})), &c, MAINNET);
+    assert!(p.iter().any(|x| x.contains("network")), "{p:?}");
 }
 
 /// RISK-REGISTER D-10, api mode: a mainnet api ceremony needs the signed event too (no roster: API nodes are not

@@ -41,3 +41,11 @@ test('rc.23: --metal-network-id pins a (private) Metal network in the signed eve
   assert.equal(eventPayload(base, 5).metal_network_id, undefined);
   assert.throws(() => eventPayload({ ...base, 'metal-network-id': 'tahoe' }), /positive integer/);
 });
+
+test('D-10: every event binds a chain_id and an H', () => {
+  assert.throws(() => eventPayload({ ...base, 'chain-id': undefined }), /--chain-id/);
+  assert.throws(() => eventPayload({ ...base, 'chain-id': 'xyz' }), /--chain-id/);
+  assert.throws(() => eventPayload({ ...base, h: undefined }), /--h/);
+  assert.throws(() => eventPayload({ ...base, h: '0' }), /--h/);
+  assert.equal(eventPayload({ ...base, 'chain-id': 'AB'.repeat(32) }, 5).chain_id, 'ab'.repeat(32));
+});

@@ -101,7 +101,10 @@ node tools/capture-static.mjs http://127.0.0.1:8888 /etc/pulse-cutover/static
 > config without a `[coordination]` section (at load, when `chain_id` is configured) and refuses to ARM (before
 > anything freezes) unless it runs the config `pulse-cutover await` derived from the signed event: `event_id` and
 > `event_hash` set and, in producer mode, the event's roster and a quorum of at least 2. API-mode nodes need the
-> signed event but no roster (they are not members of the producers' quorum). `pulse-cutover doctor` reports a
+> signed event but no roster (they are not members of the producers' quorum). At that ARM the agent also re-fetches
+> the event from mission control and checks it is the signed payload it was derived from and that it names this
+> chain, this H, this roster and this quorum; if mission control does not answer, it does not ARM. Coordinators:
+> `coord.mjs event` requires `--chain-id` and `--h`. `pulse-cutover doctor` reports a
 > host whose memory or chain cannot be read instead of passing it.
 
 Each agent decides from its own observations, so one event can end with different states on different BPs (the
