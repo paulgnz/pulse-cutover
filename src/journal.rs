@@ -123,13 +123,15 @@ pub struct Recovered {
 }
 
 impl Journal {
-    pub fn open(path: &Path) -> Result<(Self, Recovered), String> {
+    /// The exclusive lock on `<journal>.lock`, held by a ceremony agent for its whole run and by a readiness
+    /// drill for its whole run (r30), so a ceremony and a drill (or two of either) on one journal are mutually
+    /// exclusive atomically. Creates the journal's directory if needed; never touches the journal itself.
+    pub fn lock(path: &Path) -> Result<File, String> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("create journal dir: {e}"))?;
             }
         }
-        // Exclusive lock FIRST: nothing below (tail repair, appends) may race another agent.
         let lock_path = PathBuf::from(format!("{}.lock", path.display()));
         let lock = OpenOptions::new()
             .create(true)
@@ -147,18 +149,24 @@ impl Journal {
             busy = lock.try_lock();
         }
         match busy {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(format!(
-                    "another pulse-cutover process holds {} — a ceremony is already running on \
-                     this journal. Refusing to start a second one.",
-                    lock_path.display()
-                ))
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(format!("lock {}: {e}", lock_path.display()))
+            Ok(()) => Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+                "another pulse-cutover process holds {} — a ceremony (or a readiness drill) is already running on \
+                 this journal. Refusing to start a second one.",
+                lock_path.display()
+            )),
+            Err(std::fs::TryLockError::Error(e)) => Err(format!("lock {}: {e}", lock_path.display())),
+        }
+    }
+
+    pub fn open(path: &Path) -> Result<(Self, Recovered), String> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("create journal dir: {e}"))?;
             }
         }
+        // Exclusive lock FIRST: nothing below (tail repair, appends) may race another agent.
+        let lock = Self::lock(path)?;
         let torn = if path.exists() { Self::repair_torn_tail(path)? } else { false };
         let recovered = if path.exists() {
             let mut r = Self::replay(path)?;

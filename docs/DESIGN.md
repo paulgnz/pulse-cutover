@@ -428,16 +428,23 @@ None of this is scheduled.
 ## 7. Readiness drill (r30, risk register D-7)
 
 **Purpose.** Rung 4 of the mainnet test ladder ([HOW-IT-WORKS.md](HOW-IT-WORKS.md#7-how-it-gets-proven-before-mainnet)):
-every producer proves, on the live chain and with no effect on it, that its own infrastructure cuts exactly H and
+every producer proves, on the live chain and with no state or write impact on it, that its own infrastructure cuts exactly H and
 converts it to the same state as everyone else, and measures how long that takes. Nothing else can show this
 before a real event: rehearsals use rehearsal nodes, a drill uses each producer's real nodeos and hardware.
 
 **Shape.** A separate command, `pulse-cutover drill --config <ceremony.toml> --height H`, in its own module
 (`src/drill.rs`). It does not go through the state machine and never opens the ceremony journal for writing.
 
-1. Refuse unless the config uses the upstream backend with `compare_bin` and `snapshot.dir`; refuse while the
-   ceremony journal is in progress, sealed, unfinished or LIVE (only no journal, an empty one or a finished ABORTED
-   may run next to a drill); refuse H < head + 20 and an H already drilled on this box.
+1. Refuse unless the config uses the upstream backend with `compare_bin` and `snapshot.dir`, and none of its
+   conversion commands (or a small script they name) references a configured side-effect command (`hooks.*`,
+   `source.stop_cmd` / `start_cmd` / `quiesce_cmd`, `target.create_chain_cmd` / `ignite_cmd` / `stop_cmd` /
+   `post_live_probe_cmd`, flip and hyperion commands). Take the ceremony's own exclusive journal lock
+   (`<journal>.lock`) and hold it for the whole drill, so a ceremony and a drill, or two drills, on one journal
+   exclude each other atomically. Refuse while the ceremony journal is in progress, sealed, unfinished or LIVE
+   (only no journal, an empty one or a finished ABORTED may run next to a drill), while another drill is RUNNING,
+   when the drill directory overlaps (after resolving symlinks) `snapshot.staged_path`, the journal,
+   `upstream.work_dir` or `snapshot.dir`, for H < head + 20, and for an H already drilled on this box (the
+   `drill/<H>` directory is claimed with an atomic create).
 2. `schedule_snapshot(H)` (the same producer-API call ARM makes). No freeze, no pause, no burn-off gate: the chain
    keeps producing, and the blocks after H are recorded as information only.
 3. Wait for LIB ≥ H, pin H's block id, pick up `snapshot-<id of H>.bin`, hash it.
@@ -448,6 +455,26 @@ before a real event: rehearsals use rehearsal nodes, a drill uses each producer'
 5. Journal every step in `<journal dir>/drill/<H>/drill.jsonl` (`kind = "readiness_drill"` on every line), publish
    `<journal dir>/drill/latest.json`, keep the compare report and checkpoint manifest, delete the multi-GB work
    files unless `--keep-work`.
+
+**What it costs.** No state or write impact, but CPU, RAM (13.7 GB peak on mainnet state) and disk, and nodeos
+writes the snapshot at H synchronously: on a producing node that can cost blocks in its own round. Prefer a
+non-producing node with the same snapshot directory, or an H outside the producer's round. A drill that fails or
+is cancelled before H is final removes its pending request (`get_snapshot_requests` + `unschedule_snapshot`; the
+guard only lets it remove the height it scheduled itself).
+
+**What it cannot vouch for.** The guard covers every call the agent makes; it cannot sandbox shell. The
+conversion commands (`upstream.export_cmd`, `import_bin`, `compare_bin`, `fingerprint_bin`) run as configured, so
+the drill is only as harmless as those commands. The textual check above catches the obvious mistake (a
+conversion command or wrapper that calls a hook, a stop or a chain-creation command); it cannot prove what an
+arbitrary binary does. Operators must use the published conversion commands.
+
+**Both ways exclusive.** A fresh ceremony's ARM preflight refuses while `drill/latest.json` is RUNNING with a live
+drill process (same pid and start time) or a live pipeline process group; a RUNNING record with nothing alive is
+journaled as `readiness_drill_stale` and does not block. While a drill runs it also holds the journal lock, so
+`run` cannot even open the journal. `pulse-cutover drill --cancel` writes `drill/<H>/cancel` (the drill checks it
+while waiting for H and as the pipeline's cancel check, which stops the running tool), waits up to 60 s, then stops
+the pipeline's recorded process group (start-time checked, never pgid 0 or 1). If no drill process is left, it
+removes the pending snapshot request and marks the drill FAILED (cancelled) itself.
 
 **Why it cannot change anything.** The drill never holds the raw `ChainOps`: every call goes through `DrillGuard`,
 which passes read-only calls, `schedule_snapshot` and the pipeline's commands, and refuses (and records) pause,
@@ -465,7 +492,8 @@ a drill once it has `[upstream]` and `snapshot.dir`.
 and ceremonies compare directly. Mission control validates the field (`projectDrill`), compares producers per drill
 height (`drillComparison`: same block at H, snapshot, state root, compare result, timings) and shows a separate
 READINESS DRILL panel. Drill data never feeds the fleet verdict, the agreement table, the creation-evidence log or
-any agent decision. `status` prints the latest drill on its own line, labelled as not a ceremony, and `report`
+any agent decision; an invalid `drill` field is dropped on its own (`drill_invalid`), never the whole report, and a
+DONE drill counts toward agreement only with a block id at H, a snapshot hash and a fingerprint digest. `status` prints the latest drill on its own line, labelled as not a ceremony, and `report`
 bundles `drill-latest.json`.
 
 **Exit codes.** 0 = evidence complete and the compare matched; 5 = evidence complete, the compare did not match;

@@ -24,6 +24,10 @@ struct LiveChain {
     scheduled: RefCell<Option<u64>>,
     calls: RefCell<Vec<String>>,
     clock: RefCell<u64>,
+    /// LIB never reaches this height (a chain whose finality is slow): the drill waits.
+    lib_cap: RefCell<Option<u64>>,
+    /// Real milliseconds per sleep_ms (0 = no real sleep, the default).
+    real_sleep_ms: u64,
 }
 
 impl LiveChain {
@@ -38,7 +42,14 @@ impl LiveChain {
             scheduled: RefCell::new(None),
             calls: RefCell::new(vec![]),
             clock: RefCell::new(1_000_000),
+            lib_cap: RefCell::new(None),
+            real_sleep_ms: 0,
         }
+    }
+    fn stalled(dir: &Path, chain_id: &str, head: u64, lib_cap: u64, real_sleep_ms: u64) -> Self {
+        let c = LiveChain::new(dir, chain_id, head);
+        *c.lib_cap.borrow_mut() = Some(lib_cap);
+        LiveChain { real_sleep_ms, ..c }
     }
     fn call(&self, n: &str) {
         self.calls.borrow_mut().push(n.into());
@@ -56,7 +67,7 @@ impl ChainOps for LiveChain {
             *h += 1;
             *h
         };
-        let lib = head.saturating_sub(3);
+        let lib = head.saturating_sub(3).min(self.lib_cap.borrow().unwrap_or(u64::MAX));
         if let Some(h) = *self.scheduled.borrow() {
             let f = self.snap_dir.join(format!("snapshot-{}.bin", block_id(h)));
             if lib >= h && !f.exists() {
@@ -105,6 +116,14 @@ impl ChainOps for LiveChain {
         *self.scheduled.borrow_mut() = Some(h);
         Ok(())
     }
+    fn unschedule_snapshot(&self, h: u64) -> Result<bool, String> {
+        self.call("unschedule_snapshot");
+        let had = *self.scheduled.borrow() == Some(h);
+        if had {
+            *self.scheduled.borrow_mut() = None;
+        }
+        Ok(had)
+    }
     fn target_info(&self) -> Result<Option<ChainInfo>, String> {
         self.call("target_info");
         Ok(None)
@@ -138,7 +157,11 @@ impl ChainOps for LiveChain {
         *c += 100;
         *c
     }
-    fn sleep_ms(&self, _ms: u64) {}
+    fn sleep_ms(&self, _ms: u64) {
+        if self.real_sleep_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.real_sleep_ms));
+        }
+    }
 }
 
 fn script(path: &Path, body: &str) {
@@ -184,6 +207,10 @@ fn stage_tools(dir: &Path, compare_ok: bool) {
 }
 
 fn drill_config(dir: &Path, chain_id: &str, extra_upstream: &str) -> Result<Config, String> {
+    drill_config_edit(dir, chain_id, extra_upstream, |t| t)
+}
+
+fn drill_config_edit(dir: &Path, chain_id: &str, extra_upstream: &str, edit: impl Fn(String) -> String) -> Result<Config, String> {
     let d = dir.display();
     let text = format!(
         r#"
@@ -217,7 +244,7 @@ compare_bin = "{d}/compare.sh"
 "#
     );
     let p = dir.join("drill.toml");
-    std::fs::write(&p, text).unwrap();
+    std::fs::write(&p, edit(text)).unwrap();
     Config::load(&p)
 }
 
@@ -380,4 +407,206 @@ rpc_url = "http://mock"
     let cfg = Config::load(&p).unwrap();
     let problems = drill::config_problems(&cfg);
     assert_eq!(problems.len(), 3, "{problems:?}");
+}
+
+// ------------------------------------------------------------------------- r30 review: exclusion, cancel ----
+
+fn latest(cfg: &Config) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(drill::latest_path(cfg)).unwrap()).unwrap()
+}
+
+#[test]
+fn a_running_drill_blocks_a_ceremony_and_drill_cancel_stops_it_and_unschedules() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    let p = dir.path().to_path_buf();
+    // The drill runs in its own thread on a chain whose LIB stays below H: it is waiting for finality.
+    let worker = std::thread::spawn(move || {
+        let cfg = Config::load(&p.join("drill.toml")).unwrap();
+        let chain = LiveChain::stalled(&p, MAINNET, 1_000, 1_030, 5);
+        let res = drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false });
+        let calls = chain.calls.borrow().clone();
+        (res.map(|o| o.view), calls)
+    });
+    let t0 = std::time::Instant::now();
+    while !matches!(drill::activity(&cfg), drill::DrillActivity::Running { .. }) {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(20), "the drill never showed as RUNNING");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // While it runs: a fresh ceremony is refused (the ARM preflight reason) and cannot even take the journal.
+    let why = drill::ceremony_blocker(&cfg).expect("a running drill blocks a ceremony");
+    assert!(why.contains("H = 1050") && why.contains("drill --cancel"), "{why}");
+    let held = pulse_cutover::journal::Journal::open(&cfg.journal_path).err().expect("the drill holds the journal lock");
+    assert!(held.contains("holds"), "{held}");
+    // ...and a second drill is refused.
+    let other = LiveChain::new(dir.path(), MAINNET, 1_000);
+    let second = drill::run(&cfg, &other, &DrillOptions { height: 1_200, keep_work: false }).unwrap_err();
+    assert!(second.contains("lock"), "{second}");
+    assert!(!other.called("schedule_snapshot"));
+
+    let msg = drill::cancel(&cfg, &other, std::time::Duration::from_secs(20)).unwrap();
+    assert!(msg.contains("cancelled"), "{msg}");
+    let (res, calls) = worker.join().unwrap();
+    let err = res.unwrap_err();
+    assert!(err.contains("cancelled by `pulse-cutover drill --cancel`"), "{err}");
+    assert!(calls.iter().any(|c| c == "unschedule_snapshot"), "the drill removed its pending snapshot request");
+    for f in FORBIDDEN {
+        assert!(!calls.iter().any(|c| c == f), "a cancelled drill called {f}");
+    }
+    assert_eq!(latest(&cfg)["state"], "FAILED");
+    let log = std::fs::read_to_string(drill::drill_dir(&cfg, 1_050).join("drill.jsonl")).unwrap();
+    assert!(log.contains("cancel_requested") && log.contains("\"unscheduled\":true"), "{log}");
+    assert_eq!(drill::activity(&cfg), drill::DrillActivity::Idle);
+    assert!(drill::ceremony_blocker(&cfg).is_none());
+    // The lock is released with the drill.
+    assert!(pulse_cutover::journal::Journal::open(&cfg.journal_path).is_ok());
+}
+
+#[test]
+fn a_stale_running_record_does_not_block_and_cancel_closes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    std::fs::create_dir_all(drill::drill_dir(&cfg, 777)).unwrap();
+    // A drill process that died mid-wait: RUNNING, but neither its pid (start time differs) nor a group is alive.
+    std::fs::write(drill::latest_path(&cfg), serde_json::json!({"kind": "readiness_drill", "drill": true, "h": 777,
+        "state": "RUNNING", "pid": std::process::id(), "pid_start": "not this process"}).to_string()).unwrap();
+    assert_eq!(drill::activity(&cfg), drill::DrillActivity::Stale { h: 777 });
+    assert!(drill::ceremony_blocker(&cfg).is_none(), "a stale record is reported, never blocking");
+
+    let chain = LiveChain::stalled(dir.path(), MAINNET, 700, 760, 0);
+    chain.schedule_snapshot(777).unwrap();
+    let msg = drill::cancel(&cfg, &chain, std::time::Duration::from_millis(200)).unwrap();
+    assert!(msg.contains("marked cancelled"), "{msg}");
+    assert!(chain.called("unschedule_snapshot"));
+    assert!(chain.scheduled.borrow().is_none());
+    let v = latest(&cfg);
+    assert_eq!(v["state"], "FAILED");
+    assert!(v["error"].as_str().unwrap().contains("cancelled"));
+    let log = std::fs::read_to_string(drill::drill_dir(&cfg, 777).join("drill.jsonl")).unwrap();
+    assert!(log.contains("\"stage\":\"cancelled\""), "{log}");
+    // Nothing to cancel any more.
+    assert!(drill::cancel(&cfg, &chain, std::time::Duration::from_millis(10)).unwrap().contains("no readiness drill"));
+}
+
+#[test]
+fn a_drill_that_fails_before_h_is_final_unschedules_its_snapshot_request() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| t.replace("[source]\n", "[source]\nsnapshot_timeout_secs = 1\n")).unwrap();
+    let chain = LiveChain::stalled(dir.path(), MAINNET, 1_000, 1_030, 0);
+    let err = drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).unwrap_err();
+    assert!(err.contains("did not become final"), "{err}");
+    assert!(chain.called("unschedule_snapshot"));
+    assert!(chain.scheduled.borrow().is_none());
+    assert_eq!(latest(&cfg)["state"], "FAILED");
+}
+
+#[test]
+fn the_guard_only_unschedules_the_height_this_drill_scheduled() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 1);
+    let g = DrillGuard::new(&chain);
+    assert!(g.unschedule_snapshot(500).is_err(), "a request the drill never scheduled (e.g. a ceremony's)");
+    assert_eq!(g.violations.borrow().len(), 1);
+    assert!(!chain.called("unschedule_snapshot"));
+    g.schedule_snapshot(600).unwrap();
+    assert!(g.unschedule_snapshot(600).unwrap());
+    assert!(g.unschedule_snapshot(500).is_err());
+}
+
+#[test]
+fn any_guard_violation_fails_the_drill_even_when_the_pipeline_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+    let g = DrillGuard::new(&chain);
+    let _ = g.pause(); // a forbidden call recorded by the guard during the drill's lifetime
+    let err = drill::run_with_guard(&cfg, &g, &DrillOptions { height: 1_050, keep_work: false }).unwrap_err();
+    assert!(err.contains("forbidden operations") && err.contains("pause"), "{err}");
+    assert!(!chain.called("pause"));
+}
+
+#[test]
+fn the_drill_pgid_file_is_its_own_never_the_ceremonys() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    let ceremony = pulse_cutover::ops::hook_pgid_path(&cfg.journal_path);
+    for h in [1, 1_050, 408_328_634] {
+        let f = drill::pgid_file(&cfg, h);
+        assert_ne!(f, ceremony);
+        assert!(f.starts_with(drill::drill_dir(&cfg, h)), "{}", f.display());
+        assert_eq!(f, pulse_cutover::ops::hook_pgid_path(&drill::pgid_journal_for(&cfg, h)));
+    }
+    // A live group recorded in the drill's file makes it RUNNING (so a ceremony refuses) even without its pid.
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new("sh").arg("-c").arg("sleep 30").process_group(0).spawn().unwrap();
+    std::fs::create_dir_all(drill::drill_dir(&cfg, 9)).unwrap();
+    std::fs::write(drill::pgid_file(&cfg, 9), format!("{}\n", child.id())).unwrap();
+    std::fs::write(drill::latest_path(&cfg), serde_json::json!({"kind": "readiness_drill", "h": 9, "state": "RUNNING"}).to_string()).unwrap();
+    let running = drill::activity(&cfg);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(matches!(running, drill::DrillActivity::Running { h: 9, pid: None, group: Some(_) }), "{running:?}");
+    // The ceremony's own pgid file is a different path: its orphan cleanup never sees the drill's group.
+    assert!(!ceremony.exists());
+}
+
+#[test]
+fn a_drill_refuses_conversion_commands_that_reach_a_side_effect_command() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let d = dir.path().display().to_string();
+    let hook = format!("{d}/hooks/on-freeze.sh");
+    std::fs::create_dir_all(dir.path().join("hooks")).unwrap();
+    script(&dir.path().join("hooks/on-freeze.sh"), "#!/bin/sh\necho freeze\n");
+    // 1. export_cmd calls the freeze hook directly.
+    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| {
+        t.replace("export_cmd = \"sh ", &format!("export_cmd = \"{hook} r1 && sh "))
+            + &format!("\n[hooks]\non_freeze = \"{hook} r1\"\n")
+    }).unwrap();
+    let p = drill::config_problems(&cfg).join("; ");
+    assert!(p.contains("upstream.export_cmd references hooks.on_freeze"), "{p}");
+    let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+    let err = drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).unwrap_err();
+    assert!(err.contains("hooks.on_freeze"), "{err}");
+    assert!(!chain.called("schedule_snapshot"));
+    // 2. A wrapper script the pipeline names calls a stop command.
+    script(&dir.path().join("import.sh"), &format!("#!/bin/sh\nsystemctl stop nodeos-xpr\nprintf CKPT > \"$3\"\n"));
+    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| t.replace("[source]\n", "[source]\nstop_cmd = \"systemctl stop nodeos-xpr\"\n")).unwrap();
+    let p = drill::config_problems(&cfg).join("; ");
+    assert!(p.contains("upstream.import_bin (script") && p.contains("source.stop_cmd"), "{p}");
+    // 3. The published commands with unrelated hooks configured: accepted.
+    stage_tools(dir.path(), true);
+    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| t + "\n[hooks]\non_freeze = \"/opt/edge/freeze.sh\"\non_live = \"/opt/edge/flip.sh\"\n").unwrap();
+    assert!(drill::config_problems(&cfg).is_empty(), "{:?}", drill::config_problems(&cfg));
+}
+
+#[test]
+fn a_drill_refuses_paths_that_overlap_the_ceremony_even_through_a_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let d = dir.path().display().to_string();
+    // staged_path inside the drill's work directory (it would be rewritten and deleted).
+    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| t.replace(&format!("staged_path = \"{d}/staged.bin\""),
+        &format!("staged_path = \"{d}/drill/1050/work/checkpoint-1050.bin\""))).unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+    let err = drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).unwrap_err();
+    assert!(err.contains("snapshot.staged_path") && err.contains("overlaps"), "{err}");
+    assert!(!chain.called("schedule_snapshot"));
+    assert!(!drill::drill_dir(&cfg, 1_050).exists());
+
+    // The drill directory is a symlink into the ceremony's work dir.
+    let dir2 = tempfile::tempdir().unwrap();
+    stage_tools(dir2.path(), true);
+    let cfg = drill_config(dir2.path(), MAINNET, "").unwrap();
+    let work = cfg.upstream.as_ref().unwrap().work_dir.clone();
+    std::fs::create_dir_all(&work).unwrap();
+    std::os::unix::fs::symlink(&work, drill::drill_root(&cfg)).unwrap();
+    let chain = LiveChain::new(dir2.path(), MAINNET, 1_000);
+    let err = drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).unwrap_err();
+    assert!(err.contains("upstream.work_dir") && err.contains("overlaps"), "{err}");
+    assert!(!chain.called("schedule_snapshot"));
 }

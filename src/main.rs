@@ -40,7 +40,8 @@ read-only, safe anywhere (including production):
   await           arm from a signed coordinator event (same H on every producer)
   verify          hash + dual-import fingerprint a snapshot (heavy but touches nothing)
   drill           readiness drill: snapshot the LIVE chain at an agreed H (no freeze, no pause),
-                  convert it, report the evidence; never creates or ignites anything (heavy)
+                  convert it, report the evidence; never creates or ignites anything (heavy;
+                  --cancel stops a running one)
 
 mutating (normally driven by install.sh / cutover.sh):
   run             run the ceremony to LIVE (exit 0), ABORTED or HALTED (exit 1)
@@ -243,8 +244,9 @@ EXAMPLES
 
 const HELP_DRILL: &str = "\
 pulse-cutover drill --config ceremony.toml --height H [--keep-work]
+pulse-cutover drill --config ceremony.toml --cancel
 
-A zero-impact readiness drill (rung 4 of the mainnet test ladder): every producer runs it with the SAME
+A readiness drill with no state or write impact (rung 4 of the mainnet test ladder): every producer runs it with the SAME
 H, on the live chain, and mission control compares the results.
 
 It schedules nodeos's snapshot at exactly H (the ceremony's schedule_at_h call), waits while the chain
@@ -259,12 +261,27 @@ through a guard that refuses all of those. The compare result is the TRUE result
 and a pinned golden_state_root are ignored for a drill. Allowed on XPR mainnet (that is its purpose);
 rehearsal overrides in the config are still refused for mainnet at load, as always.
 
-Refused when: the config is not import_backend = \"upstream\" with compare_bin and snapshot.dir; the
-ceremony journal is in progress, sealed, unfinished or LIVE; H < head + 20; a drill at H already ran.
+The guard covers every call the agent makes, but it cannot sandbox shell: the drill runs the configured
+conversion commands (upstream export_cmd, import_bin, compare_bin, fingerprint_bin) as they are, and cannot vouch
+for what those commands do. Use the published conversion commands. A drill refuses when one of them (or a small
+script it names) references a hook, a source/target stop or start command, a chain-creation or ignite command,
+or a flip command.
 
-Heavy: on XPR mainnet state the conversion took 9.6 min and 13.7 GB RAM (2026-10-13). The multi-GB work
-files are deleted at the end (the evidence is kept) unless --keep-work. nodeos's snapshot file stays in
-snapshot.dir (yours to remove).
+Refused when: the config is not import_backend = \"upstream\" with compare_bin and snapshot.dir; the
+ceremony journal is in progress, sealed, unfinished or LIVE, or its lock is held; another drill is running;
+the drill directory overlaps snapshot.staged_path, the journal, upstream.work_dir or snapshot.dir (symlinks
+resolved); H < head + 20; a drill at H already ran. The other way round, a fresh ceremony refuses to ARM while a drill is RUNNING.
+
+What it costs: CPU, RAM and disk (on XPR mainnet state the conversion took 9.6 min and 13.7 GB RAM,
+2026-10-13), and nodeos writes the snapshot at H synchronously, which on a producing node can cost blocks
+in its own round. Prefer a non-producing node with the same snapshot directory, or an H outside your
+production round. The multi-GB work files are deleted at the end (the evidence is kept) unless
+--keep-work. nodeos's snapshot file stays in snapshot.dir (yours to remove). A drill that fails or is
+cancelled before H is final removes its pending snapshot request (Leap producer API unschedule_snapshot).
+
+--cancel: asks the running drill to stop (it checks while waiting for H and between and during pipeline
+steps), waits up to 60 s, then stops the pipeline tool's process group; if the drill process is gone it
+removes the pending snapshot request and marks the drill FAILED (cancelled).
 
 Exit codes: 0 = evidence complete and the compare matched; 5 = evidence complete, the compare did NOT
 match (the finding a drill exists to surface; the fingerprint is still reported); 1 = the drill failed.";
@@ -718,12 +735,18 @@ fn cancel_rollback_intent(cfg: &Config, understood: bool) -> Result<(), String> 
 
 fn cmd_drill(args: &[String]) -> Result<(), String> {
     let cfg = load_config(args)?;
+    if flag(args, "--cancel") {
+        let ops = HttpOps::new(&cfg.source.rpc_url, &cfg.source.producer_api_url, "", "false", cfg.source.snapshot_timeout_secs);
+        let msg = pulse_cutover::drill::cancel(&cfg, &ops, std::time::Duration::from_secs(60))?;
+        println!("{msg}");
+        return Ok(());
+    }
     let height: u64 = arg(args, "--height")
         .ok_or("missing --height H (the agreed drill height, the same on every producer)")?
         .parse()
         .map_err(|e| format!("bad --height: {e}"))?;
     // Never the ceremony's ignite command or hook process-group file: the drill has its own.
-    let pgid_for = pulse_cutover::drill::drill_root(&cfg).join(height.to_string()).join("drill.jsonl");
+    let pgid_for = pulse_cutover::drill::pgid_journal_for(&cfg, height);
     let ops = HttpOps::new(
         &cfg.source.rpc_url,
         &cfg.source.producer_api_url,
