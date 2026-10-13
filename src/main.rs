@@ -39,6 +39,8 @@ read-only, safe anywhere (including production):
   beacon          report readiness + ceremony evidence to mission control
   await           arm from a signed coordinator event (same H on every producer)
   verify          hash + dual-import fingerprint a snapshot (heavy but touches nothing)
+  drill           readiness drill: snapshot the LIVE chain at an agreed H (no freeze, no pause),
+                  convert it, report the evidence; never creates or ignites anything (heavy)
 
 mutating (normally driven by install.sh / cutover.sh):
   run             run the ceremony to LIVE (exit 0), ABORTED or HALTED (exit 1)
@@ -239,6 +241,34 @@ EXAMPLES
   pulse-cutover report
   pulse-cutover report --paranoid --out /tmp/bundle.tar.gz";
 
+const HELP_DRILL: &str = "\
+pulse-cutover drill --config ceremony.toml --height H [--keep-work]
+
+A zero-impact readiness drill (rung 4 of the mainnet test ladder): every producer runs it with the SAME
+H, on the live chain, and mission control compares the results.
+
+It schedules nodeos's snapshot at exactly H (the ceremony's schedule_at_h call), waits while the chain
+keeps producing until H is final, picks up snapshot-<id of H>.bin, and runs the configured upstream
+pipeline on it (export -> import -> 21-table compare -> state fingerprint) in <journal dir>/drill/<H>/.
+It records each step's duration and publishes the result as <journal dir>/drill/latest.json, which the
+beacon reports as `drill` (never as the ceremony).
+
+It never: closes writes, pauses or resumes the producer, runs a hook, creates or ignites a chain, flips
+an edge, stops the source, or touches snapshot.staged_path or the ceremony journal. Every chain call goes
+through a guard that refuses all of those. The compare result is the TRUE result: a rehearsal allowlist
+and a pinned golden_state_root are ignored for a drill. Allowed on XPR mainnet (that is its purpose);
+rehearsal overrides in the config are still refused for mainnet at load, as always.
+
+Refused when: the config is not import_backend = \"upstream\" with compare_bin and snapshot.dir; the
+ceremony journal is in progress, sealed, unfinished or LIVE; H < head + 20; a drill at H already ran.
+
+Heavy: on XPR mainnet state the conversion took 9.6 min and 13.7 GB RAM (2026-10-13). The multi-GB work
+files are deleted at the end (the evidence is kept) unless --keep-work. nodeos's snapshot file stays in
+snapshot.dir (yours to remove).
+
+Exit codes: 0 = evidence complete and the compare matched; 5 = evidence complete, the compare did NOT
+match (the finding a drill exists to surface; the fingerprint is still reported); 1 = the drill failed.";
+
 const HELP_JOIN: &str = "\
 pulse-cutover join --config ceremony-<event>.toml --event <event_id> [--reverify]
 
@@ -282,6 +312,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "unhalt" => Some(HELP_UNHALT),
         "rollback" => Some(HELP_ROLLBACK),
         "join" => Some(HELP_JOIN),
+        "drill" => Some(HELP_DRILL),
         _ => None,
     }
 }
@@ -331,6 +362,7 @@ fn main() {
         "unhalt" => cmd_unhalt(&args),
         "rollback" => cmd_rollback(&args),
         "join" => cmd_join(&args),
+        "drill" => cmd_drill(&args),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -684,6 +716,46 @@ fn cancel_rollback_intent(cfg: &Config, understood: bool) -> Result<(), String> 
     Ok(())
 }
 
+fn cmd_drill(args: &[String]) -> Result<(), String> {
+    let cfg = load_config(args)?;
+    let height: u64 = arg(args, "--height")
+        .ok_or("missing --height H (the agreed drill height, the same on every producer)")?
+        .parse()
+        .map_err(|e| format!("bad --height: {e}"))?;
+    // Never the ceremony's ignite command or hook process-group file: the drill has its own.
+    let pgid_for = pulse_cutover::drill::drill_root(&cfg).join(height.to_string()).join("drill.jsonl");
+    let ops = HttpOps::new(
+        &cfg.source.rpc_url,
+        &cfg.source.producer_api_url,
+        "",
+        "false",
+        cfg.source.snapshot_timeout_secs,
+    )
+    .with_pgid_file_for(&pgid_for);
+    let opts = pulse_cutover::drill::DrillOptions { height, keep_work: flag(args, "--keep-work") };
+    let out = pulse_cutover::drill::run(&cfg, &ops, &opts)?;
+    println!("{}", serde_json::to_string_pretty(&out.view).unwrap_or_default());
+    if out.evidence_complete && !out.compare_match {
+        eprintln!(
+            "readiness drill DONE, but the 21-table compare did NOT match (tables: {}): a real ceremony would refuse \
+             to verify this state. The fingerprint above is still comparable across producers.",
+            out.view["compare_failing_tables"]
+        );
+        std::process::exit(5);
+    }
+    Ok(())
+}
+
+fn print_drill_status(cfg: &pulse_cutover::config::Config) {
+    if let Some(d) = pulse_cutover::drill::beacon_view(cfg) {
+        println!(
+            "drill (readiness drill, NOT a ceremony): H={} state={} compare={} fingerprints_digest={}",
+            d["h"], d["state"].as_str().unwrap_or("?"), d["compare"].as_str().unwrap_or("-"),
+            d["fingerprints_digest"].as_str().unwrap_or("-")
+        );
+    }
+}
+
 fn cmd_status(args: &[String]) -> Result<(), String> {
     let cfg = load_config(args)?;
     let overrides = cfg.rehearsal_overrides();
@@ -698,6 +770,7 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     } else if cfg.ceremony.profile == pulse_cutover::config::Profile::Ceremony {
         println!("ceremony: production profile met");
     }
+    print_drill_status(&cfg);
     if !cfg.journal_path.exists() {
         println!("no journal at {} — ceremony not started", cfg.journal_path.display());
         return Ok(());
