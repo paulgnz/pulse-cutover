@@ -594,3 +594,16 @@ is proven gone), re-takes the lock and journals `readiness_drill_stopped_for_the
 cancel file is written as a fresh inode inside the journal directory (whatever name sits there, a symlink or a hard
 link to the journal, is unlinked first, never truncated through; every directory on the way must be a real directory;
 round 5).
+
+**Round 6 (rc.30).** *Undo only what this journal did*: a source pause and a write freeze are journaled as side
+effects (`source_pause`, `write_freeze`) before they happen; a rollback resumes only a producer this journal paused,
+runs `on_abort` only after its own freeze, and moves a staged file aside only for a ceremony that could have staged
+it. A ceremony refused at ARM (a busy lock, a producer someone else paused) ends ABORTED with `nothing_to_undo` and
+touches nothing; a later `rollback` is a no-op. Journals from older agents (no `undo_tracking` on their arming
+record) keep the previous behaviour. The per-producer lock moved from nodeos's `snapshot.dir` into an agent-owned
+`lock_dir`, keyed on the canonical snapshot directory (producer API spellings collapse); only "held by another
+process" refuses an ARM. A drill writes a work marker beside that lock (`<lock>.work.json`, fresh inode) before its
+work starts and removes it only once its work is verified gone, so a ceremony in another journal directory still
+sees an export container or pipeline group that outlived the drill process: it refuses to ARM next to it, and after
+its freeze asks it to stop and warns. `loop` fails closed on a source that does not answer (unless
+`reset_when_source_down`, refused for mainnet) and holds the producer lock through `reset_cmd`.

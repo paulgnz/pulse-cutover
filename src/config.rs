@@ -341,6 +341,12 @@ pub struct Ceremony {
     /// SHADOW on the journal, `status`, the beacon and mission control; never a real cut.
     #[serde(default)]
     pub shadow: bool,
+    /// r30 round 6: the directory for the per-producer lock and drill work markers that keep a ceremony, a readiness
+    /// drill and a `loop` on the same producer apart, whatever journal directory each uses. Absolute. Every agent,
+    /// drill and loop on one box must share it. Default: `/var/lib/pulse-cutover/locks` when it is (or can be made)
+    /// writable, else `<journal dir>/../locks`. Nothing is ever written into nodeos's `snapshot.dir`.
+    #[serde(default)]
+    pub lock_dir: Option<std::path::PathBuf>,
     /// Where the agent writes the history boundary file for the federating router in producer mode
     /// (or api mode without `[hyperion]`), once the target is verified at the cut and before LIVE.
     /// `[hyperion] boundary_path` does the same in hyperion mode.
@@ -454,6 +460,11 @@ pub struct LoopCfg {
     pub settle_secs: u64,
     /// Where per-run metrics JSONL lines are appended.
     pub metrics_path: PathBuf,
+    /// r30 round 6: allow `reset_cmd` while the source does not answer (a reset that must start a stopped node).
+    /// Default false: an unreachable source refuses the reset (its identity cannot be checked). Refused for any
+    /// config whose pinned chain_id is XPR mainnet (including shadows).
+    #[serde(default)]
+    pub reset_when_source_down: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -941,6 +952,17 @@ impl Config {
             return Err("snapshot.golden_roots and snapshot.capture_roots are mutually exclusive: \
                         a node either verifies against published goldens or captures its own"
                 .into());
+        }
+        if config.r#loop.as_ref().is_some_and(|l| l.reset_when_source_down)
+            && config.ceremony.chain_id.as_deref().is_some_and(is_xpr_mainnet)
+        {
+            return Err("loop.reset_when_source_down is refused for an XPR MAINNET chain_id (a reset must always see \
+                        the source it acts on)".into());
+        }
+        if let Some(d) = &config.ceremony.lock_dir {
+            if !d.is_absolute() {
+                return Err(format!("ceremony.lock_dir must be an absolute path (got {})", d.display()));
+            }
         }
         if config.snapshot.path_map_from.is_some() != config.snapshot.path_map_to.is_some() {
             return Err("snapshot.path_map_from and path_map_to must be set together".into());

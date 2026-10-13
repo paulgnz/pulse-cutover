@@ -101,6 +101,13 @@ pub struct Machine<'a, O: ChainOps> {
     /// producer API, in nodeos's snapshot dir), held like the drill-root lock, so a drill under ANOTHER journal
     /// directory on the same producer cannot run next to this ceremony. Lock order: journal, drill root, producer.
     producer_lock: Option<std::fs::File>,
+    /// r30 round 6 (Codex R6-1): undo only what this journal did. True once this journal recorded a source pause
+    /// (`side_effect: source_pause`, written before the pause) / a write freeze (`side_effect: write_freeze`, written
+    /// before on_freeze). A rollback resumes the producer and runs on_abort only for what this ceremony did; a
+    /// preflight refusal (a busy lock, a producer someone else paused) touches nothing. Journals from older agents
+    /// (`undo_tracking` absent on their arming record) keep the previous behaviour (both true).
+    paused_by_us: bool,
+    writes_closed_by_us: bool,
     /// The full shadow identity proof passed in THIS run, right before chain creation / ignition: the only thing that
     /// lets a shadow go past the XPR mainnet ignite refusal (never the config flag alone).
     shadow_verified: bool,
@@ -290,6 +297,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let rollback_steps_done = recovered.rollback_steps_done.clone();
         let rollback_pending = recovered.rollback_pending;
         let joining = recovered.side_effects.iter().any(|s| s == "join");
+        let legacy_undo = recovered.undo_tracking == Some(false);
+        let paused_by_us = legacy_undo || started("source_pause");
+        let writes_closed_by_us = legacy_undo || started("write_freeze");
         let create_chain_started = recovered.side_effects.iter().any(|s| s == "create_chain") || joining;
         Machine {
             cfg,
@@ -334,6 +344,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             armed_shadow: recovered.armed_shadow,
             drill_root_lock: None,
             producer_lock: None,
+            paused_by_us,
+            writes_closed_by_us,
             shadow_verified: false,
             shadow_refused: recovered.shadow_refused,
             shadow_proven: false,
@@ -449,6 +461,35 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Err(reason)
     }
 
+    /// Round 6 (Codex R6-5): after the freeze, a drill's surviving work under another journal directory (named by the
+    /// producer's work marker) is asked to stop and its recorded process group killed (evidence kept unless it is
+    /// proven gone); the cut never waits on it. Its export container can only be stopped by `drill --cancel` with
+    /// that drill's config (the ceremony never runs docker): journaled loudly.
+    fn stop_foreign_drill_work(&mut self, why: &str) -> Result<(), String> {
+        let crate::drill::MarkerWork::Live { journal_dir, h, .. } = crate::drill::marker_work(self.cfg) else {
+            eprintln!("WARNING: {why}. The cut continues.");
+            self.journal.evidence(self.state, json!({"readiness_drill_work_unknown": why,
+                "WARNING": "a drill work marker on this producer cannot be read after the freeze; the cut continues"}))?;
+            return Ok(());
+        };
+        let dir = journal_dir.join("drill").join(h.to_string());
+        let cancel = crate::ops::write_fresh_in(&journal_dir, &dir.join("cancel"), format!("{}\n", self.ops.now_ms()).as_bytes());
+        let killed = crate::ops::kill_recorded_hook_group_keep_evidence(
+            &crate::ops::hook_pgid_path(&dir.join("drill.jsonl")), std::time::Duration::from_secs(10));
+        let still = matches!(crate::drill::activity_at(&journal_dir), crate::drill::DrillActivity::Running { .. });
+        let detail = json!({"journal_dir": journal_dir, "h": h,
+            "cancel_file": cancel.as_ref().map(|_| "written".to_string()).unwrap_or_else(|e| e.to_string()),
+            "group_kill": match &killed { Ok(Some(d)) => d.clone(), Ok(None) => "no live pipeline group".into(), Err(e) => e.clone() }});
+        if still {
+            eprintln!("WARNING: {why}. It could not be verified stopped; stop it by hand. The cut continues.");
+            self.journal.evidence(self.state, json!({"readiness_drill_not_stopped": detail,
+                "WARNING": "another directory's drill work could not be verified stopped next to a cut in progress; the cut continues"}))?;
+        } else {
+            self.journal.evidence(self.state, json!({"readiness_drill_stopped_for_the_cut": detail}))?;
+        }
+        Ok(())
+    }
+
     /// Round-4 review (R4-7): a ceremony resumed AFTER its write freeze must not share the box with a readiness drill
     /// (the drill's conversion needs up to ~14 GB of RAM on mainnet, exactly what the cut needs), and must never be
     /// stranded for one. So: ask a live drill to stop (its cancel file), stop its recorded pipeline process group
@@ -516,7 +557,22 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     fn src_pause(&mut self) -> Result<(), String> {
         self.shadow_mutation_gate("pausing the source producer")?;
         self.shadow_producer_gate("pausing the source producer")?;
+        // r30 round 6: journaled BEFORE the pause, so a rollback (even after a crash) knows this ceremony paused it.
+        if !self.paused_by_us {
+            self.journal.evidence(self.state, json!({"side_effect": "source_pause"}))?;
+            self.paused_by_us = true;
+        }
         self.ops.pause() // ungated: this IS the gate
+    }
+
+    /// r30 round 6: the write freeze (on_freeze), journaled as a side effect BEFORE the hook runs, so a rollback
+    /// reopens writes (on_abort) only when this ceremony closed them.
+    fn freeze_writes(&mut self, hook: &str) -> Result<String, String> {
+        if !self.writes_closed_by_us {
+            self.journal.evidence(self.state, json!({"side_effect": "write_freeze"}))?;
+            self.writes_closed_by_us = true;
+        }
+        self.hook(hook)
     }
 
     fn src_resume(&mut self) -> Result<(), String> {
@@ -698,6 +754,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 State::Armed,
                 json!({
                     "mode": format!("{:?}", self.cfg.ceremony.mode),
+                    "undo_tracking": true,
                     "freeze_height": self.cfg.ceremony.freeze_height,
                     "resolved_h": resolved_h,
                     "simulate_freeze": self.cfg.ceremony.simulate_freeze,
@@ -801,15 +858,34 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // Round 5 (Codex R5-6): the producer's lock, shared by every config on this producer API whatever its journal
         // directory: a drill elsewhere on the same producer makes a fresh ARM (or one resumed while ARMED) refuse.
         if self.producer_lock.is_none() {
-            match Journal::lock(&crate::drill::producer_lock_base(&self.cfg)) {
+            // Round 6: only "held by another process" refuses (and only before the freeze, touching nothing: see
+            // rollback_steps). Any other failure (an unwritable or missing lock_dir) is journaled: this lock is drill
+            // hygiene; the fleet gate, not this lock, protects the cut.
+            match Journal::try_lock(&crate::drill::producer_lock_base(&self.cfg)) {
                 Ok(f) => self.producer_lock = Some(f),
-                Err(e) if pre_freeze => problems.push(format!(
-                    "another pulse-cutover process holds this producer's lock (a readiness drill on the same producer \
-                     API, possibly under another journal directory): {e}. Wait for it, or stop it with `pulse-cutover \
-                     drill --cancel` using that drill's config"
+                Err(crate::journal::LockError::Held(e)) if pre_freeze => problems.push(format!(
+                    "another pulse-cutover process holds this producer's lock (a readiness drill or loop on the same \
+                     producer, possibly under another journal directory): {e}. Wait for it, or stop it with \
+                     `pulse-cutover drill --cancel` using that drill's config"
                 )),
-                Err(_) => {} // past the freeze: reported by stop_drill_for_the_cut below
+                Err(crate::journal::LockError::Held(_)) => {} // past the freeze: reported by stop_drill_for_the_cut below
+                Err(crate::journal::LockError::Io(e)) => {
+                    eprintln!("WARNING: cannot take this producer's lock in {} ({e}); continuing without it",
+                              crate::drill::lock_dir(&self.cfg).display());
+                    self.journal.evidence(self.state, json!({"producer_lock_unavailable": e,
+                        "lock_dir": crate::drill::lock_dir(&self.cfg),
+                        "note": "the producer lock could not be taken for a reason other than another holder; the ceremony continues"}))?;
+                }
             }
+        }
+        // Round 6 (Codex R6-5): a drill under ANOTHER journal directory on this producer whose work survived its
+        // process (an export container or pipeline group not verified gone) is named by the producer's work marker.
+        if pre_freeze {
+            if let Some(why) = crate::drill::foreign_marker_blocker(&self.cfg) {
+                problems.push(why);
+            }
+        } else if let Some(why) = crate::drill::foreign_marker_blocker(&self.cfg) {
+            self.stop_foreign_drill_work(&why)?;
         }
         // A readiness drill running on this box would compete for CPU, RAM and disk in the cut window
         // (docs/DESIGN.md §7): before the freeze the ceremony refuses to ARM next to one; a stale record is only reported.
@@ -1507,7 +1583,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// rollback moves any staged file; the agent's own abort only the one this ceremony staged.
     fn unstage(&mut self, any: bool, failed: &mut Vec<String>, notes: &mut Vec<String>) -> Result<(), String> {
         let staged = self.cfg.snapshot.staged_path.clone();
-        if !staged.exists() || !(any || self.staged_sha256.is_some()) {
+        // r30 round 6: undo only what this ceremony did. "Any" file at the staged path is moved aside only for a
+        // ceremony that got far enough to stage one (it froze writes); one refused at ARM never staged anything, and
+        // the file there may belong to another ceremony on this box.
+        if !staged.exists() || !(self.staged_sha256.is_some() || (any && self.writes_closed_by_us)) {
             return Ok(());
         }
         self.shadow_mutation_gate("moving the staged snapshot aside")?;
@@ -1913,7 +1992,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             match self.cfg.ceremony.mode {
                 // Producer mode: un-pausing nodeos IS the entire rollback.
                 Mode::Producer => {
-                    if !self.step_done("resume") {
+                    if !self.paused_by_us {
+                        // r30 round 6: undo only what this ceremony did. It never paused the producer (a preflight
+                        // refusal, a producer someone else paused): resuming it would undo another process's pause.
+                        rollback["source_producer_resumed"] = json!("not paused by this ceremony: nothing to resume");
+                    } else if !self.step_done("resume") {
                         match self.src_resume() {
                             Ok(()) => {
                                 rollback["source_producer_resumed"] = json!(true);
@@ -1988,11 +2071,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.journal.transition(State::Aborted, rollback)?;
         // rc.29: a producer's writes reopen only once its source produces again (auto_rollback = false, or a failed
         // resume, would otherwise send writes into a paused chain); the operator's `rollback` reopens them later.
-        let source_back = self.cfg.ceremony.mode != Mode::Producer || (perform && self.step_done("resume"));
+        let source_back = self.cfg.ceremony.mode != Mode::Producer || !self.paused_by_us || (perform && self.step_done("resume"));
+        // r30 round 6: writes are reopened only if this ceremony closed them (its on_freeze ran or started).
+        if self.cfg.hooks.on_abort.is_some() && !self.writes_closed_by_us && !self.step_done("on_abort") {
+            self.journal.evidence(State::Aborted, json!({"on_abort_skipped": "writes were not closed by this ceremony: nothing to reopen"}))?;
+        }
         if self.cfg.hooks.on_abort.is_some() && !source_back && !self.step_done("on_abort") {
             self.journal.evidence(State::Aborted, json!({"on_abort_deferred": "the source producer was not resumed: writes stay frozen until `pulse-cutover rollback`"}))?;
         }
-        if let Some(hook) = self.cfg.hooks.on_abort.clone().filter(|_| source_back) {
+        if let Some(hook) = self.cfg.hooks.on_abort.clone().filter(|_| source_back && self.writes_closed_by_us) {
             if !self.step_done("on_abort") {
                 let result = self.hook(&hook);
                 self.journal.evidence(State::Aborted, json!({"on_abort_hook": format!("{result:?}")}))?;
@@ -2003,8 +2090,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
         self.unstage(unstage_any, &mut failed, &mut notes)?;
+        // Nothing this ceremony did needs undoing (no pause, no freeze): the rollback is complete as it stands,
+        // whatever auto_rollback says, so a later `rollback` is a no-op instead of resuming someone else's producer.
+        let nothing_to_undo = !self.paused_by_us && !self.writes_closed_by_us;
+        if nothing_to_undo {
+            self.journal.evidence(State::Aborted, json!({"nothing_to_undo": true,
+                "note": "this ceremony neither paused the producer nor froze writes: nothing was resumed or reopened"}))?;
+        }
         if failed.is_empty() {
-            if perform {
+            if perform || nothing_to_undo {
                 self.journal.evidence(State::Aborted, json!({"rollback_done": true, "rollback_complete": true}))?;
                 self.aborted_rollback_complete = true;
             }
@@ -2084,8 +2178,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // The write freeze — the moment the write gap starts (R2: an
         // explicit reject at the API edge, never just a producer pause).
         self.check_mainnet_h()?;
-        let freeze_hook = if let Some(hook) = &self.cfg.hooks.on_freeze {
-            let result = self.hook(hook);
+        let freeze_hook = if let Some(hook) = self.cfg.hooks.on_freeze.clone() {
+            let result = self.freeze_writes(&hook);
             if let Err(e) = &result {
                 self.abort("write-freeze hook failed", json!({"error": e}))?;
                 return Ok(());
@@ -2161,9 +2255,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // cannot freeze the network's writes; that happened (or is simulated
         // to have happened) at the BP edge.
         self.check_mainnet_h()?;
-        let freeze_hook = if let Some(hook) = &self.cfg.hooks.on_freeze {
+        let freeze_hook = if let Some(hook) = self.cfg.hooks.on_freeze.clone() {
             // Required hook: a failed write-freeze must not be shrugged off (run-5 lesson).
-            match self.hook(hook) {
+            match self.freeze_writes(&hook) {
                 Ok(o) => o,
                 Err(e) => {
                     self.abort("write-freeze hook failed", json!({"error": e}))?;
@@ -2384,6 +2478,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             if final_already {
                 self.journal.evidence(State::Frozen, json!({"kept_paused_on_resume": true,
                     "note": "H is already final: the scheduled snapshot needs no more blocks from this producer"}))?;
+            } else if !self.paused_by_us {
+                // r30 round 6: this journal never paused the producer: someone else did. Never resume another
+                // process's pause; stop here (writes this ceremony froze are reopened by the abort).
+                self.abort("the source producer is paused, but not by this ceremony: refusing to resume it",
+                    json!({"fix": "find out who paused it (another agent, an operator) before re-running"}))?;
+                return Ok(());
             } else {
                 self.src_resume()?;
                 self.journal.evidence(
@@ -3254,7 +3354,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Err(forget(self, "join refused: this ceremony ABORTED (on_abort reopened writes) and has no hooks.on_freeze to close \
                             them again first. Nothing was changed on either chain.".into()));
             };
-            match self.hook(&hook) {
+            match self.freeze_writes(&hook) {
                 Ok(o) => self.journal.evidence(self.state, json!({"join_refreeze": o, "note": "writes frozen again before the join"}))?,
                 Err(e) => {
                     self.journal.evidence(self.state, json!({"join_refreeze_error": e}))?;
