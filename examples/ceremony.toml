@@ -173,11 +173,18 @@ auto_rollback = true                 # on abort BEFORE ignition: resume the sour
 # [upstream]
 # work_dir = "/root/cutover-rehearsal/upstream"   # REQUIRED. export/import scratch root
 # export_cmd = "docker run --rm ... export.sh --snapshot {snapshot} --work-dir {export_dir}/work ..."   # REQUIRED
-# export_image = "leap-sidecar@sha256:..."      # READINESS DRILL only: the Leap 5.0.3 sidecar image; a drill never
+# export_image = "leap-sidecar@sha256:<64 hex>" # READINESS DRILL only: the Leap 5.0.3 sidecar image BY DIGEST; a drill never
                                                  # runs export_cmd (shell) but a fixed `docker run` argument vector
 # export_tools_dir = "/opt/xpr-chainbase-export" # READINESS DRILL only: absolute dir with the official export.sh
                                                  # (a plain file), mounted read-only
 # chain_state_db_size_mb = 12288                 # READINESS DRILL only: export.sh --chain-state-db-size-mb
+# docker_bin = "/usr/bin/docker"                 # READINESS DRILL only: the docker CLI by absolute path (never PATH);
+                                                 # run with a cleared environment (no DOCKER_* variables)
+# docker_bin_sha256 = "<64 hex>"                 # READINESS DRILL only: its content pin (checked at load and per run)
+# docker_socket = "/var/run/docker.sock"         # READINESS DRILL only: the LOCAL daemon (`--host unix://<this>`)
+# import_bin_sha256 = "<64 hex>"                 # READINESS DRILL only: content pins of the three tools; a drill runs
+# compare_bin_sha256 = "<64 hex>"                #   a program only when sha256(file) equals its pin (r30 round 5:
+# fingerprint_bin_sha256 = "<64 hex>"            #   a native-executable check alone admitted /bin/bash)
 # import_bin = "/root/pulsevm/target/release/examples/xpr_import_check"          # REQUIRED (a drill: an absolute
                                                  # native executable, not a script or link; same for the two below)
 # fingerprint_bin = "/root/pulsevm/target/release/examples/xpr_state_fingerprint"   # REQUIRED

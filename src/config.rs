@@ -562,6 +562,27 @@ pub struct Upstream {
     /// READINESS DRILL only: export.sh `--chain-state-db-size-mb` (12288 for XPR mainnet state).
     #[serde(default)]
     pub chain_state_db_size_mb: Option<u64>,
+    /// READINESS DRILL only (r30 round 5): the docker CLI the drill runs, by absolute path (a plain native
+    /// executable, pinned by `docker_bin_sha256`). A drill never looks `docker` up through PATH and runs it with a
+    /// cleared environment, so no `DOCKER_*` variable can pick another binary or daemon.
+    #[serde(default)]
+    pub docker_bin: Option<PathBuf>,
+    /// READINESS DRILL only: sha256 of `docker_bin`, checked at config time and again right before every run.
+    #[serde(default)]
+    pub docker_bin_sha256: Option<String>,
+    /// READINESS DRILL only: the LOCAL docker daemon socket the drill talks to (`--host unix://<this>`); default
+    /// `/var/run/docker.sock`. Must be an absolute path to a unix socket (not a link).
+    #[serde(default)]
+    pub docker_socket: Option<PathBuf>,
+    /// READINESS DRILL only: sha256 of `import_bin` (a drill runs a tool only when its content matches its pin).
+    #[serde(default)]
+    pub import_bin_sha256: Option<String>,
+    /// READINESS DRILL only: sha256 of `compare_bin`.
+    #[serde(default)]
+    pub compare_bin_sha256: Option<String>,
+    /// READINESS DRILL only: sha256 of `fingerprint_bin`.
+    #[serde(default)]
+    pub fingerprint_bin_sha256: Option<String>,
     /// xpr_import_check binary: `<chain_state_history.log> <arena-dir>
     /// [checkpoint]` — writes the Arena checkpoint + `.manifest.json`.
     pub import_bin: PathBuf,

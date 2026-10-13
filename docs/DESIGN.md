@@ -490,6 +490,39 @@ executables run by argument vector. The guard refuses `run_long` / `run_long_can
 `run_argv_cancellable` start only `docker` and the three validated tool paths. What remains trusted is what any
 operator trusts: the published sidecar image, the official `export.sh`, and the official tool binaries.
 
+**Pinned content, local daemon, no inherited environment (round 5).** A native-executable check alone still
+admitted `/bin/bash` as a "tool" (the import step would then run the export-produced log as shell). A drill now runs a
+program only when its content matches a configured pin: `import_bin_sha256`, `compare_bin_sha256`,
+`fingerprint_bin_sha256` and `docker_bin_sha256` (64 lowercase hex), checked at load and again by the guard right
+before each run, and the export image only by digest (`name@sha256:<64 hex>`; a tag can be moved). Docker is run by
+absolute path (`docker_bin`, never looked up through PATH) and always with `--host unix://<docker_socket>`
+(default `/var/run/docker.sock`, which must be a unix socket, not a link); the guard refuses a docker vector without
+it. Every argument-vector run gets a cleared environment (a fixed PATH, HOME and LC_ALL only), so no `DOCKER_HOST`,
+`DOCKER_CONTEXT`, `DOCKER_CONFIG` or `LD_PRELOAD` reaches it. Residual: a file could change between the guard's hash
+and the exec; each pinned file must be single-named and not writable by group or others (checked again at that
+moment), so only its owner could swap it, and the owner can already run anything (exec through the hashed file
+descriptor is not portable). The beacon reports the pins and their digest (`tools.tools_digest`); mission control
+calls producers in agreement only when they ran identical pinned tools on identical state.
+
+**The export container (round 5).** Killing the docker CLI does not stop the daemon-managed container. The drill
+names the container (`pulse-drill-<H>-<random>`, `--cidfile` in the drill directory) and records the name before it
+can exist (`export_container` in `latest.json`, `export_container_gone: false`). After the pipeline, whatever its
+outcome, and on every failure or cancel, it runs `docker kill` and `docker rm -f` on that name through the pinned CLI
+and the local socket, then `docker inspect` until the daemon answers "No such object" (any other answer is unknown,
+never gone). Until then `activity` reports the drill RUNNING whatever `latest.json` says (a ceremony's ARM keeps
+refusing), the drill ends FAILED-INCOMPLETE, and `--cancel` of a dead drill retries the stop and reports INCOMPLETE
+until the container is verified gone.
+
+**One producer, one lock (round 5).** Configs on the same producer but with different journal directories took
+different journal and drill-root locks and read different `latest.json` files. A third lock is keyed by the
+normalised `source.producer_api_url` and lives in nodeos's snapshot directory
+(`<snapshot.dir>/.pulse-cutover-producer-<16 hex>.lock`): the one resource a drill and a ceremony on one producer
+necessarily share, the same path for every process (a `/run` path would differ between root and non-root agents).
+Without a snapshot directory it falls back to the journal directory. A drill and `--cancel` hold it with the other two
+for their whole run; a ceremony takes it at ARM and holds it for its run (a fresh ARM, or one resumed while ARMED,
+refuses while it is held; after the freeze a busy lock is a loud warning, the cut continues). Lock order everywhere:
+journal lock, drill-root lock, producer lock; every acquisition is a bounded try-lock, so nothing can deadlock.
+
 **Process groups (round 4).** The drill's tools run in their own process group with a record written as a fresh
 inode (`O_CREAT | O_EXCL | O_NOFOLLOW`, exactly one name; an old name is unlinked first, never written through).
 A tool run ends only when `ps` positively shows its whole group gone: a group that survives the kill (self-cancel,

@@ -274,6 +274,15 @@ links, not group/other-writable) and run by argument vector. The guard refuses e
 program but those four. A tool whose process group cannot be verified gone (it survived the kill, or `ps` cannot
 tell) keeps its process-group record and ends the drill FAILED-INCOMPLETE: it stays RUNNING until --cancel stops it.
 
+Pinned (r30 round 5): every program a drill runs must match its sha256 pin ([upstream] import_bin_sha256,
+compare_bin_sha256, fingerprint_bin_sha256, docker_bin_sha256), checked at load and again right before each
+run; export_image must be pinned by digest (name@sha256:<64 hex>). Docker runs by absolute path (docker_bin)
+against the LOCAL daemon only (--host unix://<docker_socket>, default /var/run/docker.sock), with a cleared
+environment (no DOCKER_* variables). The export container is named and recorded before it exists; it is
+stopped and verified gone (docker kill / rm -f / inspect) after the export and on every failure or cancel,
+and until then the drill counts as running. A drill, --cancel and the ceremony also share one lock per
+producer (keyed by source.producer_api_url, in snapshot.dir), whatever their journal directories.
+
 Refused when: the config is not import_backend = \"upstream\" with compare_bin and snapshot.dir; export_image,
 export_tools_dir or chain_state_db_size_mb is missing or invalid, or a tool is not a plain native executable;
 source.producer_api_url carries a query, fragment or credentials; the ceremony journal is in progress, sealed,

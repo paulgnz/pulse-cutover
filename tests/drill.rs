@@ -9,6 +9,8 @@ use pulse_cutover::ops::{ChainInfo, ChainOps, SnapshotResult};
 use serde_json::Value;
 
 const MAINNET: &str = "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0";
+/// The export image, pinned by digest (r30 round 5: a tag is refused).
+const IMG: &str = "leap-sidecar@sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
 fn block_id(h: u64) -> String {
     format!("{h:08x}{}", "ab".repeat(28))
@@ -35,6 +37,13 @@ struct LiveChain {
     lib_cap: RefCell<Option<u64>>,
     /// Real milliseconds per sleep_ms (0 = no real sleep, the default).
     real_sleep_ms: u64,
+    /// r30 round 5: containers the fake docker daemon runs (by name). Killing the docker CLI (a cancelled `run`)
+    /// leaves its container running, as with a real daemon.
+    containers: RefCell<std::collections::BTreeSet<String>>,
+    /// `docker kill` / `docker rm -f` do not remove the container (a daemon that cannot stop it).
+    container_sticky: RefCell<bool>,
+    /// `docker run` is "killed" mid-export: the CLI returns as cancelled, the container stays.
+    cancel_export: RefCell<bool>,
 }
 
 impl LiveChain {
@@ -55,6 +64,9 @@ impl LiveChain {
             clock: RefCell::new(1_000_000),
             lib_cap: RefCell::new(None),
             real_sleep_ms: 0,
+            containers: RefCell::new(Default::default()),
+            container_sticky: RefCell::new(false),
+            cancel_export: RefCell::new(false),
         }
     }
     fn stalled(dir: &Path, chain_id: &str, head: u64, lib_cap: u64, real_sleep_ms: u64) -> Self {
@@ -193,7 +205,33 @@ impl ChainOps for LiveChain {
             return Ok(None);
         }
         let q = |a: &str| format!("'{a}'");
-        if argv[0] == "docker" {
+        if argv[0].ends_with("/docker") {
+            assert_eq!(argv[1], "--host", "every docker vector names the local daemon");
+            assert!(argv[2].starts_with("unix://"));
+            let sub = argv[3].as_str();
+            let last = argv.last().cloned().unwrap_or_default();
+            match sub {
+                "inspect" => {
+                    return if self.containers.borrow().contains(&last) {
+                        Ok(Some("running".into()))
+                    } else {
+                        Err(format!("`docker inspect` exited 1: Error: No such object: {last}"))
+                    };
+                }
+                "kill" | "rm" => {
+                    if !*self.container_sticky.borrow() {
+                        self.containers.borrow_mut().remove(&last);
+                    }
+                    return Ok(Some(String::new()));
+                }
+                "run" => {}
+                other => return Err(format!("unexpected docker subcommand {other}")),
+            }
+            let name = argv.iter().position(|a| a == "--name").map(|i| argv[i + 1].clone()).expect("--name");
+            self.containers.borrow_mut().insert(name.clone());
+            if *self.cancel_export.borrow() {
+                return Ok(None); // the CLI was killed; the daemon keeps the container
+            }
             let mount = |dst: &str| argv.iter().find_map(|a| {
                 let mut it = a.splitn(3, ':');
                 let (src, d) = (it.next()?, it.next()?);
@@ -202,8 +240,10 @@ impl ChainOps for LiveChain {
             let out = mount("/out").ok_or("no /out mount")?;
             let snap = mount("/in/cut.bin").ok_or("no snapshot mount")?;
             let tools = mount("/xce").ok_or("no /xce mount")?;
-            return pulse_cutover::ops::run_shell(&format!("sh {} {} {}", q(&format!("{tools}/export.sh")), q(&snap), q(&out)))
+            let r = pulse_cutover::ops::run_shell(&format!("sh {} {} {}", q(&format!("{tools}/export.sh")), q(&snap), q(&out)))
                 .map(Some);
+            self.containers.borrow_mut().remove(&name); // --rm
+            return r;
         }
         let rest: Vec<String> = argv[1..].iter().map(|a| q(a)).collect();
         pulse_cutover::ops::run_shell(&format!("sh {} {}", q(&format!("{}.run", argv[0])), rest.join(" "))).map(Some)
@@ -230,10 +270,12 @@ fn script(path: &Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// A fake native executable: an ELF header, mode 0755, one name. The mock runs `<path>.run` in its place.
+/// A fake native executable: an ELF header, mode 0755, one name, content unique to its name (so each pin is
+/// distinct). The mock runs `<path>.run` in its place.
 fn native(path: &Path) {
     let mut bytes = b"\x7fELF".to_vec();
     bytes.extend_from_slice(&[0u8; 60]);
+    bytes.extend_from_slice(path.file_name().unwrap().to_string_lossy().as_bytes());
     std::fs::write(path, bytes).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -279,6 +321,20 @@ fn stage_tools(dir: &Path, compare_ok: bool) {
         }
         script(&dir.join("bin").join(format!("{name}.run")), &body);
     }
+    // r30 round 5: the docker CLI by absolute path (pinned) and the local daemon's socket (a real unix socket).
+    if !dir.join("bin/docker").exists() {
+        native(&dir.join("bin/docker"));
+    }
+    let sock = dir.join("docker.sock");
+    if !sock.exists() {
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::mem::forget(l);
+    }
+}
+
+/// sha256 of a staged file (its pin), or 64 zeros when it does not exist.
+fn pin(path: &Path) -> String {
+    pulse_cutover::verify::sha256_file(path).map(|(h, _)| h).unwrap_or_else(|_| "0".repeat(64))
 }
 
 fn drill_config(dir: &Path, chain_id: &str, extra_upstream: &str) -> Result<Config, String> {
@@ -312,14 +368,24 @@ rpc_url = "http://mock"
 [upstream]
 work_dir = "{d}/ceremony-work"
 export_cmd = "sh {d}/export.sh {{snapshot}} {{export_dir}}"
-export_image = "leap-sidecar:5.0.3"
+export_image = "{IMG}"
 export_tools_dir = "{d}/xce"
 chain_state_db_size_mb = 12288
+docker_bin = "{d}/bin/docker"
+docker_bin_sha256 = "{docker_pin}"
+docker_socket = "{d}/docker.sock"
 import_bin = "{d}/bin/import"
+import_bin_sha256 = "{import_pin}"
 fingerprint_bin = "{d}/bin/fingerprint"
+fingerprint_bin_sha256 = "{fingerprint_pin}"
 compare_bin = "{d}/bin/compare"
+compare_bin_sha256 = "{compare_pin}"
 {extra_upstream}
-"#
+"#,
+        docker_pin = pin(&dir.join("bin/docker")),
+        import_pin = pin(&dir.join("bin/import")),
+        fingerprint_pin = pin(&dir.join("bin/fingerprint")),
+        compare_pin = pin(&dir.join("bin/compare")),
     );
     let p = dir.join("drill.toml");
     std::fs::write(&p, edit(text)).unwrap();
@@ -969,9 +1035,11 @@ fn r4_a_drill_never_runs_export_cmd_or_any_shell_whatever_it_says() {
         assert!(!chain.called("run_long"), "{cmd}: a shell command reached the chain ops");
         // The export is the fixed vector, built only from the explicit fields.
         let argvs = chain.argvs.borrow();
-        let ex = argvs.iter().find(|a| a[0] == "docker").expect("the export ran by argument vector");
-        assert_eq!(&ex[..5], ["docker", "run", "--rm", "--network", "none"]);
-        assert!(ex.contains(&"leap-sidecar:5.0.3".to_string()) && ex.contains(&format!("{d}/xce:/xce:ro")));
+        let ex = argvs.iter().find(|a| a[0].ends_with("/docker") && a[3] == "run").expect("the export ran by argument vector");
+        assert_eq!(ex[..5], [format!("{d}/bin/docker"), "--host".into(), format!("unix://{d}/docker.sock"), "run".into(),
+            "--rm".into()]);
+        assert!(ex.contains(&"--name".to_string()) && ex.contains(&"--cidfile".to_string()) && ex.contains(&"none".to_string()));
+        assert!(ex.contains(&IMG.to_string()) && ex.contains(&format!("{d}/xce:/xce:ro")));
         assert!(ex.contains(&"--chain-state-db-size-mb".to_string()) && ex.contains(&"12288".to_string()));
         assert!(ex.iter().all(|a| !a.contains("on-freeze") && !a.contains("wrapper")), "{ex:?}");
         for tool in ["import", "compare", "fingerprint"] {
@@ -987,7 +1055,7 @@ fn r4_the_guard_refuses_shell_and_every_program_but_the_validated_four() {
     let g = DrillGuard::new(&chain);
     assert!(g.run_long("echo hi").is_err());
     assert!(g.run_long_cancellable("echo hi", &mut || false).is_err());
-    g.allow_programs(vec!["docker".into(), "/opt/bin/import".into()]);
+    g.allow_programs(vec![drill::PinnedProgram { path: "/opt/bin/import".into(), sha256: "0".repeat(64), docker: false }], None);
     assert!(g.run_argv_cancellable(&["/bin/sh".into(), "-c".into(), "touch x".into()], &mut || false).is_err());
     assert!(g.run_argv_cancellable(&["systemctl".into(), "stop".into(), "nodeos".into()], &mut || false).is_err());
     assert_eq!(g.violations.borrow().len(), 4);
@@ -1019,9 +1087,9 @@ fn r4_drill_tools_must_be_plain_native_executables_and_the_export_fields_explici
     assert!(drill::config_problems(&cfg).join("; ").contains("not an absolute path"));
     // Missing or invalid export fields.
     for (edit, want) in [
-        (Box::new(|t: String| t.replace("export_image = \"leap-sidecar:5.0.3\"\n", "")) as Box<dyn Fn(String) -> String>, "export_image"),
-        (Box::new(|t: String| t.replace("leap-sidecar:5.0.3", "img; rm -rf /")), "plain image reference"),
-        (Box::new(|t: String| t.replace("leap-sidecar:5.0.3", "--privileged")), "plain image reference"),
+        (Box::new(|t: String| t.replace(&format!("export_image = \"{IMG}\"\n"), "")) as Box<dyn Fn(String) -> String>, "export_image"),
+        (Box::new(|t: String| t.replace(IMG, "img; rm -rf /")), "plain image reference"),
+        (Box::new(|t: String| t.replace(IMG, "--privileged")), "plain image reference"),
         (Box::new(|t: String| t.replace("chain_state_db_size_mb = 12288\n", "")), "chain_state_db_size_mb"),
         (Box::new(move |t: String| t.replace(&format!("{d}/xce"), "/nonexistent-xce")), "export_tools_dir"),
     ] {
@@ -1079,3 +1147,144 @@ fn r4_a_recorded_live_group_keeps_a_finished_drill_running() {
     assert_eq!(drill::activity(&cfg), drill::DrillActivity::Idle);
 }
 
+
+/// R5-2 (Codex): a native-executable check alone admitted `/bin/bash` as a tool (the import step would then run the
+/// export-produced log as shell). A drill runs a program only when its CONTENT matches its configured pin, and the
+/// export image only by digest; docker only by absolute path, pinned, against an explicit local socket.
+#[test]
+fn r5_a_drill_runs_only_pinned_content_never_a_host_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let d = dir.path().display().to_string();
+    let base = drill_config(dir.path(), MAINNET, "").unwrap();
+    assert!(drill::config_problems(&base).is_empty(), "{:?}", drill::config_problems(&base));
+    let bash = ["/bin/bash", "/usr/bin/bash", "/bin/sh"].into_iter().find(|p| Path::new(p).exists()).unwrap();
+    let remove = |key: &'static str| move |t: String| {
+        let start = t.find(&format!("{key} = ")).unwrap();
+        let end = start + t[start..].find('\n').unwrap() + 1;
+        format!("{}{}", &t[..start], &t[end..])
+    };
+    let regular = dir.path().join("not-a-socket");
+    std::fs::write(&regular, "x").unwrap();
+    let cases: Vec<(Box<dyn Fn(String) -> String>, &str)> = vec![
+        (Box::new(move |t: String| set_toml(&t, "import_bin", bash)), "not its pin"),
+        (Box::new(remove("import_bin_sha256")), "no sha256 pin"),
+        (Box::new(|t: String| set_toml(&t, "compare_bin_sha256", "ABC")), "64 lowercase hex"),
+        (Box::new(|t: String| t.replace(IMG, "leap-sidecar:5.0.3")), "not pinned by digest"),
+        (Box::new(remove("docker_bin")), "docker_bin"),
+        (Box::new(remove("docker_bin_sha256")), "no sha256 pin"),
+        (Box::new(move |t: String| set_toml(&t, "docker_socket", &regular.display().to_string())), "not a unix socket"),
+        (Box::new(|t: String| set_toml(&t, "docker_socket", "run/docker.sock")), "not an absolute path"),
+    ];
+    for (edit, want) in cases {
+        let cfg = drill_config_edit(dir.path(), MAINNET, "", edit).unwrap();
+        let p = drill::config_problems(&cfg).join("; ");
+        assert!(p.contains(want), "{want}: {p}");
+        let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+        assert!(drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).is_err());
+        assert!(!chain.called("schedule_snapshot") && !chain.called("run_argv"), "{want}: the drill started");
+    }
+
+    // At USE time: a tool whose content changed after the config was checked is not run.
+    let chain = LiveChain::new(dir.path(), MAINNET, 1);
+    let g = DrillGuard::new(&chain);
+    let import = format!("{d}/bin/import");
+    g.allow_programs(vec![drill::PinnedProgram { path: import.clone(), sha256: pin(&dir.path().join("bin/import")), docker: false }], None);
+    let mut bytes = std::fs::read(&import).unwrap();
+    bytes.extend_from_slice(b"tampered");
+    std::fs::write(&import, bytes).unwrap();
+    let err = g.run_argv_cancellable(&[import.clone(), "x".into()], &mut || false).unwrap_err();
+    assert!(err.contains("not its pin"), "{err}");
+    assert!(!chain.called("run_argv"), "the changed tool reached the runner");
+
+    // Docker must name the local daemon: a vector without `--host unix://<socket>` is refused.
+    let docker = format!("{d}/bin/docker");
+    g.allow_programs(vec![drill::PinnedProgram { path: docker.clone(), sha256: pin(&dir.path().join("bin/docker")), docker: true }],
+        Some(format!("unix://{d}/docker.sock")));
+    assert!(g.run_argv_cancellable(&[docker.clone(), "run".into(), "x".into()], &mut || false).is_err());
+    assert!(g.run_argv_cancellable(&[docker, "--host".into(), "tcp://remote:2375".into(), "run".into()], &mut || false).is_err());
+    assert!(!chain.called("run_argv"));
+}
+
+/// R5-3 (Codex): killing the docker CLI does not stop the daemon-managed export container. The drill names the
+/// container before it exists, stops it (kill, rm -f) and verifies it gone through the pinned CLI; until then the drill
+/// counts as running (a ceremony keeps refusing) and a cancel is INCOMPLETE.
+#[test]
+fn r5_an_export_container_that_outlives_the_docker_cli_keeps_the_drill_running_until_verified_gone() {
+    // 1. The CLI is killed mid-export; the daemon CAN stop the container: the drill stops it, verifies it gone, FAILED.
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+    *chain.cancel_export.borrow_mut() = true;
+    assert!(drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).is_err());
+    assert!(chain.containers.borrow().is_empty(), "the container was left running");
+    let v = latest(&cfg);
+    assert_eq!(v["state"], "FAILED", "{v}");
+    assert_eq!(v["export_container_gone"], true);
+    assert_eq!(drill::activity(&cfg), drill::DrillActivity::Idle);
+    let argvs = chain.argvs.borrow();
+    for verb in ["kill", "rm", "inspect"] {
+        assert!(argvs.iter().any(|a| a[0].ends_with("/docker") && a[3] == verb), "no docker {verb}");
+    }
+    drop(argvs);
+
+    // 2. The container cannot be stopped: the drill stays RUNNING, a ceremony is refused, cancel is INCOMPLETE.
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+    *chain.cancel_export.borrow_mut() = true;
+    *chain.container_sticky.borrow_mut() = true;
+    let err = drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).unwrap_err();
+    assert!(err.contains("FAILED-INCOMPLETE") && err.contains("not verified gone"), "{err}");
+    assert_eq!(chain.containers.borrow().len(), 1);
+    let v = latest(&cfg);
+    assert_eq!(v["state"], "RUNNING", "{v}");
+    assert!(matches!(drill::activity(&cfg), drill::DrillActivity::Running { h: 1_050, .. }));
+    assert!(drill::ceremony_blocker(&cfg).is_some(), "a ceremony must keep refusing while the container may run");
+    // The drill process exits after returning (here: this test process): its record now names a dead process. The
+    // recorded container alone keeps it running.
+    let mut v = latest(&cfg);
+    v["pid_start"] = serde_json::json!("a process that is gone");
+    std::fs::write(drill::latest_path(&cfg), v.to_string()).unwrap();
+    assert!(matches!(drill::activity(&cfg), drill::DrillActivity::Running { pid: None, group: None, .. }));
+    let err = drill::cancel(&cfg, &chain, std::time::Duration::from_millis(20)).unwrap_err();
+    assert!(err.contains("INCOMPLETE") && err.contains("not verified gone"), "{err}");
+    assert!(matches!(drill::activity(&cfg), drill::DrillActivity::Running { .. }));
+
+    // 3. Once the daemon can stop it, cancel stops it, verifies it gone and closes the drill.
+    *chain.container_sticky.borrow_mut() = false;
+    let ok = drill::cancel(&cfg, &chain, std::time::Duration::from_millis(20)).unwrap();
+    assert!(ok.contains("marked cancelled"), "{ok}");
+    assert!(chain.containers.borrow().is_empty());
+    assert_eq!(drill::activity(&cfg), drill::DrillActivity::Idle);
+}
+
+/// R5-6 (Codex): exclusion was keyed on the journal directory. Two configs on the SAME producer (same producer API,
+/// same nodeos snapshot dir) under different journal directories now share one producer lock: a second drill (or a
+/// ceremony) is refused while the first holds it.
+#[test]
+fn r5_drills_on_the_same_producer_exclude_each_other_across_journal_directories() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    stage_tools(a.path(), true);
+    stage_tools(b.path(), true);
+    let shared_snapshots = a.path().join("snapshots");
+    let cfg_a = drill_config(a.path(), MAINNET, "").unwrap();
+    let cfg_b = drill_config_edit(b.path(), MAINNET, "", |t| t.replace(&format!("{}/snapshots", b.path().display()),
+        &shared_snapshots.display().to_string())).unwrap();
+    assert_ne!(drill::drill_root(&cfg_a), drill::drill_root(&cfg_b));
+    assert_eq!(drill::producer_lock_base(&cfg_a), drill::producer_lock_base(&cfg_b));
+    // A's drill holds the producer lock (as it does for its whole run).
+    let held = pulse_cutover::journal::Journal::lock(&drill::producer_lock_base(&cfg_a)).unwrap();
+    let chain = LiveChain::new(b.path(), MAINNET, 1_000);
+    let err = drill::run(&cfg_b, &chain, &DrillOptions { height: 1_050, keep_work: false }).unwrap_err();
+    assert!(err.contains("producer's lock"), "{err}");
+    assert!(!chain.called("schedule_snapshot"));
+    drop(held);
+    // Another producer API on the same box has its own lock.
+    let cfg_c = drill_config_edit(b.path(), MAINNET, "", |t| t.replacen("producer_api_url = \"http://mock\"",
+        "producer_api_url = \"http://other-node:8888\"", 1)).unwrap();
+    assert_ne!(drill::producer_lock_base(&cfg_a), drill::producer_lock_base(&cfg_c));
+}

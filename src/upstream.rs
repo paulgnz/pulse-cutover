@@ -233,9 +233,24 @@ pub enum PipelineExec {
 /// The drill's export: the published Leap 5.0.3 sidecar image and the export tools directory, mounted read-only.
 #[derive(Debug, Clone)]
 pub struct DrillExport {
+    /// Pinned by digest (`name@sha256:<64 hex>`, r30 round 5).
     pub image: String,
     pub tools_dir: PathBuf,
     pub chain_state_db_size_mb: u64,
+    /// The docker CLI by absolute path (pinned by sha256 in the drill; never looked up through PATH).
+    pub docker_bin: PathBuf,
+    /// The LOCAL daemon socket, passed explicitly as `--host unix://<socket>`.
+    pub docker_socket: PathBuf,
+    /// r30 round 5: the container's name, chosen before it is created and journaled first, so a cancel can stop the
+    /// container itself (killing the docker CLI does not stop a daemon-managed container).
+    pub container_name: String,
+    /// `--cidfile`: docker writes the container id there (it refuses an existing file).
+    pub cidfile: PathBuf,
+}
+
+/// `<docker_bin> --host unix://<socket>`: the start of every docker argument vector a drill runs.
+pub fn drill_docker_prefix(docker_bin: &Path, socket: &Path) -> Vec<String> {
+    vec![docker_bin.display().to_string(), "--host".into(), format!("unix://{}", socket.display())]
 }
 
 /// Inside the image: where the sidecar image keeps nodeos and the pinned Leap checkout (the published
@@ -256,8 +271,20 @@ pub fn drill_export_argv(ex: &DrillExport, export_dir: &Path, snapshot: &Path) -
         }
         Ok(s)
     };
-    Ok(vec![
-        "docker".into(), "run".into(), "--rm".into(), "--network".into(), "none".into(),
+    if !ex.docker_bin.is_absolute() || !ex.docker_socket.is_absolute() {
+        return Err("docker_bin and docker_socket must be absolute paths".into());
+    }
+    let name_ok = !ex.container_name.is_empty() && ex.container_name.len() <= 64
+        && ex.container_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !name_ok {
+        return Err(format!("container name {:?} is not a plain name", ex.container_name));
+    }
+    let mut argv = drill_docker_prefix(&ex.docker_bin, &ex.docker_socket);
+    argv.extend([
+        "run".to_string(), "--rm".into(), "--name".into(), ex.container_name.clone(),
+        "--cidfile".into(), mount(&ex.cidfile, "cidfile")?, "--network".into(), "none".into(),
+    ]);
+    argv.extend(vec![
         "-v".into(), format!("{}:/out", mount(export_dir, "export dir")?),
         "-v".into(), format!("{}:/in/cut.bin:ro", mount(snapshot, "snapshot")?),
         "-v".into(), format!("{}:/xce:ro", mount(&ex.tools_dir, "export_tools_dir")?),
@@ -271,7 +298,8 @@ pub fn drill_export_argv(ex: &DrillExport, export_dir: &Path, snapshot: &Path) -
         "--chain-state-db-size-mb".into(), ex.chain_state_db_size_mb.to_string(),
         "--timeout-seconds".into(), DRILL_EXPORT_TIMEOUT_SECS.to_string(),
         "--deferred-sidecar".into(), "/out/deferred-transactions.json".into(),
-    ])
+    ]);
+    Ok(argv)
 }
 
 /// The ceremony's quoted shell form of a tool's argument vector: byte-for-byte what the pipeline always ran

@@ -7207,3 +7207,36 @@ fn r30r4_a_resumed_ceremony_handles_a_live_readiness_drill() {
     assert!(text.contains("readiness_drill_not_stopped"), "{text}");
     not_for_the_drill(&cfg);
 }
+
+/// R5-6 (Codex, ceremony side): a readiness drill on the SAME producer under ANOTHER journal directory holds the
+/// producer's lock; before round 5 the ceremony only looked at its own journal directory and armed next to it. Now a
+/// fresh ARM refuses before anything freezes.
+#[test]
+fn r30r5_a_fresh_ceremony_refuses_next_to_a_drill_on_the_same_producer_in_another_directory() {
+    let shared = tempfile::tempdir().unwrap();
+    let snapdir = shared.path().join("snapshots");
+    std::fs::create_dir_all(&snapdir).unwrap();
+    let with_snapdir = |dir: &std::path::Path| {
+        let cfg = test_config(dir, 120);
+        let p = dir.join("ceremony.toml");
+        let t = std::fs::read_to_string(&p).unwrap()
+            .replacen("[snapshot]\n", &format!("[snapshot]\ndir = \"{}\"\n", snapdir.display()), 1);
+        std::fs::write(&p, t).unwrap();
+        let _ = cfg;
+        Config::load(&p).unwrap()
+    };
+    let drill_dir = tempfile::tempdir().unwrap();
+    let ceremony_dir = tempfile::tempdir().unwrap();
+    let drill_cfg = with_snapdir(drill_dir.path());
+    let cfg = with_snapdir(ceremony_dir.path());
+    assert_eq!(pulse_cutover::drill::producer_lock_base(&drill_cfg), pulse_cutover::drill::producer_lock_base(&cfg));
+    // The other directory's drill holds the producer lock for its whole run.
+    let held = pulse_cutover::journal::Journal::lock(&pulse_cutover::drill::producer_lock_base(&drill_cfg)).unwrap();
+    let ops = MockOps::new(ceremony_dir.path(), 110);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("producer's lock"), "{err}");
+    assert!(transition(&journal_entries(&cfg), "FROZEN").is_none(), "nothing froze");
+    assert!(!ops.paused.get());
+    drop(held);
+}
+

@@ -16,7 +16,10 @@ const drill = (over = {}) => ({
   state_root: '42b0a70fa12998bd', fingerprints_digest: ROOT, compare: 'MISMATCH',
   compare_failing_tables: ['contract_index_double', 'global_property', 'generated_transaction'],
   timings_ms: { export: 168900, import: 191600, compare: 140400, fingerprint: 71600, conversion_total: 572500 },
-  error: null, finished_ts_ms: 1791900000000, ...over,
+  error: null, finished_ts_ms: 1791900000000,
+  tools: { docker_bin_sha256: '11'.repeat(32), import_bin_sha256: '22'.repeat(32), compare_bin_sha256: '33'.repeat(32),
+    fingerprint_bin_sha256: '44'.repeat(32), export_image_digest: '55'.repeat(32), tools_digest: '66'.repeat(32) },
+  ...over,
 });
 
 test('r30: a drill is projected into its own field and does not touch the ceremony', () => {
@@ -98,3 +101,23 @@ test('r30 review (e): a DONE drill without complete evidence never counts toward
   assert.equal(ok[0].agree, true);
   assert.deepEqual(ok[0].incomplete, []);
 });
+
+test('r30 round 5: producers that ran different (or unpinned) tools are never in agreement', () => {
+  const t = (digest) => ({ ...drill().tools, tools_digest: digest });
+  const differ = drillComparison([
+    { producer: 'bpa', report: { drill: drill() } },
+    { producer: 'bpb', report: { drill: drill({ tools: t('77'.repeat(32)) }) } },
+  ]);
+  assert.equal(differ[0].agree, false);
+  assert.equal(differ[0].tools_digest.length, 2);
+  const unpinned = drillComparison([
+    { producer: 'bpa', report: { drill: drill() } },
+    { producer: 'bpb', report: { drill: drill({ tools: null }) } },
+  ]);
+  assert.equal(unpinned[0].agree, false);
+  assert.deepEqual(unpinned[0].incomplete, ['bpb']);
+  // Malformed pins are refused (the drill is dropped, the report kept).
+  assert.throws(() => projectDrill(drill({ tools: { tools_digest: 'not-hex' } })), /drill.tools.tools_digest/);
+  assert.equal(projectDrill(drill()).tools.tools_digest, '66'.repeat(32));
+});
+

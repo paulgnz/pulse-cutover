@@ -97,6 +97,10 @@ pub struct Machine<'a, O: ChainOps> {
     /// journal lock alone cannot keep a drill (with another journal name) from starting next to this ceremony. Lock
     /// order everywhere: journal lock, then drill-root lock (drill, `drill --cancel` and the ceremony).
     drill_root_lock: Option<std::fs::File>,
+    /// r30 round 5 (Codex R5-6): the producer's own lock (`drill::producer_lock_base`, keyed by the normalised
+    /// producer API, in nodeos's snapshot dir), held like the drill-root lock, so a drill under ANOTHER journal
+    /// directory on the same producer cannot run next to this ceremony. Lock order: journal, drill root, producer.
+    producer_lock: Option<std::fs::File>,
     /// The full shadow identity proof passed in THIS run, right before chain creation / ignition: the only thing that
     /// lets a shadow go past the XPR mainnet ignite refusal (never the config flag alone).
     shadow_verified: bool,
@@ -329,6 +333,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             degraded_note: String::new(),
             armed_shadow: recovered.armed_shadow,
             drill_root_lock: None,
+            producer_lock: None,
             shadow_verified: false,
             shadow_refused: recovered.shadow_refused,
             shadow_proven: false,
@@ -457,6 +462,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.journal.evidence(self.state, json!({"readiness_drill_lock_busy": {"note": "resumed after the \
                     freeze: the drill lock is held but no drill is recorded running; the cut continues"}}))?;
             }
+            if self.producer_lock.is_none() {
+                // Round 5: a drill (or another agent) on this producer under ANOTHER journal directory holds the
+                // producer lock: this ceremony cannot see or stop it. Loud, never stranding the cut.
+                eprintln!("WARNING: another pulse-cutover process holds this producer's lock ({}.lock): a readiness \
+                           drill under another journal directory may be running next to this cut. Stop it by hand \
+                           (`pulse-cutover drill --cancel` with that config). The cut continues.",
+                          crate::drill::producer_lock_base(self.cfg).display());
+                self.journal.evidence(self.state, json!({"readiness_drill_producer_lock_busy": {
+                    "lock": format!("{}.lock", crate::drill::producer_lock_base(self.cfg).display()),
+                    "WARNING": "another process holds this producer's lock after the freeze; the cut continues"}}))?;
+            }
             return Ok(());
         };
         let cancel_file = crate::drill::cancel_path(self.cfg, dh);
@@ -481,6 +497,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.drill_root_lock.is_none() {
             if let Ok(f) = Journal::lock(&crate::drill::root_lock_base(self.cfg)) {
                 self.drill_root_lock = Some(f);
+            }
+        }
+        if self.producer_lock.is_none() {
+            if let Ok(f) = Journal::lock(&crate::drill::producer_lock_base(self.cfg)) {
+                self.producer_lock = Some(f);
             }
         }
         let still = activity(self.cfg);
@@ -782,6 +803,19 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                      it, or stop it with `pulse-cutover drill --cancel`"
                 )),
                 Err(_) => {} // past the freeze: handled by stop_drill_for_the_cut below
+            }
+        }
+        // Round 5 (Codex R5-6): the producer's lock, shared by every config on this producer API whatever its journal
+        // directory: a drill elsewhere on the same producer makes a fresh ARM (or one resumed while ARMED) refuse.
+        if self.producer_lock.is_none() {
+            match Journal::lock(&crate::drill::producer_lock_base(&self.cfg)) {
+                Ok(f) => self.producer_lock = Some(f),
+                Err(e) if pre_freeze => problems.push(format!(
+                    "another pulse-cutover process holds this producer's lock (a readiness drill on the same producer \
+                     API, possibly under another journal directory): {e}. Wait for it, or stop it with `pulse-cutover \
+                     drill --cancel` using that drill's config"
+                )),
+                Err(_) => {} // past the freeze: reported by stop_drill_for_the_cut below
             }
         }
         // A readiness drill running on this box would compete for CPU, RAM and disk in the cut window
