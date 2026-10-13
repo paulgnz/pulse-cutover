@@ -338,6 +338,23 @@ function targetView(t) {
     unread_for_ms: int(t.unread_for_ms, 'ceremony.target.unread_for_ms') };
 }
 
+const XPR_MAINNET_CHAIN_ID = '384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0';
+
+/**
+ * r30 shadow-fix: a SHADOW report (docs/DESIGN-shadow.md) lands only on a shadow board: one whose id starts with
+ * "shadow" and whose configured chain_id is NOT XPR mainnet (judged by the board's chain_id in networks.json, never by
+ * its name alone). Returns the refusal reason, or null.
+ */
+export function shadowBoardProblem(report, networks) {
+  if (!report || report.shadow == null) return null;
+  const n = (networks || []).find((x) => x && x.id === report.network);
+  if (!n) return 'a SHADOW report needs a configured shadow board';
+  if (typeof n.chain_id === 'string' && n.chain_id.toLowerCase() === XPR_MAINNET_CHAIN_ID)
+    return `board ${n.id} is configured with the XPR MAINNET chain_id: a SHADOW ceremony never reports there`;
+  if (!/^shadow/i.test(String(n.id))) return `board ${n.id} is not a shadow board (its id must start with "shadow")`;
+  return null;
+}
+
 /**
  * Validate a beacon report. Throws Bad (message = path: problem) on any violation of the declared types;
  * returns ONLY the allow-listed public projection (unknown fields are dropped, free text is redacted).

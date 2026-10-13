@@ -266,4 +266,6 @@ on_abort = "echo 'page the operator'"                    # on ABORT after rollba
                                                 # active schedule must sign with these only (real mainnet never does)
 # i_understand_signatures_are_valid_on_mainnet = true   # REQUIRED. the shadow shares mainnet's signing domain:
                                                 # never sign on it with real keys, never expose it publicly
-# metal_info_url = "http://127.0.0.1:9650"      # target metalgo for info.getNetworkID (default: target.rpc_url's origin)
+# The identity proof (docs/DESIGN-shadow.md §3) also needs: target.rpc_url a metalgo /ext/ URL (the network is proven
+# on that metalgo), source.rpc_url == source.producer_api_url's node, [coordination]/[beacon] networks named "shadow*",
+# producer mode coordinated (signed event, roster, quorum >= 2), and outbound HTTPS to public XPR mainnet APIs.

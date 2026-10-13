@@ -573,6 +573,9 @@ fn cmd_unhalt(args: &[String]) -> Result<(), String> {
     if recovered.state != Some(state::State::Halted) {
         return Err(format!("journal state is {:?}, not HALTED: nothing to clear", recovered.state.map(|s| s.to_string())));
     }
+    if let Some(why) = pulse_cutover::shadow::journal_mismatch(&cfg, recovered.armed_shadow.as_ref()) {
+        return Err(format!("unhalt refused: {why}. Nothing was changed."));
+    }
     let back = recovered.halted_from.unwrap_or(state::State::Verified);
     let who = std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "unknown".into());
     journal.evidence(state::State::Halted, serde_json::json!({"unhalted_by": who, "returning_to": back.as_str()}))?;

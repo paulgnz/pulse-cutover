@@ -76,8 +76,6 @@ pub trait ChainOps {
     fn source_producer(&self, producer: &str) -> Result<Option<Value>, String> {
         Err(format!("source_producer({producer}) is not supported by this ChainOps"))
     }
-    /// Bind values for `{name}` placeholders in the target RPC URL and the ignite command (the
-    /// upstream backend learns `blockchain_id` only when it creates the chain). Default: no-op.
     /// Shadow mode (docs/DESIGN-shadow.md): the network id the target metalgo reports
     /// (`info.getNetworkID` under `base`/ext/info). None = not answered (the shadow check fails closed).
     fn metal_network_id(&self, _base: &str) -> Result<Option<u64>, String> {
@@ -87,6 +85,13 @@ pub trait ChainOps {
     fn source_producer_schedule(&self) -> Result<Option<Value>, String> {
         Ok(None)
     }
+    /// Shadow mode: POST `body` to `path` on a PUBLIC chain API `base` (the pinned public XPR mainnet endpoints in
+    /// `shadow::PUBLIC_XPR_MAINNET_APIS`). Default: not supported (the shadow proof fails closed).
+    fn public_chain_post(&self, base: &str, path: &str, _body: Value) -> Result<Value, String> {
+        Err(format!("public_chain_post({base}{path}) is not supported by this ChainOps"))
+    }
+    /// Bind values for `{name}` placeholders in the target RPC URL and the ignite command (the
+    /// upstream backend learns `blockchain_id` only when it creates the chain). Default: no-op.
     fn bind_target(&self, _vars: &[(String, String)]) {}
     fn ignite(&self) -> Result<String, String>;
     /// Hooks and operator commands: killed after the configured hook timeout.
@@ -753,6 +758,10 @@ impl ChainOps for HttpOps {
     fn source_producer_schedule(&self) -> Result<Option<Value>, String> {
         let v = self.post(&format!("{}/v1/chain/get_producer_schedule", self.source_rpc), Some(json!({})), None)?;
         Ok(v.get("active").is_some().then_some(v))
+    }
+
+    fn public_chain_post(&self, base: &str, path: &str, body: Value) -> Result<Value, String> {
+        self.post(&format!("{}{path}", base.trim_end_matches('/')), Some(body), Some(Duration::from_secs(10)))
     }
 
     fn bind_target(&self, vars: &[(String, String)]) {

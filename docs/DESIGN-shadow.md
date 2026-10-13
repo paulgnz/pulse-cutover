@@ -1,6 +1,6 @@
 # Design: shadow cutovers
 
-**Status: implemented (minimum safe version), not yet rehearsed.** Test-ladder rung 5 in
+**Status: implemented and hardened after an adversarial review (r30 shadow-fix), not yet rehearsed.** Test-ladder rung 5 in
 [HOW-IT-WORKS.md](HOW-IT-WORKS.md#7-how-it-gets-proven-before-mainnet); risk-register rows D-6 and G-8.
 
 A **shadow cutover** runs the full ceremony (freeze, snapshot at exactly H, convert, fleet gate, chain
@@ -21,6 +21,9 @@ real cut and stay exactly as they are. Shadow mode is a separate, explicit path 
 | T3 | **A shadow is mistaken for a real cut** (or its evidence for real evidence) on mission control, in a report or a journal. | False confidence; a shadow's fleet reports counted for a real event. |
 | T4 | **A real cut quietly inherits a shadow relaxation** (config copied from the shadow). | The production refusals exist for the real cut. |
 | T5 | **The shadow passes because it was relaxed**, and the pass is read as "mainnet is ready". | The point of the shadow is the true result. |
+| T6 | **Operator-supplied proof.** Any identity check that trusts an endpoint, key list or flag the operator chose can be satisfied by a stub. | The review showed a free-text metalgo URL plus the real producer keys passed every check on a real node. |
+| T7 | **The config changes mid-ceremony.** A real ceremony's journal resumed, joined, rolled back or unhalted with a shadow config (or the reverse). | The relaxed path would act on a real ceremony's state. |
+| T8 | **A failed identity check acts on the source.** The ordinary abort resumes the producer and reopens writes. | A shadow config pointed at a real, already-paused mainnet producer would unpause it while its peers ignite. |
 
 ## 2. What shadow mode allows
 
@@ -31,14 +34,24 @@ Only with `[ceremony] shadow = true` **and** a complete `[shadow]` section:
 chain_id = "384da888…"          # required: a shadow pins the chain it imitates
 shadow = true
 
+[source]
+rpc_url = "http://127.0.0.1:8888"            # rpc_url and producer_api_url: the SAME node (scheme, host, port)
+producer_api_url = "http://127.0.0.1:8888"
+
 [target]
-metal_network_id = 4242         # required: a PRIVATE Metal network (never 1 or 5)
+metal_network_id = 4242                      # required: a PRIVATE Metal network (never 1 or 5)
+rpc_url = "http://127.0.0.1:9650/ext/bc/{blockchain_id}/rpc"   # required: a metalgo /ext/ URL
+
+[coordination]                               # required in producer mode (signed event, roster, quorum >= 2)
+network = "shadow-fleet-a"                   # must start with "shadow"
+
+[beacon]
+network = "shadow-fleet-a"                   # must start with "shadow"
 
 [shadow]
 label = "shadow-2026-11-04-a"   # required: shown on every record, report and board
 producer_keys = ["PUB_K1_…"]    # required: the shadow source's block-signing keys
 i_understand_signatures_are_valid_on_mainnet = true   # required
-# metal_info_url = "http://127.0.0.1:9650"  # where to ask info.getNetworkID (default: target.rpc_url's origin)
 ```
 
 With that, and only after the runtime checks in §3 pass:
@@ -66,32 +79,61 @@ mainnet's from the first block it produces. `[shadow] producer_keys` declares th
 1. `[shadow]` without `shadow = true`, or `shadow = true` without `[shadow]`, is an error (no silent no-op).
 2. `label` non-empty; `producer_keys` non-empty; the acknowledgement is `true`; `ceremony.chain_id` set.
 3. `target.metal_network_id` set and **not** a public Metal network (1, 5).
-4. `[beacon] network` and `[coordination] network` are not `"mainnet"`: shadow evidence never lands on the
-   mainnet board or counts for a mainnet event.
-5. `[flip] public_url`, when set, is a **private** address: loopback, RFC 1918, link-local, IPv6 unique-local,
-   or a `.local` / `.internal` / `.test` / `.localhost` / `.lan` / `.home.arpa` name. A shadow is never served on a
-   public URL by the agent's own flip.
+4. `target.rpc_url` is a metalgo `/ext/` URL: the network proof asks the metalgo **in front of that URL** and no
+   other (there is no separate, operator-chosen info endpoint; T6).
+5. `source.rpc_url` and `source.producer_api_url` are the **same node** (scheme, host and port, parsed strictly):
+   the identity is read on the node whose producer the ceremony pauses (T6).
+6. `[beacon] network` and `[coordination] network` start with `shadow`: shadow evidence never lands on a real
+   board and never counts for a real event. Mission control also refuses a shadow report on any board whose
+   configured chain_id is XPR mainnet or whose id does not start with `shadow`, judged from `networks.json`, not
+   from the report.
+7. `[flip] public_url`, when set, is a **private** address (loopback, RFC 1918, link-local, IPv6 unique-local, or a
+   `.local` / `.internal` / `.test` / `.localhost` / `.lan` / `.home.arpa` name), parsed with the same URL parser the
+   HTTP client uses; backslashes and userinfo count as public (ambiguous authorities).
+8. **Producer mode keeps the multi-party controls of a real cut**: a mainnet-chain_id shadow needs `[coordination]`
+   at load and, at ARM, a signed event, a roster and `fleet_quorum` ≥ 2 (the D-10 rule). Only an API-mode shadow
+   may run alone.
 
-**At ARM and again right before the write freeze** (fail-closed: anything unreadable refuses):
+**The identity proof** (`shadow::identity_problems`), three independent parts, every one fail-closed:
 
-6. The target metalgo reports `info.getNetworkID` equal to `target.metal_network_id` (so the agent is really
-   talking to the private network it was told about).
-7. The source's **active producer schedule** signs only with keys listed in `[shadow] producer_keys`. Real
-   mainnet's schedule signs with the real producers' keys, so a shadow config on a real mainnet node refuses
-   here before anything freezes (T2).
+9. **Target**: the metalgo behind `target.rpc_url` reports `info.getNetworkID` equal to the configured private id.
+10. **Source**: its active producer schedule signs only with the declared `producer_keys`.
+11. **Public mainnet** (a pinned list of public XPR mainnet API endpoints in `shadow::PUBLIC_XPR_MAINNET_APIS`;
+    not configurable, T6): every endpoint that answers as XPR mainnet (by its `get_info` chain_id) is asked; the
+    proof fails if **any** of them lists a declared shadow key in mainnet's active, pending or proposed producer
+    schedule, or serves **the source's own block id** at the source's LIB. A mainnet that has not reached the
+    source's LIB proves the source is not mainnet. If no endpoint can answer either question, the proof fails:
+    **a shadow run needs outbound HTTPS to at least one of those endpoints**.
 
-**Labelling (T3):** the ARMED record carries `"shadow": {label, metal_network_id}`; a `SHADOW` evidence record
-says it is not a cutover; every shadow override is journaled as such; `status` prints
-`ceremony: SHADOW <label>`; the beacon sends `shadow` in its summary and a failing `shadow` setup check (red
-on mission control, like a rehearsal); the board shows SHADOW.
+A real mainnet node can pass 10 only by declaring the real keys, which 11 refuses; it can never pass the block-id half
+of 11, whatever is declared.
 
-**Real cut stays as it was (T4):** a config without `shadow = true` gets every refusal unchanged. A shadow
-config cannot be a real cut: it requires a private network id, which a real cut's target never has, and
-the beacon network is not mainnet.
+The proof runs **at ARM, right before the write freeze, right before chain creation / ignition** (also on every
+resume or `join` that reaches that step) and, for the target half, **again after ignition** before IGNITED. Only
+the positive result of the check right before creation **in the same run** (`shadow_verified`) lets the shadow past
+the mainnet ignition refusal; the config flag alone never does.
 
-**True result (T5):** a shadow verifies with the real gate unless the operator adds the compare allowlist;
-then the VERIFIED record says it passed under a shadow override. Mission control and `report` show the
-override list. The `HOW-IT-WORKS` exit criteria ask for shadow runs **without** overrides.
+**A failed proof touches nothing (T8).** Before chain creation it ends ABORTED **without** resuming the producer,
+running any hook or unstaging anything, and journals the rollback as complete-and-empty, so a later `rollback`
+resumes nothing either; a producer this agent paused stays paused and an operator checks by hand which chain that
+node belongs to. After chain creation or ignition it HALTS (sealed), like every failure past the point of no return.
+
+**The journal binds the identity (T7).** The ARMED record carries `"shadow": {label, metal_network_id,
+producer_keys_sha256}` (or `null` for a real ceremony). `run`, `join`, `rollback` and `unhalt` refuse when the current
+config's identity differs: a real ceremony's journal can never take the shadow path, a shadow's never the real one,
+and a shadow's label, network and keys are fixed at ARM.
+
+**Labelling (T3):** a `SHADOW` evidence record says it is not a cutover; every shadow override is journaled as such;
+`status` prints `ceremony: SHADOW <label>`; the beacon sends `shadow` in its summary and a failing `shadow` setup
+check (red on mission control, like a rehearsal); the board shows SHADOW.
+
+**Real cut stays as it was (T4):** a config without `shadow = true` gets every refusal unchanged. A shadow config
+cannot be a real cut: its target must report a private network id, its coordination and beacon networks are shadow
+boards, and public mainnet must contradict its source.
+
+**True result (T5):** a shadow verifies with the real gate unless the operator adds the compare allowlist; then the
+VERIFIED record says it passed under a shadow override. Mission control and `report` show the override list. The
+`HOW-IT-WORKS` exit criteria ask for shadow runs **without** overrides.
 
 ## 4. What is only documented (not enforced)
 
@@ -100,14 +142,18 @@ override list. The `HOW-IT-WORKS` exit criteria ask for shadow runs **without** 
   already executed, which mainnet's own dedupe then rejects if they leak back.
 - **No other public exposure.** The agent checks its own flip URL only. Operators must keep the target RPC,
   any hyperion `/v2`, metalgo's HTTP port and the source's API off the internet.
-- **The re-keying** of the source is done outside the agent; the agent only checks its result (rule 7).
-- A shadow source peering with real mainnet nodes is not detected beyond rule 7 (a re-keyed chain diverges
+- **The re-keying** of the source is done outside the agent; the agent only checks its result (rules 10, 11).
+- A shadow source peering with real mainnet nodes is not detected beyond rules 10 and 11 (a re-keyed chain diverges
   from mainnet at its first block, so real peers would reject it, but operators should not peer it).
+- **`create_chain_cmd` and `ignite_cmd` are operator hooks.** The agent proves the network of the metalgo it reads
+  the target through (before creation and after ignition); a hook that creates the chain on another network would
+  fail the lineage check on the private metalgo and halt, but the chain it created elsewhere is the operator's to
+  retire.
+- **The pinned public endpoints are trusted** to tell the truth about mainnet; DNS or TLS interception of all of them
+  could fake an answer. Any one honest endpoint refuses a real node.
 
 ## 5. Open questions
 
-- Should mission control refuse shadow reports outright on a network named `mainnet` (today the agent
-  refuses to send them; the relay does not check)?
 - Traffic replay (`tools/shadow-replay`, a parallel track) needs the target to accept already-signed mainnet
   transactions whose TAPOS references blocks the shadow never had; until PulseVM enforces TAPOS (#108) they
   are accepted, after it they will be rejected unless the shadow seeds mainnet's block summaries.
