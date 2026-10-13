@@ -913,6 +913,12 @@ impl Config {
         }
         crate::shadow::check_config(&config)?;
         config.check_rehearsal_overrides()?;
+        if enforce_production && config.ceremony.chain_id.as_deref().is_some_and(is_xpr_mainnet) {
+            let problems = config.mainnet_coordination_problems(false);
+            if !problems.is_empty() {
+                return Err(problems.join("; "));
+            }
+        }
         if enforce_production && config.ceremony.profile == Profile::Ceremony && !config.ceremony.rehearsal {
             let problems = config.production_problems();
             if !problems.is_empty() {
@@ -1143,6 +1149,50 @@ impl Config {
                 if self.snapshot.golden_roots.is_none() {
                     out.push("snapshot.golden_roots is not set (fork backend: verify against published goldens; capture_roots is the rehearsal/first-node mode)".into());
                 }
+            }
+        }
+        out
+    }
+
+    /// XPR MAINNET is cut only by a coordinated ceremony (RISK-REGISTER D-10): without signed
+    /// coordination an agent has no fleet gate, no roster and no positive "no abort" check.
+    /// `at_arm = false` (config load) asks only for the `[coordination]` section, because the base
+    /// config `pulse-cutover await` starts from has no event yet; `at_arm = true` (ARM preflight, the
+    /// config `await` derived) also asks for the signed event, and in producer mode a roster and a
+    /// quorum of at least 2. API mode needs the signed event but no roster: API nodes are not
+    /// members of the producers' quorum. Readiness configs are not ceremonies and are not checked.
+    pub fn mainnet_coordination_problems(&self, at_arm: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.ceremony.profile != Profile::Ceremony {
+            return out;
+        }
+        let Some(co) = &self.coordination else {
+            out.push(
+                "an XPR MAINNET ceremony must be coordinated: add a [coordination] section (url, network, \
+                 coordinator_keys) and arm it through `pulse-cutover await` with the signed event"
+                    .into(),
+            );
+            return out;
+        };
+        if !at_arm {
+            return out;
+        }
+        if co.event_id.is_none() || co.event_hash.is_none() {
+            out.push(
+                "an XPR MAINNET ceremony must run from a signed event: coordination.event_id and event_hash are \
+                 written by `pulse-cutover await`; run the config it derived"
+                    .into(),
+            );
+        }
+        if self.ceremony.mode == Mode::Producer {
+            if co.roster.is_empty() {
+                out.push("an XPR MAINNET producer ceremony needs the event's roster (coordination.roster is empty)".into());
+            }
+            if co.fleet_quorum < 2 {
+                out.push(format!(
+                    "an XPR MAINNET producer ceremony needs a fleet quorum of at least 2 (coordination.fleet_quorum = {})",
+                    co.fleet_quorum
+                ));
             }
         }
         out

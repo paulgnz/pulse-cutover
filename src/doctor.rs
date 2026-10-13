@@ -836,6 +836,22 @@ pub fn compute_verdicts(r: &DoctorReport) -> BTreeMap<String, Verdict> {
 
         // Resources.
         let mainnet = r.nodeos.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet);
+        // RISK-REGISTER D-11: an unknown is reported, never read as "enough". Memory that cannot be read is
+        // a need; so is a node whose chain_id cannot be read when the host is below the mainnet bar
+        // (the smaller testnet threshold would otherwise pass it silently).
+        if r.host.ram_mb == 0 {
+            needs.push(
+                "could not read this host's memory (/proc/meminfo); check by hand: an XPR mainnet cutover needs \
+                 32GB+ RAM"
+                    .into(),
+            );
+        } else if r.nodeos.detected && r.nodeos.chain_id.is_none() && r.host.ram_mb < RAM_MIN_XPR_MAINNET_MB {
+            needs.push(format!(
+                "could not read the node's chain_id, so the RAM bar is unknown (found {:.1}GB): an XPR mainnet \
+                 cutover needs 32GB+ RAM; check which chain this node follows",
+                r.host.ram_mb as f64 / 1024.0
+            ));
+        }
         let ram_min = if mainnet {
             RAM_MIN_XPR_MAINNET_MB
         } else if mode == "api" {
@@ -2085,6 +2101,31 @@ LISTEN 0      4096   *:9650          *:*"#;
         assert!(!v["bp"].needs.iter().any(|n| n.contains("RAM")));
         // The testnet keeps its own bar: 16 GB is still READY there.
         r.nodeos.chain_id = Some("71ee83bc".into());
+        r.host.ram_mb = 15_884;
+        assert_eq!(compute_verdicts(&r)["bp"].status, "READY");
+    }
+
+    #[test]
+    fn d11_unknown_memory_or_chain_is_a_need_not_a_pass() {
+        // Memory that cannot be read: a need in every mode, whatever the chain.
+        let mut r = ready_report();
+        r.host.ram_mb = 0;
+        let v = compute_verdicts(&r);
+        for mode in ["bp", "api", "hyperion"] {
+            assert_eq!(v[mode].status, "NEEDS", "{mode}");
+            assert!(v[mode].needs.iter().any(|n| n.contains("could not read this host's memory")), "{mode}");
+        }
+        // A detected node whose chain_id cannot be read, on a 16 GB host: unknown bar, reported.
+        let mut r = ready_report();
+        r.nodeos.chain_id = None;
+        r.host.ram_mb = 15_884;
+        let v = compute_verdicts(&r);
+        assert!(v["bp"].needs.iter().any(|n| n.contains("could not read the node's chain_id")));
+        // ...on a host that already clears the mainnet bar, nothing to report.
+        r.host.ram_mb = 31_300;
+        assert_eq!(compute_verdicts(&r)["bp"].status, "READY");
+        // A known testnet chain keeps its own bar (no unknown to report).
+        let mut r = ready_report();
         r.host.ram_mb = 15_884;
         assert_eq!(compute_verdicts(&r)["bp"].status, "READY");
     }

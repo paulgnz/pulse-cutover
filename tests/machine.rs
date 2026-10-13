@@ -4311,22 +4311,110 @@ fn upstream_production_config(dir: &std::path::Path) -> Result<Config, String> {
     Config::load(&path)
 }
 
+/// The production upstream config, coordinated the way a mainnet ceremony must be (RISK-REGISTER D-10): a signed
+/// event (id + hash), a roster of bp1 (this node, with its beacon) and bp2, quorum 2.
+fn upstream_mainnet_coordinated_config(dir: &std::path::Path) -> Config {
+    let _ = upstream_production_config(dir).unwrap();
+    std::fs::write(dir.join("beacon.token"), "tok\n").unwrap();
+    let text = std::fs::read_to_string(dir.join("ceremony-upstream-ignite.toml")).unwrap()
+        + &format!("\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nevent_hash = \"{}\"\nfleet_quorum = 2\nfleet_timeout_secs = 5\nreport_max_age_secs = 60\n",
+            hex::encode(coord_key().verifying_key().to_bytes()), mock_event_hash())
+        + "\n[[coordination.roster]]\nproducer = \"bp1\"\n\n[[coordination.roster]]\nproducer = \"bp2\"\n"
+        + &format!("\n[beacon]\nurl = \"https://mc.example/api/report\"\nproducer = \"bp1\"\nnetwork = \"rehearsal\"\ntoken_file = \"{}/beacon.token\"\n", dir.display());
+    load_toml(dir, "mainnet-coord.toml", &text).unwrap()
+}
+
 #[test]
 fn upstream_ignite_is_refused_for_mainnet_while_gaps_remain() {
-    // No overrides, production profile, mainnet chain: verification runs, ignition is refused
-    // (pre-ignition abort).
+    // No overrides, production profile, coordinated, mainnet chain: verification runs, ignition is refused
+    // (pre-ignition abort). The only peer has aborted, so the resume guard lets this node resume the old chain.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_mainnet_coordinated_config(dir.path());
+    let ops = upstream_ops(dir.path());
+    ops.schedule_ok.set(true);
+    *ops.chain_id.borrow_mut() = MAINNET.into();
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp1", serde_json::json!({"state": "VERIFIED", "aborting": true})),
+        ("bp2", serde_json::json!({"state": "ABORTED"}))]));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(upstream_journal_has_verified(&text));
+    assert!(text.contains("refused for XPR MAINNET") && text.contains("TAPOS"));
+    assert!(text.contains("#106") && text.contains("#107") && text.contains("#113"), "every open mainnet blocker is named");
+    assert!(!dir.path().join("create-chain.calls").exists(), "no chain created");
+    assert_eq!(ops.resumes.get(), 1);
+}
+
+/// RISK-REGISTER D-10: an XPR MAINNET ceremony without signed coordination is refused, at load when chain_id is
+/// configured and at ARM (before anything freezes) when it is discovered; `await`'s base config still loads.
+#[test]
+fn d10_mainnet_producer_ceremony_must_be_coordinated() {
+    // Load: a configured mainnet chain_id without a [coordination] section.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let _ = upstream_production_config(dir.path()).unwrap();
+    let base = std::fs::read_to_string(dir.path().join("ceremony-upstream-ignite.toml")).unwrap();
+    let with_chain = base.replacen("[ceremony]\n", &format!("[ceremony]\nchain_id = \"{MAINNET}\"\n"), 1);
+    let err = load_toml(dir.path(), "m.toml", &with_chain).unwrap_err();
+    assert!(err.contains("must be coordinated") && err.contains("[coordination]"), "{err}");
+    // ...the same config for the testnet loads: the rule is mainnet-only.
+    assert!(load_toml(dir.path(), "t.toml", &base).is_ok());
+    // await's base config: [coordination] without an event or roster yet loads for mainnet.
+    let await_base = with_chain.clone() + &format!("\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\n",
+        hex::encode(coord_key().verifying_key().to_bytes()));
+    let cfg = load_toml(dir.path(), "await-base.toml", &await_base).unwrap();
+    // ...but it cannot ARM: no signed event, no roster, quorum below 2. Nothing freezes.
+    let ops = upstream_ops(dir.path());
+    ops.schedule_ok.set(true);
+    *ops.chain_id.borrow_mut() = MAINNET.into();
+    assert!(run_machine_result(&cfg, &ops).is_err());
+    let e = journal_entries(&cfg);
+    assert!(transition(&e, "FROZEN").is_none(), "nothing froze");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("must run from a signed event") && text.contains("roster is empty") && text.contains("quorum of at least 2"), "{text}");
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "freeze-writes"), "writes never froze: {:?}", ops.hooks.borrow());
+
+    // ARM: a config that leaves chain_id to discovery has no [coordination]; the source turns out to be mainnet.
     let dir = tempfile::tempdir().unwrap();
     stage_fake_upstream_tools(dir.path(), 0);
     let cfg = upstream_production_config(dir.path()).unwrap();
     let ops = upstream_ops(dir.path());
     ops.schedule_ok.set(true);
     *ops.chain_id.borrow_mut() = MAINNET.into();
-    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    assert!(run_machine_result(&cfg, &ops).is_err());
+    assert!(transition(&journal_entries(&cfg), "FROZEN").is_none(), "nothing froze");
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
-    assert!(upstream_journal_has_verified(&text));
-    assert!(text.contains("refused for XPR MAINNET") && text.contains("TAPOS"));
-    assert!(!dir.path().join("create-chain.calls").exists(), "no chain created");
-    assert_eq!(ops.resumes.get(), 1);
+    assert!(text.contains("must be coordinated"), "{text}");
+    // ...and the same config runs on the testnet as before.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_production_config(dir.path()).unwrap();
+    let ops = upstream_ops(dir.path());
+    ops.schedule_ok.set(true);
+    let _ = run_machine_result(&cfg, &ops);
+    assert!(transition(&journal_entries(&cfg), "FROZEN").is_some(), "testnet: the rule does not apply");
+}
+
+/// RISK-REGISTER D-10, api mode: a mainnet api ceremony needs the signed event too (no roster: API nodes are not
+/// members of the producers' quorum).
+#[test]
+fn d10_mainnet_api_ceremony_needs_the_signed_event_but_no_roster() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = api_test_config(dir.path(), 120);
+    let mut c = cfg.clone();
+    assert!(c.mainnet_coordination_problems(true).iter().any(|p| p.contains("must be coordinated")));
+    c.coordination = coord_config(dir.path(), 120, 0, 5).coordination;
+    assert!(c.mainnet_coordination_problems(true).is_empty(), "api: event id + hash suffice, no roster or quorum");
+    c.coordination.as_mut().unwrap().event_hash = None;
+    assert!(c.mainnet_coordination_problems(true).iter().any(|p| p.contains("signed event")));
+    // Producer mode with the same coordination still needs a roster and a quorum.
+    let mut p = coord_config(dir.path(), 120, 0, 5);
+    assert!(p.mainnet_coordination_problems(true).iter().any(|x| x.contains("roster is empty")));
+    p.coordination.as_mut().unwrap().fleet_quorum = 1;
+    assert!(p.mainnet_coordination_problems(true).iter().any(|x| x.contains("quorum of at least 2")));
+    // A readiness config is not a ceremony.
+    p.ceremony.profile = pulse_cutover::config::Profile::Readiness;
+    assert!(p.mainnet_coordination_problems(true).is_empty());
 }
 
 #[test]

@@ -534,6 +534,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 problems.push(format!("SHADOW identity: {p}"));
             }
         }
+        // RISK-REGISTER D-10: a mainnet ceremony is coordinated, whether chain_id was configured (checked at load,
+        // section only) or discovered here; at ARM the signed event, roster and quorum must be in place.
+        if crate::config::is_xpr_mainnet(&info.chain_id) {
+            problems.extend(self.cfg.mainnet_coordination_problems(true));
+        }
         match self.ops.producer_paused() {
             // api mode: this node does not produce; we only need producer_api
             // reachable for create_snapshot — its paused flag is irrelevant.
