@@ -21,7 +21,7 @@ found; never delete one, mark it closed with its evidence.*
 *BPs* = block producers · *coord* = the cutover coordinator and governance · *ecosystem* = exchanges,
 wallets, apps, API and history providers.
 
-**Summary (2026-10-13), 84 risks:** 6 BLOCKER · 50 OPEN · 7 PARTIAL · 10 DECISION · 10 MITIGATED · 1 CLOSED.
+**Summary (2026-10-13), 84 risks:** 6 BLOCKER · 48 OPEN · 7 PARTIAL · 10 DECISION · 12 MITIGATED · 1 CLOSED.
 The six blockers: A-1 split brain (sealed start), A-6 compare fails on mainnet state, A-9 source chain_id
 for signing, B-1 CPU units, B-2 per-producer keys, C-1 MetalGo 1.14 on Metal mainnet.
 
@@ -97,8 +97,8 @@ for signing, B-1 CPU units, B-2 per-producer keys, C-1 MetalGo 1.14 on Metal mai
 | D-7 | No zero-impact way for every real producer to prove it can cut and convert mainnet | — | — | OPEN | agent | a drill mode: snapshot at H, convert, fingerprint, report; no freeze, no pause |
 | D-8 | Supply chain: a tampered binary or script | pinned releases, sha256 sums, SHA-pinned CI, pins checked at release | rc.29; but the sums come from the same party that builds the binaries, and the installer is fetched and run as root | PARTIAL | agent | a second independent build that reproduces the sums |
 | D-9 | The test plan itself: replaying post-H mainnet transactions into a shadow chain fails TAPOS if it is enforced (their reference blocks are after H); no soak period, no validator restart or plugin hot-swap under load | — | — | OPEN | agent | rung 5 replays only transactions whose reference block is ≤ H (or documents the rest); a soak rung added |
-| D-10 | The production profile does not require coordination: an agent run from a config file alone has no fleet gate, no roster and no positive "no abort" check | `await` refuses a producer event without a roster | config.rs production profile | OPEN | agent | XPR mainnet producer mode refuses to run without signed coordination and a roster |
-| D-11 | `doctor` fails open: if it cannot read the node's memory or chain_id it applies the smaller testnet thresholds | — | doctor.rs | OPEN | agent | unknown memory or chain identity reported as a need, not skipped |
+| D-10 | The production profile does not require coordination: an agent run from a config file alone has no fleet gate, no roster and no positive "no abort" check | XPR mainnet: `[coordination]` required at config load; at ARM (before anything freezes) the signed event (`event_id`, `event_hash`), and in producer mode a roster and a quorum ≥ 2; api mode needs the signed event, no roster | tests `d10_mainnet_producer_ceremony_must_be_coordinated`, `d10_mainnet_api_ceremony_needs_the_signed_event_but_no_roster`, `upstream_ignite_is_refused_for_mainnet_while_gaps_remain` (now coordinated) | MITIGATED | agent | rehearsed: a mainnet-chain_id shadow or drill run refused without coordination |
+| D-11 | `doctor` fails open: if it cannot read the node's memory or chain_id it applies the smaller testnet thresholds | unreadable memory is a need in every mode; an unreadable chain_id on a host below the mainnet bar is a need | test `d11_unknown_memory_or_chain_is_a_need_not_a_pass` | MITIGATED | agent | — |
 
 ## E. Time and resources
 
