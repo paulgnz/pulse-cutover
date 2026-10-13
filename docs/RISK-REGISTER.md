@@ -21,7 +21,7 @@ found; never delete one, mark it closed with its evidence.*
 *BPs* = block producers · *coord* = the cutover coordinator and governance · *ecosystem* = exchanges,
 wallets, apps, API and history providers.
 
-**Summary (2026-10-13), 84 risks:** 6 BLOCKER · 45 OPEN · 10 PARTIAL · 10 DECISION · 12 MITIGATED · 1 CLOSED.
+**Summary (2026-10-13), 86 risks:** 6 BLOCKER · 47 OPEN · 10 PARTIAL · 10 DECISION · 12 MITIGATED · 1 CLOSED.
 The six blockers: A-1 split brain (sealed start), A-6 compare fails on mainnet state, A-9 source chain_id
 for signing, B-1 CPU units, B-2 per-producer keys, C-1 MetalGo 1.14 on Metal mainnet.
 
@@ -83,6 +83,7 @@ for signing, B-1 CPU units, B-2 per-producer keys, C-1 MetalGo 1.14 on Metal mai
 | C-7 | The migrated system contract keeps re-electing the top producers by votes every round; a node not in that schedule refuses to build, and an elected producer without a Metal validator cannot build | — | #107 | OPEN | upstream + coord | the schedule frozen at the cut or fed from the validator set; decided with C-4 |
 | C-8 | Every future node boots from the migration checkpoint (2.1 GB), manifest and genesis; if they are lost, no new validator can join | — | no state sync | OPEN | coord + upstream | the artifacts archived in several places with published hashes; a new node joining after the cut rehearsed |
 | C-9 | XPR becomes dependent on Metal's upgrade schedule: a mandatory MetalGo upgrade missed by enough producers halts XPR | — | — | OPEN | Metal + BPs | upgrade process and notice period agreed with Metal |
+| C-10 | The PulseVM v1.0.0 release binaries need glibc 2.35 (built on Ubuntu 22.04); a producer on Ubuntu 20.04 cannot run them, although pulse-cutover itself supports 20.04 | — | v1.0.0 release notes | OPEN | BPs | every roster host on Ubuntu 22.04+ (or a PulseVM build for its glibc), checked by `doctor` |
 
 ## D. The ceremony tooling
 
@@ -99,6 +100,7 @@ for signing, B-1 CPU units, B-2 per-producer keys, C-1 MetalGo 1.14 on Metal mai
 | D-9 | The test plan itself: replaying post-H mainnet transactions into a shadow chain fails TAPOS if it is enforced (their reference blocks are after H); no soak period, no validator restart or plugin hot-swap under load | — | — | OPEN | agent | rung 5 replays only transactions whose reference block is ≤ H (or documents the rest); a soak rung added |
 | D-10 | The production profile does not require coordination: an agent run from a config file alone has no fleet gate, no roster and no positive "no abort" check | XPR mainnet: a `[coordination]` section is required at load; at a fresh ARM, before anything freezes, the relay must serve the signed event the config was derived from (signature against `coordinator_keys`, sha256 = `event_hash`), and its payload must bind network, event_id, the source chain_id, H, the roster and the quorum; a relay that does not answer refuses; the authenticated bindings (event, hash, network, chain, H, roster hash, quorum) are journaled as `mainnet_event_verified` before anything freezes and compared offline on every run, rollback, join and unhalt (a journal past ARMED without them refuses; one still at ARMED authenticates again); `coord.mjs event` requires `--chain-id` and `--h` | tests `d10_mainnet_producer_ceremony_must_be_coordinated`, `d10_mainnet_api_ceremony_needs_the_signed_event_but_no_roster`, `d10_mainnet_arm_authenticates_and_binds_the_signed_event`, `r30r2_mainnet_event_binding_survives_crashes_and_config_edits`, control `fleet.test.mjs`; round 3: the authenticated H must equal the H the journal executes, checked at run start, at authentication, before scheduling and before the freeze (`r30r3_mainnet_resume_cannot_authorize_another_h_than_the_journal_executes`) | MITIGATED | agent | rehearsed with a real signed mainnet-shaped event on the fleet |
 | D-11 | `doctor` fails open: if it cannot read the node's memory or chain_id it applies the smaller testnet thresholds | unreadable memory is a need in every mode; an unreadable chain_id on a host below the mainnet bar is a need | test `d11_unknown_memory_or_chain_is_a_need_not_a_pass` | MITIGATED | agent | — |
+| D-12 | Every rehearsal so far ran a pre-release PulseVM build (fleet plugin sha256 `0e06db7a…`); the released v1.0.0 binary is a different build (`d8ba5d97…`), and the v1.0.0 tag was moved after the fleet runs | — | release assets, 2026-10-13 | OPEN | agent + coord | rehearsals, drills and shadow cutovers re-run on the released, sha-pinned binary |
 
 ## E. Time and resources
 
@@ -137,7 +139,7 @@ for signing, B-1 CPU units, B-2 per-producer keys, C-1 MetalGo 1.14 on Metal mai
 | G-3 | On-chain approval for the migration and for retiring the old schedule | — | — | DECISION | coord + BPs | the msig and its timing agreed |
 | G-4 | Communication fails (users, exchanges, apps surprised) | — | — | OPEN | coord | announcement plan, status page and incident channel |
 | G-5 | Key custody: coordinator and producer keys | — | — | DECISION | coord + BPs | threshold coordinator keys; per-BP producer keys (B-2) |
-| G-6 | Validators' right to run PulseVM under its license | — | PulseVM Business License | DECISION | upstream | written confirmation for every validator |
+| G-6 | Validators' right to run PulseVM under its license: the PulseVM Business License 1.0 permits non-commercial use; commercial use needs Metallicus's prior written permission, and running a producer is arguably commercial | — | v1.0.0 release notes and LICENSE | DECISION | upstream | written permission covering every validator, before producers are asked to run it |
 | G-7 | After LIVE there is no way back without losing writes | halt instead of resume; forward fixes only | inherent | DECISION | coord | forward-fix runbook and HALT criteria agreed |
 | G-8 | A shadow chain carries the real chain_id: anything signed there shares mainnet's signing domain | shadow mode proves it is not mainnet (D-6) and refuses public flip URLs (strictly parsed); mission control refuses shadow reports on any board configured with the mainnet chain_id or not named "shadow*"; the replay tool signs nothing and refuses real mainnet targets (`tools/SHADOW-REPLAY.md`); written rule in HOW-IT-WORKS §7 | tests | PARTIAL | coord + agent | the written rule adopted by everyone who runs a shadow; no public listeners |
 | G-9 | A human enters a wrong parameter (H, chain_id, roster) | signed events; `await` writes the config; doctor; production profile | — | MITIGATED | coord | two-person check on every published event |
