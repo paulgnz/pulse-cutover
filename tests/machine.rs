@@ -567,8 +567,7 @@ impl ChainOps for MockOps {
                 return Err("mission control unreachable".into());
             }
             // The relay is up and serves the signed event e1 (no abort) unless a test sets another document.
-            return Ok(Some(self.coord_doc.borrow().clone().unwrap_or_else(|| serde_json::json!({
-                "event": signed(serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1"}))}))));
+            return Ok(Some(self.coord_doc.borrow().clone().unwrap_or_else(|| serde_json::json!({"event": mock_event()}))));
         }
         if url.ends_with("/api/status") {
             if self.coord_down.get() {
@@ -1844,8 +1843,8 @@ fn upstream_abort_rig(dir: &std::path::Path, tool: &str, sleep_secs: u64) -> (Co
     write_script(&script, &format!("{shebang}\ntouch {}/abort-now\nsleep {sleep_secs}\n{rest}", dir.display()));
     let _ = upstream_test_config(dir, 120);
     let path = dir.join("ceremony-upstream.toml");
-    let text = format!("{}\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\n",
-        std::fs::read_to_string(&path).unwrap(), hex::encode(coord_key().verifying_key().to_bytes()));
+    let text = format!("{}\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nevent_hash = \"{}\"\n",
+        std::fs::read_to_string(&path).unwrap(), hex::encode(coord_key().verifying_key().to_bytes()), mock_event_hash());
     std::fs::write(&path, text).unwrap();
     let cfg = Config::load(&path).unwrap();
     let ops = MockOps::new(dir, 110);
@@ -1961,12 +1960,20 @@ fn signed(payload: serde_json::Value) -> serde_json::Value {
         "key": hex::encode(sk.verifying_key().to_bytes())})
 }
 
+/// The event the mock relay serves by default, and its payload hash (rc.29: a derived config carries it).
+fn mock_event() -> serde_json::Value {
+    signed(serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1"}))
+}
+fn mock_event_hash() -> String {
+    pulse_cutover::coord::payload_hash(&mock_event()).unwrap()
+}
+
 fn coord_config(dir: &std::path::Path, freeze_height: u64, quorum: usize, timeout: u64) -> Config {
     let base = test_config(dir, freeze_height);
     let _ = base;
     let text = std::fs::read_to_string(dir.join("ceremony.toml")).unwrap();
-    let text = format!("{text}\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nfleet_quorum = {quorum}\nfleet_timeout_secs = {timeout}\n",
-        hex::encode(coord_key().verifying_key().to_bytes()));
+    let text = format!("{text}\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nevent_hash = \"{}\"\nfleet_quorum = {quorum}\nfleet_timeout_secs = {timeout}\n",
+        hex::encode(coord_key().verifying_key().to_bytes()), mock_event_hash());
     let path = dir.join("ceremony-coord.toml");
     std::fs::write(&path, text).unwrap();
     Config::load(&path).unwrap()
@@ -2025,7 +2032,7 @@ fn rc29_no_abort_needs_the_exact_accepted_event_payload() {
     let other = signed(serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "h": 121}));
     let hash = pulse_cutover::coord::payload_hash(&ev).unwrap();
     let path = dir.path().join("ceremony-hash.toml");
-    std::fs::write(&path, text.replace("event_id = \"e1\"\n", &format!("event_id = \"e1\"\nevent_hash = \"{hash}\"\n"))).unwrap();
+    std::fs::write(&path, text.replace(&format!("event_hash = \"{}\"\n", mock_event_hash()), &format!("event_hash = \"{hash}\"\n"))).unwrap();
     let cfg = Config::load(&path).unwrap();
     let ops = MockOps::new(dir.path(), 110);
     *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"event": other}));
@@ -2036,7 +2043,7 @@ fn rc29_no_abort_needs_the_exact_accepted_event_payload() {
     let _ = coord_config(dir.path(), 120, 0, 60);
     let text = std::fs::read_to_string(dir.path().join("ceremony-coord.toml")).unwrap();
     let path = dir.path().join("ceremony-hash.toml");
-    std::fs::write(&path, text.replace("event_id = \"e1\"\n", &format!("event_id = \"e1\"\nevent_hash = \"{hash}\"\n"))).unwrap();
+    std::fs::write(&path, text.replace(&format!("event_hash = \"{}\"\n", mock_event_hash()), &format!("event_hash = \"{hash}\"\n"))).unwrap();
     let cfg = Config::load(&path).unwrap();
     let ops = MockOps::new(dir.path(), 110);
     *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"event": ev}));
@@ -4371,8 +4378,8 @@ fn rc21_signed_abort_or_unreachable_relay_right_before_create_stops_before_the_b
         stage_fake_upstream_tools(dir, 0);
         let _ = upstream_ignite_config(dir, "", "").unwrap();
         let path = dir.join("ceremony-upstream-ignite.toml");
-        let text = format!("{}\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\n",
-            std::fs::read_to_string(&path).unwrap(), hex::encode(coord_key().verifying_key().to_bytes()));
+        let text = format!("{}\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nevent_hash = \"{}\"\n",
+            std::fs::read_to_string(&path).unwrap(), hex::encode(coord_key().verifying_key().to_bytes()), mock_event_hash());
         std::fs::write(&path, text).unwrap();
         Config::load(&path).unwrap()
     };
@@ -5141,8 +5148,8 @@ fn rc23_upstream_fleet_with(dir: &std::path::Path, extra_upstream: &str) -> Conf
     stage_fake_upstream_tools(dir, 0);
     let _ = upstream_ignite_config(dir, "", extra_upstream).unwrap();
     let path = dir.join("ceremony-upstream-ignite.toml");
-    let mut text = format!("{}\non_halt = \"page-human\"\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nfleet_quorum = 4\nfleet_timeout_secs = 5\n",
-        std::fs::read_to_string(&path).unwrap(), hex::encode(coord_key().verifying_key().to_bytes()));
+    let mut text = format!("{}\non_halt = \"page-human\"\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nevent_hash = \"{}\"\nfleet_quorum = 4\nfleet_timeout_secs = 5\n",
+        std::fs::read_to_string(&path).unwrap(), hex::encode(coord_key().verifying_key().to_bytes()), mock_event_hash());
     for p in ["bp1", "bp2", "bp3", "bp4", "bp5"] {
         text += &format!("\n[[coordination.roster]]\nproducer = \"{p}\"\n");
     }
@@ -5768,4 +5775,86 @@ fn rc29_fork_backend_rehashes_the_staged_snapshot_before_ignition() {
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(text.contains("staged snapshot does not match the artifact this ceremony verified"), "{st:?} {text}");
     assert!(!text.contains("ignite_started"), "never ignited");
+}
+
+fn rc29_noauto_config(d: &std::path::Path) -> Config {
+    let _ = rc23_fleet_config(d);
+    let text = std::fs::read_to_string(d.join("fleet.toml")).unwrap().replacen("[target]\n", "[target]\nauto_rollback = false\n", 1);
+    load_toml(d, "fleet-noauto.toml", &text).unwrap()
+}
+
+#[test]
+fn rc29_an_abort_before_snapshotted_keeps_writes_frozen_and_rollback_stays_guarded() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc29_noauto_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    ops.burnoff_tx_per_block.set(1); // aborts in the burn-off audit: after the pause, before SNAPSHOTTED
+    let clean = rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
+        ("bp4", serde_json::json!({"state": "FROZEN"})), ("bp5", serde_json::json!({"state": "FROZEN"}))]);
+    *ops.status_doc.borrow_mut() = Some(clean.clone());
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(!text.contains("head_at_pause"), "no pause head journaled before SNAPSHOTTED");
+    assert!(text.contains("on_abort_deferred"), "{text}");
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "writes stay frozen: the source was not resumed");
+    assert_eq!(ops.resumes.get(), 0);
+    // A peer ignites later: the operator's plain rollback must not resume the old chain.
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp2", serde_json::json!({"state": "IGNITED", "ignition_started": true})),
+        ("bp3", serde_json::json!({"state": "ABORTED"})), ("bp4", serde_json::json!({"state": "FROZEN"})), ("bp5", serde_json::json!({"state": "FROZEN"}))]));
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let err = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).unwrap_err();
+    assert!(err.contains("bp2 was reported past chain creation"), "{err}");
+    assert_eq!(ops.resumes.get(), 0);
+    // With every peer before creation it resumes, and only then reopens writes.
+    *ops.status_doc.borrow_mut() = Some(clean);
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).unwrap();
+    assert_eq!((out.state, ops.resumes.get()), (State::Aborted, 1), "{:?}", out.failed);
+    assert!(ops.hooks.borrow().iter().any(|h| h == "reopen-writes"));
+}
+
+#[test]
+fn rc29_a_crash_after_abort_intent_does_not_replay_as_a_ceremony_in_progress() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
+        ("bp4", serde_json::json!({"state": "FROZEN"})), ("bp5", serde_json::json!({"state": "FROZEN"}))]));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let kept: Vec<&str> = text.lines().take_while(|l| !l.contains("own_report_withdrawn")).collect();
+    assert!(kept.last().unwrap().contains("abort_intent"), "{kept:?}");
+    std::fs::write(&cfg.journal_path, kept.join("\n") + "\n").unwrap();
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("refusing to run") && err.contains("rollback_requested"), "{err}");
+}
+
+#[test]
+fn rc29_a_strand_pauses_a_producer_that_is_still_producing() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    rc29_killed_at_verified(d.path(), &cfg, &ops);
+    ops.paused.set(false); // e.g. an operator resumed it by hand, or the agent died before the pause
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert!(Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).is_err());
+    assert!(ops.paused.get(), "a STRANDED producer is paused");
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("strand_paused_producer"));
+}
+
+#[test]
+fn rc29_a_config_without_the_event_hash_cannot_authorize_creation() {
+    // A config derived by rc.28 has no event_hash: it cannot tell this event from another payload signed under the
+    // same id (a different H or chain), so before ignition the relay's answer is unknown.
+    let d = tempfile::tempdir().unwrap();
+    let _ = coord_config(d.path(), 120, 0, 60);
+    let text = std::fs::read_to_string(d.path().join("ceremony-coord.toml")).unwrap()
+        .replace(&format!("event_hash = \"{}\"\n", mock_event_hash()), "");
+    let cfg = load_toml(d.path(), "nohash.toml", &text).unwrap();
+    assert!(cfg.coordination.as_ref().unwrap().event_hash.is_none());
+    let ops = MockOps::new(d.path(), 110);
+    let st = run_machine(&cfg, &ops);
+    assert_ne!(st, State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("cannot confirm the event is not aborted") && !text.contains("ignite_started"), "{st:?}");
 }

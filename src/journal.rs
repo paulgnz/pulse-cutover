@@ -375,7 +375,9 @@ impl Journal {
                 // Every ABORTED transition (re)opens the rollback; only a later `rollback_done` closes
                 // it. Leaving ABORTED (a new ceremony on this journal) forgets the episode's steps.
                 out.aborted_rollback_complete = false;
-                if st == State::Aborted {
+                // A STRANDED node is sealed (rc.29: its rollback intent may precede the strand); `join` and the
+                // guarded `rollback` take it from there.
+                if st == State::Aborted || st == State::Stranded {
                     out.rollback_pending = false;
                 }
                 if st != State::Aborted {

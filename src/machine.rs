@@ -181,7 +181,10 @@ fn coordinator_abort_state<O: ChainOps>(cfg: &Config, ops: &O, last: &mut u64, f
             if crate::coord::aborted(&doc, &co.coordinator_keys, &co.network, id) {
                 crate::coord::record_tombstone(cfg, id, "aborted", "signed abort seen by the ceremony");
                 AbortPoll::Aborted
-            } else if crate::coord::carries_event(&doc, &co.coordinator_keys, &co.network, id, co.event_hash.as_deref()) {
+            } else if co.event_hash.is_some()
+                && crate::coord::carries_event(&doc, &co.coordinator_keys, &co.network, id, co.event_hash.as_deref()) {
+                // rc.29: only with the accepted payload's hash (a config without it, e.g. derived by rc.28, cannot tell
+                // this event from another payload signed under the same id): no hash = unknown before create/ignite.
                 AbortPoll::Clear
             } else {
                 // rc.29: a 200 without our signed event (e.g. `{}` from a relay that lost its store) is not "no abort".
@@ -936,6 +939,26 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// resumed) only if the resume guard passes now, or with
     /// `force_stranded` (an operator's record of a fleet-wide decision, journaled).
     pub fn operator_rollback_opts(&mut self, force: bool, force_stranded: bool) -> Result<RollbackOutcome, String> {
+        let mut notes: Vec<String> = vec![];
+        // FIRST, on every path (including "already rolled back", and since rc.29 before the fleet guard, whose strand
+        // runs on_halt): an agent killed mid-hook or mid pipeline step leaves that process group running (they run in their own group). Stop it
+        // before anything below, or e.g. a still-running on_freeze could close writes again after
+        // on_abort reopened them, or a late import could re-create the staged artifact. If it cannot
+        // be stopped nothing is done: that is a refusal (nothing changed), not an incomplete rollback.
+        match self.ops.kill_orphan_hooks() {
+            Ok(None) => {}
+            Ok(Some(desc)) => {
+                self.journal.evidence(self.state, json!({"orphan_hook_killed": desc}))?;
+                notes.push(desc);
+            }
+            Err(e) => {
+                self.journal.evidence(self.state, json!({"orphan_hook_kill_error": e, "rollback_blocked": true}))?;
+                return Err(format!(
+                    "refusing to roll back: a hook left running by a killed agent could not be stopped ({e}). \
+                     Nothing was rolled back. Stop that process group by hand, then re-run."
+                ));
+            }
+        }
         let guarded = self.operator_rollback_needs_guard();
         if guarded {
             if force_stranded {
@@ -974,6 +997,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         writes stay frozen). If the fleet went LIVE, use `pulse-cutover join`; after a fleet-wide decision \
                         to resume the old chain, re-run with --force-stranded --i-understand."));
                 }
+                self.journal.evidence(self.state, json!({"rollback_requested": true, "by": "operator_rollback"}))?;
+                self.rollback_pending = true;
                 self.journal.evidence(self.state, json!({"abort_intent": true, "reason": reason,
                     "note": "withdrawing this node's VERIFIED report before resuming the old chain"}))?;
                 self.wait_own_report_withdrawn()?;
@@ -986,26 +1011,6 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
         let past = self.past_point_of_no_return();
-        let mut notes = vec![];
-        // FIRST, on every path (including "already rolled back"): an agent killed mid-hook or mid
-        // pipeline step leaves that process group running (they run in their own group). Stop it
-        // before anything below, or e.g. a still-running on_freeze could close writes again after
-        // on_abort reopened them, or a late import could re-create the staged artifact. If it cannot
-        // be stopped nothing is done: that is a refusal (nothing changed), not an incomplete rollback.
-        match self.ops.kill_orphan_hooks() {
-            Ok(None) => {}
-            Ok(Some(desc)) => {
-                self.journal.evidence(self.state, json!({"orphan_hook_killed": desc}))?;
-                notes.push(desc);
-            }
-            Err(e) => {
-                self.journal.evidence(self.state, json!({"orphan_hook_kill_error": e, "rollback_blocked": true}))?;
-                return Err(format!(
-                    "refusing to roll back: a hook left running by a killed agent could not be stopped ({e}). \
-                     Nothing was rolled back. Stop that process group by hand, then re-run."
-                ));
-            }
-        }
         if self.state == State::Aborted && self.aborted_rollback_complete {
             // Idempotent even here: a staged artifact that appeared after the rollback (e.g. a late
             // pipeline write) is moved aside too.
@@ -1115,6 +1120,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             if let Err(why) = self.resume_guard()? {
                 return self.strand(reason, detail, &why);
             }
+            // rc.29: the decision to go back is journaled before the node tells its peers it is aborting: a crash in
+            // the withdrawal wait must not replay as a ceremony still in progress.
+            self.journal.evidence(self.state, json!({"rollback_requested": true, "by": "agent_abort"}))?;
+            self.rollback_pending = true;
             self.journal.evidence(self.state, json!({"abort_intent": true, "reason": reason,
                 "note": "withdrawing this node's VERIFIED report before resuming the old chain"}))?;
             self.wait_own_report_withdrawn()?;
@@ -1122,7 +1131,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return self.strand(reason, detail, &why);
             }
         }
-        if perform {
+        if perform && !self.rollback_pending {
             // rc.29: intent before the first step, as the operator path does: an agent that dies between resuming
             // the source and the ABORTED transition must not replay as a ceremony still in progress.
             self.journal.evidence(self.state, json!({"rollback_requested": true, "by": "agent_abort"}))?;
@@ -1147,8 +1156,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             && !self.step_done("resume")
             && match self.state {
                 State::Stranded | State::Frozen | State::Snapshotted | State::Verified => true,
-                // Only an abort that paused the source for this event (a pause head is journaled).
-                State::Aborted => !self.aborted_rollback_complete && self.head_at_pause.is_some(),
+                // An abort after this ceremony froze (the FROZEN transition is durable; the pause head is only
+                // journaled at SNAPSHOTTED, so an abort during quiescence or the burn-off audit has none).
+                State::Aborted => !self.aborted_rollback_complete && (self.frozen_ts_ms.is_some() || self.head_at_pause.is_some()),
                 _ => false,
             }
     }
@@ -1365,6 +1375,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     fn strand(&mut self, reason: &str, detail: serde_json::Value, why: &str) -> Result<(), String> {
         let from = self.state;
         self.journal.error(self.state, reason, detail.clone())?;
+        // rc.29: sealed means not producing old-chain blocks either (a strand before the pause, e.g. an operator
+        // rollback from FROZEN, would otherwise keep producing past H and trip every peer's quiescence window).
+        if self.cfg.ceremony.mode == Mode::Producer && !matches!(self.ops.producer_paused(), Ok(true)) {
+            let r = self.ops.pause().and_then(|_| self.ops.producer_paused());
+            self.journal.evidence(self.state, json!({"strand_paused_producer": format!("{r:?}")}))?;
+        }
+        self.rollback_pending = false;
         self.state = State::Stranded;
         self.journal.transition(State::Stranded, json!({
             "stranded_from": from.as_str(), "reason": reason, "detail": detail,
@@ -1476,7 +1493,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         rollback["reverts_ok"] = json!(perform && failed.is_empty());
         self.state = State::Aborted;
         self.journal.transition(State::Aborted, rollback)?;
-        if let Some(hook) = self.cfg.hooks.on_abort.clone() {
+        // rc.29: a producer's writes reopen only once its source produces again (auto_rollback = false, or a failed
+        // resume, would otherwise send writes into a paused chain); the operator's `rollback` reopens them later.
+        let source_back = self.cfg.ceremony.mode != Mode::Producer || (perform && self.step_done("resume"));
+        if self.cfg.hooks.on_abort.is_some() && !source_back && !self.step_done("on_abort") {
+            self.journal.evidence(State::Aborted, json!({"on_abort_deferred": "the source producer was not resumed: writes stay frozen until `pulse-cutover rollback`"}))?;
+        }
+        if let Some(hook) = self.cfg.hooks.on_abort.clone().filter(|_| source_back) {
             if !self.step_done("on_abort") {
                 let result = self.ops.run_hook(&hook);
                 self.journal.evidence(State::Aborted, json!({"on_abort_hook": format!("{result:?}")}))?;

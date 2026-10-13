@@ -444,6 +444,9 @@ function commitCoord(next) {
 // report nor forget an identity conflict. Only the per-server chart history is memory-only.
 // A corrupt state file stops startup (same rule as the coordination store).
 const lastTs = dict();
+// rc.29: watermarks older than the freshness window are dropped; the highest dropped one stays as a floor (persisted as
+// `ts_floor`), so a report replayed after a backward step of the relay's clock is still refused.
+let tsFloor = 0;
 // Per network, per producer, PER EVENT ID: the highest ceremony stage reported for that event (rc.23 review #2).
 // Only ever raised; a report for another event id never touches it (a token holder bouncing its event id cannot
 // reset it), and replacing a silent instance never lowers it, so an agent's resume guard still sees a member that
@@ -463,7 +466,12 @@ function loadServerState() {
   if (existsSync(STATE_FILE)) {
     let j; try { j = JSON.parse(readFileSync(STATE_FILE, 'utf8')); } catch (e) { throw new Error(`not JSON (${e.message})`); }
     if (!j || typeof j !== 'object' || j.v !== 1 || typeof j.lastTs !== 'object' || typeof j.nodes !== 'object' || !j.lastTs || !j.nodes) throw new Error('bad shape');
-    for (const [k, v] of Object.entries(j.lastTs)) { if (!KEY_RE.test(k) || !Number.isFinite(v)) throw new Error(`lastTs.${k.slice(0, 20)}`); lastTs[k] = v; }
+    if (j.ts_floor !== undefined && !Number.isFinite(j.ts_floor)) throw new Error('ts_floor');
+    tsFloor = j.ts_floor || 0;
+    for (const [k, v] of Object.entries(j.lastTs)) {
+      if (!KEY_RE.test(k) || !Number.isFinite(v)) throw new Error(`lastTs.${k.slice(0, 20)}`);
+      if (v < Date.now() - TS_PAST_MS) tsFloor = Math.max(tsFloor, v); else lastTs[k] = v;
+    }
     for (const [netId, prods] of Object.entries(j.nodes)) {
       if (!RE.net.test(netId) || !prods || typeof prods !== 'object') throw new Error(`nodes.${netId}`);
       for (const [prod, byKey] of Object.entries(prods)) {
@@ -565,8 +573,9 @@ function serverSnapshot(override, lastOverride, emOverride, evOverride) {
   if (evOverride) (evd[evOverride[0]] ||= {})[evOverride[1]] = evOverride[2]; // the producer's whole evidence log
   // rc.29: a watermark older than the freshness window can never matter (such reports are refused as too old): not kept.
   const cutoff = Date.now() - TS_PAST_MS;
-  const ts = Object.fromEntries(Object.entries({ ...lastTs, ...(lastOverride || {}) }).filter(([, v]) => v >= cutoff));
-  const out = { v: 1, lastTs: ts, nodes: {}, event_max: em, evidence: evd };
+  let floor = tsFloor;
+  const ts = Object.fromEntries(Object.entries({ ...lastTs, ...(lastOverride || {}) }).filter(([, v]) => v >= cutoff || ((floor = Math.max(floor, v)), false)));
+  const out = { v: 1, lastTs: ts, ts_floor: floor, nodes: {}, event_max: em, evidence: evd };
   const put = (netId, prod, byKey) => { const o = ((out.nodes[netId] ||= {})[prod] = {});
     for (const [k, e] of Object.entries(byKey)) o[k] = { report: e.report, received: e.received, first_seen: e.first_seen, instance_id: e.instance_id ?? null, conflict: !!e.conflict }; };
   for (const [netId, prods] of Object.entries(nodes)) for (const [prod, byKey] of Object.entries(prods)) {
@@ -1050,7 +1059,7 @@ async function handle(req, res) {
     if (ts < now - TS_PAST_MS) return send(res, 400, { error: 'report is too old' });
     const live = nodes[r.network]?.[r.producer] || dict();
     const key = r.instance_id ? `${tokenHash}:${r.instance_id}` : tokenHash;
-    if (ts <= (lastTs[key] || 0)) return send(res, 409, { error: 'replayed or out-of-order report' });
+    if (ts <= Math.max(lastTs[key] || 0, tsFloor)) return send(res, 409, { error: 'replayed or out-of-order report' });
     // Work on a copy; nothing live changes until the new state is durably on disk.
     const byKey = dict(); for (const [k, v] of Object.entries(live)) byKey[k] = v;
     // Pre-instance_id entry of the same token upgrades in place to the keyed entry (same machine, newer beacon).
@@ -1113,7 +1122,7 @@ async function handle(req, res) {
     (nodes[r.network] ||= dict())[r.producer] = byKey;
     if (em) (eventMax[r.network] ||= dict())[r.producer] = em;
     lastTs[key] = ts;
-    for (const [k, v] of Object.entries(lastTs)) if (v < now - TS_PAST_MS) delete lastTs[k];
+    for (const [k, v] of Object.entries(lastTs)) if (v < now - TS_PAST_MS) { tsFloor = Math.max(tsFloor, v); delete lastTs[k]; }
     const label = servers(r.network, r.producer).find((s) => s.key === key)?.label || r.node;
     const who = Object.keys(byKey).length > 1 || r.node ? `${r.producer} · ${label}` : r.producer;
     if (replaced.length) pushEvent(r.network, who, `replaced ${replaced.length} silent instance${replaced.length > 1 ? 's' : ''} of this beacon token (new instance id; the old one stopped reporting)`);

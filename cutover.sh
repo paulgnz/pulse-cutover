@@ -46,9 +46,12 @@ case "$CMD" in
         fi;;
       3)
         echo "  REFUSED: NOT rolled back. The agent is stopped; the source was NOT resumed and public routing was NOT reverted."
-        echo "  Read the reason above. If it says ignition may have started, and ONLY if the coordinator has"
-        echo "  confirmed a fleet-wide rollback, run:"
-        echo "    ./cutover.sh abort --force-after-ignite";;
+        echo "  Read the reason above."
+        echo "  - 'ignition may have started': ONLY if the coordinator has confirmed a fleet-wide rollback, run"
+        echo "      ./cutover.sh abort --force-after-ignite"
+        echo "  - 'STRANDED' (a coordinated producer: peers may have created or ignited the new chain): the node is sealed"
+        echo "    (source paused, writes frozen). If the fleet went LIVE: pulse-cutover join --config $CONFIG --event <id>."
+        echo "    ONLY after a fleet-wide decision to resume the old chain: ./cutover.sh abort --force-stranded --i-understand";;
       4)
         echo "  rollback INCOMPLETE: the steps listed above failed; the source may NOT be producing and routing"
         echo "  may NOT be reverted. Fix each failed step by hand (or re-run ./cutover.sh abort once fixed).";;

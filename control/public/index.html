@@ -1229,15 +1229,17 @@ function staleBanner(msg) {
 }
 async function poll() {
   try {
-    const r = await fetch('/api/status', { cache: 'no-store' });
+    const r = await fetch('/api/status', { cache: 'no-store', signal: AbortSignal.timeout(8000) });
     if (!r.ok) { let e = ''; try { e = (await r.json()).error || ''; } catch {} throw new Error(`HTTP ${r.status}${e ? ': ' + e : ''}`); }
-    data = await r.json();
-    fails = 0; lastOk = Date.now(); staleBanner(null);
+    const doc = await r.json();
+    if (!doc || !Array.isArray(doc.networks)) throw new Error('malformed status document');
+    data = doc;
     const n = data.networks.find((x) => x.id === (active || data.networks[0].id));
     if (n?.chain?.head && lastHead[n.id] && n.chain.head > lastHead[n.id]) fireBlock(n.chain.head_producer);
     if (n?.chain?.head) lastHead[n.id] = n.chain.head;
     render(); renderPage();
     $('clock').textContent = new Date(data.generated_at).toISOString().slice(11, 19) + ' UTC';
+    fails = 0; lastOk = Date.now(); staleBanner(null);
   } catch (e) {
     $('clock').textContent = 'reconnecting';
     if (++fails >= 3) staleBanner(`STALE: mission control is not answering (${e.message || 'network error'}). Nothing below is current`
@@ -1245,6 +1247,9 @@ async function poll() {
   }
 }
 poll(); setInterval(poll, 2000);
+// A hung or slow poll never counts as a failure on its own: also flag the view by the age of the last good render.
+setInterval(() => { if (lastOk && Date.now() - lastOk > 20000 && !document.getElementById('stale'))
+  staleBanner(`STALE: no current data from mission control since ${new Date(lastOk).toISOString().slice(11, 19)} UTC. Nothing below is current.`); }, 5000);
 </script>
 </body>
 </html>

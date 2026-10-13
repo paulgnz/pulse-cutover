@@ -114,7 +114,7 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   every mark migrated from rc.27: retire those by id before reusing the network); the board warns on another-H observations or overflow.
   Marks (`event_max`) are progress bookkeeping only, kept for coordinator-signed events. After confirming THAT target is
   fenced, retire exactly one observation on the mission-control host:
-  `curl -X POST 'http://127.0.0.1:8787/api/admin/retire-evidence?net=<net>&producer=<bp>&id=<id>'` (`&overflow=1` for the
+  `curl -X POST -H "Authorization: Bearer $(cat /var/lib/pulse-control/admin.token)" 'http://127.0.0.1:8787/api/admin/retire-evidence?net=<net>&producer=<bp>&id=<id>'` (`&overflow=1` for the
   flag; loopback only, like clear-split). What blocks an event: its own observations (any H), any event's observations
   at the SAME H (an unfenced earlier target at this cut) or at an unknown H (rc.29), and unattributed ones (no event id: quarantined, block every
   event). Logged = past state, or creation / ignition / a join started, also on an ABORTED report. Retiring the last
@@ -130,7 +130,7 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   disk: the request answers 503 and can simply be retried.
   rc.23 state files (marks without these fields) load unchanged. A SPLIT is **latched** in the coordination store for that event and stays red, whatever the
   reports say later, until an operator clears it after the split is resolved. On the mission-control host itself:
-  `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-split?net=<net>'` (use the port mission control listens on).
+  `curl -X POST -H "Authorization: Bearer $(cat /var/lib/pulse-control/admin.token)" 'http://127.0.0.1:8787/api/admin/clear-split?net=<net>'` (use the port mission control listens on).
   Same rule as clear-server: loopback only, refused (403) with `X-Real-IP`/`X-Forwarded-For`, so never through the
   public proxy; 404 when nothing is latched. The clear is persisted and logged; if the condition still holds, the
   next status computation latches it again. A new event id starts without a latch.
