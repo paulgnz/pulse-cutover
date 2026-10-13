@@ -39,13 +39,19 @@ Exit codes: 0 = dry run done, or every forwarded transaction matched; 1 = mismat
 
 ## Target safety
 
-Before sending anything the tool refuses a target that:
+Before sending anything the tool must **prove** the target is a shadow of this cut. A missing or failed answer is
+never taken as proof: it refuses. It refuses a target that:
 
 - is one of the built-in public XPR mainnet API hosts, or a `--deny-host`;
-- reports a chain_id different from the source's (replayed signatures could not verify there);
-- reports the XPR mainnet chain_id without `--shadow-i-understand` and `--cut-id`, or whose block at H is not the cut;
-- has a block H+1 equal to mainnet's H+1. A real mainnet node has the same block at H as a shadow does; the block after
-  H is what tells them apart, so this check catches any mainnet node, listed or not.
+- does not report a chain_id, or reports one different from the source's (with `--blocks-file`, pass
+  `--source-chain-id`; an unknown source chain_id refuses);
+- reports the XPR mainnet chain_id without `--shadow-i-understand`;
+- cannot show its block at H, or whose block at H is not `--cut-id` (required for every send);
+- cannot show its own block H+1: a shadow must have produced its first block before replay starts (its head must be
+  past H and the read must succeed);
+- has a block H+1 equal to mainnet's H+1. A real mainnet node has the same block at H as a shadow; the block after H
+  is what tells them apart, so this check catches any mainnet node, listed or not. Mainnet's H+1 must therefore be
+  known: from the source, or present in the blocks file; without it the tool refuses.
 
 The report never contains signatures or packed transactions, only ids, statuses and outcomes.
 
@@ -55,7 +61,20 @@ The report never contains signatures or packed transactions, only ids, statuses 
 transactions whose receipt carries only an id), `predicted` (what the dry run expects to meet: `tapos_ref_after_cut`,
 `context_free`, `delay_sec`, `mainnet_<status>`), `result` (`match` / `mismatch` / `skipped` / `not_sent`) and
 `mismatch_categories`: `expired`, `tapos`, `duplicate`, `resource`, `assertion`, `authorization`, `deferred`, `other`,
-`missing` (accepted but never included before the timeout), and `status_<mainnet>_vs_<shadow>`.
+`missing` (accepted but never included before the timeout), `status_<mainnet>_vs_<shadow>`, and
+`mainnet_<status>_vs_rejected_<reason>`.
+
+How outcomes are matched, by mainnet's receipt status:
+
+| Mainnet | Means | Same outcome on the shadow |
+|---|---|---|
+| `executed` | ran, state changed | included as `executed` |
+| `delayed` | accepted and queued to run later | included as `delayed` (a rejection is a mismatch) |
+| `soft_fail` | failed, `onerror` handled it | included as `soft_fail` |
+| `hard_fail` | included, failed, no effects | included as `hard_fail`, or rejected for an execution failure (`assertion`); an admission rejection (authorization, TAPOS, expiry, duplicate, resources) is a mismatch |
+| `expired` | included only to retire it | included as `expired`, or rejected as `expired` |
+
+Only `hard_fail` and `expired` mean "neither executed nor queued", so only they can match a rejection.
 
 ## What it cannot show
 

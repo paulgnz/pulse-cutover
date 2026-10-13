@@ -117,47 +117,69 @@ export function classifyError(text) {
 
 /**
  * Decide whether a target may receive replayed mainnet transactions. Returns {ok, reasons[], checks{}}.
- * target: {host, chain_id, head, block_at_cut_id, block_after_cut_id}; source: {chain_id, block_after_cut_id}.
+ * Lineage must be PROVEN, never inferred from a missing answer: the target must be on the cut (its block at H is
+ * --cut-id) and must have produced its OWN block H+1 (it exists and differs from mainnet's H+1, which the source
+ * must supply). Any fetch failure, missing block or unknown value refuses.
+ * target: {host, chain_id, head, block_at_cut_id, block_after_cut_id, block_at_cut_error, block_after_cut_error};
+ * source: {chain_id, block_after_cut_id}.
  */
 export function checkTargetSafety({ target, source, cutHeight, cutId, iUnderstand, denyHosts = [] }) {
   const reasons = [];
   const host = String(target.host || '').toLowerCase();
+  const lc = (v) => (v == null ? null : String(v).toLowerCase());
   const checks = { host, target_chain_id: target.chain_id ?? null, source_chain_id: source.chain_id ?? null };
   const deny = [...PUBLIC_MAINNET_HOSTS, ...denyHosts.map((h) => String(h).toLowerCase())];
   if (deny.some((h) => host === h || host.endsWith(`.${h}`))) reasons.push(`target host ${host} is a public XPR mainnet API`);
   if (!target.chain_id) reasons.push('target did not report a chain_id');
-  if (source.chain_id && target.chain_id && source.chain_id !== target.chain_id) {
+  if (!source.chain_id) reasons.push('the source chain_id is unknown (with --blocks-file pass --source-chain-id): the target cannot be checked against it');
+  if (source.chain_id && target.chain_id && lc(source.chain_id) !== lc(target.chain_id)) {
     reasons.push(`target chain_id ${target.chain_id} differs from the source's ${source.chain_id}: replayed signatures cannot verify there`);
   }
-  const mainnet = String(target.chain_id || '').toLowerCase() === XPR_MAINNET_CHAIN_ID;
+  const mainnet = lc(target.chain_id) === XPR_MAINNET_CHAIN_ID;
   checks.mainnet_chain_id = mainnet;
-  if (mainnet) {
-    if (!iUnderstand) reasons.push('target reports the XPR mainnet chain_id: pass --shadow-i-understand to confirm it is a private shadow chain');
-    if (!cutId) reasons.push('target reports the XPR mainnet chain_id: --cut-id (the block id at H) is required');
-    else if (!target.block_at_cut_id) reasons.push(`target cannot show its block at H=${cutHeight}: lineage unverified`);
-    else if (target.block_at_cut_id.toLowerCase() !== cutId.toLowerCase()) reasons.push(`target block at H is ${target.block_at_cut_id}, not the cut ${cutId}: not a shadow of this cut`);
-  }
-  // A real mainnet node also has the cut block at H; what tells it apart is the block AFTER H: a shadow chain
-  // produced its own H+1 (or none yet), mainnet's H+1 is the source's.
-  if (source.block_after_cut_id && target.block_after_cut_id && target.block_after_cut_id.toLowerCase() === source.block_after_cut_id.toLowerCase()) {
+  if (mainnet && !iUnderstand) reasons.push('target reports the XPR mainnet chain_id: pass --shadow-i-understand to confirm it is a private shadow chain');
+  // 1. On the cut: the target's block at H is the cut block.
+  if (!cutId) reasons.push('--cut-id (the block id at H) is required to send: lineage cannot be checked without it');
+  else if (!target.block_at_cut_id) reasons.push(`target cannot show its block at H=${cutHeight}${target.block_at_cut_error ? ` (${target.block_at_cut_error})` : ''}: lineage unproven`);
+  else if (lc(target.block_at_cut_id) !== lc(cutId)) reasons.push(`target block at H is ${target.block_at_cut_id}, not the cut ${cutId}: not a shadow of this cut`);
+  // 2. Its own chain after the cut: a real mainnet node also has the cut block at H; what tells it apart is the
+  //    block AFTER H. The shadow must already have produced one, and it must not be mainnet's.
+  if (!source.block_after_cut_id) reasons.push(`mainnet's block H+1=${cutHeight + 1} is unknown (the source or blocks file must include it): cannot tell the target from mainnet`);
+  if (!target.block_after_cut_id) reasons.push(`target cannot show its block H+1=${cutHeight + 1}${target.block_after_cut_error ? ` (${target.block_after_cut_error})` : ''}: lineage unproven (a shadow must have produced its first block before replay)`);
+  if (source.block_after_cut_id && target.block_after_cut_id && lc(target.block_after_cut_id) === lc(source.block_after_cut_id)) {
     reasons.push(`target block H+1 equals mainnet's (${source.block_after_cut_id}): the target is following the real chain, not a shadow`);
   }
   checks.block_at_cut_id = target.block_at_cut_id ?? null;
   checks.block_after_cut_id = target.block_after_cut_id ?? null;
+  checks.source_block_after_cut_id = source.block_after_cut_id ?? null;
   return { ok: reasons.length === 0, reasons, checks };
 }
+
+// What each mainnet receipt status means, and which shadow outcomes are the SAME outcome.
+//   executed  : ran, state changed            → shadow must include it as executed
+//   delayed   : accepted and queued (runs later) → shadow must include it as delayed; a rejection is a mismatch
+//   soft_fail : failed, onerror handled it     → shadow must include it as soft_fail
+//   hard_fail : included, failed, no effects   → shadow included as hard_fail, or rejected for an execution failure
+//               (an assertion) — not for admission reasons (auth, TAPOS, expiry, duplicate, resources)
+//   expired   : included only to retire it     → shadow included as expired, or rejected as expired
+// Only hard_fail and expired mean "not executed and not queued", so only they can match a rejection, and only
+// with the compatible reason below. Every other combination is a mismatch with a category.
+const REJECTION_MATCHES = { hard_fail: new Set(['assertion']), expired: new Set(['expired']) };
 
 /** Compare one transaction's mainnet outcome with the shadow outcome. */
 export function compareOutcome(tx, shadow) {
   if (!tx.replayable) return { result: 'skipped', category: tx.reason === 'deferred' ? 'deferred' : 'not_replayable' };
   if (!shadow) return { result: 'not_sent', category: 'not_sent' };
+  const status = String(tx.status);
   if (shadow.rejected) {
     const category = classifyError(shadow.error);
-    return { result: tx.status === 'executed' ? 'mismatch' : 'match', category };
+    if (REJECTION_MATCHES[status]?.has(category)) return { result: 'match', category };
+    if (status === 'executed') return { result: 'mismatch', category };
+    return { result: 'mismatch', category: `mainnet_${status}_vs_rejected_${category}` };
   }
   if (!shadow.included) return { result: 'mismatch', category: 'missing' };
-  const same = shadow.included_status === 'executed' ? tx.status === 'executed' : shadow.included_status === tx.status;
-  return { result: same ? 'match' : 'mismatch', category: same ? 'match' : `status_${tx.status}_vs_${shadow.included_status}` };
+  const same = shadow.included_status === status;
+  return { result: same ? 'match' : 'mismatch', category: same ? 'match' : `status_${status}_vs_${shadow.included_status}` };
 }
 
 /** Summarise per-transaction rows into the report's counts. */
@@ -263,9 +285,13 @@ async function main() {
   const ti = await tgt.info();
   if (ti.error) { console.error(`target info failed: ${ti.error}`); process.exit(2); }
   const atH = await tgt.block(H);
-  const afterH = ti.head > H ? await tgt.block(H + 1) : {};
+  const afterH = ti.head > H ? await tgt.block(H + 1) : { error: `target head ${ti.head} is not past H` };
   const safety = checkTargetSafety({
-    target: { host: new URL(TARGET).hostname, chain_id: ti.chain_id, head: ti.head, block_at_cut_id: blockId(atH.block), block_after_cut_id: blockId(afterH.block) },
+    target: {
+      host: new URL(TARGET).hostname, chain_id: ti.chain_id, head: ti.head,
+      block_at_cut_id: atH.error ? null : blockId(atH.block), block_at_cut_error: atH.error ?? null,
+      block_after_cut_id: afterH.error ? null : blockId(afterH.block), block_after_cut_error: afterH.error ?? null,
+    },
     source: { chain_id: sourceChainId, block_after_cut_id: sourceAfterId },
     cutHeight: H, cutId: CUT_ID, iUnderstand: I_UNDERSTAND, denyHosts: (arg('deny-host', '') || '').split(',').filter(Boolean),
   });
