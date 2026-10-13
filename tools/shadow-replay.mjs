@@ -16,6 +16,12 @@
 //
 // Because a shadow chain carries the mainnet chain_id, a target that IS mainnet would accept nothing new (every
 // transaction is a duplicate there) but the tool still refuses it outright: see checkTargetSafety().
+//
+// What tells the shadow apart from mainnet is the block AFTER the cut (H+1). Mainnet's H+1 is never taken from
+// --source or --blocks-file (those could be anything, even the shadow itself): it is AUTHENTICATED independently,
+// from at least two independent reference endpoints that agree (a built-in pinned list of public XPR mainnet APIs for
+// the mainnet chain_id, which --mainnet-endpoint can only add to; --reference-endpoint for any other chain_id).
+// No request follows an HTTP redirect: a 3xx on any read is an error, and a 3xx on a send stops the whole run.
 // No dependencies (Node >= 18). Exit 0 = dry run done / every outcome matched, 1 = mismatches, 2 = refused or error.
 import { createHash } from 'node:crypto';
 import { writeFileSync, readFileSync } from 'node:fs';
@@ -30,6 +36,14 @@ export const PUBLIC_MAINNET_HOSTS = [
   'proton.greymass.com', 'proton.cryptolions.io', 'proton.eosusa.io', 'proton.eoscafeblock.com', 'api.protonnz.com',
   'xpr-mainnet-api.bloxprod.io',
 ];
+// The pinned reference endpoints for XPR mainnet: where mainnet's own H+1 is read, independently of --source.
+// --mainnet-endpoint adds to this list; nothing removes from it.
+export const MAINNET_REFERENCE_ENDPOINTS = PUBLIC_MAINNET_HOSTS.map((h) => `https://${h}`);
+// A reference H+1 needs this many independent hosts that agree (and no valid answer that disagrees).
+export const MIN_REFERENCE_AGREEMENT = 2;
+// Test-only: with this env var set, the pinned list is REPLACED by --mainnet-endpoint, but only when every one of
+// those endpoints is a loopback address (the test mocks). It can never point the reference at another real host.
+export const TEST_PINNED_ENV = 'PULSE_SHADOW_REPLAY_TEST_ONLY_LOOPBACK_REFERENCES';
 const STATUS_BY_NUM = ['executed', 'soft_fail', 'hard_fail', 'delayed', 'expired'];
 // The only receipt statuses Leap has. Anything else (a number outside the enum, an empty or new string) is UNKNOWN:
 // two equal unsupported values say nothing about the outcome (r30 round-3 review: `status_9` vs `status_9` matched).
@@ -120,6 +134,53 @@ export function classifyError(text) {
   return 'other';
 }
 
+/** True for 127.0.0.0/8, ::1 and localhost (the only hosts the test-only pinned override accepts). */
+export function isLoopbackHost(host) {
+  const h = String(host || '').toLowerCase().replace(/^\[|\]$/g, '');
+  return h === 'localhost' || h === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+/**
+ * Authenticate the reference chain's blocks at H and H+1 from independent endpoints, never from --source.
+ * answers: [{endpoint, host, chain_id, block_at_cut_id, block_after_cut_id, error}]. excludeHosts: hosts that may not
+ * vouch (the source and the target). A valid answer reports the expected chain_id and both blocks. Fail-closed:
+ *  - fewer than `minAgree` distinct hosts with valid answers → refuse;
+ *  - any two valid answers that disagree on H or H+1 → refuse (ambiguity is never resolved by majority);
+ *  - a valid answer whose block at H is not --cut-id → refuse (the cut is not this chain's H).
+ * Returns {ok, block_after_cut_id, agreeing[], reasons[], answers[]}.
+ */
+export function decideReference({ answers, chainId, cutId, minAgree = MIN_REFERENCE_AGREEMENT, excludeHosts = [] }) {
+  const lc = (v) => (v == null ? null : String(v).toLowerCase());
+  const reasons = [];
+  const excluded = new Set(excludeHosts.map(lc).filter(Boolean));
+  const seen = new Set();
+  const valid = [];
+  const notes = [];
+  for (const a of answers) {
+    const host = lc(a.host);
+    if (a.error) { notes.push(`${a.endpoint}: ${a.error}`); continue; }
+    if (excluded.has(host)) { notes.push(`${a.endpoint}: is the source or the target, so it cannot vouch independently`); continue; }
+    if (lc(a.chain_id) !== lc(chainId)) { notes.push(`${a.endpoint}: reports chain_id ${a.chain_id ?? 'none'}, not ${chainId}`); continue; }
+    if (!a.block_at_cut_id || !a.block_after_cut_id) { notes.push(`${a.endpoint}: did not show its blocks at H and H+1`); continue; }
+    if (seen.has(host)) continue; // one vote per host
+    seen.add(host);
+    valid.push(a);
+  }
+  const afterIds = new Set(valid.map((a) => lc(a.block_after_cut_id)));
+  const atIds = new Set(valid.map((a) => lc(a.block_at_cut_id)));
+  if (afterIds.size > 1 || atIds.size > 1) {
+    reasons.push(`reference endpoints disagree on the blocks at H/H+1 (${valid.map((a) => `${a.host}: ${a.block_at_cut_id}/${a.block_after_cut_id}`).join('; ')}): refusing rather than guessing`);
+  }
+  if (cutId && valid.some((a) => lc(a.block_at_cut_id) !== lc(cutId))) {
+    reasons.push(`the reference chain's block at H is not --cut-id ${cutId}: the cut is not block H of chain ${chainId}`);
+  }
+  if (valid.length < minAgree) {
+    reasons.push(`only ${valid.length} independent reference endpoint(s) answered for chain ${chainId} (need ${minAgree} that agree)${notes.length ? `: ${notes.join('; ')}` : ''}`);
+  }
+  const ok = reasons.length === 0;
+  return { ok, block_after_cut_id: ok ? lc(valid[0].block_after_cut_id) : null, agreeing: valid.map((a) => a.host), reasons, notes };
+}
+
 /**
  * Decide whether a target may receive replayed mainnet transactions. Returns {ok, reasons[], checks{}}.
  * Lineage must be PROVEN, never inferred from a missing answer: the target must be on the cut (its block at H is
@@ -128,7 +189,7 @@ export function classifyError(text) {
  * target: {host, chain_id, head, block_at_cut_id, block_after_cut_id, block_at_cut_error, block_after_cut_error};
  * source: {chain_id, block_after_cut_id}.
  */
-export function checkTargetSafety({ target, source, cutHeight, cutId, iUnderstand, denyHosts = [] }) {
+export function checkTargetSafety({ target, source, reference, cutHeight, cutId, iUnderstand, denyHosts = [] }) {
   const reasons = [];
   const host = String(target.host || '').toLowerCase();
   const lc = (v) => (v == null ? null : String(v).toLowerCase());
@@ -154,6 +215,21 @@ export function checkTargetSafety({ target, source, cutHeight, cutId, iUnderstan
   if (source.block_after_cut_id && target.block_after_cut_id && lc(target.block_after_cut_id) === lc(source.block_after_cut_id)) {
     reasons.push(`target block H+1 equals mainnet's (${source.block_after_cut_id}): the target is following the real chain, not a shadow`);
   }
+  // 3. Mainnet's H+1 itself is authenticated independently of the source (round 4: swapping source and target made a
+  //    real mainnet target pass, because the "mainnet" H+1 came from the supplied source, i.e. the shadow).
+  const refId = reference?.ok ? lc(reference.block_after_cut_id) : null;
+  if (!reference || !reference.ok) {
+    reasons.push(`mainnet's block H+1 could not be authenticated independently of the source: ${(reference?.reasons || ['no reference endpoints were asked']).join('; ')}`);
+  } else {
+    if (source.block_after_cut_id && lc(source.block_after_cut_id) !== refId) {
+      reasons.push(`the source's block H+1 (${source.block_after_cut_id}) is not the authenticated reference H+1 (${refId}): the source is not the chain it claims to be (a shadow passed as the source?)`);
+    }
+    if (target.block_after_cut_id && lc(target.block_after_cut_id) === refId) {
+      reasons.push(`target block H+1 equals the authenticated reference H+1 (${refId}): the target is following the real chain, not a shadow`);
+    }
+  }
+  checks.reference_block_after_cut_id = refId;
+  checks.reference_agreeing = reference?.agreeing ?? [];
   checks.block_at_cut_id = target.block_at_cut_id ?? null;
   checks.block_after_cut_id = target.block_after_cut_id ?? null;
   checks.source_block_after_cut_id = source.block_after_cut_id ?? null;
@@ -213,10 +289,18 @@ const arg = (k, d) => { const i = process.argv.indexOf(`--${k}`); return i > 0 ?
 const flag = (k) => process.argv.includes(`--${k}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function postJson(url, body, timeoutMs = 15000) {
+/**
+ * POST JSON and NEVER follow a redirect (round 4: a target could pass every read and then 307 the send to a real
+ * mainnet API, and fetch would have forwarded the signed body). A 3xx comes back as {redirected: true, error}.
+ */
+export async function postJson(url, body, timeoutMs = 15000) {
   const ac = new AbortController(); const t = setTimeout(() => ac.abort(), timeoutMs);
   try {
-    const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: ac.signal });
+    const r = await fetch(url, { method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: ac.signal });
+    if ((r.status >= 300 && r.status < 400) || r.type === 'opaqueredirect') {
+      try { await r.body?.cancel(); } catch { /* nothing to drain */ }
+      return { status: r.status, redirected: true, error: `redirect refused: HTTP ${r.status} to ${r.headers.get('location') ?? '(no location)'}` };
+    }
     const text = await r.text(); let json; try { json = JSON.parse(text); } catch { json = undefined; }
     return { status: r.status, json, text };
   } catch (e) { return { status: 0, error: String(e.message || e) }; } finally { clearTimeout(t); }
@@ -227,6 +311,7 @@ function makeClient(base, api) {
     let id = 0;
     const rpc = async (method, params) => {
       const r = await postJson(base, { jsonrpc: '2.0', id: ++id, method, params });
+      if (r.redirected) return { error: r.error, redirected: true };
       if (r.json?.error) return { error: r.json.error.message || JSON.stringify(r.json.error) };
       if (r.json && 'result' in r.json) return { result: r.json.result };
       return { error: r.error || `HTTP ${r.status} ${(r.text || '').slice(0, 200)}` };
@@ -234,17 +319,48 @@ function makeClient(base, api) {
     return {
       info: async () => { const r = await rpc('pulsevm.getInfo', {}); return r.result ? { chain_id: r.result.chain_id, head: Number(r.result.head_block_num) } : { error: r.error }; },
       block: async (n) => { const r = await rpc('pulsevm.getBlock', { block_num_or_id: String(n) }); return r.result ? { block: r.result } : { error: r.error }; },
-      send: async (p) => { const r = await rpc('pulsevm.issueTx', p); return r.result ? { ok: true, result: r.result } : { ok: false, error: r.error }; },
+      send: async (p) => { const r = await rpc('pulsevm.issueTx', p); return r.result ? { ok: true, result: r.result } : { ok: false, error: r.error, redirected: !!r.redirected }; },
     };
   }
   const v1 = async (name, body) => postJson(`${base}/v1/chain/${name}`, body);
   return {
-    info: async () => { const r = await v1('get_info', {}); return r.json && r.status === 200 ? { chain_id: r.json.chain_id, head: Number(r.json.head_block_num) } : { error: r.error || `HTTP ${r.status}` }; },
-    block: async (n) => { const r = await v1('get_block', { block_num_or_id: String(n) }); return r.status === 200 && r.json ? { block: r.json } : { error: r.error || JSON.stringify(r.json ?? r.text).slice(0, 300) }; },
-    send: async (p) => { const r = await v1('send_transaction', p); return r.status >= 200 && r.status < 300 ? { ok: true, result: r.json } : { ok: false, error: r.error || JSON.stringify(r.json ?? r.text).slice(0, 600) }; },
+    info: async () => { const r = await v1('get_info', {}); return r.json && r.status === 200 ? { chain_id: r.json.chain_id, head: Number(r.json.head_block_num) } : { error: r.error || `HTTP ${r.status}`, redirected: !!r.redirected }; },
+    block: async (n) => { const r = await v1('get_block', { block_num_or_id: String(n) }); return r.status === 200 && r.json ? { block: r.json } : { error: r.error || JSON.stringify(r.json ?? r.text).slice(0, 300), redirected: !!r.redirected }; },
+    send: async (p) => { const r = await v1('send_transaction', p); return r.status >= 200 && r.status < 300 ? { ok: true, result: r.json } : { ok: false, error: r.error || JSON.stringify(r.json ?? r.text).slice(0, 600), redirected: !!r.redirected }; },
   };
 }
 const blockId = (b) => b?.id ?? b?.block_id ?? null;
+const argAll = (k) => process.argv.flatMap((v, i) => (v === `--${k}` && process.argv[i + 1] ? process.argv[i + 1].split(',') : [])).map((x) => x.trim()).filter(Boolean);
+const hostOf = (u) => { try { return new URL(u).hostname.toLowerCase().replace(/^\[|\]$/g, ''); } catch { return null; } };
+// Independence is judged per host:port (two endpoints on one host:port are one voice).
+const hostKey = (u) => { try { return new URL(u).host.toLowerCase(); } catch { return null; } };
+
+/** Which endpoints vouch for chain `chainId`'s blocks at H and H+1: pinned + added for mainnet, user-given otherwise. */
+export function referenceEndpoints({ chainId, mainnetAdded = [], referenceGiven = [], env = process.env }) {
+  if (String(chainId || '').toLowerCase() === XPR_MAINNET_CHAIN_ID) {
+    if (env[TEST_PINNED_ENV] === '1') {
+      // Test-only replacement: every endpoint must be loopback, else the override is ignored (pinned list stays).
+      if (mainnetAdded.length && mainnetAdded.every((u) => isLoopbackHost(hostOf(u)))) return { endpoints: mainnetAdded, pinned: false };
+    }
+    return { endpoints: [...MAINNET_REFERENCE_ENDPOINTS, ...mainnetAdded], pinned: true };
+  }
+  return { endpoints: referenceGiven, pinned: false };
+}
+
+/** Ask every reference endpoint for its chain_id and its blocks at H and H+1 (no redirects followed). */
+async function askReferences(endpoints, H) {
+  return Promise.all(endpoints.map(async (endpoint) => {
+    const host = hostKey(endpoint);
+    if (!host) return { endpoint, host: null, error: 'not a URL' };
+    const c = makeClient(endpoint, 'v1');
+    const info = await c.info();
+    if (info.error) return { endpoint, host, error: `get_info: ${info.error}` };
+    if (!(info.head > H)) return { endpoint, host, chain_id: info.chain_id, error: `head ${info.head} is not past H` };
+    const [at, after] = [await c.block(H), await c.block(H + 1)];
+    if (at.error || after.error) return { endpoint, host, chain_id: info.chain_id, error: `get_block: ${at.error || after.error}` };
+    return { endpoint, host, chain_id: info.chain_id, block_at_cut_id: blockId(at.block), block_after_cut_id: blockId(after.block) };
+  }));
+}
 
 async function main() {
   const SOURCE = arg('source'), BLOCKS_FILE = arg('blocks-file'), TARGET = arg('target'), TARGET_API = arg('target-api', 'v1');
@@ -253,7 +369,8 @@ async function main() {
   const SEND = flag('send'), I_UNDERSTAND = flag('shadow-i-understand'), ALLOW_INCONCLUSIVE = flag('allow-inconclusive');
   if ((!SOURCE && !BLOCKS_FILE) || !Number.isInteger(H) || H <= 0 || (SEND && !TARGET) || !['v1', 'native'].includes(TARGET_API)) {
     console.error('usage: shadow-replay.mjs (--source URL | --blocks-file f.json) --cut-height H [--blocks N] [--out f.json]\n' +
-      '       [--target URL --target-api v1|native --cut-id ID --send --shadow-i-understand --rate TPS --inclusion-timeout S --deny-host h1,h2 --allow-inconclusive]');
+      '       [--target URL --target-api v1|native --cut-id ID --send --shadow-i-understand --rate TPS --inclusion-timeout S --deny-host h1,h2 --allow-inconclusive]\n' +
+      '       [--mainnet-endpoint URL (adds to the pinned mainnet references) | --reference-endpoint URL (≥ 2, any other chain_id)]');
     process.exit(2);
   }
   const report = { tool: 'shadow-replay', version: VERSION, generated_at: new Date().toISOString(), mode: SEND ? 'send' : 'dry-run', cut: { height: H, id: CUT_ID || null } };
@@ -297,7 +414,15 @@ async function main() {
   if (ti.error) { console.error(`target info failed: ${ti.error}`); process.exit(2); }
   const atH = await tgt.block(H);
   const afterH = ti.head > H ? await tgt.block(H + 1) : { error: `target head ${ti.head} is not past H` };
+  // Mainnet's H+1 from independent references, never from the source (round 4).
+  const sourceHost = SOURCE ? hostKey(SOURCE) : null;
+  const refs = referenceEndpoints({ chainId: sourceChainId, mainnetAdded: argAll('mainnet-endpoint'), referenceGiven: argAll('reference-endpoint') });
+  const refAnswers = refs.endpoints.length ? await askReferences(refs.endpoints, H) : [];
+  const reference = decideReference({ answers: refAnswers, chainId: sourceChainId, cutId: CUT_ID, excludeHosts: [hostKey(TARGET), sourceHost] });
+  if (!refs.endpoints.length) reference.reasons.unshift('no reference endpoints: for a chain_id other than XPR mainnet pass --reference-endpoint (at least 2 independent ones)');
+  report.reference = { pinned: refs.pinned, endpoints: refs.endpoints, ok: reference.ok, agreeing: reference.agreeing, block_after_cut_id: reference.block_after_cut_id, reasons: reference.reasons, notes: reference.notes };
   const safety = checkTargetSafety({
+    reference,
     target: {
       host: new URL(TARGET).hostname, chain_id: ti.chain_id, head: ti.head,
       block_at_cut_id: atH.error ? null : blockId(atH.block), block_at_cut_error: atH.error ?? null,
@@ -316,6 +441,12 @@ async function main() {
     if (!r.replayable) continue;
     const t0 = Date.now();
     const res = await tgt.send(r.payload);
+    if (res.redirected) {
+      // The target tried to send the signed body elsewhere: stop everything, nothing more is sent anywhere.
+      report.aborted = `target redirected a send: ${res.error}`;
+      console.error(`REFUSED: ${report.aborted}; stopping the replay`);
+      finish(report, rows, OUT, 2); return;
+    }
     sent.set(r.id.toLowerCase(), res.ok ? { accepted: true } : { rejected: true, error: res.error });
     const wait = gap - (Date.now() - t0); if (wait > 0) await sleep(wait);
   }
