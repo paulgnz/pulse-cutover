@@ -371,24 +371,25 @@ install_agent_release(){
   echo "  verified + installed: pulse-cutover $tag ($bin, sha256 $sums)"
 }
 install_agent_source(){
-  local repo want at; repo=$(cd "$(dirname "$0")" && pwd)
-  # rc.29: the source build is a fallback for the PINNED release only: the checkout must be exactly that tag
-  # (or the operator opts in), never whatever happens to be checked out.
+  local repo want src; repo=$(cd "$(dirname "$0")" && pwd)
+  # rc.29: the source build is a fallback for the PINNED release only. It builds a fresh clone of that tag from the
+  # public repository in a private temp dir, never the files around this script (whatever is checked out, modified,
+  # untracked or ignored there). PULSE_CUTOVER_ALLOW_SOURCE_BUILD=1 builds this checkout instead (operator's choice).
   want=$(agent_release_tag "$(mget_opt '.artifacts.agent_release_tag')" "$AGENT_RELEASE_DEFAULT") || return 1
-  at=$(cd "$repo" && git describe --tags --exact-match 2>/dev/null || true)
-  # The tag names HEAD, not the working tree: no modified tracked files and no untracked (non-ignored) files either
-  # (e.g. an added build.rs would be built).
-  if [ -n "$at" ] && [ -n "$(cd "$repo" && git status --porcelain --untracked-files=all 2>/dev/null)" ]; then at="$at (modified)"; fi
-  if [ "$at" != "$want" ] && [ "${PULSE_CUTOVER_ALLOW_SOURCE_BUILD:-}" != "1" ]; then
-    echo "  not building from source: this checkout is ${at:-not a release tag}, the pinned release is $want"
-    echo "  (git checkout $want, or set PULSE_CUTOVER_ALLOW_SOURCE_BUILD=1 to build this checkout anyway)"
-    return 1
-  fi
   command -v cargo >/dev/null || { echo "  no cargo either — install rustup (see README Step 1) or add artifacts.agent to the manifest"; return 1; }
-  echo "  building from source in $repo (this takes a few minutes) ..."
-  (cd "$repo" && cargo build --release --locked) || return 1
-  install -m 0755 "$repo/target/release/pulse-cutover" /usr/local/bin/pulse-cutover
-  echo "  built + installed: pulse-cutover (source build)"
+  if [ "${PULSE_CUTOVER_ALLOW_SOURCE_BUILD:-}" = "1" ]; then
+    src=$repo
+    echo "  building THIS checkout from source (PULSE_CUTOVER_ALLOW_SOURCE_BUILD=1) in $src ..."
+  else
+    command -v git >/dev/null || { echo "  no git: cannot fetch $want to build it from source"; return 1; }
+    src=$(mktemp -d)/pulse-cutover
+    echo "  building $want from a fresh clone of the public repository (this takes a few minutes) ..."
+    git clone -q --depth 1 --branch "$want" https://github.com/paulgnz/pulse-cutover.git "$src" \
+      || { echo "  could not clone $want"; return 1; }
+  fi
+  (cd "$src" && cargo build --release --locked) || return 1
+  install -m 0755 "$src/target/release/pulse-cutover" /usr/local/bin/pulse-cutover
+  echo "  built + installed: pulse-cutover (source build: $src)"
 }
 echo "artifacts:"
 AGENT_URL=$(mget_opt '.artifacts.agent.url')
