@@ -354,8 +354,9 @@ export function projectReport(r) {
     profile: r.profile == null ? null : (PROFILES.includes(r.profile) ? r.profile : bad('profile', `must be one of ${PROFILES.join('|')}`)),
     agent_version: str(r.agent_version, 'agent_version', { max: 32, re: /^[0-9A-Za-z.+-]+$/ }),
     ts: tsStr(r.ts, 'ts', false),
-    // rc.29: at most 200 s, so 3 × the interval fits the relay's 600 s silence cap (agents refuse more at load).
-    interval_secs: r.interval_secs === 0 ? null : int(r.interval_secs, 'interval_secs', { min: 1, max: 200 }),
+    // rc.29: clamped to 200 s, so 3 × the interval fits the relay's 600 s silence cap (agents refuse more at load;
+    // stored reports from older beacons still load).
+    interval_secs: r.interval_secs === 0 ? null : Math.min(int(r.interval_secs, 'interval_secs', { min: 1, max: 3600 }) ?? 0, 200) || null,
     mode: str(r.mode, 'mode', { max: 16, nullable: true, re: /^[a-z]+$/ }),
     ready: bool(r.ready, 'ready', { nullable: false }),
   };

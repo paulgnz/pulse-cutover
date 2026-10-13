@@ -320,15 +320,6 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     pub fn run(&mut self) -> Result<State, String> {
         // Defense in depth (main.rs checks too): a readiness-only config never drives anything.
         self.cfg.ensure_ceremony_profile()?;
-        // rc.29: before chain creation and ignition the agent needs the accepted event's payload hash (`await` writes
-        // it next to event_id). Refused here, before anything freezes; `rollback`, `status` and `join` still load it.
-        if let Some(co) = self.cfg.coordination.as_ref().filter(|co| co.event_id.is_some() && co.event_hash.is_none()) {
-            if !self.reached_ignited && !self.create_chain_started && !self.joining {
-                return Err(format!("refusing to run: [coordination] event_id = {:?} has no event_hash. Re-derive this config \
-                    with `pulse-cutover await` (rc.29+), which records the accepted event's payload hash",
-                    co.event_id.as_deref().unwrap_or("")));
-            }
-        }
         if self.rollback_pending {
             return Err("refusing to run: a rollback (`pulse-cutover rollback`, or this agent's own abort) was started \
                  on this journal and did not finish (it recorded `rollback_requested` but never reached ABORTED). \
@@ -370,6 +361,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 eprintln!("UNSEALED: the source producer could NOT be confirmed paused; pause it by hand now.");
             }
             return Err(self.stranded_message());
+        }
+        // rc.29: before chain creation and ignition the agent needs the accepted event's payload hash (`await` writes
+        // it next to event_id). Refused here, before anything freezes; `rollback`, `status` and `join` still load it.
+        if let Some(co) = self.cfg.coordination.as_ref().filter(|co| co.event_id.is_some() && co.event_hash.is_none()) {
+            if !self.reached_ignited && !self.create_chain_started && !self.joining {
+                return Err(format!("refusing to run: [coordination] event_id = {:?} has no event_hash. Re-derive this config \
+                    with `pulse-cutover await` (rc.29+), which records the accepted event's payload hash",
+                    co.event_id.as_deref().unwrap_or("")));
+            }
         }
         if self.resumed && self.reached_ignited && !self.unhalted && matches!(self.state, State::Armed | State::Frozen | State::Snapshotted | State::Verified) {
             // The previous run journaled `ignite_started` and died before IGNITED: the target may
@@ -1385,6 +1385,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(true);
         }
         if matches!(self.ops.producer_paused(), Ok(true)) {
+            if self.state == State::Stranded {
+                // Record the confirmation: an UNSEALED strand paused by hand is reported sealed again.
+                self.journal.evidence(self.state, json!({"source_pause_enforced": true, "result": "already paused"}))?;
+            }
             return Ok(true);
         }
         let r = self.ops.pause().and_then(|_| self.ops.producer_paused());

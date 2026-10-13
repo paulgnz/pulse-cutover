@@ -5953,3 +5953,29 @@ fn rc29_the_beacon_reports_an_unsealed_strand_until_a_pause_is_confirmed() {
     std::fs::write(&cfg.journal_path, &text).unwrap();
     assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["sealed"], serde_json::json!(true));
 }
+
+#[test]
+fn rc29_a_hashless_stranded_run_still_retries_the_pause_and_the_latest_check_wins_on_the_beacon() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    rc29_killed_at_verified(d.path(), &cfg, &ops);
+    ops.paused.set(false);
+    ops.pause_ignored.set(true);
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert!(Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).is_err());
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["sealed"], serde_json::json!(false));
+    // An older derived config (no event_hash) on that STRANDED journal: run refuses, but retries the pause first.
+    let text = std::fs::read_to_string(d.path().join("fleet.toml")).unwrap()
+        .replace(&format!("event_hash = \"{}\"\n", mock_event_hash()), "");
+    let old = load_toml(d.path(), "fleet-old.toml", &text).unwrap();
+    ops.pause_ignored.set(false);
+    assert!(run_machine_result(&old, &ops).unwrap_err().starts_with("STRANDED"));
+    assert!(ops.paused.get());
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["sealed"], serde_json::json!(true));
+    // A later failed check unseals again.
+    ops.paused.set(false);
+    ops.pause_ignored.set(true);
+    assert!(run_machine_result(&cfg, &ops).is_err());
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["sealed"], serde_json::json!(false));
+}

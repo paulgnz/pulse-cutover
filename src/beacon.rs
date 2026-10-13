@@ -509,8 +509,9 @@ fn apply_line(acc: &mut Acc, v: &Value) {
     if d["reverified"].as_bool() == Some(true) {
         put_verified(&mut acc.ev, d);
     }
+    // The latest pause check wins (a later failed retry unseals again).
     if let (Some(ok), Some(_)) = (d["source_pause_enforced"].as_bool(), acc.sealed) {
-        acc.sealed = Some(acc.sealed == Some(true) || ok);
+        acc.sealed = Some(ok);
     }
     if d["rollback_intent_cancelled"].as_bool() == Some(true) {
         acc.rollback_pending = false;

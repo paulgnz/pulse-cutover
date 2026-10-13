@@ -295,3 +295,9 @@ test('rc.29: an UNSEALED stranded member is surfaced first in the warnings', () 
   assert.equal(v.verdict, 'STRANDED');
   assert.match(v.warnings[0], /^UNSEALED: bpa/);
 });
+
+test('rc.29: a stored report from an older beacon with a long interval still loads, clamped to 200 s', async () => {
+  const { projectReport } = await import('../lib.mjs');
+  const r = projectReport({ ...fixture(), producer: 'bpa', network: 'testnet', interval_secs: 900 });
+  assert.equal(r.interval_secs, 200);
+});
