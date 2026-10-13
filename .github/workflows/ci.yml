@@ -40,7 +40,7 @@ jobs:
       - name: Example manifest is valid JSON
         run: jq -e . examples/ceremony.json >/dev/null
       - name: Edge + federator + mission control + conformance tests (node:test, mock upstreams, no network)
-        run: node --test control/test/*.test.mjs gateway/test/*.test.mjs federator/test/*.test.mjs tools/conformance/test/*.test.mjs
+        run: node --test control/test/*.test.mjs gateway/test/*.test.mjs federator/test/*.test.mjs tools/conformance/test/*.test.mjs tools/test/*.test.mjs
       - name: Installer unit tests
         run: bash tools/test/run.sh
       - name: Native /v1/chain pass-through (extracted from install.sh)
