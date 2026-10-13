@@ -371,7 +371,7 @@ install_agent_release(){
   echo "  verified + installed: pulse-cutover $tag ($bin, sha256 $sums)"
 }
 install_agent_source(){
-  local repo want src; repo=$(cd "$(dirname "$0")" && pwd)
+  local repo want src tmp=""; repo=$(cd "$(dirname "$0")" && pwd)
   # rc.29: the source build is a fallback for the PINNED release only. It builds a fresh clone of that tag from the
   # public repository in a private temp dir, never the files around this script (whatever is checked out, modified,
   # untracked or ignored there). PULSE_CUTOVER_ALLOW_SOURCE_BUILD=1 builds this checkout instead (operator's choice).
@@ -382,14 +382,18 @@ install_agent_source(){
     echo "  building THIS checkout from source (PULSE_CUTOVER_ALLOW_SOURCE_BUILD=1) in $src ..."
   else
     command -v git >/dev/null || { echo "  no git: cannot fetch $want to build it from source"; return 1; }
-    src=$(mktemp -d)/pulse-cutover
+    tmp=$(mktemp -d) && [ -n "$tmp" ] && [ -d "$tmp" ] || { echo "  could not create a private temp dir"; return 1; }
+    src="$tmp/pulse-cutover"
     echo "  building $want from a fresh clone of the public repository (this takes a few minutes) ..."
     git clone -q --depth 1 --branch "$want" https://github.com/paulgnz/pulse-cutover.git "$src" \
-      || { echo "  could not clone $want"; return 1; }
+      || { echo "  could not clone $want"; rm -rf "$tmp"; return 1; }
   fi
-  (cd "$src" && cargo build --release --locked) || return 1
-  install -m 0755 "$src/target/release/pulse-cutover" /usr/local/bin/pulse-cutover
-  echo "  built + installed: pulse-cutover (source build: $src)"
+  (cd "$src" && cargo build --release --locked) || { [ -n "$tmp" ] && rm -rf "$tmp"; return 1; }
+  install -m 0755 "$src/target/release/pulse-cutover" /usr/local/bin/pulse-cutover \
+    || { echo "  could not install the built binary"; [ -n "$tmp" ] && rm -rf "$tmp"; return 1; }
+  echo "  built + installed: pulse-cutover (source build of ${want})"
+  [ -n "$tmp" ] && rm -rf "$tmp"
+  return 0
 }
 echo "artifacts:"
 AGENT_URL=$(mget_opt '.artifacts.agent.url')
