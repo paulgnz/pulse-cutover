@@ -330,6 +330,82 @@ pub fn identity_problems<O: ChainOps + ?Sized>(cfg: &Config, ops: &O) -> Vec<Str
         Err(e) => out.push(format!("cannot read the source's producer schedule: {e} (shadow source unverified)")),
     }
     out.extend(public_mainnet_problems(&allowed, ops));
+    out.extend(producer_binding_problems(ops));
+    out
+}
+
+/// Part 4 of the proof (round-4 review): the PRODUCER API is the shadow node. Parts 1-3 read the chain API, but pause
+/// and resume go to `/v1/producer/*`; a path-routing proxy could serve one from the shadow and the other from a real
+/// producer behind an identical base URL. So the producer API's own head block id (`get_integrity_hash`) must (a) be
+/// the block the chain API serves at that height (one node behind both) and (b) NOT be public XPR mainnet's block at
+/// that height, judged like part 3 (every answering pinned endpoint; "far ahead" only on the highest head). Fail-closed:
+/// any unreadable answer is a problem. Checked with the rest of the proof, and again right before every pause/resume.
+pub fn producer_binding_problems<O: ChainOps + ?Sized>(ops: &O) -> Vec<String> {
+    let head_id = match ops.source_producer_head() {
+        Ok(Some(id)) if id.len() >= 8 => id,
+        Ok(Some(id)) => return vec![format!("the producer API's head block id {id:?} is malformed (producer node unverified)")],
+        Ok(None) => return vec!["the producer API did not report its head block id (get_integrity_hash): the node that \
+                                 would be paused is unverified".into()],
+        Err(e) => return vec![format!("cannot read the producer API's head block (get_integrity_hash): {e} (producer node \
+                                       unverified)")],
+    };
+    let Ok(num) = u64::from_str_radix(&head_id[..8], 16) else {
+        return vec![format!("the producer API's head block id {head_id} has no block number (producer node unverified)")];
+    };
+    let mut out = vec![];
+    // (a) one node behind both APIs.
+    match ops.source_block_id(num) {
+        Ok((id, _)) if id.eq_ignore_ascii_case(&head_id) => {}
+        Ok((id, _)) => out.push(format!(
+            "the producer API's head block {num} is {head_id} but the chain API serves {id} at that height: the two \
+             source URLs reach DIFFERENT nodes. Refused (pause/resume would not touch the node the proof checked)"
+        )),
+        Err(e) => out.push(format!("the chain API cannot serve the producer API's head block {num} ({e}): the two source \
+                                    URLs may reach different nodes (producer node unverified)")),
+    }
+    // (b) not public mainnet's block.
+    let (mut compared, mut max_head, mut unreachable) = (0usize, None::<u64>, vec![]);
+    for base in PUBLIC_XPR_MAINNET_APIS {
+        let info = match ops.public_chain_post(base, "/v1/chain/get_info", json!({})) {
+            Ok(v) if v["chain_id"].as_str().is_some_and(crate::config::is_xpr_mainnet) => v,
+            Ok(v) => { unreachable.push(format!("{base}: not XPR mainnet (chain_id {})", v["chain_id"])); continue; }
+            Err(e) => { unreachable.push(format!("{base}: {e}")); continue; }
+        };
+        let Some(mainnet_head) = info["head_block_num"].as_u64() else {
+            unreachable.push(format!("{base}: get_info without head_block_num"));
+            continue;
+        };
+        max_head = max_head.max(Some(mainnet_head));
+        if mainnet_head < num {
+            unreachable.push(format!("{base}: mainnet head {mainnet_head} is behind the producer's head {num}"));
+            continue;
+        }
+        match ops.public_chain_post(base, "/v1/chain/get_block", json!({"block_num_or_id": num})) {
+            Ok(b) => match b["id"].as_str() {
+                Some(id) => {
+                    compared += 1;
+                    if id.eq_ignore_ascii_case(&head_id) {
+                        out.push(format!(
+                            "the PRODUCER API serves XPR MAINNET's own block {id} at {num} (per {base}): the node pause/resume \
+                             would reach is a real mainnet producer. Refused"
+                        ));
+                    }
+                }
+                None => unreachable.push(format!("{base}: get_block {num}: no id")),
+            },
+            Err(e) => unreachable.push(format!("{base}: get_block {num}: {e}")),
+        }
+    }
+    if compared == 0 {
+        match max_head {
+            Some(h) if h < num && num - h > FAR_AHEAD_BLOCKS => {}
+            _ => out.push(format!(
+                "the producer API's head block {num} could not be compared with public XPR mainnet ({}): producer node \
+                 unverified",
+                if unreachable.is_empty() { "no answer".to_string() } else { unreachable.join("; ") }
+            )),
+        }
+    }
     out
 }
 

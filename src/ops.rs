@@ -109,6 +109,12 @@ pub trait ChainOps {
     fn source_producer_schedule(&self) -> Result<Option<Value>, String> {
         Ok(None)
     }
+    /// Shadow mode (round-4 review): the head block id as the PRODUCER API itself reports it (`/v1/producer/
+    /// get_integrity_hash` → `head_block_id`), so the identity proof is made through the endpoint that pause/resume
+    /// reach, not only through the chain API. None = not answered (fails closed).
+    fn source_producer_head(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     /// Shadow mode: POST `body` to `path` on a PUBLIC chain API `base` (the pinned public XPR mainnet endpoints in
     /// `shadow::PUBLIC_XPR_MAINNET_APIS`). Default: not supported (the shadow proof fails closed).
     fn public_chain_post(&self, base: &str, path: &str, _body: Value) -> Result<Value, String> {
@@ -878,6 +884,11 @@ impl ChainOps for HttpOps {
     fn source_producer_schedule(&self) -> Result<Option<Value>, String> {
         let v = self.post(&format!("{}/v1/chain/get_producer_schedule", self.source_rpc), Some(json!({})), None)?;
         Ok(v.get("active").is_some().then_some(v))
+    }
+
+    fn source_producer_head(&self) -> Result<Option<String>, String> {
+        let v = self.post(&format!("{}/v1/producer/get_integrity_hash", self.producer_api), Some(json!({})), None)?;
+        Ok(v["head_block_id"].as_str().map(str::to_string))
     }
 
     fn public_chain_post(&self, base: &str, path: &str, body: Value) -> Result<Value, String> {

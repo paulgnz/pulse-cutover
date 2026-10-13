@@ -166,6 +166,11 @@ struct MockOps {
     shadow_schedule: RefCell<Option<serde_json::Value>>,
     /// r30 shadow-fix: what PUBLIC XPR mainnet answers ({"keys": [...], "same_blocks": bool, "head": n}); None = unreachable.
     public_mainnet: RefCell<Option<serde_json::Value>>,
+    /// round-4 (R4-1): what the PRODUCER API reports as its head block id. None = the source node's own head block
+    /// (one node behind both APIs); Some(answer) = that answer (e.g. a real mainnet block behind a routing proxy).
+    producer_head: RefCell<Option<Option<String>>>,
+    /// round-4 (R4-1): once any hook has run (the write freeze), the producer API answers with this head block id instead.
+    producer_head_after_hook: RefCell<Option<String>>,
     /// r30 shadow-fix: metal_network_id calls so far, and from which call on it answers this instead.
     metal_calls: Cell<u32>,
     metal_network_from_call: Cell<Option<(u32, Option<u64>)>>,
@@ -272,6 +277,8 @@ impl MockOps {
             shadow_network_id: Cell::new(None),
             shadow_schedule: RefCell::new(None),
             public_mainnet: RefCell::new(None),
+            producer_head: RefCell::new(None),
+            producer_head_after_hook: RefCell::new(None),
             metal_calls: Cell::new(0),
             metal_network_from_call: Cell::new(None),
             metal_chain_status: RefCell::new(Some("Validating".into())),
@@ -353,6 +360,15 @@ impl ChainOps for MockOps {
     }
     fn source_producer_schedule(&self) -> Result<Option<serde_json::Value>, String> {
         Ok(self.shadow_schedule.borrow().clone())
+    }
+    fn source_producer_head(&self) -> Result<Option<String>, String> {
+        if let Some(id) = self.producer_head_after_hook.borrow().clone().filter(|_| !self.hooks.borrow().is_empty()) {
+            return Ok(Some(id));
+        }
+        match self.producer_head.borrow().clone() {
+            Some(answer) => Ok(answer),
+            None => Ok(Some(self.block_id(self.head.get()))),
+        }
     }
     fn source_info(&self) -> Result<ChainInfo, String> {
         self.source_calls.set(self.source_calls.get() + 1);
@@ -7008,4 +7024,51 @@ fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
     assert!(raw.is_empty(), "ungated source mutation(s) in src/machine.rs: {raw:?}");
     let marked = src.lines().filter(|l| l.contains("// ungated:")).count();
     assert_eq!(marked, 5, "exactly the three gate bodies and the two on_halt pages are ungated");
+}
+
+/// Round-4 review (Codex R4-1): a proxy can route `/v1/chain/*` to the shadow node and `/v1/producer/*` to a real
+/// producer behind an identical base URL. The identity proof is therefore also made THROUGH the producer API (its head
+/// block must be the chain API's block at that height and not public mainnet's), with the rest of the proof and again
+/// right before every pause/resume. A producer API that answers with a real mainnet block is refused; nothing is paused,
+/// resumed or (before the freeze) hooked.
+#[test]
+fn r30r4_a_producer_api_routed_to_a_real_producer_is_refused_before_any_pause() {
+    let mainnet_id = |n: u64| format!("{n:08x}{}", "ee".repeat(28)); // the mock's public mainnet block at n
+    // Fresh run: the chain API is the proven shadow, the producer API is real mainnet's node.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = shadow_config(dir.path(), |t| t).unwrap();
+    let ops = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+    let head = ops.head.get();
+    *ops.producer_head.borrow_mut() = Some(Some(mainnet_id(head)));
+    let _ = run_machine_result(&cfg, &ops);
+    assert_eq!((ops.pauses.get(), ops.resumes.get()), (0, 0), "the real producer was touched");
+    assert!(ops.hooks.borrow().is_empty(), "a hook ran with an unproven producer API: {:?}", ops.hooks.borrow());
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("PRODUCER API serves XPR MAINNET's own block"), "{text}");
+    assert!(text.contains("reach DIFFERENT nodes"), "{text}");
+    assert!(Journal::replay(&cfg.journal_path).unwrap().shadow_refused);
+
+    // The producer API cannot be read at all: fail closed, nothing touched.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = shadow_config(dir.path(), |t| t).unwrap();
+    let ops = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+    *ops.producer_head.borrow_mut() = Some(None);
+    let _ = run_machine_result(&cfg, &ops);
+    assert_eq!((ops.pauses.get(), ops.resumes.get()), (0, 0));
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("did not report its head block id"));
+
+    // Proven at ARM, then retargeted between the freeze and the pause: the per-pause re-check refuses the pause.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = shadow_config(dir.path(), |t| t).unwrap();
+    let ops = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+    *ops.producer_head_after_hook.borrow_mut() = Some(mainnet_id(130));
+    let _ = run_machine_result(&cfg, &ops);
+    assert!(!ops.hooks.borrow().is_empty(), "the freeze hook ran on the proven shadow");
+    assert_eq!((ops.pauses.get(), ops.resumes.get()), (0, 0), "the retargeted producer was paused or resumed");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("SHADOW producer API not bound to the proven shadow node, so pausing the source producer was refused"), "{text}");
+    assert!(Journal::replay(&cfg.journal_path).unwrap().shadow_refused);
 }

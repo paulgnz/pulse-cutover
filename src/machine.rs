@@ -427,13 +427,32 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Err(reason)
     }
 
+    /// Round-4 review: on a SHADOW journal, right before EVERY pause/resume (not once per run), the producer API itself
+    /// must still be the proven shadow node: its head block is the chain API's block at that height and not public
+    /// mainnet's (`shadow::producer_binding_problems`). A failure refuses through `shadow_refuse` (touches nothing).
+    fn shadow_producer_gate(&mut self, what: &str) -> Result<(), String> {
+        if !self.is_shadow_journal() {
+            return Ok(());
+        }
+        let problems = crate::shadow::producer_binding_problems(self.ops);
+        if problems.is_empty() {
+            return Ok(());
+        }
+        let reason = format!("SHADOW producer API not bound to the proven shadow node, so {what} was refused (the source was \
+                              not touched)");
+        self.shadow_refuse(&reason, json!({"identity_problems": problems}))?;
+        Err(reason)
+    }
+
     fn src_pause(&mut self) -> Result<(), String> {
         self.shadow_mutation_gate("pausing the source producer")?;
+        self.shadow_producer_gate("pausing the source producer")?;
         self.ops.pause() // ungated: this IS the gate
     }
 
     fn src_resume(&mut self) -> Result<(), String> {
         self.shadow_mutation_gate("resuming the source producer")?;
+        self.shadow_producer_gate("resuming the source producer")?;
         self.ops.resume() // ungated: this IS the gate
     }
 
