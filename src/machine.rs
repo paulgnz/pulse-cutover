@@ -444,6 +444,61 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Err(reason)
     }
 
+    /// Round-4 review (R4-7): a ceremony resumed AFTER its write freeze must not share the box with a readiness drill
+    /// (the drill's conversion needs up to ~14 GB of RAM on mainnet, exactly what the cut needs), and must never be
+    /// stranded for one. So: ask a live drill to stop (its cancel file), stop its recorded pipeline process group
+    /// (keeping the group record unless it is proven gone), wait a bounded time, re-take the drill-root lock, and
+    /// journal what happened. If the drill cannot be verified stopped, journal a loud warning and continue.
+    fn stop_drill_for_the_cut(&mut self) -> Result<(), String> {
+        use crate::drill::{activity, DrillActivity};
+        let lock_held = self.drill_root_lock.is_some();
+        let DrillActivity::Running { h: dh, pid, group } = activity(self.cfg) else {
+            if !lock_held {
+                self.journal.evidence(self.state, json!({"readiness_drill_lock_busy": {"note": "resumed after the \
+                    freeze: the drill lock is held but no drill is recorded running; the cut continues"}}))?;
+            }
+            return Ok(());
+        };
+        let cancel_file = crate::drill::cancel_path(self.cfg, dh);
+        let cancel_written = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new().write(true).create(true).truncate(true)
+                    .custom_flags(libc::O_NOFOLLOW).open(&cancel_file)
+                    .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{}\n", self.ops.now_ms()).as_bytes()))
+            }
+            #[cfg(not(unix))]
+            { std::fs::write(&cancel_file, format!("{}\n", self.ops.now_ms())) }
+        };
+        let killed = crate::ops::kill_recorded_hook_group_keep_evidence(&crate::drill::pgid_file(self.cfg, dh),
+                                                                         std::time::Duration::from_secs(10));
+        let wait_ms = (self.cfg.poll_ms.max(1) * 120).min(60_000);
+        let start = self.ops.now_ms();
+        while matches!(activity(self.cfg), DrillActivity::Running { .. }) && self.ops.now_ms().saturating_sub(start) < wait_ms {
+            std::thread::sleep(std::time::Duration::from_millis(self.cfg.poll_ms.clamp(1, 1000)));
+        }
+        if self.drill_root_lock.is_none() {
+            if let Ok(f) = Journal::lock(&crate::drill::root_lock_base(self.cfg)) {
+                self.drill_root_lock = Some(f);
+            }
+        }
+        let still = activity(self.cfg);
+        let detail = json!({"h": dh, "pid": pid, "group": group,
+            "cancel_file": cancel_written.as_ref().map(|_| "written".to_string()).unwrap_or_else(|e| e.to_string()),
+            "group_kill": match &killed { Ok(Some(d)) => d.clone(), Ok(None) => "no live pipeline group".into(), Err(e) => e.clone() },
+            "drill_lock_held": self.drill_root_lock.is_some()});
+        if matches!(still, DrillActivity::Running { .. }) {
+            eprintln!("WARNING: a readiness drill at H = {dh} is still running next to this cut and could not be stopped; \
+                       stop it by hand (`pulse-cutover drill --cancel`). The cut continues.");
+            self.journal.evidence(self.state, json!({"readiness_drill_not_stopped": detail,
+                "WARNING": "a readiness drill could not be verified stopped next to a cut in progress; the cut continues"}))?;
+        } else {
+            self.journal.evidence(self.state, json!({"readiness_drill_stopped_for_the_cut": detail}))?;
+        }
+        Ok(())
+    }
+
     fn src_pause(&mut self) -> Result<(), String> {
         self.shadow_mutation_gate("pausing the source producer")?;
         self.shadow_producer_gate("pausing the source producer")?;
@@ -715,33 +770,34 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         // r30 round 3: hold the drill root's lock for the whole run, so a drill under another journal name in this
         // directory cannot start next to the ceremony (and one that is starting, before it published RUNNING, makes
-        // a fresh ARM refuse here). A resumed ceremony mid-cut is never refused for it: it warns and continues.
+        // a fresh ARM refuse here). Round 4 (R4-7): a ceremony resumed while still ARMED (nothing frozen yet) is
+        // treated like a fresh one; one resumed AFTER the freeze is never refused for a drill (a cut in progress
+        // continues) but stops a live drill on this box first (`stop_drill_for_the_cut`).
+        let pre_freeze = !resumed || self.state == State::Armed;
         if self.drill_root_lock.is_none() {
             match Journal::lock(&crate::drill::root_lock_base(&self.cfg)) {
                 Ok(f) => self.drill_root_lock = Some(f),
-                Err(e) if !resumed => problems.push(format!(
+                Err(e) if pre_freeze => problems.push(format!(
                     "a readiness drill holds this directory's drill lock (it is starting or running): {e}. Wait for \
                      it, or stop it with `pulse-cutover drill --cancel`"
                 )),
-                Err(e) => {
-                    self.journal.evidence(self.state, json!({"readiness_drill_lock_busy": {"error": e,
-                        "note": "resumed ceremony: not refused for a drill lock; stop the drill with `pulse-cutover drill --cancel`"}}))?;
-                }
+                Err(_) => {} // past the freeze: handled by stop_drill_for_the_cut below
             }
         }
         // A readiness drill running on this box would compete for CPU, RAM and disk in the cut window
-        // (docs/DESIGN.md §7): a fresh ceremony refuses to ARM next to one; a stale record is only reported.
-        if !resumed {
-            match crate::drill::activity(&self.cfg) {
-                crate::drill::DrillActivity::Running { .. } => {
-                    problems.extend(crate::drill::ceremony_blocker(&self.cfg));
-                }
-                crate::drill::DrillActivity::Stale { h: dh } => {
-                    self.journal.evidence(self.state, json!({"readiness_drill_stale": {"h": dh,
-                        "note": "drill/latest.json says RUNNING but no drill process or pipeline group is alive; not blocking"}}))?;
-                }
-                crate::drill::DrillActivity::Idle => {}
+        // (docs/DESIGN.md §7): before the freeze the ceremony refuses to ARM next to one; a stale record is only reported.
+        match crate::drill::activity(&self.cfg) {
+            crate::drill::DrillActivity::Running { .. } if pre_freeze => {
+                problems.extend(crate::drill::ceremony_blocker(&self.cfg));
             }
+            crate::drill::DrillActivity::Stale { h: dh } if pre_freeze => {
+                self.journal.evidence(self.state, json!({"readiness_drill_stale": {"h": dh,
+                    "note": "drill/latest.json says RUNNING but no drill process or pipeline group is alive; not blocking"}}))?;
+            }
+            _ => {}
+        }
+        if !pre_freeze {
+            self.stop_drill_for_the_cut()?;
         }
         if let Some(expected) = &self.cfg.ceremony.chain_id {
             if expected != &info.chain_id {

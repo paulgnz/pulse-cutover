@@ -7072,3 +7072,88 @@ fn r30r4_a_producer_api_routed_to_a_real_producer_is_refused_before_any_pause() 
     assert!(text.contains("SHADOW producer API not bound to the proven shadow node, so pausing the source producer was refused"), "{text}");
     assert!(Journal::replay(&cfg.journal_path).unwrap().shadow_refused);
 }
+
+/// Round-4 review (Codex R4-7): a resumed ceremony skipped the drill check and only journaled a busy drill lock.
+/// Resumed while still ARMED (nothing frozen yet) it now refuses next to a live drill like a fresh ARM; resumed AFTER
+/// the freeze it is never refused (the cut continues) but stops the drill on this box first, and journals a loud
+/// warning when the drill cannot be verified stopped.
+#[cfg(unix)]
+#[test]
+fn r30r4_a_resumed_ceremony_handles_a_live_readiness_drill() {
+    let write_latest = |cfg: &Config, v: serde_json::Value| {
+        std::fs::create_dir_all(pulse_cutover::drill::drill_root(cfg)).unwrap();
+        std::fs::write(pulse_cutover::drill::latest_path(cfg), v.to_string()).unwrap();
+    };
+    // A hand-built FROZEN journal has no scheduled-snapshot record, so the mock cut may end on its own (snapshot not at
+    // H); what matters here is that nothing is refused or aborted FOR THE DRILL.
+    let not_for_the_drill = |cfg: &Config| {
+        for e in journal_entries(cfg) {
+            if e["kind"] == "error" || (e["kind"] == "transition" && (e["state"] == "ABORTED" || e["state"] == "STRANDED")) {
+                let s = e.to_string();
+                assert!(!s.contains("readiness drill") && !s.contains("drill lock"), "refused for a drill: {s}");
+            }
+        }
+    };
+    let me = std::process::id();
+    let live_me = serde_json::json!({"kind": "readiness_drill", "h": 99, "state": "RUNNING", "pid": me,
+        "pid_start": pulse_cutover::ops::process_start(me)});
+
+    // 1. Resumed at ARMED next to a live drill: refused before anything freezes.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    {
+        let (mut j, _) = open_journal(&cfg.journal_path);
+        j.transition(State::Armed, serde_json::json!({"resolved_h": 120, "freeze_height": 120})).unwrap();
+    }
+    write_latest(&cfg, live_me.clone());
+    let ops = MockOps::new(dir.path(), 110);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("readiness drill at H = 99 is RUNNING"), "{err}");
+    assert!(transition(&journal_entries(&cfg), "FROZEN").is_none(), "nothing froze");
+    assert!(!ops.paused.get());
+
+    // 2. Resumed AFTER the freeze with a drill whose only live part is its pipeline group: the group is stopped, the
+    //    cut continues to LIVE, and the stop is journaled.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    {
+        let (mut j, _) = open_journal(&cfg.journal_path);
+        j.transition(State::Armed, serde_json::json!({"resolved_h": 120, "freeze_height": 120})).unwrap();
+        j.transition(State::Frozen, serde_json::json!({"freeze_at": 96, "declared_h": 120})).unwrap();
+    }
+    write_latest(&cfg, serde_json::json!({"kind": "readiness_drill", "h": 99, "state": "RUNNING", "pid": me,
+        "pid_start": "another process"}));
+    let script = dir.path().join("conv.sh");
+    std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (pid, exited) = spawn_group(&script.display().to_string());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::fs::create_dir_all(pulse_cutover::drill::drill_dir(&cfg, 99)).unwrap();
+    std::fs::write(pulse_cutover::drill::pgid_file(&cfg, 99), format!("{pid}\n{}\n", script.display())).unwrap();
+    assert!(matches!(pulse_cutover::drill::activity(&cfg), pulse_cutover::drill::DrillActivity::Running { .. }));
+    let ops = MockOps::new(dir.path(), 110);
+    let _ = run_machine_result(&cfg, &ops);
+    assert!(wait_exited(&exited, pid), "the drill's pipeline group was stopped for the cut");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("readiness_drill_stopped_for_the_cut"), "{text}");
+    assert!(!text.contains("readiness_drill_not_stopped"), "{text}");
+    assert!(pulse_cutover::drill::cancel_path(&cfg, 99).exists(), "the drill was asked to stop");
+    not_for_the_drill(&cfg);
+
+    // 3. Resumed AFTER the freeze next to a drill that cannot be stopped (its process stays alive): a loud warning,
+    //    and the cut still continues (never stranded for a drill).
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    {
+        let (mut j, _) = open_journal(&cfg.journal_path);
+        j.transition(State::Armed, serde_json::json!({"resolved_h": 120, "freeze_height": 120})).unwrap();
+        j.transition(State::Frozen, serde_json::json!({"freeze_at": 96, "declared_h": 120})).unwrap();
+    }
+    write_latest(&cfg, live_me);
+    let ops = MockOps::new(dir.path(), 110);
+    let _ = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("readiness_drill_not_stopped"), "{text}");
+    not_for_the_drill(&cfg);
+}
