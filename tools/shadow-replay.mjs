@@ -152,7 +152,12 @@ export function decideReference({ answers, chainId, cutId, minAgree = MIN_REFERE
   // Round 6: authority is EXACT provenance, never a hostname. An answer vouches only when its endpoint, strictly
   // normalized, IS one of the authority URLs (XPR mainnet: the built-in pinned https URLs). An added endpoint on a
   // pinned hostname (another scheme, port or path) is compared like any other answer, so it can refuse, but never vouches.
-  const vouchers = authorities ? new Set(authorities.map(normalizeUrl).filter(Boolean)) : null;
+  // Round 7: when the answers carry a `vouches` flag (run() always sets it, by POSITION in the list referenceEndpoints
+  // built: only the built-in pinned constants get true), that flag alone decides. Nothing derived from user input can
+  // vouch, even when it normalizes equal to a pinned URL (`https://<pinned-host>//` did, while requesting `//v1/...`).
+  // The string `authorities` path remains for callers that pass none of the flags.
+  const flagged = answers.some((a) => typeof a.vouches === 'boolean');
+  const vouchers = flagged ? null : (authorities ? new Set(authorities.map(normalizeUrl).filter(Boolean)) : null);
   const valid = [];
   const notes = [];
   for (const a of answers) {
@@ -178,13 +183,13 @@ export function decideReference({ answers, chainId, cutId, minAgree = MIN_REFERE
   const seen = new Set();
   const counted = [];
   for (const a of valid) {
-    if (vouchers && !vouchers.has(normalizeUrl(a.endpoint))) continue;
+    if (flagged ? a.vouches !== true : (vouchers && !vouchers.has(normalizeUrl(a.endpoint)))) continue;
     if (seen.has(a.host)) continue;
     seen.add(a.host);
     counted.push(a);
   }
   if (counted.length < minAgree) {
-    reasons.push(`only ${counted.length} ${vouchers ? 'pinned ' : ''}reference endpoint(s) on distinct hostnames answered for chain ${chainId} (need ${minAgree} that agree${vouchers ? '; only the exact built-in pinned https URLs vouch, an added --mainnet-endpoint never counts, whatever its hostname' : ''})${notes.length ? `: ${notes.join('; ')}` : ''}`);
+    reasons.push(`only ${counted.length} ${vouchers || flagged ? 'pinned ' : ''}reference endpoint(s) on distinct hostnames answered for chain ${chainId} (need ${minAgree} that agree${vouchers || flagged ? '; only the exact built-in pinned https URLs vouch, an added --mainnet-endpoint never counts, whatever its hostname' : ''})${notes.length ? `: ${notes.join('; ')}` : ''}`);
   }
   const ok = reasons.length === 0;
   return { ok, block_after_cut_id: ok ? lc(counted[0].block_after_cut_id) : null, agreeing: counted.map((a) => a.host), reasons, notes };
@@ -314,8 +319,15 @@ export async function postJson(url, body, timeoutMs = 15000) {
     return { status: r.status, json, text };
   } catch (e) { return { status: 0, error: String(e.message || e) }; } finally { clearTimeout(t); }
 }
+/**
+ * The ONE way a request URL is built from an endpoint (round 7): every trailing slash of the base is removed, the same
+ * rule normalizeUrl applies, so the URL requested is exactly the endpoint's normalized URL plus the API path.
+ */
+export function joinUrl(base, path = '') {
+  return String(base).replace(/\/+$/, '') + path;
+}
 function makeClient(base, api) {
-  base = base.replace(/\/$/, '');
+  base = joinUrl(base);
   if (api === 'native') {
     let id = 0;
     const rpc = async (method, params) => {
@@ -331,7 +343,7 @@ function makeClient(base, api) {
       send: async (p) => { const r = await rpc('pulsevm.issueTx', p); return r.result ? { ok: true, result: r.result } : { ok: false, error: r.error, redirected: !!r.redirected }; },
     };
   }
-  const v1 = async (name, body) => postJson(`${base}/v1/chain/${name}`, body);
+  const v1 = async (name, body) => postJson(joinUrl(base, `/v1/chain/${name}`), body);
   return {
     info: async () => { const r = await v1('get_info', {}); return r.json && r.status === 200 ? { chain_id: r.json.chain_id, head: Number(r.json.head_block_num) } : { error: r.error || `HTTP ${r.status}`, redirected: !!r.redirected }; },
     block: async (n) => { const r = await v1('get_block', { block_num_or_id: String(n) }); return r.status === 200 && r.json ? { block: r.json } : { error: r.error || JSON.stringify(r.json ?? r.text).slice(0, 300), redirected: !!r.redirected }; },
@@ -369,9 +381,12 @@ export function referenceEndpoints({ chainId, mainnetAdded = [], referenceGiven 
   if (String(chainId || '').toLowerCase() === XPR_MAINNET_CHAIN_ID) {
     // Only https pinned URLs can vouch, by exact (normalized) URL: provenance, not hostname (round 6).
     const authorities = pinned.map(normalizeUrl).filter((u) => u && u.startsWith('https://'));
-    return { endpoints: [...pinned, ...mainnetAdded], authorities, pinned: true };
+    // Round 7: vouching is decided by POSITION: an entry of the built-in pinned list (https) vouches; an added one never
+    // does, whatever it normalizes to.
+    const vouches = [...pinned.map((u) => (normalizeUrl(u) || '').startsWith('https://')), ...mainnetAdded.map(() => false)];
+    return { endpoints: [...pinned, ...mainnetAdded], vouches, authorities, pinned: true };
   }
-  return { endpoints: referenceGiven, authorities: null, pinned: false };
+  return { endpoints: referenceGiven, vouches: referenceGiven.map(() => true), authorities: null, pinned: false };
 }
 
 /** Ask every reference endpoint for its chain_id and its blocks at H and H+1 (no redirects followed). */
@@ -453,7 +468,9 @@ export async function run(argv = process.argv, opts = {}) {
   const refs = referenceEndpoints({ chainId: sourceChainId, mainnetAdded: argAll('mainnet-endpoint'), referenceGiven: argAll('reference-endpoint'),
     ...(opts.pinnedReferenceEndpoints ? { pinned: opts.pinnedReferenceEndpoints } : {}) });
   const fetchRefs = opts.referenceFetcher ?? askReferences;
-  const refAnswers = refs.endpoints.length ? await fetchRefs(refs.endpoints, H) : [];
+  const fetched = refs.endpoints.length ? await fetchRefs(refs.endpoints, H) : [];
+  // Each answer's vouching right comes from the position of the endpoint it was asked as, never from the answer.
+  const refAnswers = refs.endpoints.map((endpoint, i) => ({ ...(fetched[i] ?? { error: 'no answer' }), endpoint, vouches: refs.vouches[i] === true }));
   const reference = decideReference({ answers: refAnswers, chainId: sourceChainId, cutId: CUT_ID, excludeHosts: [hostOf(TARGET), sourceHost], authorities: refs.authorities });
   if (!refs.endpoints.length) reference.reasons.unshift('no reference endpoints: for a chain_id other than XPR mainnet pass --reference-endpoint (at least 2, on distinct hostnames)');
   report.reference = { pinned: refs.pinned, endpoints: refs.endpoints, authorities: refs.authorities, ok: reference.ok, agreeing: reference.agreeing, block_after_cut_id: reference.block_after_cut_id, reasons: reference.reasons, notes: reference.notes };

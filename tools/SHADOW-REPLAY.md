@@ -64,7 +64,10 @@ on one host are one voice; the source's and the target's hostnames never vote), 
   the deny list), and only by **exact URL** (round 6): an answer counts only when its endpoint, normalized (scheme and
   host lowercased, default port and trailing slash ignored; userinfo, query or fragment never match), is one of the
   built-in `https://` URLs. A `--mainnet-endpoint` on a pinned hostname with another scheme, port or path is an added
-  endpoint like any other: compared, never vouching. `--mainnet-endpoint URL` (repeatable, or comma-separated) adds endpoints that are asked and
+  endpoint like any other: compared, never vouching. Since round 7 the right to vouch is decided by **position**, not
+  by string comparison: only an entry of the built-in pinned list itself vouches, so an added URL that normalizes to a
+  pinned one (`https://<pinned-host>//`) still never counts. Every request URL is built by one function (`joinUrl`)
+  from the same normalized base, so the URL requested is exactly the endpoint's. `--mainnet-endpoint URL` (repeatable, or comma-separated) adds endpoints that are asked and
   compared, but they **never count toward the two**: an added endpoint can only make the check refuse (any
   disagreement refuses), never make it pass. With every pinned endpoint unreachable the tool refuses, whatever the
   added endpoints say. A shadow replay therefore needs outbound HTTPS to at least two pinned hosts;

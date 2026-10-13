@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
-import { normalizeUrl,
+import { normalizeUrl, joinUrl,
   extractTxs, extractBlockIds, refBlockNumber, classifyError, checkTargetSafety, compareOutcome, summarise,
   packedTrxId, statusName, XPR_MAINNET_CHAIN_ID, decideReference, referenceEndpoints, hostOf,
   MAINNET_REFERENCE_ENDPOINTS, postJson, run as runTool,
@@ -614,4 +614,49 @@ test('round 6 end to end: the Codex reproduction (pinned down, added http URLs o
     const rep = JSON.parse(readFileSync(join(dir, 'r.json'), 'utf8'));
     assert.equal(rep.reference.ok, false, JSON.stringify(rep.reference));
   } finally { source.close(); target.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('round 7: an added URL that NORMALIZES to a pinned one (https://<pinned-host>//) never vouches; nothing is sent', async () => {
+  const cutBlock = { block_num: H, id: 'cutid', transactions: [] };
+  const shadowAfter = { block_num: H + 1, id: 'shadow-own-1001', transactions: [] };
+  const source = await mock((url, b) => {
+    if (url.endsWith('/get_info')) return [200, { chain_id: XPR_MAINNET_CHAIN_ID, head_block_num: 1002 }];
+    if (url.endsWith('/get_block')) { const n = Number(b.block_num_or_id); return [200, n === H ? cutBlock : n === H + 1 ? shadowAfter : BLOCKS.find((x) => x.block_num === n)]; }
+    return [404, {}];
+  });
+  const sent = [];
+  const realAfter = BLOCKS.find((x) => x.block_num === H + 1);
+  const target = await mock((url, b) => {
+    if (url.endsWith('/get_info')) return [200, { chain_id: XPR_MAINNET_CHAIN_ID, head_block_num: 1002 }];
+    if (url.endsWith('/get_block')) { const n = Number(b.block_num_or_id); return [200, n === H ? cutBlock : n === H + 1 ? realAfter : BLOCKS.find((x) => x.block_num === n)]; }
+    if (url.endsWith('/send_transaction')) { sent.push(b); return [202, { transaction_id: 'x' }]; }
+    return [404, {}];
+  });
+  const S = `http://127.0.0.1:${source.address().port}`, T = `http://127.0.0.1:${target.address().port}`;
+  const pinnedReferenceEndpoints = ['https://ref-a.example', 'https://ref-b.example'];
+  // The exact pinned URLs are down; the attacker's `//` variants (same normalized URL) vouch for the shadow's H+1.
+  const referenceFetcher = async (endpoints) => endpoints.map((endpoint) => (pinnedReferenceEndpoints.includes(endpoint)
+    ? { endpoint, host: hostOf(endpoint), error: 'HTTP 0' }
+    : { endpoint, host: hostOf(endpoint), chain_id: XPR_MAINNET_CHAIN_ID, block_at_cut_id: cutBlock.id, block_after_cut_id: shadowAfter.id }));
+  assert.equal(normalizeUrl('https://ref-a.example//'), normalizeUrl('https://ref-a.example'), 'the attack relies on equal normalization');
+  const dir = mkdtempSync(join(tmpdir(), 'shadow-replay-r7-'));
+  try {
+    const code = await run(['node', TOOL, '--source', S, '--cut-height', String(H), '--cut-id', cutBlock.id, '--blocks', '2',
+      '--target', T, '--send', '--shadow-i-understand', '--rate', '50',
+      '--mainnet-endpoint', 'https://ref-a.example//', '--mainnet-endpoint', 'https://ref-b.example//',
+      '--out', join(dir, 'r.json')], { pinnedReferenceEndpoints, referenceFetcher });
+    assert.notEqual(code, 0, 'the run is refused');
+    assert.equal(sent.length, 0, 'nothing reached the target');
+    const rep = JSON.parse(readFileSync(join(dir, 'r.json'), 'utf8'));
+    assert.equal(rep.reference.ok, false, JSON.stringify(rep.reference));
+  } finally { source.close(); target.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('round 7: one URL join for every request: the requested URL is the normalized endpoint plus the API path', () => {
+  assert.equal(joinUrl('https://a.example//', '/v1/chain/get_info'), 'https://a.example/v1/chain/get_info');
+  assert.equal(joinUrl('https://a.example/', '/v1/chain/get_info'), 'https://a.example/v1/chain/get_info');
+  assert.equal(joinUrl('https://a.example', '/v1/chain/get_info'), 'https://a.example/v1/chain/get_info');
+  // referenceEndpoints marks vouching by position: pinned https entries only.
+  const r = referenceEndpoints({ chainId: XPR_MAINNET_CHAIN_ID, pinned: ['https://p1.example', 'http://p2.example'], mainnetAdded: ['https://p1.example'] });
+  assert.deepEqual(r.vouches, [true, false, false]);
 });
