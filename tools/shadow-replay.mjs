@@ -19,8 +19,9 @@
 //
 // What tells the shadow apart from mainnet is the block AFTER the cut (H+1). Mainnet's H+1 is never taken from
 // --source or --blocks-file (those could be anything, even the shadow itself): it is AUTHENTICATED independently,
-// from at least two independent reference endpoints that agree (a built-in pinned list of public XPR mainnet APIs for
-// the mainnet chain_id, which --mainnet-endpoint can only add to; --reference-endpoint for any other chain_id).
+// from at least two reference endpoints on distinct hostnames that agree. For the mainnet chain_id only the built-in
+// pinned list of public XPR mainnet APIs can vouch; a --mainnet-endpoint adds evidence that can only REFUSE (any
+// disagreement refuses) and never counts toward the quorum (round 5). Any other chain_id: --reference-endpoint.
 // No request follows an HTTP redirect: a 3xx on any read is an error, and a 3xx on a send stops the whole run.
 // No dependencies (Node >= 18). Exit 0 = dry run done / every outcome matched, 1 = mismatches, 2 = refused or error.
 import { createHash } from 'node:crypto';
@@ -36,14 +37,12 @@ export const PUBLIC_MAINNET_HOSTS = [
   'proton.greymass.com', 'proton.cryptolions.io', 'proton.eosusa.io', 'proton.eoscafeblock.com', 'api.protonnz.com',
   'xpr-mainnet-api.bloxprod.io',
 ];
-// The pinned reference endpoints for XPR mainnet: where mainnet's own H+1 is read, independently of --source.
-// --mainnet-endpoint adds to this list; nothing removes from it.
+// The pinned reference endpoints for XPR mainnet: where mainnet's own H+1 is read, independently of --source. Only
+// these vouch; --mainnet-endpoint adds answers that can only make the check refuse. Nothing removes from the list.
 export const MAINNET_REFERENCE_ENDPOINTS = PUBLIC_MAINNET_HOSTS.map((h) => `https://${h}`);
-// A reference H+1 needs this many independent hosts that agree (and no valid answer that disagrees).
+// A reference H+1 needs this many vouching endpoints on DISTINCT HOSTNAMES that agree (and no valid answer, from any
+// endpoint, that disagrees). Two ports on one host are one voice.
 export const MIN_REFERENCE_AGREEMENT = 2;
-// Test-only: with this env var set, the pinned list is REPLACED by --mainnet-endpoint, but only when every one of
-// those endpoints is a loopback address (the test mocks). It can never point the reference at another real host.
-export const TEST_PINNED_ENV = 'PULSE_SHADOW_REPLAY_TEST_ONLY_LOOPBACK_REFERENCES';
 const STATUS_BY_NUM = ['executed', 'soft_fail', 'hard_fail', 'delayed', 'expired'];
 // The only receipt statuses Leap has. Anything else (a number outside the enum, an empty or new string) is UNKNOWN:
 // two equal unsupported values say nothing about the outcome (r30 round-3 review: `status_9` vs `status_9` matched).
@@ -134,25 +133,22 @@ export function classifyError(text) {
   return 'other';
 }
 
-/** True for 127.0.0.0/8, ::1 and localhost (the only hosts the test-only pinned override accepts). */
-export function isLoopbackHost(host) {
-  const h = String(host || '').toLowerCase().replace(/^\[|\]$/g, '');
-  return h === 'localhost' || h === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
-}
-
 /**
  * Authenticate the reference chain's blocks at H and H+1 from independent endpoints, never from --source.
- * answers: [{endpoint, host, chain_id, block_at_cut_id, block_after_cut_id, error}]. excludeHosts: hosts that may not
- * vouch (the source and the target). A valid answer reports the expected chain_id and both blocks. Fail-closed:
- *  - fewer than `minAgree` distinct hosts with valid answers → refuse;
+ * answers: [{endpoint, host (hostname), chain_id, block_at_cut_id, block_after_cut_id, error}]. excludeHosts: hostnames
+ * that may not vouch (the source's and the target's). authorities: when given (XPR mainnet: the pinned hostnames), only
+ * answers from those hostnames count toward the quorum; every other valid answer is still compared and can only
+ * refuse. A valid answer reports the expected chain_id and both blocks. Fail-closed:
+ *  - fewer than `minAgree` vouching answers on distinct hostnames → refuse;
  *  - any two valid answers that disagree on H or H+1 → refuse (ambiguity is never resolved by majority);
  *  - a valid answer whose block at H is not --cut-id → refuse (the cut is not this chain's H).
  * Returns {ok, block_after_cut_id, agreeing[], reasons[], answers[]}.
  */
-export function decideReference({ answers, chainId, cutId, minAgree = MIN_REFERENCE_AGREEMENT, excludeHosts = [] }) {
+export function decideReference({ answers, chainId, cutId, minAgree = MIN_REFERENCE_AGREEMENT, excludeHosts = [], authorities = null }) {
   const lc = (v) => (v == null ? null : String(v).toLowerCase());
   const reasons = [];
   const excluded = new Set(excludeHosts.map(lc).filter(Boolean));
+  const vouchers = authorities ? new Set(authorities.map(lc).filter(Boolean)) : null;
   const seen = new Set();
   const valid = [];
   const notes = [];
@@ -174,11 +170,12 @@ export function decideReference({ answers, chainId, cutId, minAgree = MIN_REFERE
   if (cutId && valid.some((a) => lc(a.block_at_cut_id) !== lc(cutId))) {
     reasons.push(`the reference chain's block at H is not --cut-id ${cutId}: the cut is not block H of chain ${chainId}`);
   }
-  if (valid.length < minAgree) {
-    reasons.push(`only ${valid.length} independent reference endpoint(s) answered for chain ${chainId} (need ${minAgree} that agree)${notes.length ? `: ${notes.join('; ')}` : ''}`);
+  const counted = vouchers ? valid.filter((a) => vouchers.has(lc(a.host))) : valid;
+  if (counted.length < minAgree) {
+    reasons.push(`only ${counted.length} ${vouchers ? 'pinned ' : ''}reference endpoint(s) on distinct hostnames answered for chain ${chainId} (need ${minAgree} that agree${vouchers ? '; an added --mainnet-endpoint never counts' : ''})${notes.length ? `: ${notes.join('; ')}` : ''}`);
   }
   const ok = reasons.length === 0;
-  return { ok, block_after_cut_id: ok ? lc(valid[0].block_after_cut_id) : null, agreeing: valid.map((a) => a.host), reasons, notes };
+  return { ok, block_after_cut_id: ok ? lc(counted[0].block_after_cut_id) : null, agreeing: counted.map((a) => a.host), reasons, notes };
 }
 
 /**
@@ -285,8 +282,8 @@ export function summarise(rows) {
 
 // ---------------------------------------------------------------- I/O --
 
-const arg = (k, d) => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : d; };
-const flag = (k) => process.argv.includes(`--${k}`);
+const argOf = (argv) => (k, d) => { const i = argv.indexOf(`--${k}`); return i > 0 ? argv[i + 1] : d; };
+const flagOf = (argv) => (k) => argv.includes(`--${k}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -330,27 +327,27 @@ function makeClient(base, api) {
   };
 }
 const blockId = (b) => b?.id ?? b?.block_id ?? null;
-const argAll = (k) => process.argv.flatMap((v, i) => (v === `--${k}` && process.argv[i + 1] ? process.argv[i + 1].split(',') : [])).map((x) => x.trim()).filter(Boolean);
-const hostOf = (u) => { try { return new URL(u).hostname.toLowerCase().replace(/^\[|\]$/g, ''); } catch { return null; } };
-// Independence is judged per host:port (two endpoints on one host:port are one voice).
-const hostKey = (u) => { try { return new URL(u).host.toLowerCase(); } catch { return null; } };
+const argAllOf = (argv) => (k) => argv.flatMap((v, i) => (v === `--${k}` && argv[i + 1] ? argv[i + 1].split(',') : [])).map((x) => x.trim()).filter(Boolean);
+// Independence is judged per HOSTNAME (round 5): two ports on one host are one voice, never two.
+export const hostOf = (u) => { try { return new URL(u).hostname.toLowerCase().replace(/^\[|\]$/g, '') || null; } catch { return null; } };
 
-/** Which endpoints vouch for chain `chainId`'s blocks at H and H+1: pinned + added for mainnet, user-given otherwise. */
-export function referenceEndpoints({ chainId, mainnetAdded = [], referenceGiven = [], env = process.env }) {
+/**
+ * Which endpoints are asked about chain `chainId`'s blocks at H and H+1, and which of them may vouch. XPR mainnet: the
+ * pinned list vouches (authorities = its hostnames); added --mainnet-endpoint answers are compared but never vouch.
+ * Any other chain_id: the user-given --reference-endpoint list vouches (no authority list). `pinned` exists for tests
+ * that call run() in-process; the CLI never sets it, and no environment variable can change it.
+ */
+export function referenceEndpoints({ chainId, mainnetAdded = [], referenceGiven = [], pinned = MAINNET_REFERENCE_ENDPOINTS }) {
   if (String(chainId || '').toLowerCase() === XPR_MAINNET_CHAIN_ID) {
-    if (env[TEST_PINNED_ENV] === '1') {
-      // Test-only replacement: every endpoint must be loopback, else the override is ignored (pinned list stays).
-      if (mainnetAdded.length && mainnetAdded.every((u) => isLoopbackHost(hostOf(u)))) return { endpoints: mainnetAdded, pinned: false };
-    }
-    return { endpoints: [...MAINNET_REFERENCE_ENDPOINTS, ...mainnetAdded], pinned: true };
+    return { endpoints: [...pinned, ...mainnetAdded], authorities: pinned.map(hostOf).filter(Boolean), pinned: true };
   }
-  return { endpoints: referenceGiven, pinned: false };
+  return { endpoints: referenceGiven, authorities: null, pinned: false };
 }
 
 /** Ask every reference endpoint for its chain_id and its blocks at H and H+1 (no redirects followed). */
-async function askReferences(endpoints, H) {
+export async function askReferences(endpoints, H) {
   return Promise.all(endpoints.map(async (endpoint) => {
-    const host = hostKey(endpoint);
+    const host = hostOf(endpoint);
     if (!host) return { endpoint, host: null, error: 'not a URL' };
     const c = makeClient(endpoint, 'v1');
     const info = await c.info();
@@ -362,16 +359,23 @@ async function askReferences(endpoints, H) {
   }));
 }
 
-async function main() {
+/**
+ * The CLI, callable in-process. Returns the exit code. opts (tests only; the CLI passes none):
+ * pinnedReferenceEndpoints replaces the pinned mainnet list, referenceFetcher(endpoints, H) replaces the network
+ * reads of the references, log/err replace console.log/console.error.
+ */
+export async function run(argv = process.argv, opts = {}) {
+  const arg = argOf(argv), flag = flagOf(argv), argAll = argAllOf(argv);
+  const log = opts.log ?? ((m) => console.log(m)), err = opts.err ?? ((m) => console.error(m));
   const SOURCE = arg('source'), BLOCKS_FILE = arg('blocks-file'), TARGET = arg('target'), TARGET_API = arg('target-api', 'v1');
   const H = Number(arg('cut-height')), CUT_ID = arg('cut-id'), N = Number(arg('blocks', '100'));
   const RATE = Number(arg('rate', '5')), INCL_TIMEOUT = Number(arg('inclusion-timeout', '120')), OUT = arg('out');
   const SEND = flag('send'), I_UNDERSTAND = flag('shadow-i-understand'), ALLOW_INCONCLUSIVE = flag('allow-inconclusive');
   if ((!SOURCE && !BLOCKS_FILE) || !Number.isInteger(H) || H <= 0 || (SEND && !TARGET) || !['v1', 'native'].includes(TARGET_API)) {
-    console.error('usage: shadow-replay.mjs (--source URL | --blocks-file f.json) --cut-height H [--blocks N] [--out f.json]\n' +
+    err('usage: shadow-replay.mjs (--source URL | --blocks-file f.json) --cut-height H [--blocks N] [--out f.json]\n' +
       '       [--target URL --target-api v1|native --cut-id ID --send --shadow-i-understand --rate TPS --inclusion-timeout S --deny-host h1,h2 --allow-inconclusive]\n' +
-      '       [--mainnet-endpoint URL (adds to the pinned mainnet references) | --reference-endpoint URL (≥ 2, any other chain_id)]');
-    process.exit(2);
+      '       [--mainnet-endpoint URL (extra mainnet evidence: can only refuse) | --reference-endpoint URL (≥ 2 hosts, any other chain_id)]');
+    return 2;
   }
   const report = { tool: 'shadow-replay', version: VERSION, generated_at: new Date().toISOString(), mode: SEND ? 'send' : 'dry-run', cut: { height: H, id: CUT_ID || null } };
 
@@ -386,17 +390,17 @@ async function main() {
   } else {
     const src = makeClient(SOURCE, 'v1');
     const info = await src.info();
-    if (info.error) { console.error(`source get_info failed: ${info.error}`); process.exit(2); }
+    if (info.error) { err(`source get_info failed: ${info.error}`); return 2; }
     sourceChainId = info.chain_id;
     report.source = { url: SOURCE, chain_id: info.chain_id, head: info.head };
     if (CUT_ID) {
       const b = await src.block(H);
-      if (b.error || String(blockId(b.block)).toLowerCase() !== CUT_ID.toLowerCase()) { console.error(`source block at H is ${blockId(b.block) ?? b.error}, not --cut-id ${CUT_ID}`); process.exit(2); }
+      if (b.error || String(blockId(b.block)).toLowerCase() !== CUT_ID.toLowerCase()) { err(`source block at H is ${blockId(b.block) ?? b.error}, not --cut-id ${CUT_ID}`); return 2; }
     }
     blocks = [];
     for (let n = H + 1; n <= Math.min(H + N, info.head); n++) {
       const b = await src.block(n);
-      if (b.error) { console.error(`source block ${n}: ${b.error}`); process.exit(2); }
+      if (b.error) { err(`source block ${n}: ${b.error}`); return 2; }
       blocks.push(b.block);
     }
   }
@@ -406,21 +410,23 @@ async function main() {
   const sourceAfterId = blockId(blocks.find((b) => Number(b.block_num) === H + 1));
 
   // 2. Dry run stops here: classification only, the target is never contacted.
-  if (!SEND) return finish(report, rows, OUT);
+  if (!SEND) return finish(report, rows, OUT, 0, log);
 
   // 3. Target safety, then send in mainnet order at the given rate.
   const tgt = makeClient(TARGET, TARGET_API);
   const ti = await tgt.info();
-  if (ti.error) { console.error(`target info failed: ${ti.error}`); process.exit(2); }
+  if (ti.error) { err(`target info failed: ${ti.error}`); return 2; }
   const atH = await tgt.block(H);
   const afterH = ti.head > H ? await tgt.block(H + 1) : { error: `target head ${ti.head} is not past H` };
   // Mainnet's H+1 from independent references, never from the source (round 4).
-  const sourceHost = SOURCE ? hostKey(SOURCE) : null;
-  const refs = referenceEndpoints({ chainId: sourceChainId, mainnetAdded: argAll('mainnet-endpoint'), referenceGiven: argAll('reference-endpoint') });
-  const refAnswers = refs.endpoints.length ? await askReferences(refs.endpoints, H) : [];
-  const reference = decideReference({ answers: refAnswers, chainId: sourceChainId, cutId: CUT_ID, excludeHosts: [hostKey(TARGET), sourceHost] });
-  if (!refs.endpoints.length) reference.reasons.unshift('no reference endpoints: for a chain_id other than XPR mainnet pass --reference-endpoint (at least 2 independent ones)');
-  report.reference = { pinned: refs.pinned, endpoints: refs.endpoints, ok: reference.ok, agreeing: reference.agreeing, block_after_cut_id: reference.block_after_cut_id, reasons: reference.reasons, notes: reference.notes };
+  const sourceHost = SOURCE ? hostOf(SOURCE) : null;
+  const refs = referenceEndpoints({ chainId: sourceChainId, mainnetAdded: argAll('mainnet-endpoint'), referenceGiven: argAll('reference-endpoint'),
+    ...(opts.pinnedReferenceEndpoints ? { pinned: opts.pinnedReferenceEndpoints } : {}) });
+  const fetchRefs = opts.referenceFetcher ?? askReferences;
+  const refAnswers = refs.endpoints.length ? await fetchRefs(refs.endpoints, H) : [];
+  const reference = decideReference({ answers: refAnswers, chainId: sourceChainId, cutId: CUT_ID, excludeHosts: [hostOf(TARGET), sourceHost], authorities: refs.authorities });
+  if (!refs.endpoints.length) reference.reasons.unshift('no reference endpoints: for a chain_id other than XPR mainnet pass --reference-endpoint (at least 2, on distinct hostnames)');
+  report.reference = { pinned: refs.pinned, endpoints: refs.endpoints, authorities: refs.authorities, ok: reference.ok, agreeing: reference.agreeing, block_after_cut_id: reference.block_after_cut_id, reasons: reference.reasons, notes: reference.notes };
   const safety = checkTargetSafety({
     reference,
     target: {
@@ -433,7 +439,7 @@ async function main() {
   });
   report.target = { url: TARGET, api: TARGET_API, chain_id: ti.chain_id, head_at_start: ti.head };
   report.safety = safety;
-  if (!safety.ok) { console.error(`REFUSED:\n- ${safety.reasons.join('\n- ')}`); finish(report, rows, OUT, 2); return; }
+  if (!safety.ok) { err(`REFUSED:\n- ${safety.reasons.join('\n- ')}`); return finish(report, rows, OUT, 2, log); }
 
   const sent = new Map();
   const gap = RATE > 0 ? 1000 / RATE : 0;
@@ -444,8 +450,8 @@ async function main() {
     if (res.redirected) {
       // The target tried to send the signed body elsewhere: stop everything, nothing more is sent anywhere.
       report.aborted = `target redirected a send: ${res.error}`;
-      console.error(`REFUSED: ${report.aborted}; stopping the replay`);
-      finish(report, rows, OUT, 2); return;
+      err(`REFUSED: ${report.aborted}; stopping the replay`);
+      return finish(report, rows, OUT, 2, log);
     }
     sent.set(r.id.toLowerCase(), res.ok ? { accepted: true } : { rejected: true, error: res.error });
     const wait = gap - (Date.now() - t0); if (wait > 0) await sleep(wait);
@@ -479,19 +485,21 @@ async function main() {
   const inconclusive = rows.filter((r) => ['unknown', 'not_sent'].includes(r.compare?.result)).length;
   report.verdict = mism ? 'mismatch' : inconclusive ? 'inconclusive' : 'match';
   report.inconclusive = inconclusive;
-  finish(report, rows, OUT, mism ? 1 : inconclusive && !ALLOW_INCONCLUSIVE ? 3 : 0);
+  return finish(report, rows, OUT, mism ? 1 : inconclusive && !ALLOW_INCONCLUSIVE ? 3 : 0, log);
 }
 
-function finish(report, rows, out, code = 0) {
+function finish(report, rows, out, code = 0, log = (m) => console.log(m)) {
   for (const r of rows) delete r.payload; // the report never carries the transactions themselves
   if (report.mode === 'dry-run') for (const r of rows) r.compare = compareOutcome(r, null);
   report.summary = summarise(rows);
   report.transactions = rows;
   const text = JSON.stringify(report, null, 1);
   if (out) writeFileSync(out, text);
-  console.log(JSON.stringify({ mode: report.mode, range: report.range, summary: report.summary, verdict: report.verdict ?? null,
+  log(JSON.stringify({ mode: report.mode, range: report.range, summary: report.summary, verdict: report.verdict ?? null,
     safety: report.safety?.ok ?? null }, null, 1));
-  process.exitCode = code;
+  return code;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) main().catch((e) => { console.error(e?.stack || e); process.exit(2); });
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+  run(process.argv).then((code) => { process.exitCode = code; }, (e) => { console.error(e?.stack || e); process.exitCode = 2; });
+}

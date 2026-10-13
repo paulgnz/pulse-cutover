@@ -56,23 +56,26 @@ never taken as proof: it refuses. It refuses a target that:
 
 **Mainnet's H+1 is authenticated independently of the source.** The source (or blocks file) could be anything, even
 the shadow itself: swapping `--source` and `--target` used to make a real mainnet target pass. So the reference H+1
-is read from **at least two independent reference endpoints that agree** (one vote per host:port; the source and the
-target never vote), and every reference must also show `--cut-id` at H:
+is read from **at least two reference endpoints on distinct hostnames that agree** (one vote per hostname: two ports
+on one host are one voice; the source's and the target's hostnames never vote), and every reference must also show
+`--cut-id` at H:
 
-- for the XPR mainnet chain_id, a built-in pinned list of public mainnet APIs (the same hosts as the deny list).
-  `--mainnet-endpoint URL` (repeatable, or comma-separated) **adds** to it; nothing removes from it. A shadow replay
-  therefore needs outbound HTTPS to those hosts;
-- for any other chain_id, `--reference-endpoint URL` (at least two).
+- for the XPR mainnet chain_id, **only the built-in pinned list of public mainnet APIs vouches** (the same hosts as
+  the deny list). `--mainnet-endpoint URL` (repeatable, or comma-separated) adds endpoints that are asked and
+  compared, but they **never count toward the two**: an added endpoint can only make the check refuse (any
+  disagreement refuses), never make it pass. With every pinned endpoint unreachable the tool refuses, whatever the
+  added endpoints say. A shadow replay therefore needs outbound HTTPS to at least two pinned hosts;
+- for any other chain_id, `--reference-endpoint URL`: at least two, on distinct hostnames.
 
-The tool refuses when fewer than two agree, when any two valid answers disagree (never a majority vote), when the
-cut is not the reference chain's H, when the source's H+1 is not the reference H+1 (the source is not the chain it
-claims), and when the target's H+1 equals it.
+The tool refuses when fewer than two vouching endpoints agree, when any two valid answers disagree (never a majority
+vote), when the cut is not the reference chain's H, when the source's H+1 is not the reference H+1 (the source is not
+the chain it claims), and when the target's H+1 equals it.
 
 **No redirects.** No request follows an HTTP redirect. A 3xx on a read is an error (lineage unproven). A 3xx on a
 send stops the whole run (exit 2, `aborted` in the report): the signed body is never forwarded anywhere else.
 
-(Tests only: with `PULSE_SHADOW_REPLAY_TEST_ONLY_LOOPBACK_REFERENCES=1`, `--mainnet-endpoint` replaces the pinned list,
-and only when every endpoint is a loopback address; otherwise the pinned list stays.)
+No environment variable changes any of this. Tests call the tool in-process (`run(argv, opts)`) and inject stand-in
+references through `opts`; the command line has no way to do that.
 
 The report never contains signatures or packed transactions, only ids, statuses and outcomes.
 

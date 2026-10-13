@@ -12,8 +12,8 @@ import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
 import {
   extractTxs, extractBlockIds, refBlockNumber, classifyError, checkTargetSafety, compareOutcome, summarise,
-  packedTrxId, statusName, XPR_MAINNET_CHAIN_ID, decideReference, referenceEndpoints, isLoopbackHost,
-  MAINNET_REFERENCE_ENDPOINTS, TEST_PINNED_ENV, postJson,
+  packedTrxId, statusName, XPR_MAINNET_CHAIN_ID, decideReference, referenceEndpoints, hostOf,
+  MAINNET_REFERENCE_ENDPOINTS, postJson, run as runTool,
 } from '../shadow-replay.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -203,21 +203,50 @@ test('round 4: mainnet H+1 is authenticated by >= 2 independent agreeing referen
   assert.ok(!d([A('a'), A('b')], { excludeHosts: ['b'] }).ok);
 });
 
-test('round 4: references: pinned for mainnet (added to, never removed), user-given otherwise; test override is loopback-only', () => {
-  const m = referenceEndpoints({ chainId: XPR_MAINNET_CHAIN_ID, mainnetAdded: ['https://extra.example'], env: {} });
+test('round 5: only pinned mainnet endpoints vouch; added ones can only refuse; no env override exists', () => {
+  const m = referenceEndpoints({ chainId: XPR_MAINNET_CHAIN_ID, mainnetAdded: ['https://extra.example'] });
   assert.ok(m.pinned);
   for (const e of MAINNET_REFERENCE_ENDPOINTS) assert.ok(m.endpoints.includes(e), e);
-  assert.ok(m.endpoints.includes('https://extra.example'));
-  assert.ok(MAINNET_REFERENCE_ENDPOINTS.length >= 2);
-  // the test-only replacement needs the env var AND loopback-only endpoints; otherwise the pinned list stays
-  const env = { [TEST_PINNED_ENV]: '1' };
-  assert.deepEqual(referenceEndpoints({ chainId: XPR_MAINNET_CHAIN_ID, mainnetAdded: ['http://127.0.0.1:9'], env }).endpoints, ['http://127.0.0.1:9']);
-  const mixed = referenceEndpoints({ chainId: XPR_MAINNET_CHAIN_ID, mainnetAdded: ['http://127.0.0.1:9', 'https://evil.example'], env });
-  assert.ok(mixed.pinned && MAINNET_REFERENCE_ENDPOINTS.every((e) => mixed.endpoints.includes(e)));
-  assert.ok(referenceEndpoints({ chainId: XPR_MAINNET_CHAIN_ID, mainnetAdded: ['http://127.0.0.1:9'], env: {} }).pinned);
-  // another chain_id: only what the user gives
-  assert.deepEqual(referenceEndpoints({ chainId: 'aa'.repeat(32), referenceGiven: ['https://r1', 'https://r2'], env: {} }).endpoints, ['https://r1', 'https://r2']);
-  assert.ok(isLoopbackHost('127.0.0.1') && isLoopbackHost('::1') && isLoopbackHost('localhost') && !isLoopbackHost('10.0.0.1'));
+  assert.ok(m.endpoints.includes('https://extra.example'), 'added endpoints are still asked');
+  assert.ok(!m.authorities.includes('extra.example'), 'but never vouch');
+  assert.deepEqual(m.authorities, MAINNET_REFERENCE_ENDPOINTS.map(hostOf));
+  assert.ok(new Set(m.authorities).size >= 2, 'the pinned list spans at least two hostnames');
+  // the old test-only environment override is gone: setting it changes nothing
+  const before = process.env.PULSE_SHADOW_REPLAY_TEST_ONLY_LOOPBACK_REFERENCES;
+  process.env.PULSE_SHADOW_REPLAY_TEST_ONLY_LOOPBACK_REFERENCES = '1';
+  try {
+    const e = referenceEndpoints({ chainId: XPR_MAINNET_CHAIN_ID, mainnetAdded: ['http://127.0.0.1:8001', 'http://127.0.0.1:8002'] });
+    assert.ok(e.pinned && MAINNET_REFERENCE_ENDPOINTS.every((x) => e.endpoints.includes(x)));
+    assert.deepEqual(e.authorities, MAINNET_REFERENCE_ENDPOINTS.map(hostOf));
+  } finally {
+    if (before === undefined) delete process.env.PULSE_SHADOW_REPLAY_TEST_ONLY_LOOPBACK_REFERENCES;
+    else process.env.PULSE_SHADOW_REPLAY_TEST_ONLY_LOOPBACK_REFERENCES = before;
+  }
+  assert.ok(!readFileSync(TOOL, 'utf8').includes('process.env'), 'the tool reads no environment variable');
+  // another chain_id: what the user gives vouches
+  const o = referenceEndpoints({ chainId: 'aa'.repeat(32), referenceGiven: ['https://r1', 'https://r2'] });
+  assert.deepEqual(o.endpoints, ['https://r1', 'https://r2']); assert.equal(o.authorities, null);
+
+  const A = (host, over = {}) => ({ endpoint: `https://${host}`, host, chain_id: XPR_MAINNET_CHAIN_ID, block_at_cut_id: 'cut', block_after_cut_id: 'mainnet-1001', ...over });
+  const auth = ['pin-a.example', 'pin-b.example'];
+  const d = (answers) => decideReference({ answers, chainId: XPR_MAINNET_CHAIN_ID, cutId: 'cut', authorities: auth });
+  // every pinned endpoint down, two custom ports on one box agreeing: refused
+  const custom = d([A('pin-a.example', { error: 'HTTP 0' }), A('pin-b.example', { error: 'HTTP 0' }), A('127.0.0.1'), A('127.0.0.1')]);
+  assert.ok(!custom.ok && custom.reasons.some((r) => r.includes('pinned')), JSON.stringify(custom));
+  // two custom HOSTS agreeing, pinned down: still refused (they never vouch)
+  assert.ok(!d([A('pin-a.example', { error: 'x' }), A('c1.example'), A('c2.example')]).ok);
+  // one pinned + one custom: refused
+  assert.ok(!d([A('pin-a.example'), A('c1.example')]).ok);
+  // two pinned agreeing: ok, and only they are reported as vouching
+  const two = d([A('pin-a.example'), A('pin-b.example'), A('c1.example')]);
+  assert.ok(two.ok, JSON.stringify(two)); assert.deepEqual(two.agreeing, auth);
+  // any disagreement refuses, including from an added endpoint
+  assert.ok(!d([A('pin-a.example'), A('pin-b.example'), A('c1.example', { block_after_cut_id: 'other' })]).ok);
+  assert.ok(!d([A('pin-a.example'), A('pin-b.example', { block_after_cut_id: 'other' })]).ok);
+  // independence is per hostname: one pinned host on two ports is one voice
+  assert.ok(!decideReference({ answers: [A('pin-a.example'), { ...A('pin-a.example'), endpoint: 'https://pin-a.example:8443' }],
+    chainId: XPR_MAINNET_CHAIN_ID, cutId: 'cut', authorities: ['pin-a.example'] }).ok);
+  assert.equal(hostOf('http://127.0.0.1:8001'), hostOf('http://127.0.0.1:8002'));
 });
 
 test('round 4: the swap attack (a shadow passed as the source) and a target on the real chain are refused', () => {
@@ -248,21 +277,31 @@ function mock(handler) {
     srv.listen(0, '127.0.0.1', () => res(srv));
   });
 }
-const run = (args) => new Promise((res) => {
-  const p = spawn(process.execPath, [TOOL, ...args], { env: { ...process.env, [TEST_PINNED_ENV]: '1' } }); let out = '', err = '';
+/** The CLI in-process (round 5: references are injected through run()'s options; no environment variable). */
+const run = async (args, opts = {}) => {
+  let out = '', err = '';
+  const code = await runTool([process.execPath, TOOL, ...args], { ...opts, log: (m) => { out += `${m}\n`; }, err: (m) => { err += `${m}\n`; } });
+  return { code, out, err };
+};
+/** The real CLI as a child process (exit code wiring). */
+const runCli = (args) => new Promise((res) => {
+  const p = spawn(process.execPath, [TOOL, ...args]); let out = '', err = '';
   p.stdout.on('data', (d) => (out += d)); p.stderr.on('data', (d) => (err += d));
   p.on('close', (code) => res({ code, out, err }));
 });
 
-/** Two independent mock "mainnet" references serving the cut block and mainnet's real H+1 (fixture id 000003e9aa). */
-async function references(cutBlock, chainId = XPR_MAINNET_CHAIN_ID) {
-  const mk = () => mock((url, b) => {
-    if (url.endsWith('/get_info')) return [200, { chain_id: chainId, head_block_num: 5000 }];
-    if (url.endsWith('/get_block')) { const n = Number(b.block_num_or_id); return [200, n === H ? cutBlock : BLOCKS.find((x) => x.block_num === n)]; }
-    return [404, {}];
+/**
+ * Injected mainnet references: `pinned` stand-ins for the pinned list (distinct hostnames, answered in memory, no
+ * network), serving the cut block and mainnet's real H+1 (fixture id 000003e9aa). `answers` overrides per hostname.
+ */
+async function references(cutBlock, { pinned = 2, answers = {} } = {}) {
+  const pinnedEndpoints = ['https://ref-a.example', 'https://ref-b.example', 'https://ref-c.example'].slice(0, pinned);
+  const after = BLOCKS.find((x) => x.block_num === H + 1).id;
+  const referenceFetcher = async (endpoints) => endpoints.map((endpoint) => {
+    const host = hostOf(endpoint);
+    return answers[host] ?? { endpoint, host, chain_id: XPR_MAINNET_CHAIN_ID, block_at_cut_id: cutBlock.id, block_after_cut_id: after };
   });
-  const servers = [await mk(), await mk()];
-  return { servers, args: servers.flatMap((s) => ['--mainnet-endpoint', `http://127.0.0.1:${s.address().port}`]), close: () => servers.forEach((s) => s.close()) };
+  return { opts: { pinnedReferenceEndpoints: pinnedEndpoints, referenceFetcher }, close: () => {} };
 }
 
 test('end to end: dry run needs no target; send replays, confirms inclusion and reports a mismatch', async () => {
@@ -295,10 +334,10 @@ test('end to end: dry run needs no target; send replays, confirms inclusion and 
     const d = JSON.parse(readFileSync(join(dir, 'dry.json'), 'utf8'));
     assert.equal(d.mode, 'dry-run'); assert.equal(d.summary.transactions, 4); assert.equal(sent.length, 0);
 
-    const refused = await run(['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', ...refs.args]);
+    const refused = await run(['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send'], refs.opts);
     assert.equal(refused.code, 2); assert.match(refused.err, /shadow-i-understand/); assert.equal(sent.length, 0);
 
-    const r = await run(['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand', '--rate', '0', '--inclusion-timeout', '5', '--out', join(dir, 'send.json'), ...refs.args]);
+    const r = await run(['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand', '--rate', '0', '--inclusion-timeout', '5', '--out', join(dir, 'send.json')], refs.opts);
     const rep = JSON.parse(readFileSync(join(dir, 'send.json'), 'utf8'));
     assert.equal(r.code, 1, r.err);
     assert.equal(sent.length, 3, 'deferred id is never sent');
@@ -335,22 +374,22 @@ test('end to end: refuses when lineage cannot be proven (no shadow H+1, failed H
   const S = `http://127.0.0.1:${source.address().port}`, T = `http://127.0.0.1:${target.address().port}`;
   const refs = await references(cutBlock);
   const dir = mkdtempSync(join(tmpdir(), 'shadow-replay-'));
-  const base = ['--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand', '--rate', '0', '--inclusion-timeout', '1', ...refs.args];
+  const base = ['--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand', '--rate', '0', '--inclusion-timeout', '1'];
   try {
     // the shadow has not produced its own H+1 yet
-    let r = await run(['--source', S, ...base]);
+    let r = await run(['--source', S, ...base], refs.opts);
     assert.equal(r.code, 2, r.err); assert.match(r.err, /block H\+1/); assert.equal(sent.length, 0);
     // its H+1 read fails
     mode = 'h1_error';
-    r = await run(['--source', S, ...base]);
+    r = await run(['--source', S, ...base], refs.opts);
     assert.equal(r.code, 2, r.err); assert.match(r.err, /lineage unproven/); assert.equal(sent.length, 0);
     // a blocks file that lacks mainnet's H+1 (only H+2), against an otherwise fine target
     const file = join(dir, 'blocks.json');
     writeFileSync(file, JSON.stringify(BLOCKS.filter((x) => x.block_num !== H + 1)));
-    r = await run(['--blocks-file', file, '--source-chain-id', XPR_MAINNET_CHAIN_ID, ...base]);
+    r = await run(['--blocks-file', file, '--source-chain-id', XPR_MAINNET_CHAIN_ID, ...base], refs.opts);
     assert.equal(r.code, 2, r.err); assert.match(r.err, /mainnet's block H\+1/); assert.equal(sent.length, 0);
     // a blocks file without --source-chain-id
-    r = await run(['--blocks-file', file, ...base]);
+    r = await run(['--blocks-file', file, ...base], refs.opts);
     assert.equal(r.code, 2, r.err); assert.match(r.err, /source chain_id is unknown/); assert.equal(sent.length, 0);
   } finally { source.close(); target.close(); refs.close(); }
 });
@@ -378,14 +417,14 @@ test('end to end (round 3): unknown outcomes are inconclusive: exit 3 unless --a
   const refs = await references(cutBlock);
   const dir = mkdtempSync(join(tmpdir(), 'shadow-replay-'));
   try {
-    const base = ['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand', '--rate', '0', '--inclusion-timeout', '5', ...refs.args];
-    const r = await run([...base, '--out', join(dir, 'a.json')]);
+    const base = ['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand', '--rate', '0', '--inclusion-timeout', '5'];
+    const r = await run([...base, '--out', join(dir, 'a.json')], refs.opts);
     const rep = JSON.parse(readFileSync(join(dir, 'a.json'), 'utf8'));
     assert.equal(rep.summary.result.match ?? 0, 0, 'no unknown outcome counts as a match');
     // ID3 failed on mainnet: its unknown shadow status is unknown too, so nothing mismatches and nothing matches.
     assert.equal(rep.verdict, 'inconclusive');
     assert.equal(r.code, 3, r.err);
-    const allowed = await run([...base, '--allow-inconclusive']);
+    const allowed = await run([...base, '--allow-inconclusive'], refs.opts);
     assert.equal(allowed.code, 0, allowed.err);
   } finally { source.close(); target.close(); refs.close(); }
 });
@@ -414,13 +453,13 @@ test('end to end (round 4): the swap attack is refused: a shadow as --source, re
   const refs = await references(cutBlock);
   const S = `http://127.0.0.1:${shadowSrc.address().port}`, T = `http://127.0.0.1:${realTarget.address().port}`;
   try {
-    const r = await run(['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand', '--rate', '0', '--inclusion-timeout', '1', ...refs.args]);
+    const r = await run(['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand', '--rate', '0', '--inclusion-timeout', '1'], refs.opts);
     assert.equal(r.code, 2, r.err);
     assert.match(r.err, /not the chain it claims/);
     assert.match(r.err, /following the real chain/);
     assert.equal(sent.length, 0, 'nothing reached the real chain');
     // with only one reference, nothing is authenticated: refused as well
-    const one = await run(['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand', '--rate', '0', '--inclusion-timeout', '1', ...refs.args.slice(0, 2)]);
+    const one = await run(['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand', '--rate', '0', '--inclusion-timeout', '1'], (await references(cutBlock, { pinned: 1 })).opts);
     assert.equal(one.code, 2, one.err); assert.match(one.err, /could not be authenticated/); assert.equal(sent.length, 0);
   } finally { shadowSrc.close(); realTarget.close(); refs.close(); }
 });
@@ -447,7 +486,7 @@ test('end to end (round 4): a 307 on send stops the run; nothing reaches the red
   const S = `http://127.0.0.1:${source.address().port}`, T = `http://127.0.0.1:${target.address().port}`;
   const dir = mkdtempSync(join(tmpdir(), 'shadow-replay-'));
   try {
-    const r = await run(['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand', '--rate', '0', '--inclusion-timeout', '1', '--out', join(dir, 'r.json'), ...refs.args]);
+    const r = await run(['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand', '--rate', '0', '--inclusion-timeout', '1', '--out', join(dir, 'r.json')], refs.opts);
     assert.equal(r.code, 2, r.err);
     assert.match(r.err, /redirect/);
     assert.equal(sends, 1, 'the run stops at the first redirected send');
@@ -458,4 +497,53 @@ test('end to end (round 4): a 307 on send stops the run; nothing reaches the red
     const red = await postJson(`${T}/v1/chain/send_transaction`, {});
     assert.equal(red.redirected, true); assert.equal(sink.length, 0);
   } finally { source.close(); target.close(); destination.close(); refs.close(); }
+});
+
+test('end to end (round 5): pinned references down and two custom mainnet hosts agreeing: refused, nothing sent', async () => {
+  const cutBlock = { block_num: H, id: 'cutid', transactions: [] };
+  const source = await mock((url, b) => {
+    if (url.endsWith('/get_info')) return [200, { chain_id: XPR_MAINNET_CHAIN_ID, head_block_num: 1002 }];
+    if (url.endsWith('/get_block')) { const n = Number(b.block_num_or_id); return [200, n === H ? cutBlock : BLOCKS.find((x) => x.block_num === n)]; }
+    return [404, {}];
+  });
+  const sent = [];
+  const shadowBlocks = { [H]: cutBlock, [H + 1]: { block_num: H + 1, id: 'shadow-own-1001', transactions: [] } };
+  const target = await mock((url, b) => {
+    if (url.endsWith('/get_info')) return [200, { chain_id: XPR_MAINNET_CHAIN_ID, head_block_num: H + 1 }];
+    if (url.endsWith('/get_block')) { const blk = shadowBlocks[Number(b.block_num_or_id)]; return blk ? [200, blk] : [400, {}]; }
+    if (url.endsWith('/send_transaction')) { sent.push(b); return [202, {}]; }
+    return [404, {}];
+  });
+  const S = `http://127.0.0.1:${source.address().port}`, T = `http://127.0.0.1:${target.address().port}`;
+  const down = (host) => ({ endpoint: `https://${host}`, host, error: 'get_info: HTTP 0' });
+  const refs = await references(cutBlock, { answers: { 'ref-a.example': down('ref-a.example'), 'ref-b.example': down('ref-b.example') } });
+  try {
+    const r = await run(['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand',
+      '--rate', '0', '--inclusion-timeout', '1', '--mainnet-endpoint', 'https://custom-a.example,https://custom-b.example'], refs.opts);
+    assert.equal(r.code, 2, r.err);
+    assert.match(r.err, /could not be authenticated/);
+    assert.equal(sent.length, 0);
+    // two pinned agreeing but an added endpoint disagreeing: refused too
+    const after = BLOCKS.find((x) => x.block_num === H + 1).id;
+    const dis = await references(cutBlock, { pinned: 2, answers: { 'custom.example': { endpoint: 'https://custom.example', host: 'custom.example',
+      chain_id: XPR_MAINNET_CHAIN_ID, block_at_cut_id: 'cutid', block_after_cut_id: `${after}-other` } } });
+    const r2 = await run(['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand',
+      '--rate', '0', '--inclusion-timeout', '1', '--mainnet-endpoint', 'https://custom.example'], dis.opts);
+    assert.equal(r2.code, 2, r2.err); assert.match(r2.err, /disagree|could not be authenticated/); assert.equal(sent.length, 0);
+  } finally { source.close(); target.close(); }
+});
+
+test('CLI: the child process keeps its exit codes (usage error, dry run)', async () => {
+  const bad = await runCli(['--cut-height', 'x']);
+  assert.equal(bad.code, 2); assert.match(bad.err, /usage/);
+  const cutBlock = { block_num: H, id: 'cutid', transactions: [] };
+  const source = await mock((url, b) => {
+    if (url.endsWith('/get_info')) return [200, { chain_id: XPR_MAINNET_CHAIN_ID, head_block_num: 1002 }];
+    if (url.endsWith('/get_block')) { const n = Number(b.block_num_or_id); return [200, n === H ? cutBlock : BLOCKS.find((x) => x.block_num === n)]; }
+    return [404, {}];
+  });
+  try {
+    const dry = await runCli(['--source', `http://127.0.0.1:${source.address().port}`, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2']);
+    assert.equal(dry.code, 0, dry.err); assert.match(dry.out, /dry-run/);
+  } finally { source.close(); }
 });
