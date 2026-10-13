@@ -53,9 +53,11 @@ pub trait ChainOps {
     fn schedule_snapshot_request(&self, height: u64) -> Result<Option<u64>, String> {
         self.schedule_snapshot(height).map(|_| None)
     }
-    /// Remove the pending snapshot request `id`, and only it. Ok(true) when it was pending and removed, Ok(false)
-    /// when no request with that id is pending (or this ChainOps cannot unschedule).
-    fn unschedule_snapshot_request(&self, _id: u64) -> Result<bool, String> {
+    /// Remove the pending snapshot request `id`, and only it, and only while it is still the single-block request at
+    /// `height` it was recorded as (r30 round 3: a producer-local id proves nothing on its own). Ok(true) when it was
+    /// pending at that height and removed, Ok(false) when no such request is pending (or this ChainOps cannot
+    /// unschedule).
+    fn unschedule_snapshot_request(&self, _id: u64, _height: u64) -> Result<bool, String> {
         Ok(false)
     }
     /// getInfo against the target pulsevm chain; Ok(None) while unreachable
@@ -263,6 +265,23 @@ pub fn process_start(pid: u32) -> Option<String> {
 /// a group was killed, Err when it could not be killed. The record is removed afterwards.
 #[cfg(unix)]
 pub fn kill_recorded_hook_group(pgid_file: &Path, grace: Duration) -> Result<Option<String>, String> {
+    kill_recorded_group(pgid_file, grace, false)
+}
+
+/// [`kill_recorded_hook_group`] for a readiness drill's `--cancel` (r30 round 3): the record is removed only when the
+/// group is verified gone. On a refusal (the leader is not the recorded process) or a group that survived SIGKILL
+/// the record stays, so the drill keeps showing as RUNNING and a ceremony's ARM keeps refusing.
+#[cfg(unix)]
+pub fn kill_recorded_hook_group_keep_evidence(pgid_file: &Path, grace: Duration) -> Result<Option<String>, String> {
+    kill_recorded_group(pgid_file, grace, true)
+}
+#[cfg(not(unix))]
+pub fn kill_recorded_hook_group_keep_evidence(_pgid_file: &Path, _grace: Duration) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn kill_recorded_group(pgid_file: &Path, grace: Duration, keep_on_failure: bool) -> Result<Option<String>, String> {
     let text = match std::fs::read_to_string(pgid_file) {
         Ok(t) => t,
         Err(_) => return Ok(None),
@@ -314,6 +333,12 @@ pub fn kill_recorded_hook_group(pgid_file: &Path, grace: Duration) -> Result<Opt
                 }
             };
             if !ours {
+                if keep_on_failure {
+                    return Err(format!(
+                        "recorded process group {pgid} now has the leader `{leader}`, not the recorded process: not \
+                         killed. The record is kept (live work may remain); check it by hand"
+                    ));
+                }
                 let _ = std::fs::remove_file(pgid_file);
                 return Err(format!(
                     "recorded hook process group {pgid} now belongs to `{leader}` (a different process: pid \
@@ -333,8 +358,11 @@ pub fn kill_recorded_hook_group(pgid_file: &Path, grace: Duration) -> Result<Opt
         how = "SIGKILL";
         std::thread::sleep(Duration::from_millis(200));
     }
-    let _ = std::fs::remove_file(pgid_file);
-    if group_members(pgid).is_empty() {
+    let gone = group_members(pgid).is_empty();
+    if gone || !keep_on_failure {
+        let _ = std::fs::remove_file(pgid_file);
+    }
+    if gone {
         Ok(Some(format!("killed orphaned hook process group {pgid} ({how}): `{cmd}`")))
     } else {
         Err(format!("orphaned hook process group {pgid} (`{cmd}`) survived SIGKILL"))
@@ -702,11 +730,16 @@ impl ChainOps for HttpOps {
         Ok(r["snapshot_request_id"].as_u64())
     }
 
-    fn unschedule_snapshot_request(&self, id: u64) -> Result<bool, String> {
+    fn unschedule_snapshot_request(&self, id: u64, height: u64) -> Result<bool, String> {
         let reqs = self.post(&format!("{}/v1/producer/get_snapshot_requests", self.producer_api), Some(json!({})), None)?;
-        let pending = reqs["snapshot_requests"]
-            .as_array()
-            .is_some_and(|a| a.iter().any(|r| r["snapshot_request_id"].as_u64() == Some(id)));
+        let pending = reqs["snapshot_requests"].as_array().is_some_and(|a| {
+            a.iter().any(|r| {
+                r["snapshot_request_id"].as_u64() == Some(id)
+                    && r["start_block_num"].as_u64() == Some(height)
+                    && r["end_block_num"].as_u64() == Some(height)
+                    && r["block_spacing"].as_u64().unwrap_or(0) == 0
+            })
+        });
         if !pending {
             return Ok(false);
         }

@@ -33,6 +33,7 @@ node tools/shadow-replay.mjs --source http://127.0.0.1:8888 --cut-height <H> --c
 | `--rate TPS` | send rate (default 5; 0 = as fast as answers come) |
 | `--inclusion-timeout S` | how long to read the shadow chain's blocks for the forwarded ids (default 120) |
 | `--deny-host a,b` | extra hostnames to refuse as targets |
+| `--allow-inconclusive` | exit 0 instead of 3 when nothing mismatched but some outcomes are unknown or not sent |
 | `--out f.json` | the full report |
 
 Exit codes: 0 = dry run done, or every forwarded transaction matched; 1 = mismatches; 2 = refused or error.
@@ -75,6 +76,13 @@ How outcomes are matched, by mainnet's receipt status:
 | `expired` | included only to retire it | included as `expired`, or rejected as `expired` |
 
 Only `hard_fail` and `expired` mean "neither executed nor queued", so only they can match a rejection.
+
+Only Leap's five receipt statuses are outcomes. Any other value on either side (a number outside the enum, an empty
+or unfamiliar string) is `unknown`: it is never a match, even when both sides report the same unsupported value.
+
+**Exit codes (send mode):** 0 when every replayed transaction matched; 1 when any mismatched; 3 when nothing
+mismatched but some outcomes are `unknown` or `not_sent` (inconclusive: not a pass), unless `--allow-inconclusive`;
+2 when the tool refused or failed. `verdict` in the report is `match`, `mismatch` or `inconclusive`.
 
 ## What it cannot show
 

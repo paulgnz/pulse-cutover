@@ -143,15 +143,17 @@ impl ChainOps for LiveChain {
         self.foreign.borrow_mut().retain(|(_, fh)| *fh != h);
         Ok(had)
     }
-    fn unschedule_snapshot_request(&self, id: u64) -> Result<bool, String> {
+    /// As the producer API's get_snapshot_requests + unschedule_snapshot: only a pending request with this id AT this
+    /// height is removed.
+    fn unschedule_snapshot_request(&self, id: u64, height: u64) -> Result<bool, String> {
         self.call("unschedule_snapshot");
-        if *self.request_id.borrow() == Some(id) {
+        if *self.request_id.borrow() == Some(id) && *self.scheduled.borrow() == Some(height) {
             *self.request_id.borrow_mut() = None;
             *self.scheduled.borrow_mut() = None;
             return Ok(true);
         }
         let before = self.foreign.borrow().len();
-        self.foreign.borrow_mut().retain(|(fid, _)| *fid != id);
+        self.foreign.borrow_mut().retain(|(fid, fh)| !(*fid == id && *fh == height));
         Ok(self.foreign.borrow().len() != before)
     }
     fn target_info(&self) -> Result<Option<ChainInfo>, String> {
@@ -505,7 +507,8 @@ fn a_stale_running_record_does_not_block_and_cancel_closes_it() {
     // A ceremony holds its own request at the same height: a drill cancel must never remove it.
     chain.foreign.borrow_mut().push((99, 777));
     std::fs::write(drill::latest_path(&cfg), serde_json::json!({"kind": "readiness_drill", "drill": true, "h": 777,
-        "state": "RUNNING", "pid": std::process::id(), "pid_start": "not this process", "snapshot_request_id": id}).to_string()).unwrap();
+        "state": "RUNNING", "pid": std::process::id(), "pid_start": "not this process", "snapshot_request_id": id,
+        "snapshot_request_h": 777, "snapshot_request_endpoint": drill::normalized_endpoint("http://mock")}).to_string()).unwrap();
     assert_eq!(drill::activity(&cfg), drill::DrillActivity::Stale { h: 777 });
     assert!(drill::ceremony_blocker(&cfg).is_none(), "a stale record is reported, never blocking");
 
@@ -543,16 +546,18 @@ fn the_guard_only_unschedules_the_request_this_drill_scheduled_by_id_never_by_he
     let chain = LiveChain::new(dir.path(), MAINNET, 1);
     chain.foreign.borrow_mut().push((99, 600)); // a ceremony's request at the same height
     let g = DrillGuard::new(&chain);
-    assert!(g.unschedule_snapshot_request(99).is_err(), "a request the drill never scheduled (a ceremony's)");
+    assert!(g.unschedule_snapshot_request(99, 600).is_err(), "a request the drill never scheduled (a ceremony's)");
     assert_eq!(g.violations.borrow().len(), 1);
     assert!(!chain.called("unschedule_snapshot"));
     let id = g.schedule_snapshot_request(600).unwrap().unwrap();
     // By height is refused outright, even for the drill's own height.
     assert!(g.unschedule_snapshot(600).is_err());
     assert!(!chain.called("unschedule_by_height"));
-    assert!(g.unschedule_snapshot_request(id).unwrap());
+    // Its own id at another height is refused too (round 3: an id is bound to its height).
+    assert!(g.unschedule_snapshot_request(id, 601).is_err());
+    assert!(g.unschedule_snapshot_request(id, 600).unwrap());
     assert_eq!(*chain.foreign.borrow(), vec![(99, 600)]);
-    assert!(g.unschedule_snapshot_request(99).is_err());
+    assert!(g.unschedule_snapshot_request(99, 600).is_err());
 }
 
 #[test]
@@ -730,7 +735,8 @@ fn r2_cancel_takes_the_locks_refuses_next_to_a_ceremony_and_never_unschedules_by
     let id = chain.schedule_snapshot_request(777).unwrap().unwrap();
     chain.foreign.borrow_mut().push((99, 777));
     let stale = serde_json::json!({"kind": "readiness_drill", "drill": true, "h": 777, "state": "RUNNING",
-        "pid": std::process::id(), "pid_start": "not this process", "snapshot_request_id": id});
+        "pid": std::process::id(), "pid_start": "not this process", "snapshot_request_id": id,
+        "snapshot_request_h": 777, "snapshot_request_endpoint": drill::normalized_endpoint("http://mock")});
     std::fs::write(drill::latest_path(&cfg), stale.to_string()).unwrap();
 
     // 1. A ceremony in progress on this journal (its agent not running): refused, nothing changed.
@@ -819,7 +825,8 @@ fn r2_a_failed_kill_of_the_pipeline_group_is_an_incomplete_cancel_never_success(
     let mut child = std::process::Command::new("sh").arg("-c").arg("sleep 30").process_group(0).spawn().unwrap();
     std::fs::write(drill::pgid_file(&cfg, 9), format!("{}\nstart=not the leader\nexport\n", child.id())).unwrap();
     std::fs::write(drill::latest_path(&cfg), serde_json::json!({"kind": "readiness_drill", "h": 9, "state": "RUNNING",
-        "pid": 999_999, "pid_start": "gone", "snapshot_request_id": 3}).to_string()).unwrap();
+        "pid": 999_999, "pid_start": "gone", "snapshot_request_id": 3, "snapshot_request_h": 9,
+        "snapshot_request_endpoint": drill::normalized_endpoint("http://mock")}).to_string()).unwrap();
     let chain = LiveChain::new(dir.path(), MAINNET, 1);
     let res = drill::cancel(&cfg, &chain, std::time::Duration::from_millis(50));
     let _ = child.kill();
@@ -830,4 +837,166 @@ fn r2_a_failed_kill_of_the_pipeline_group_is_an_incomplete_cancel_never_success(
     assert!(!chain.called("unschedule_snapshot"));
     let log = std::fs::read_to_string(drill::drill_dir(&cfg, 9).join("drill.jsonl")).unwrap();
     assert!(log.contains("cancel_incomplete") && !log.contains("\"stage\":\"cancelled\""), "{log}");
+}
+
+// ------------------------------------------------------------------------------- r30 round 3 review ----
+
+fn set_export_cmd(t: &str, cmd: &str, tail: &str) -> String {
+    let start = t.find("export_cmd = ").unwrap();
+    let end = start + t[start..].find('\n').unwrap();
+    format!("{}export_cmd = {}{}{}", &t[..start], toml_str(cmd), &t[end..], tail)
+}
+
+#[test]
+fn r3_a_drill_never_writes_through_a_symlink_or_hard_link_beneath_its_root() {
+    for kind in ["symlink", "hardlink"] {
+        for name in ["latest.json.tmp", "latest.json"] {
+            let dir = tempfile::tempdir().unwrap();
+            stage_tools(dir.path(), true);
+            let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+            // The staged snapshot (a protected file) lives outside the drill root, so the root's overlap check passes.
+            std::fs::write(&cfg.snapshot.staged_path, "STAGED").unwrap();
+            std::fs::create_dir_all(drill::drill_root(&cfg)).unwrap();
+            let link = drill::drill_root(&cfg).join(name);
+            if kind == "symlink" {
+                std::os::unix::fs::symlink(&cfg.snapshot.staged_path, &link).unwrap();
+            } else {
+                std::fs::hard_link(&cfg.snapshot.staged_path, &link).unwrap();
+            }
+            let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+            let err = drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).unwrap_err();
+            assert!(err.contains(name) && (err.contains("symlink") || err.contains("hard link")), "{kind} {name}: {err}");
+            assert!(!chain.called("schedule_snapshot"), "{kind} {name}");
+            assert_eq!(std::fs::read_to_string(&cfg.snapshot.staged_path).unwrap(), "STAGED", "{kind} {name}: untouched");
+        }
+    }
+}
+
+#[test]
+fn r3_cancel_checks_paths_locks_and_binding_before_writing_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let d = dir.path().display().to_string();
+    let stale = |cfg: &Config, endpoint: &str| {
+        std::fs::create_dir_all(drill::drill_dir(cfg, 777)).unwrap();
+        std::fs::write(drill::latest_path(cfg), serde_json::json!({"kind": "readiness_drill", "drill": true, "h": 777,
+            "state": "RUNNING", "pid": std::process::id(), "pid_start": "not this process", "snapshot_request_id": 8,
+            "snapshot_request_h": 777, "snapshot_request_endpoint": endpoint}).to_string()).unwrap();
+    };
+    // 1. An overlapping config (staged_path = the drill's own log): refused, nothing written.
+    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| t.replace(&format!("staged_path = \"{d}/staged.bin\""),
+        &format!("staged_path = \"{d}/drill/777/drill.jsonl\""))).unwrap();
+    stale(&cfg, &drill::normalized_endpoint("http://mock"));
+    let chain = LiveChain::new(dir.path(), MAINNET, 700);
+    let err = drill::cancel(&cfg, &chain, std::time::Duration::from_millis(20)).unwrap_err();
+    assert!(err.contains("cancel refused, nothing changed") && err.contains("overlaps"), "{err}");
+    assert!(!drill::drill_dir(&cfg, 777).join("drill.jsonl").exists(), "no log written");
+    assert!(!drill::cancel_path(&cfg, 777).exists(), "no cancel file written");
+    assert_eq!(latest(&cfg)["state"], "RUNNING");
+
+    // 2. The drill's log is a symlink to a protected file: refused, the target untouched.
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    stale(&cfg, &drill::normalized_endpoint("http://mock"));
+    std::fs::write(&cfg.snapshot.staged_path, "STAGED").unwrap();
+    std::os::unix::fs::symlink(&cfg.snapshot.staged_path, drill::drill_dir(&cfg, 777).join("drill.jsonl")).unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 700);
+    let err = drill::cancel(&cfg, &chain, std::time::Duration::from_millis(20)).unwrap_err();
+    assert!(err.contains("symlink"), "{err}");
+    assert_eq!(std::fs::read_to_string(&cfg.snapshot.staged_path).unwrap(), "STAGED");
+    assert!(!chain.called("unschedule_snapshot"));
+
+    // 3. The request was made on another producer API (the config now points elsewhere): refused, nothing written,
+    //    nothing unscheduled.
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    stale(&cfg, "http://other-node:8888");
+    let chain = LiveChain::stalled(dir.path(), MAINNET, 700, 760, 0);
+    chain.foreign.borrow_mut().push((8, 777)); // on THIS node, id 8 is a ceremony's request
+    let err = drill::cancel(&cfg, &chain, std::time::Duration::from_millis(20)).unwrap_err();
+    assert!(err.contains("other-node") && err.contains("nothing changed"), "{err}");
+    assert!(!chain.called("unschedule_snapshot"));
+    assert_eq!(*chain.foreign.borrow(), vec![(8, 777)]);
+    assert!(!drill::drill_dir(&cfg, 777).join("drill.jsonl").exists(), "no log written");
+    assert_eq!(latest(&cfg)["state"], "RUNNING");
+}
+
+#[test]
+fn r3_a_recorded_request_is_only_removed_at_its_recorded_height() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    std::fs::create_dir_all(drill::drill_dir(&cfg, 777)).unwrap();
+    let chain = LiveChain::stalled(dir.path(), MAINNET, 700, 760, 0);
+    // The id the drill recorded now names a request at ANOTHER height on this node: never removed.
+    let id = chain.schedule_snapshot_request(778).unwrap().unwrap();
+    std::fs::write(drill::latest_path(&cfg), serde_json::json!({"kind": "readiness_drill", "drill": true, "h": 777,
+        "state": "RUNNING", "pid": std::process::id(), "pid_start": "x", "snapshot_request_id": id,
+        "snapshot_request_h": 777, "snapshot_request_endpoint": drill::normalized_endpoint("http://mock")}).to_string()).unwrap();
+    drill::cancel(&cfg, &chain, std::time::Duration::from_millis(20)).unwrap();
+    assert_eq!(*chain.scheduled.borrow(), Some(778), "the request at another height survives");
+}
+
+#[test]
+fn r3_a_failed_cancel_keeps_the_group_record_so_the_drill_keeps_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    std::fs::create_dir_all(drill::drill_dir(&cfg, 9)).unwrap();
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new("sh").arg("-c").arg("sleep 30").process_group(0).spawn().unwrap();
+    std::fs::write(drill::pgid_file(&cfg, 9), format!("{}\nstart=not the leader\nexport\n", child.id())).unwrap();
+    std::fs::write(drill::latest_path(&cfg), serde_json::json!({"kind": "readiness_drill", "h": 9, "state": "RUNNING",
+        "pid": 999_999, "pid_start": "gone", "snapshot_request_id": 3, "snapshot_request_h": 9,
+        "snapshot_request_endpoint": drill::normalized_endpoint("http://mock")}).to_string()).unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 1);
+    let first = drill::cancel(&cfg, &chain, std::time::Duration::from_millis(50));
+    let record_kept = drill::pgid_file(&cfg, 9).exists();
+    let activity = drill::activity(&cfg);
+    let blocker = drill::ceremony_blocker(&cfg);
+    let second = drill::cancel(&cfg, &chain, std::time::Duration::from_millis(50));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(first.unwrap_err().contains("INCOMPLETE"));
+    assert!(record_kept, "the group record is kept while the group may still run");
+    assert!(matches!(activity, drill::DrillActivity::Running { h: 9, .. }), "{activity:?}");
+    assert!(blocker.is_some(), "a fresh ceremony's ARM is still refused");
+    assert!(second.unwrap_err().contains("INCOMPLETE"), "a second cancel does not report success");
+    assert_eq!(latest(&cfg)["state"], "RUNNING");
+}
+
+#[test]
+fn r3_hook_references_are_found_after_quotes_dots_cd_and_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let d = dir.path().display().to_string();
+    std::fs::create_dir_all(dir.path().join("hooks")).unwrap();
+    script(&dir.path().join("hooks/on-freeze.sh"), "#!/bin/sh\necho freeze\n");
+    std::os::unix::fs::symlink(dir.path().join("hooks/on-freeze.sh"), dir.path().join("innocent.sh")).unwrap();
+    let hooks = format!("\n[hooks]\non_freeze = \"{d}/hooks/on-freeze.sh r1\"\n");
+    let export = format!("sh {d}/export.sh {{snapshot}} {{export_dir}}");
+    let cases = [
+        (format!("sh {d}/hooks/on-'freeze'.sh && {export}"), "hooks.on_freeze"),
+        (format!("sh {d}/hooks/./on-freeze.sh && {export}"), "hooks.on_freeze"),
+        (format!("sh {d}/hooks/../hooks/on-freeze.sh && {export}"), "hooks.on_freeze"),
+        (format!("cd {d}/hooks && ./on-freeze.sh && {export}"), "hooks.on_freeze"),
+        (format!("cd {d}/hooks && sh on-freeze.sh && {export}"), "hooks.on_freeze"),
+        (format!("sh {d}/innocent.sh && {export}"), "hooks.on_freeze"),
+        (format!("sh ~/hooks/on-freeze.sh && {export}"), "home directory"),
+        (format!("cd hooks && sh on-freeze.sh && {export}"), "absolute path"),
+    ];
+    for (cmd, want) in cases {
+        let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| set_export_cmd(&t, &cmd, &hooks)).unwrap();
+        let p = drill::config_problems(&cfg).join("; ");
+        assert!(p.contains(want), "{cmd}: {p}");
+    }
+    // A wrapper script that cds and calls the hook relatively is caught too.
+    script(&dir.path().join("wrap.sh"), &format!("#!/bin/sh\n# a comment with ~ in it\ncd {d}/hooks\n./on-freeze.sh r1\n"));
+    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| set_export_cmd(&t, &format!("sh {d}/wrap.sh && {export}"), &hooks)).unwrap();
+    let p = drill::config_problems(&cfg).join("; ");
+    assert!(p.contains("(script ") && p.contains("hooks.on_freeze"), "{p}");
+    // The published command shape with unrelated hooks stays accepted.
+    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| set_export_cmd(&t, &export, &hooks)).unwrap();
+    assert!(drill::config_problems(&cfg).is_empty(), "{:?}", drill::config_problems(&cfg));
 }

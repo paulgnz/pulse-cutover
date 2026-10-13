@@ -31,13 +31,17 @@ export const PUBLIC_MAINNET_HOSTS = [
   'xpr-mainnet-api.bloxprod.io',
 ];
 const STATUS_BY_NUM = ['executed', 'soft_fail', 'hard_fail', 'delayed', 'expired'];
+// The only receipt statuses Leap has. Anything else (a number outside the enum, an empty or new string) is UNKNOWN:
+// two equal unsupported values say nothing about the outcome (r30 round-3 review: `status_9` vs `status_9` matched).
+export const KNOWN_STATUSES = new Set(STATUS_BY_NUM);
 
 // ---------------------------------------------------------------- pure helpers (tested) --
 
 /** Normalise a receipt status (Leap JSON string or numeric enum) to a name. */
 export function statusName(s) {
-  if (typeof s === 'number') return STATUS_BY_NUM[s] || `status_${s}`;
-  return String(s ?? 'unknown');
+  if (typeof s === 'number') return Number.isInteger(s) && STATUS_BY_NUM[s] ? STATUS_BY_NUM[s] : 'unknown';
+  const v = String(s ?? '').trim().toLowerCase();
+  return KNOWN_STATUSES.has(v) ? v : 'unknown';
 }
 
 /** Transaction id = sha256 of the (decompressed) packed transaction. */
@@ -173,7 +177,8 @@ export function compareOutcome(tx, shadow) {
   if (!shadow) return { result: 'not_sent', category: 'not_sent' };
   const status = String(tx.status);
   // An outcome nobody knows is neither a match nor a mismatch: it is reported as unknown and never counted as a match.
-  if (status === 'unknown') return { result: 'unknown', category: 'mainnet_status_unknown' };
+  // Only Leap's own statuses are outcomes; anything else is unknown, on either side.
+  if (!KNOWN_STATUSES.has(status)) return { result: 'unknown', category: 'mainnet_status_unknown' };
   if (shadow.rejected) {
     const category = classifyError(shadow.error);
     if (REJECTION_MATCHES[status]?.has(category)) return { result: 'match', category };
@@ -181,7 +186,7 @@ export function compareOutcome(tx, shadow) {
     return { result: 'mismatch', category: `mainnet_${status}_vs_rejected_${category}` };
   }
   if (!shadow.included) return { result: 'mismatch', category: 'missing' };
-  if (shadow.included_status == null || String(shadow.included_status) === 'unknown') {
+  if (shadow.included_status == null || !KNOWN_STATUSES.has(String(shadow.included_status))) {
     return { result: 'unknown', category: 'shadow_status_unknown' };
   }
   const same = shadow.included_status === status;
@@ -245,10 +250,10 @@ async function main() {
   const SOURCE = arg('source'), BLOCKS_FILE = arg('blocks-file'), TARGET = arg('target'), TARGET_API = arg('target-api', 'v1');
   const H = Number(arg('cut-height')), CUT_ID = arg('cut-id'), N = Number(arg('blocks', '100'));
   const RATE = Number(arg('rate', '5')), INCL_TIMEOUT = Number(arg('inclusion-timeout', '120')), OUT = arg('out');
-  const SEND = flag('send'), I_UNDERSTAND = flag('shadow-i-understand');
+  const SEND = flag('send'), I_UNDERSTAND = flag('shadow-i-understand'), ALLOW_INCONCLUSIVE = flag('allow-inconclusive');
   if ((!SOURCE && !BLOCKS_FILE) || !Number.isInteger(H) || H <= 0 || (SEND && !TARGET) || !['v1', 'native'].includes(TARGET_API)) {
     console.error('usage: shadow-replay.mjs (--source URL | --blocks-file f.json) --cut-height H [--blocks N] [--out f.json]\n' +
-      '       [--target URL --target-api v1|native --cut-id ID --send --shadow-i-understand --rate TPS --inclusion-timeout S --deny-host h1,h2]');
+      '       [--target URL --target-api v1|native --cut-id ID --send --shadow-i-understand --rate TPS --inclusion-timeout S --deny-host h1,h2 --allow-inconclusive]');
     process.exit(2);
   }
   const report = { tool: 'shadow-replay', version: VERSION, generated_at: new Date().toISOString(), mode: SEND ? 'send' : 'dry-run', cut: { height: H, id: CUT_ID || null } };
@@ -338,7 +343,12 @@ async function main() {
     r.compare = compareOutcome(r, shadow);
   }
   const mism = rows.filter((r) => r.compare?.result === 'mismatch').length;
-  finish(report, rows, OUT, mism ? 1 : 0);
+  // A send whose outcomes are not all known is not a pass (round 3): exit 3 unless --allow-inconclusive. A mismatch
+  // always wins (exit 1).
+  const inconclusive = rows.filter((r) => ['unknown', 'not_sent'].includes(r.compare?.result)).length;
+  report.verdict = mism ? 'mismatch' : inconclusive ? 'inconclusive' : 'match';
+  report.inconclusive = inconclusive;
+  finish(report, rows, OUT, mism ? 1 : inconclusive && !ALLOW_INCONCLUSIVE ? 3 : 0);
 }
 
 function finish(report, rows, out, code = 0) {
@@ -348,7 +358,8 @@ function finish(report, rows, out, code = 0) {
   report.transactions = rows;
   const text = JSON.stringify(report, null, 1);
   if (out) writeFileSync(out, text);
-  console.log(JSON.stringify({ mode: report.mode, range: report.range, summary: report.summary, safety: report.safety?.ok ?? null }, null, 1));
+  console.log(JSON.stringify({ mode: report.mode, range: report.range, summary: report.summary, verdict: report.verdict ?? null,
+    safety: report.safety?.ok ?? null }, null, 1));
   process.exitCode = code;
 }
 

@@ -92,6 +92,11 @@ pub struct Machine<'a, O: ChainOps> {
     /// The `shadow` value of this journal's ARMED record (None: not armed yet); every later run, join and rollback
     /// must present the same shadow identity (docs/DESIGN-shadow.md).
     armed_shadow: Option<serde_json::Value>,
+    /// r30 round 3: the drill root's lock (`<journal dir>/drill/drill.lock`), held for the whole run of a ceremony.
+    /// Configs that share a journal directory share `drill/latest.json` but lock different journal files, so the
+    /// journal lock alone cannot keep a drill (with another journal name) from starting next to this ceremony. Lock
+    /// order everywhere: journal lock, then drill-root lock (drill, `drill --cancel` and the ceremony).
+    drill_root_lock: Option<std::fs::File>,
     /// The full shadow identity proof passed in THIS run, right before chain creation / ignition: the only thing that
     /// lets a shadow go past the XPR mainnet ignite refusal (never the config flag alone).
     shadow_verified: bool,
@@ -323,6 +328,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             fleet_unhealthy_since: None,
             degraded_note: String::new(),
             armed_shadow: recovered.armed_shadow,
+            drill_root_lock: None,
             shadow_verified: false,
             shadow_refused: recovered.shadow_refused,
             shadow_proven: false,
@@ -620,6 +626,22 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 if self.cfg.ceremony.mode == Mode::Api { "lib" } else { "head" },
                 reference
             ));
+        }
+        // r30 round 3: hold the drill root's lock for the whole run, so a drill under another journal name in this
+        // directory cannot start next to the ceremony (and one that is starting, before it published RUNNING, makes
+        // a fresh ARM refuse here). A resumed ceremony mid-cut is never refused for it: it warns and continues.
+        if self.drill_root_lock.is_none() {
+            match Journal::lock(&crate::drill::root_lock_base(&self.cfg)) {
+                Ok(f) => self.drill_root_lock = Some(f),
+                Err(e) if !resumed => problems.push(format!(
+                    "a readiness drill holds this directory's drill lock (it is starting or running): {e}. Wait for \
+                     it, or stop it with `pulse-cutover drill --cancel`"
+                )),
+                Err(e) => {
+                    self.journal.evidence(self.state, json!({"readiness_drill_lock_busy": {"error": e,
+                        "note": "resumed ceremony: not refused for a drill lock; stop the drill with `pulse-cutover drill --cancel`"}}))?;
+                }
+            }
         }
         // A readiness drill running on this box would compete for CPU, RAM and disk in the cut window
         // (docs/DESIGN.md §7): a fresh ceremony refuses to ARM next to one; a stale record is only reported.

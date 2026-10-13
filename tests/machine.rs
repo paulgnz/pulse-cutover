@@ -6514,6 +6514,29 @@ fn r30_a_fresh_ceremony_refuses_to_arm_while_a_readiness_drill_is_running() {
     assert!(text.contains("readiness_drill_stale"));
 }
 
+#[test]
+fn r30r3_a_fresh_ceremony_refuses_while_a_drill_under_another_journal_name_holds_the_drill_root() {
+    // Round 3: configs sharing a journal directory lock different journal files. A drill under ANOTHER journal name
+    // that has taken the drill root's lock but not yet published RUNNING (latest.json absent) used to be invisible to
+    // the ceremony: now a fresh ARM needs that lock too, and refuses before anything freezes.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    assert!(!pulse_cutover::drill::latest_path(&cfg).exists());
+    let held = pulse_cutover::journal::Journal::lock(&pulse_cutover::drill::root_lock_base(&cfg)).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("drill lock"), "{err}");
+    let e = journal_entries(&cfg);
+    assert!(transition(&e, "FROZEN").is_none(), "nothing froze");
+    assert!(!ops.paused.get(), "the producer was never paused");
+    drop(held);
+    // Free: the ceremony takes the lock and runs.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+}
+
 /// shadow-fix #2: the journal binds the shadow identity at ARM. A real journal can never take the shadow path (run, join,
 /// rollback, unhalt), a shadow journal never the real one, and a shadow's identity never changes mid-ceremony.
 #[test]

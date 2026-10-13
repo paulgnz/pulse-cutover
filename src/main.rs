@@ -284,9 +284,11 @@ height: a ceremony may hold a request at the same height).
 
 --cancel: asks the running drill to stop (it checks while waiting for H and between and during pipeline
 steps), waits up to 60 s, then stops the pipeline tool's process group and checks it is gone (if not: a
-cancel INCOMPLETE, non-zero exit, the drill stays RUNNING). If the drill process is gone it takes the
-drill's locks, refuses next to a ceremony in progress, removes only the recorded snapshot request and marks
-the drill FAILED (cancelled).
+cancel INCOMPLETE, non-zero exit, the drill stays RUNNING and its process-group record is kept). If the
+drill process is gone it takes the drill's locks, refuses next to a ceremony in progress, removes only the
+recorded snapshot request (on the producer API it was made on, at its recorded H: run --cancel with the
+drill's own config) and marks the drill FAILED (cancelled). Every check runs before anything is written; a
+refused cancel writes nothing. A drill never writes through a symlink or a hard link.
 
 Exit codes: 0 = evidence complete and the compare matched; 5 = evidence complete, the compare did NOT
 match (the finding a drill exists to surface; the fingerprint is still reported); 1 = the drill failed.";
