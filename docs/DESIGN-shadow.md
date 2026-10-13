@@ -147,6 +147,14 @@ source first re-proves the identity (parts 9–12) in the same run, unless this 
 goes through the refusal above. (A resumed run at VERIFIED, for example, can fail an ordinary preflight check before
 the step that re-proves the identity; that failure no longer reaches a resume.)
 
+**`loop` is gated too (round 5).** The rehearsal harness runs `[loop] reset_cmd` (service commands on the source)
+before any ceremony exists, so every reset first passes `looper::loop_gate`: `ceremony.chain_id` must be pinned in the
+config, real XPR mainnet is refused unless the config is a shadow, a source that answers must report the pinned chain,
+a shadow's identity proof (parts 9–12) must pass right before **every** reset, and no ceremony or drill may hold this
+box's journal or drill lock. A refused gate runs nothing. The repo-wide scan also treats `run_shell` (every free-form
+shell command) as a mutation that needs the gate or an explicit `// ungated:` reason, and it now scans everything but
+`#[cfg(test)]` **modules**, with comments and string literals blanked and calls split across lines matched.
+
 **The chain about to be ignited must be on the proven network.** Right before ignition the agent asks the proven
 private metalgo (`platform.getBlockchainStatus` under `target.rpc_url`'s base) about the journaled blockchain id (or
 the id in `target.rpc_url`); anything but a known status refuses (upstream backend: after creation, so it halts).

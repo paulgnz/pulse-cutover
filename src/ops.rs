@@ -355,6 +355,64 @@ pub fn kill_recorded_hook_group_keep_evidence(_pgid_file: &Path, _grace: Duratio
     Ok(None)
 }
 
+/// Write `bytes` to `path` as a FRESH inode inside `base` (r30 round 5): every directory between `base` and the file
+/// must be a real directory (no symlinked ancestor can carry the write elsewhere), and whatever name already sits at
+/// `path` (a stale file, a symlink, a hard link to the journal) is UNLINKED first, which never touches the file it
+/// pointed at, then a new file is created with O_CREAT|O_EXCL|O_NOFOLLOW and fsynced. Never truncates through a link.
+pub fn write_fresh_in(base: &Path, path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let dot = Path::new(".");
+    let base = if base.as_os_str().is_empty() { dot } else { base };
+    let parent = path.parent().ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let parent = if parent.as_os_str().is_empty() { dot } else { parent };
+    let rel = if base == dot && parent.is_relative() {
+        parent.strip_prefix(dot).unwrap_or(parent)
+    } else {
+        parent.strip_prefix(base).map_err(|_| format!("{} is not inside {}: refused", path.display(), base.display()))?
+    };
+    let mut dir = base.to_path_buf();
+    for c in std::iter::once(None).chain(rel.components().map(Some)) {
+        if let Some(c) = c {
+            if !matches!(c, std::path::Component::Normal(_)) {
+                return Err(format!("{}: unexpected path component {c:?}: refused", path.display()));
+            }
+            dir.push(c);
+        }
+        let m = std::fs::symlink_metadata(&dir).map_err(|e| format!("stat {}: {e}", dir.display()))?;
+        if m.file_type().is_symlink() || !m.is_dir() {
+            return Err(format!("{} is not a real directory (a symlink or a file): refused", dir.display()));
+        }
+    }
+    let real_base = std::fs::canonicalize(base).map_err(|e| format!("resolve {}: {e}", base.display()))?;
+    let real_parent = std::fs::canonicalize(parent).map_err(|e| format!("resolve {}: {e}", parent.display()))?;
+    if !real_parent.starts_with(&real_base) {
+        return Err(format!("{} resolves outside {}: refused", parent.display(), base.display()));
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => return Err(format!("{} is a directory: refused", path.display())),
+        Ok(_) => std::fs::remove_file(path).map_err(|e| format!("replace {}: {e}", path.display()))?,
+        Err(_) => {}
+    }
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = o.open(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let n = f.metadata().map_err(|e| format!("stat {}: {e}", path.display()))?.nlink();
+        if n != 1 {
+            return Err(format!("{} has {n} names right after its creation: refused", path.display()));
+        }
+    }
+    f.write_all(bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+    f.sync_all().map_err(|e| format!("fsync {}: {e}", path.display()))
+}
+
 #[cfg(unix)]
 fn kill_recorded_group(pgid_file: &Path, grace: Duration, keep_on_failure: bool) -> Result<Option<String>, String> {
     let text = match std::fs::read_to_string(pgid_file) {

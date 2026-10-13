@@ -7013,6 +7013,86 @@ fn r30r3_far_ahead_is_judged_on_the_highest_public_head() {
 /// Round-3 review: every source-side mutation in the state machine goes through the shadow gate (`src_pause`,
 /// `src_resume`, `hook`). A raw `self.ops.pause()` / `resume()` / `run_hook(` is allowed only on a line marked `ungated`
 /// (the gate itself and the paging-only on_halt), so a new call site cannot skip the shadow identity proof.
+/// Round 5 (Codex R5-7): the code of a Rust source with every comment and string/char literal blanked (newlines kept, so
+/// line numbers stay), and every `#[cfg(test)] mod … { … }` block removed. Other `#[cfg(test)]` items stay scanned.
+fn rust_code_mask(text: &str) -> String {
+    let c: Vec<char> = text.chars().collect();
+    let mut out: Vec<char> = Vec::with_capacity(c.len());
+    let blank = |ch: char| if ch == '\n' { '\n' } else { ' ' };
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] == '/' && c.get(i + 1) == Some(&'/') {
+            while i < c.len() && c[i] != '\n' { out.push(' '); i += 1; }
+        } else if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+            let mut depth = 0;
+            while i < c.len() {
+                if c[i] == '/' && c.get(i + 1) == Some(&'*') { depth += 1; out.push(' '); out.push(' '); i += 2; continue; }
+                if c[i] == '*' && c.get(i + 1) == Some(&'/') { depth -= 1; out.push(' '); out.push(' '); i += 2; if depth == 0 { break; } continue; }
+                out.push(blank(c[i])); i += 1;
+            }
+        } else if c[i] == 'r' && (c.get(i + 1) == Some(&'"') || c.get(i + 1) == Some(&'#'))
+            && (i == 0 || !(c[i - 1].is_alphanumeric() || c[i - 1] == '_')) {
+            let mut j = i + 1;
+            let mut hashes = 0;
+            while c.get(j) == Some(&'#') { hashes += 1; j += 1; }
+            if c.get(j) != Some(&'"') { out.push(c[i]); i += 1; continue; }
+            out.push('r'); for _ in 0..hashes { out.push('#'); } out.push('"');
+            j += 1;
+            loop {
+                if j >= c.len() { break; }
+                if c[j] == '"' && (0..hashes).all(|k| c.get(j + 1 + k) == Some(&'#')) {
+                    out.push('"'); for _ in 0..hashes { out.push('#'); } j += 1 + hashes; break;
+                }
+                out.push(blank(c[j])); j += 1;
+            }
+            i = j;
+        } else if c[i] == '"' {
+            out.push('"'); i += 1;
+            while i < c.len() && c[i] != '"' {
+                if c[i] == '\\' { out.push(' '); i += 1; if i < c.len() { out.push(blank(c[i])); i += 1; } continue; }
+                out.push(blank(c[i])); i += 1;
+            }
+            if i < c.len() { out.push('"'); i += 1; }
+        } else if c[i] == '\'' && (c.get(i + 1) == Some(&'\\') || c.get(i + 2) == Some(&'\'')) {
+            out.push('\''); i += 1;
+            while i < c.len() && c[i] != '\'' { if c[i] == '\\' { out.push(' '); i += 1; } if i < c.len() { out.push(' '); i += 1; } }
+            if i < c.len() { out.push('\''); i += 1; }
+        } else { out.push(c[i]); i += 1; }
+    }
+    let masked: String = out.into_iter().collect();
+    // Remove #[cfg(test)] mod NAME { ... } blocks (braces are balanced: strings and comments are already blank).
+    let re = regex::Regex::new(r"#\[cfg\(test\)\](\s*#\[[^\]]*\])*\s*(pub(\([^)]*\))?\s+)?mod\s+\w+\s*\{").unwrap();
+    let mut b: Vec<char> = masked.chars().collect();
+    let starts: Vec<(usize, usize)> = re.find_iter(&masked).map(|m| (masked[..m.start()].chars().count(), masked[..m.end()].chars().count())).collect();
+    for (st, open_end) in starts.into_iter().rev() {
+        let mut depth = 1;
+        let mut k = open_end;
+        while k < b.len() && depth > 0 { if b[k] == '{' { depth += 1 } else if b[k] == '}' { depth -= 1 } k += 1; }
+        for x in b.iter_mut().take(k).skip(st) { if *x != '\n' { *x = ' ' } }
+    }
+    b.into_iter().collect()
+}
+
+/// Every mutating call outside test modules, as (line number, original line), unless that line carries
+/// `// ungated: <reason of at least 10 chars>`. Mutating: the ChainOps calls that change the source, the producer or the
+/// target, and `run_shell` (loop's reset_cmd and every other free-form shell command).
+fn mutation_scan(text: &str) -> Vec<(usize, String)> {
+    let code = rust_code_mask(text);
+    let lines: Vec<&str> = text.lines().collect();
+    let re = regex::Regex::new(r"(?:\.|::|\b)\s*(pause|resume|run_hook|ignite|create_snapshot|schedule_snapshot\w*|unschedule_snapshot\w*|run_shell)\s*\(").unwrap();
+    let mut out = vec![];
+    for m in re.captures_iter(&code) {
+        let name = m.get(1).unwrap();
+        let before = code[..m.get(0).unwrap().start()].trim_end();
+        if before.ends_with("fn") { continue; } // a definition, not a call
+        let n = code[..name.start()].matches('\n').count();
+        let line = lines.get(n).copied().unwrap_or("");
+        let marked = line.split("// ungated:").nth(1).is_some_and(|r| r.trim().len() >= 10);
+        if !marked { out.push((n + 1, line.to_string())); }
+    }
+    out
+}
+
 #[test]
 fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
     // Round-4 review (F3): scan EVERY src/*.rs (outside its #[cfg(test)] module) for EVERY mutating ChainOps call,
@@ -7039,25 +7119,11 @@ fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
         "let rec = match ops.unschedule_snapshot_request(id, h) {",
         "let request_id = ops.schedule_snapshot_request(h).map_err(|e| format!(\"schedule_snapshot({h}) failed: {e}\"))?;",
     ];
-    let mutating = |l: &str| ["pause", "resume", "run_hook", "ignite", "create_snapshot", "schedule_snapshot", "unschedule_snapshot"]
-        .iter().any(|m| l.contains(&format!(".{m}(")) || l.contains(&format!("::{m}("))
-            || l.contains(&format!(".{m}_")) && (m.ends_with("snapshot")));
     let scan = |name: &str, text: &str| -> Vec<String> {
-        let mut bad = vec![];
-        for (i, line) in text.lines().enumerate() {
-            if line.contains("#[cfg(test)]") {
-                break;
-            }
-            let t = line.trim();
-            if t.starts_with("//") || !mutating(t) {
-                continue;
-            }
-            let marked = t.split("// ungated:").nth(1).is_some_and(|r| r.trim().len() >= 10);
-            if !marked && !(name == "drill.rs" && drill_allowed.contains(&t)) {
-                bad.push(format!("src/{name}:{}: {t}", i + 1));
-            }
-        }
-        bad
+        mutation_scan(text).into_iter()
+            .filter(|(_, line)| !(name == "drill.rs" && drill_allowed.contains(&line.trim())))
+            .map(|(n, line)| format!("src/{name}:{n}: {}", line.trim()))
+            .collect()
     };
     let bad: Vec<String> = files.iter().flat_map(|(n, t)| scan(n, t)).collect();
     assert!(bad.is_empty(), "source mutation(s) without the shadow gate or an `// ungated: <reason>` marker:\n{}", bad.join("\n"));
@@ -7067,8 +7133,20 @@ fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
     assert_eq!(on_disk, files.len(), "add the new src/*.rs file to this scan");
     // The scanner itself flags the shapes that used to escape it.
     for sneaky in ["let o = self.ops; o.resume();", "ChainOps::pause(self.ops)?;", "self.ops.unschedule_snapshot_request(1, 2)?;",
-                   "ops.ignite()?;", "self.ops.run_hook(\"x\") // ungated: no"] {
+                   "ops.ignite()?;", "self.ops.run_hook(\"x\") // ungated: no",
+                   // round 5 (Codex R5-7): a call split across lines, and production code after a NON-module
+                   // #[cfg(test)] item (the old scan stopped at the first #[cfg(test)] it saw).
+                   "fn f() {\n    self.ops.pause\n        ()?;\n}",
+                   "#[cfg(test)]\nthread_local! { static X: u8 = 0; }\nfn f() { self.ops.resume().ok(); }",
+                   "let out = crate::ops::run_shell(&cmd)?;"] {
         assert_eq!(scan("looper.rs", sneaky).len(), 1, "the scan must flag `{sneaky}`");
+    }
+    // ...while a #[cfg(test)] MODULE, comments and string literals are not code.
+    for benign in ["#[cfg(test)]\nmod tests {\n    fn t() { ops.pause().unwrap(); }\n}",
+                   "// self.ops.pause() in a comment\n/* ops.resume() */ let s = \"ops.ignite()\";",
+                   "fn pause(&self) -> Result<(), String>;",
+                   "self.ops.resume() // ungated: a reason long enough"] {
+        assert!(scan("looper.rs", benign).is_empty(), "the scan must not flag `{benign}`");
     }
     // The gate bodies themselves are the only raw pause/resume/run_hook outside the on_halt pages.
     let m = files.iter().find(|(n, _)| *n == "machine.rs").unwrap().1;
@@ -7206,4 +7284,101 @@ fn r30r4_a_resumed_ceremony_handles_a_live_readiness_drill() {
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(text.contains("readiness_drill_not_stopped"), "{text}");
     not_for_the_drill(&cfg);
+}
+
+/// Round 5 (Codex R5-4): `loop` ran `[loop] reset_cmd` (service commands on the source) before any machine existed or
+/// any shadow identity was proven. Now every reset is gated: the chain must be pinned in the config, never real XPR
+/// mainnet (unless a shadow), a source that answers must report that chain, a shadow's identity is proven (parts 1-4)
+/// right before EVERY reset, and no ceremony or drill may hold this box's locks. A refused gate runs nothing.
+#[test]
+fn r30r5_loop_never_runs_reset_cmd_before_its_gate() {
+    let loop_cfg = |dir: &std::path::Path, base: String, marker: &std::path::Path| -> String {
+        base.replace("freeze_height = 120\n", "freeze_height = 0\nfreeze_margin = 20\nderive_h_at_arm = true\n")
+            .replace("freeze_height = 120", "freeze_height = 0\nfreeze_margin = 20\nderive_h_at_arm = true")
+            + &format!("\n[loop]\nreset_cmd = \"touch '{}'\"\nmetrics_path = \"{}/loop-metrics.jsonl\"\n",
+                       marker.display(), dir.display())
+    };
+    // 1. No pinned chain: refused, nothing ran.
+    let dir = tempfile::tempdir().unwrap();
+    let _ = test_config(dir.path(), 120);
+    let marker = dir.path().join("reset-ran");
+    let text = loop_cfg(dir.path(), std::fs::read_to_string(dir.path().join("ceremony.toml")).unwrap(), &marker);
+    let cfg = load_toml(dir.path(), "loop.toml", &text).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    let err = pulse_cutover::looper::run_loop(&cfg, &ops, 1).unwrap_err();
+    assert!(err.contains("set ceremony.chain_id"), "{err}");
+    assert!(!marker.exists(), "reset_cmd ran before its gate");
+
+    // 2. Pinned testnet chain, but the source answering is real XPR mainnet: refused, nothing ran.
+    let chain = hex::encode(CHAIN_ID);
+    let pinned = text.replacen("[ceremony]\n", &format!("[ceremony]\nchain_id = \"{chain}\"\n"), 1);
+    let cfg = load_toml(dir.path(), "loop-pinned.toml", &pinned).unwrap();
+    *ops.chain_id.borrow_mut() = MAINNET.into();
+    let err = pulse_cutover::looper::run_loop(&cfg, &ops, 1).unwrap_err();
+    assert!(err.contains("source reports chain_id"), "{err}");
+    assert!(!marker.exists(), "reset_cmd ran against a real mainnet source");
+
+    // 3. A ceremony holds this box's journal lock: refused, nothing ran.
+    *ops.chain_id.borrow_mut() = chain.clone();
+    let held = pulse_cutover::journal::Journal::lock(&cfg.journal_path).unwrap();
+    let err = pulse_cutover::looper::run_loop(&cfg, &ops, 1).unwrap_err();
+    assert!(err.contains("journal lock"), "{err}");
+    assert!(!marker.exists());
+    drop(held);
+
+    // 4. A SHADOW loop whose source signs with a real (non-shadow) key: the identity proof fails BEFORE the reset.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let _ = shadow_config(dir.path(), |t| t).unwrap();
+    let marker = dir.path().join("reset-ran");
+    let base = std::fs::read_to_string(dir.path().join("ceremony-upstream-ignite.toml")).unwrap()
+        .replacen("[ceremony]\n", "[ceremony]\nrehearsal = true\n", 1);
+    let text = loop_cfg(dir.path(), base, &marker);
+    let shadow = load_toml(dir.path(), "shadow-loop.toml", &text).unwrap();
+    assert!(shadow.is_shadow());
+    let real = shadow_ops(dir.path(), &["PUB_K1_aRealMainnetProducerKeyThatIsNotAShadowKey"], Some(4242));
+    let err = pulse_cutover::looper::run_loop(&shadow, &real, 1).unwrap_err();
+    assert!(err.contains("SHADOW identity not proven before reset_cmd"), "{err}");
+    assert!(!marker.exists(), "reset_cmd ran on an unproven shadow source");
+    assert_eq!((real.pauses.get(), real.resumes.get()), (0, 0));
+    assert!(real.hooks.borrow().is_empty());
+
+    // 5. The same shadow loop with its identity intact passes the gate (the reset runs; the run itself is not the
+    //    point here).
+    let proven = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+    assert!(pulse_cutover::looper::loop_gate(&shadow, &proven).is_ok());
+    let _ = pulse_cutover::looper::run_loop(&shadow, &proven, 1);
+    assert!(marker.exists(), "a proven shadow loop runs its reset");
+}
+
+/// Round 5 (Codex R5-5): a ceremony resumed after its freeze asks a live drill to stop by writing the drill's cancel
+/// file. That write opened the name with truncate and only O_NOFOLLOW, so a hard link planted at the cancel path
+/// truncated whatever it named: here, the ceremony's own journal. It now unlinks the name and creates a fresh inode;
+/// the journal keeps every record and the ceremony continues (a loud warning: the drill could not be stopped).
+#[test]
+fn r30r5_drill_cancel_write_never_truncates_through_a_hard_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    {
+        let (mut j, _) = open_journal(&cfg.journal_path);
+        j.transition(State::Armed, serde_json::json!({"resolved_h": 120, "freeze_height": 120})).unwrap();
+        j.transition(State::Frozen, serde_json::json!({"freeze_at": 96, "declared_h": 120})).unwrap();
+    }
+    let me = std::process::id();
+    std::fs::create_dir_all(pulse_cutover::drill::drill_dir(&cfg, 99)).unwrap();
+    std::fs::write(pulse_cutover::drill::latest_path(&cfg), serde_json::json!({"kind": "readiness_drill", "h": 99,
+        "state": "RUNNING", "pid": me, "pid_start": pulse_cutover::ops::process_start(me)}).to_string()).unwrap();
+    // The planted hard link: the drill's cancel name IS the ceremony's journal.
+    std::fs::hard_link(&cfg.journal_path, pulse_cutover::drill::cancel_path(&cfg, 99)).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    let _ = run_machine_result(&cfg, &ops);
+    let e = journal_entries(&cfg);
+    assert_eq!(e.first().map(|v| v["state"].clone()), Some(serde_json::json!("ARMED")), "the journal was truncated: {e:?}");
+    assert!(transition(&e, "FROZEN").is_some(), "the FROZEN record survived");
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::fs::metadata(&cfg.journal_path).unwrap().nlink(), 1, "the cancel file is a separate inode now");
+    let cancel = std::fs::read_to_string(pulse_cutover::drill::cancel_path(&cfg, 99)).unwrap();
+    assert!(!cancel.contains("ARMED"), "the cancel file is not the journal");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("readiness_drill_not_stopped"), "{text}");
 }

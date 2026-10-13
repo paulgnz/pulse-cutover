@@ -143,7 +143,12 @@ pub fn run_loop<O: ChainOps>(cfg: &Config, ops: &O, runs: u32) -> Result<(), Str
 
     for run in 1..=runs {
         eprintln!("=== loop run {run}/{runs}: reset ===");
-        let reset = crate::ops::run_shell(&loop_cfg.reset_cmd);
+        // Round 5 (Codex R5-4): reset_cmd runs service commands on the source BEFORE any ceremony exists, so it is gated
+        // like every other source mutation: the chain must be known, never real XPR mainnet, a shadow's identity must be
+        // proven (parts 1-4) right before EVERY reset, and no ceremony or drill may be active on this box.
+        let locks = loop_gate(cfg, ops)?;
+        let reset = crate::ops::run_shell(&loop_cfg.reset_cmd); // ungated: loop_gate above, right before every reset
+        drop(locks); // the run's own Machine takes the per-run journal lock and the drill-root lock itself
         if let Err(e) = &reset {
             eprintln!("reset failed: {e} — recording and continuing");
             let m = RunMetrics {
@@ -200,6 +205,49 @@ pub fn run_loop<O: ChainOps>(cfg: &Config, ops: &O, runs: u32) -> Result<(), Str
     }
     print_summary(&all);
     Ok(())
+}
+
+/// Every precondition for running `[loop] reset_cmd` (r30 round 5). Returns the locks to hold while it runs.
+///
+/// - `ceremony.chain_id` must be configured: the reset may stop or start the source, so the chain cannot be learned
+///   from a node that may be down; an unknown chain is refused.
+/// - XPR mainnet is refused unless the config is a shadow (`loop` is a rehearsal harness); a shadow must pass the full
+///   identity proof (parts 1-4, `shadow::identity_problems`) right now, before this reset.
+/// - A source that answers must report the configured chain (a real mainnet node under a testnet config is refused).
+/// - No ceremony (the base journal's lock) and no readiness drill (the drill-root lock, and the drill's activity record)
+///   may be active on this box.
+pub fn loop_gate<O: ChainOps>(cfg: &Config, ops: &O) -> Result<(std::fs::File, std::fs::File), String> {
+    let chain = cfg.ceremony.chain_id.as_deref().map(str::trim).filter(|c| !c.is_empty()).ok_or(
+        "loop refused: set ceremony.chain_id (the reset may stop or start the source, so the chain must be pinned in the \
+         config, not learned from a node that may be down)")?;
+    let mainnet = crate::config::is_xpr_mainnet(chain);
+    if mainnet && !cfg.is_shadow() {
+        return Err("loop refused: ceremony.chain_id is XPR MAINNET and this is not a shadow config (`loop` is a \
+                    rehearsal harness and never runs against mainnet)".into());
+    }
+    if let Ok(info) = ops.source_info() {
+        if !info.chain_id.trim().eq_ignore_ascii_case(chain) {
+            return Err(format!("loop refused: the source reports chain_id {} but the config pins {chain}", info.chain_id));
+        }
+        if crate::config::is_xpr_mainnet(&info.chain_id) && !cfg.is_shadow() {
+            return Err("loop refused: the source is XPR MAINNET".into());
+        }
+    }
+    if cfg.is_shadow() {
+        let problems = crate::shadow::identity_problems(cfg, ops);
+        if !problems.is_empty() {
+            return Err(format!("loop refused: SHADOW identity not proven before reset_cmd (nothing was run): {}",
+                               problems.join("; ")));
+        }
+    }
+    let journal_lock = Journal::lock(&cfg.journal_path)
+        .map_err(|e| format!("loop refused: a ceremony holds this box's journal lock ({e})"))?;
+    let drill_lock = Journal::lock(&crate::drill::root_lock_base(cfg))
+        .map_err(|e| format!("loop refused: a readiness drill or ceremony holds the drill lock ({e})"))?;
+    if let Some(why) = crate::drill::ceremony_blocker(cfg) {
+        return Err(format!("loop refused: {why}"));
+    }
+    Ok((journal_lock, drill_lock))
 }
 
 fn write_metrics(file: &mut std::fs::File, m: &RunMetrics) -> Result<(), String> {
