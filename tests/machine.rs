@@ -5849,15 +5849,20 @@ fn rc29_a_strand_pauses_a_producer_that_is_still_producing() {
 }
 
 #[test]
-fn rc29_a_config_without_the_event_hash_is_refused_at_load() {
+fn rc29_a_config_without_the_event_hash_cannot_run_but_can_roll_back() {
     // A config derived by rc.28 has no event_hash: it cannot tell this event from another payload signed under the
-    // same id (a different H or chain). Refused when loaded, before anything freezes.
+    // same id. `run` refuses before anything freezes; the config still loads, so `rollback`/`status` keep working.
     let d = tempfile::tempdir().unwrap();
     let _ = coord_config(d.path(), 120, 0, 60);
     let text = std::fs::read_to_string(d.path().join("ceremony-coord.toml")).unwrap()
         .replace(&format!("event_hash = \"{}\"\n", mock_event_hash()), "");
-    let err = load_toml(d.path(), "nohash.toml", &text).unwrap_err();
+    let cfg = load_toml(d.path(), "nohash.toml", &text).unwrap();
+    let ops = MockOps::new(d.path(), 110);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
     assert!(err.contains("has no event_hash") && err.contains("await"), "{err}");
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "freeze-writes"), "nothing frozen");
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert!(Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).is_ok(), "rollback still works");
 }
 
 #[test]

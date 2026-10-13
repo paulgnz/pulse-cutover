@@ -169,7 +169,7 @@ What your agent does with the same view (rc.23, coordinated events only):
   source was never resumed (if the guard fails it refuses, exit 3, nothing changed). A producer's `on_abort` (writes
   reopen) runs only once its source produces again. Also since rc.29 the agent treats the relay's answer as
   "no abort" before chain creation and ignition only when it carries this event's signed payload (the `event_hash`
-  `await` writes; a derived config without it is refused at load); an empty answer is unknown and the step is
+  `await` writes; `run` refuses a derived config without it, while `rollback`, `status` and `join` still load it); an empty answer is unknown and the step is
   refused. Before creating or igniting, the producer must still be paused at its journaled pause head. A STRANDED
   journal whose pause could not be confirmed says UNSEALED: pause the producer by hand (`run`/`rollback` retry it).
 - **After ignition.** A local symptom (a block gap in the sustained-LIVE window, a slow first block, a failing

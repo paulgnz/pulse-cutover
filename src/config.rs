@@ -888,12 +888,6 @@ impl Config {
         if config.ceremony.quiescence_timeout_secs == 0 {
             return Err("ceremony.quiescence_timeout_secs must be > 0 (0 would abort every ceremony at the pause)".into());
         }
-        // rc.29: before chain creation and ignition the agent needs the accepted event's payload hash; `await` writes
-        // it next to event_id. A config without it (e.g. derived by rc.28) would freeze and verify, then abort.
-        if let Some(co) = config.coordination.as_ref().filter(|co| co.event_id.is_some() && co.event_hash.is_none()) {
-            return Err(format!("[coordination] event_id = {:?} has no event_hash: re-derive this config with \
-                `pulse-cutover await` (rc.29+), which records the accepted event's payload hash", co.event_id.as_deref().unwrap_or("")));
-        }
         // rc.29: mission control calls a beacon silent after 3 × its interval, capped at 600 s.
         if let Some(b) = config.beacon.as_ref().filter(|b| b.interval_secs == 0 || b.interval_secs > 200) {
             return Err(format!("beacon.interval_secs = {} must be 1..=200 (mission control treats a beacon as silent \
