@@ -92,6 +92,16 @@ struct MockOps {
     burnoff_tx_per_block: Cell<u64>,
     burnoff_read_fails: Cell<bool>,
     hooks: RefCell<Vec<String>>,
+    // --- r30 round 10: model-checker instrumentation (join model; inert unless `model_on`) ---
+    /// Ground-truth checks at the action point (I2 reopen into paused, I3 external resume, I4 resume past the point
+    /// of no return) and a crash injected at the N-th instrumented operation.
+    model_on: Cell<bool>,
+    model_journal: RefCell<Option<PathBuf>>,
+    model_calls: Cell<u64>,
+    model_crash_at: Cell<u64>,
+    /// The current pause is someone else's (the model's external actor), not this agent's.
+    model_external_pause: Cell<bool>,
+    model_violations: RefCell<Vec<String>>,
     now: Cell<u64>,
     // --- api-mode world ---
     /// Blocks the source head advances per source_info poll (a live chain
@@ -233,6 +243,27 @@ fn fixture_block(h: u64) -> serde_json::Value {
 }
 
 impl MockOps {
+    /// r30 round 10 model: count an instrumented operation; panic (a simulated kill) at the scripted one.
+    fn model_op(&self, name: &str) {
+        if !self.model_on.get() {
+            return;
+        }
+        let n = self.model_calls.get() + 1;
+        self.model_calls.set(n);
+        if self.model_crash_at.get() == n {
+            self.model_crash_at.set(0);
+            panic!("MODEL-CRASH-INJECTED at op {n} ({name})");
+        }
+    }
+
+    fn model_journal_text(&self) -> String {
+        self.model_journal.borrow().as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default()
+    }
+
+    fn model_violate(&self, inv: &str, why: String) {
+        self.model_violations.borrow_mut().push(format!("{inv}: {why}"));
+    }
+
     fn new(dir: &std::path::Path, start_head: u64) -> Self {
         MockOps {
             dir: dir.to_path_buf(),
@@ -252,6 +283,12 @@ impl MockOps {
             burnoff_tx_per_block: Cell::new(0),
             burnoff_read_fails: Cell::new(false),
             hooks: RefCell::new(Vec::new()),
+            model_on: Cell::new(false),
+            model_journal: RefCell::new(None),
+            model_calls: Cell::new(0),
+            model_crash_at: Cell::new(0),
+            model_external_pause: Cell::new(false),
+            model_violations: RefCell::new(Vec::new()),
             now: Cell::new(1_000_000),
             drift: Cell::new(1),
             external_pause_at: Cell::new(0),
@@ -397,6 +434,7 @@ impl ChainOps for MockOps {
         }
     }
     fn source_info(&self) -> Result<ChainInfo, String> {
+        self.model_op("source_info");
         self.source_calls.set(self.source_calls.get() + 1);
         if self.stopped.get() {
             return Err("connection refused (nodeos stopped)".into());
@@ -466,6 +504,7 @@ impl ChainOps for MockOps {
     }
 
     fn producer_paused(&self) -> Result<bool, String> {
+        self.model_op("producer_paused");
         if self.paused_read_fails.get() {
             return Err("http://mock/v1/producer/paused: connection refused".into());
         }
@@ -481,14 +520,29 @@ impl ChainOps for MockOps {
     }
 
     fn pause(&self) -> Result<(), String> {
+        self.model_op("pause");
         self.pauses.set(self.pauses.get() + 1);
         if !self.pause_ignored.get() {
+            if !self.paused.get() {
+                self.model_external_pause.set(false);
+            }
             self.paused.set(true);
         }
         Ok(())
     }
 
     fn resume(&self) -> Result<(), String> {
+        self.model_op("resume");
+        if self.model_on.get() {
+            let j = self.model_journal_text();
+            if self.paused.get() && self.model_external_pause.get() && !j.contains("external_pause_release") {
+                self.model_violate("I3", "the agent resumed an EXTERNAL pause with no journaled release".into());
+            }
+            if j.contains(r#""side_effect":"create_chain""#) || j.contains(r#""side_effect":"ignite_started""#)
+                || j.contains(r#""side_effect":"join""#) {
+                self.model_violate("I4", "the agent resumed the source after this journal's point of no return".into());
+            }
+        }
         self.events.borrow_mut().push("resume".into());
         if self.resume_fails.get() {
             return Err("http://mock/v1/producer/resume: connection refused".into());
@@ -638,6 +692,11 @@ impl ChainOps for MockOps {
     }
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
+        self.model_op(&format!("hook {cmd}"));
+        if self.model_on.get() && cmd == "reopen-writes" && self.paused.get() {
+            self.model_violate("I2", format!("writes reopened while the producer is paused (external: {})",
+                self.model_external_pause.get()));
+        }
         self.hooks.borrow_mut().push(cmd.to_string());
         self.events.borrow_mut().push(format!("hook:{cmd}"));
         if self.panic_on_hook.borrow().as_deref() == Some(cmd) {
@@ -699,6 +758,7 @@ impl ChainOps for MockOps {
     }
 
     fn run_long_cancellable(&self, cmd: &str, cancel: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
+        self.model_op("run_long");
         if !cmd.contains("fake-") {
             return if cancel() { Ok(None) } else { self.run_long(cmd).map(Some) };
         }
@@ -713,6 +773,7 @@ impl ChainOps for MockOps {
     }
 
     fn get_json(&self, url: &str) -> Result<Option<serde_json::Value>, String> {
+        self.model_op("get_json");
         if url.contains("/api/coord/") {
             if self.dir.join("abort-now").exists() {
                 if let Some(doc) = self.coord_doc_when_abort_file.borrow().clone() {
@@ -2402,6 +2463,10 @@ fn rc29_a_resumed_frozen_run_keeps_the_producer_paused_once_h_is_final() {
         // pause would be someone else's and is adopted instead (r30r7_* tests).
         serde_json::json!({"seq": 3, "ts_ms": 4, "ts": "t", "kind": "evidence", "state": "FROZEN",
             "data": {"side_effect": "source_pause"}}),
+        // r30 round 10: ...and its confirmed pause (the ack): without it the pause's ownership is unknown and it is
+        // adopted (never resumed) instead.
+        serde_json::json!({"seq": 4, "ts_ms": 5, "ts": "t", "kind": "evidence", "state": "FROZEN",
+            "data": {"source_pause_ack": 1}}),
     ];
     std::fs::write(&cfg.journal_path, entries.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
     // The crashed agent had paused the producer after H became final.
@@ -8150,6 +8215,8 @@ fn r30r9_a_crashed_join_is_rolled_back_by_its_own_segment() {
         j.evidence(st, serde_json::json!({"join_refreeze": "ran: freeze-writes"})).unwrap();
         j.evidence(st, serde_json::json!({"join": {"event_id": "e1", "source_paused": false}})).unwrap();
         j.evidence(st, serde_json::json!({"side_effect": "source_pause", "episode": 2})).unwrap();
+        // r30 round 10: the pause took effect and was confirmed (its ack), so it is the join's own.
+        j.evidence(st, serde_json::json!({"source_pause_ack": 2})).unwrap();
     }
     ops.paused.set(true); // the join's pause RPC took effect before the crash
     *ops.status_doc.borrow_mut() = Some(all_aborted());
@@ -8159,6 +8226,30 @@ fn r30r9_a_crashed_join_is_rolled_back_by_its_own_segment() {
     assert!(!out.already && out.failed.is_empty(), "{out:?}");
     assert_eq!(ops.resumes.get(), resumes + 1, "the join's own pause is resumed");
     assert_eq!(ops.hooks.borrow().last().map(String::as_str), Some("reopen-writes"), "and writes reopen");
+
+    // (c) r30 round 10: killed after the join's pause INTENT but before its ack, with the producer paused: ownership is
+    // unknown (it may be someone else's), so nothing resumes it and writes stay frozen (sealed), never reopened into a
+    // paused producer.
+    let d = tempfile::tempdir().unwrap();
+    let (cfg, ops) = aborted(d.path());
+    {
+        let (mut j, rec) = open_journal(&cfg.journal_path);
+        let st = rec.state.unwrap();
+        j.evidence(st, serde_json::json!({"segment_start": 1, "by": "join"})).unwrap();
+        j.evidence(st, serde_json::json!({"side_effect": "write_freeze"})).unwrap();
+        j.evidence(st, serde_json::json!({"join_refreeze": "ran: freeze-writes"})).unwrap();
+        j.evidence(st, serde_json::json!({"join": {"event_id": "e1", "source_paused": false}})).unwrap();
+        j.evidence(st, serde_json::json!({"side_effect": "source_pause", "episode": 2})).unwrap();
+    }
+    ops.paused.set(true);
+    *ops.status_doc.borrow_mut() = Some(all_aborted());
+    let resumes = ops.resumes.get();
+    let hooks_before = ops.hooks.borrow().len();
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let _ = Machine::new(&cfg, &ops, j, rec).operator_rollback(false);
+    assert_eq!(ops.resumes.get(), resumes, "an unacknowledged pause is never resumed");
+    assert!(!ops.hooks.borrow()[hooks_before..].iter().any(|h| h == "reopen-writes"), "writes stay frozen");
+    assert!(ops.paused.get());
 }
 
 /// r30 round 9 (Codex R9-2): this ceremony resumed its own pause, then on_abort failed, then someone else paused the
@@ -8301,4 +8392,152 @@ fn r30r9_a_transient_read_during_adoption_is_retried() {
     ops.fail_reads_after_freeze.set(3);
     assert_eq!(run_machine(&cfg, &ops), State::Live);
     assert!(journal_entries(&cfg).iter().any(|v| v["data"]["producer_state_read_failed"].is_string()));
+}
+
+// ------------------------------------------------------------ r30 round 10: join model --
+//
+// The randomized model checker (tests/model.rs) covers the fork backend's run / rollback / unhalt paths. `join` and the
+// upstream backend's chain-creation point of no return need the upstream fixtures that live here, so their model runs
+// here on an instrumented MockOps: a seeded scenario starts from an ABORTED or STRANDED coordinated ceremony, lets an
+// external actor pause or resume the producer, injects a kill at a random instrumented operation inside `join`, and
+// follows up with joins, plain and forced rollbacks and re-runs. Invariants are checked at the action point (I2, I3, I4
+// inside MockOps) and after every step (I5 journal replays). `JOIN_MODEL_SCENARIOS` (default 60), `JOIN_MODEL_SEED`.
+
+struct JoinRng(u64);
+impl JoinRng {
+    fn new(seed: u64) -> Self {
+        JoinRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        if n == 0 { 0 } else { self.next() % n }
+    }
+    fn chance(&mut self, pct: u64) -> bool {
+        self.below(100) < pct
+    }
+}
+
+fn join_model_quiet_panics() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload().downcast_ref::<String>().cloned()
+                .or_else(|| info.payload().downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+            if payload.starts_with("MODEL-CRASH-INJECTED") {
+                return;
+            }
+            prev(info)
+        }));
+    });
+}
+
+/// One seeded join scenario. Returns (violations, trace).
+fn join_scenario(seed: u64) -> (Vec<String>, Vec<String>) {
+    let mut rng = JoinRng::new(seed);
+    let mut trace = vec![format!("seed {seed}")];
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_upstream_fleet(d.path());
+    let ops = upstream_ops(d.path());
+    let stranded = rng.chance(50);
+    let start = if stranded {
+        ops.coord_down.set(true);
+        run_machine(&cfg, &ops)
+    } else {
+        *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})),
+            ("bp3", serde_json::json!({"state": "ABORTED"})), ("bp4", serde_json::json!({"state": "FROZEN"})),
+            ("bp5", serde_json::json!({"state": "FROZEN"}))]));
+        run_machine(&cfg, &ops)
+    };
+    trace.push(format!("start: {start:?}"));
+    ops.coord_down.set(false);
+    let ours = pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"].clone();
+    let live = rc23_live_peers(&ours, &["bp2", "bp3", "bp4", "bp5"]);
+    let all_aborted = rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
+        ("bp4", serde_json::json!({"state": "ABORTED"})), ("bp5", serde_json::json!({"state": "ABORTED"}))]);
+    // From here the model watches.
+    *ops.model_journal.borrow_mut() = Some(cfg.journal_path.clone());
+    ops.model_on.set(true);
+    let external = |ops: &MockOps, pause: bool, trace: &mut Vec<String>| {
+        if pause && !ops.paused.get() {
+            ops.paused.set(true);
+            ops.model_external_pause.set(true);
+            trace.push("external pause".into());
+        } else if !pause && ops.paused.get() && ops.model_external_pause.get() {
+            ops.paused.set(false);
+            ops.model_external_pause.set(false);
+            trace.push("external resume".into());
+        }
+    };
+    let steps = 2 + rng.below(4);
+    for i in 0..steps {
+        match rng.below(4) {
+            0 => external(&ops, true, &mut trace),
+            1 => external(&ops, false, &mut trace),
+            _ => {}
+        }
+        *ops.status_doc.borrow_mut() = Some(if rng.chance(70) { live.clone() } else { all_aborted.clone() });
+        if rng.chance(60) {
+            ops.model_crash_at.set(ops.model_calls.get() + 1 + rng.below(60));
+        }
+        let pick = if i == 0 { 0 } else { rng.below(10) };
+        let label = match pick { 0..=4 => "join", 5..=6 => "rollback", 7 => "rollback --force-stranded", _ => "run" };
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<String, String> {
+            let (j, rec) = Journal::open(&cfg.journal_path)?;
+            let mut m = Machine::new(&cfg, &ops, j, rec);
+            match label {
+                "join" => m.join("e1").map(|s| s.as_str().to_string()),
+                "rollback" => m.operator_rollback_opts(false, false).map(|o| format!("{} failed={:?}", o.state.as_str(), o.failed)),
+                "rollback --force-stranded" => m.operator_rollback_opts(false, true).map(|o| format!("{} failed={:?}", o.state.as_str(), o.failed)),
+                _ => m.run().map(|s| s.as_str().to_string()),
+            }
+        }));
+        ops.model_crash_at.set(0);
+        let shown = match &r {
+            Ok(x) => format!("{x:?}"),
+            Err(p) => {
+                let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+                if !msg.starts_with("MODEL-CRASH-INJECTED") {
+                    ops.model_violate("PANIC", format!("unexpected panic in {label}: {msg}"));
+                }
+                msg
+            }
+        };
+        trace.push(format!("{label}: {shown} (paused={} external={})", ops.paused.get(), ops.model_external_pause.get()));
+        if let Err(e) = Journal::replay(&cfg.journal_path) {
+            ops.model_violate("I5", format!("journal does not replay after {label}: {e}"));
+        }
+    }
+    let state = Journal::replay(&cfg.journal_path).ok().and_then(|r| r.state).map(|s| s.as_str().to_string());
+    trace.push(format!("final: {state:?}"));
+    let v = ops.model_violations.borrow().clone();
+    (v, trace)
+}
+
+#[test]
+fn r30r10_join_model_finds_no_invariant_violation() {
+    join_model_quiet_panics();
+    let (start, count) = match std::env::var("JOIN_MODEL_SEED").ok().and_then(|s| s.parse::<u64>().ok()) {
+        Some(s) => (s, 1),
+        None => (1, std::env::var("JOIN_MODEL_SCENARIOS").ok().and_then(|s| s.parse().ok()).unwrap_or(60)),
+    };
+    let mut bad = Vec::new();
+    let mut finals: std::collections::BTreeMap<String, u64> = Default::default();
+    for seed in start..start + count {
+        let (v, t) = join_scenario(seed);
+        *finals.entry(t.last().cloned().unwrap_or_default()).or_default() += 1;
+        if !v.is_empty() {
+            bad.push((seed, v, t));
+        }
+    }
+    eprintln!("JOIN MODEL over {count} scenarios: {finals:?}");
+    let report: String = bad.iter().take(10).map(|(s, v, t)| format!("\n=== seed {s}: {}\n    {}", v.join(" | "), t.join("\n    "))).collect();
+    assert!(bad.is_empty(), "{} of {count} join scenarios violated an invariant:{report}", bad.len());
 }

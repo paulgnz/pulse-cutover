@@ -750,7 +750,6 @@ fn directed_r9_2(dir: &Path, force_last: bool) -> Vec<String> {
 
 /// FAILS on r30/integrate 5518752 (I3): un-ignore once round 9's pause-episode fix lands.
 #[test]
-#[ignore = "I3 violation on 5518752 (Codex R9-2): un-ignore with the pause-episode fix"]
 fn directed_i3_codex_r9_2_external_pause_after_a_completed_resume() {
     let dir = tempfile::tempdir().unwrap();
     let v = directed_r9_2(dir.path(), false);
@@ -766,13 +765,11 @@ fn assert_seed_clean(seed: u64) {
 /// Class A (= Codex R9-2), found by the checker: own pause resumed, on_abort fails, someone else pauses, a later
 /// rollback (plain or --force-stranded) resumes that external pause as if it were ours (no release journaled).
 #[test]
-#[ignore = "I3 violation on 5518752 (class A, pause episodes): un-ignore with the round-9 fix"]
 fn model_i3_class_a_seed_1300() {
     assert_seed_clean(1300);
 }
 
 #[test]
-#[ignore = "I3 violation on 5518752 (class A, pause episodes): un-ignore with the round-9 fix"]
 fn model_i3_class_a_seed_5955() {
     assert_seed_clean(5955);
 }
@@ -780,13 +777,11 @@ fn model_i3_class_a_seed_5955() {
 /// Class B (new): the agent crashes after journaling its pause intent and before the pause RPC; someone else then
 /// pauses the producer; the recovered run trusts the intent and resumes that external pause.
 #[test]
-#[ignore = "I3 violation on 5518752 (class B, pause intent without ack): un-ignore once ownership needs an ack"]
 fn model_i3_class_b_seed_3470() {
     assert_seed_clean(3470);
 }
 
 #[test]
-#[ignore = "I3 violation on 5518752 (class B, pause intent without ack): un-ignore once ownership needs an ack"]
 fn model_i3_class_b_seed_4771() {
     assert_seed_clean(4771);
 }

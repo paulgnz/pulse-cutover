@@ -146,6 +146,16 @@ stateDiagram-v2
   that decide ownership at the start of FROZEN and confirm our pause; a definite "paused" still seals at once. An
   operator rollback that ends STRANDED is reported as INCOMPLETE (exit 4), never as "rolled back" (R9-4); its forced
   release is journaled only after its `rollback_requested` intent (R9-6).
+  **Round 10: a pause is ours only once acknowledged.** The randomized model checker (`tests/model.rs`) found that an
+  intent alone is not enough: killed after the `source_pause` intent and before the pause RPC, then someone else
+  pausing, a recovered run trusted the intent and resumed their pause. Journals armed from round 10 on (`pause_ack` on
+  the arming record) write a `source_pause_ack` once the RPC succeeded **and** a read (retried on errors) confirmed the
+  producer paused; an own episode counts as ours only with its ack. An intent without one is **ownership unknown**: R1
+  never resumes it; with the producer producing there is nothing to undo, and the ceremony simply pauses again in a new
+  episode; with the producer paused it is adopted as evidence (`pause_ownership_unknown: true`) and R2 keeps writes
+  frozen and seals. The cost is conservative: a kill between a successful pause RPC and its ack leaves that pause to
+  the operator (`rollback --force-stranded --i-understand`) instead of an automatic resume. Older journals keep their
+  intent-only rule.
 - **ABORTED** is reachable only before `create_chain` (upstream) or `ignite_started` is journaled. It resumes the source
   producer (producer mode, if `target.auto_rollback`), restarts the source and reverts flips
   (API mode, if they ran), runs `on_abort`, and moves the staged snapshot aside. The rollback

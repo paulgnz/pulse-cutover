@@ -26,6 +26,17 @@ in the README, end to end:
 
 Budget about 40 minutes for a first run.
 
+## Model checking the ceremony (for contributors)
+
+Besides the scenario tests, `tests/model.rs` drives the real state machine through seeded random scenarios (crashes at
+any operation, someone else pausing or resuming the producer, aborts, re-runs, plain and forced rollbacks, `unhalt`)
+and checks invariants at the moment of every action: no pause the agent made is left behind after a rollback, writes
+never reopen into a paused producer, someone else's pause is never resumed without a journaled release, nothing
+resumes the old chain past the point of no return, and the journal always replays. `r30r10_join_model_*` in
+`tests/machine.rs` does the same for `join` on the upstream backend. CI runs a few hundred scenarios; a long run:
+`MODEL_SCENARIOS=20000 cargo test --test model -- --nocapture`, `JOIN_MODEL_SCENARIOS=300 cargo test --test machine
+r30r10_join_model -- --nocapture`; replay one with `MODEL_SEED=<seed>` / `JOIN_MODEL_SEED=<seed>`.
+
 ## It never touches production
 
 - `doctor`, `status`, `scan-contracts` and `report` are strictly read-only.

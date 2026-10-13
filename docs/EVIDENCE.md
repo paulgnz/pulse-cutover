@@ -432,6 +432,29 @@ tested in CI and review, not on the fleet.
 
 ---
 
+## Model checking the ceremony state machine (2026-10-14)
+
+A seeded, randomized model checker (`tests/model.rs`; the `join` model is `r30r10_join_model_*` in `tests/machine.rs`)
+drives the real `Machine` against a world that knows who paused the producer and whether old-chain writes are open,
+with kills injected at random operations, external pauses and resumes, aborts, re-runs, plain and forced rollbacks,
+`unhalt` and `join`. Invariants are checked at every action: I1 no pause the agent made is left after a rollback; I2
+writes never reopen into a paused producer; I3 an external pause is never resumed without a journaled release; I4
+nothing resumes the old chain past the point of no return (creation, ignition, join); I5 the journal always replays;
+I6 every step terminates.
+
+On the code before round 10 it found two classes of I3 violation (an external pause resumed after an own pause was
+resumed and someone else paused again; and a kill between the pause intent and the pause RPC). Both are fixed (pause
+episodes in round 9, the pause acknowledgement in round 10) and kept as regression tests.
+
+| Run | Scenarios | Result |
+|---|---|---|
+| main model, seeds 1–20,000 | 20,000 (3,408 with a crash, 6,252 with an external pause, 513 forced releases) | 0 violations; ended LIVE 8,313, ABORTED 8,855, STRANDED 1,216, IGNITED 1,044, HALTED 533, other 39 |
+| join model, seeds 1–300 | 300 (from ABORTED and STRANDED, kills inside `join`) | 0 violations |
+
+**Proves:** the invariants hold over the generated interleavings on mocks. **Does not prove:** anything about real
+nodeos, metalgo or network behaviour; scenarios the generator does not produce (API and hyperion modes, shadow, the
+drill, mainnet `lock_dir`).
+
 ## Mainnet conversion (2026-10-13)
 
 The upstream conversion pipeline, run once per stage exactly as the agent's upstream backend invokes it

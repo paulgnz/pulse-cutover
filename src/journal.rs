@@ -137,6 +137,11 @@ pub struct Recovered {
     /// undoes only those. Some(false) = an arming record from an older agent (rollback keeps its old behaviour).
     /// None = no arming record yet (nothing was done).
     pub undo_tracking: Option<bool>,
+    /// r30 round 10 (model checker, class B): the arming record's `pause_ack` flag. Some(true) = this journal writes a
+    /// `source_pause_ack` record once its own pause RPC succeeded and a read confirmed the producer paused, and an own
+    /// pause INTENT without its ack is ownership UNKNOWN (never resumed). Otherwise (older journals) an own intent
+    /// counts as ours, the previous behaviour.
+    pub pause_ack_tracking: Option<bool>,
     /// Round-2 review: a shadow identity refusal was journaled (its first record). Sticky: from then on nothing may
     /// resume the source or run on_abort on this journal, whatever records follow (a crash between the refusal's
     /// records must not reopen a rollback that resumes a node which may be real).
@@ -165,39 +170,79 @@ pub struct Recovered {
 /// r30 round 9: one entry of the pause-episode log (`Recovered::pause_events`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PauseEvent {
-    /// A pause: `ours` = this ceremony made it (intent before the RPC); false = someone else's, adopted as evidence.
+    /// A pause: `ours` = this ceremony INTENDED it (intent before the RPC); false = someone else's, adopted as evidence.
     Pause { ours: bool },
+    /// r30 round 10: this ceremony's pause RPC succeeded and a read confirmed the producer paused (`source_pause_ack`):
+    /// the latest open own intent becomes ours. Without it (a crash between the intent and the RPC, then someone else
+    /// pausing) the episode's ownership is UNKNOWN and nothing resumes it.
+    Ack,
     /// A journaled resume (a rollback's `resume` step): closes the latest open episode.
     Resume,
     /// The operator's journaled release of an external pause (`rollback --force-stranded --i-understand`).
     Release,
 }
 
+/// r30 round 9/10: the folded pause-episode log.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Episodes {
+    /// The latest open episode is this ceremony's own, confirmed pause (intent + ack, or legacy, or released).
+    pub ours: bool,
+    /// The latest open episode is someone else's (adopted) pause.
+    pub external: bool,
+    /// The latest open episode is an own pause INTENT without its ack: ownership unknown, never resumed (round 10).
+    pub unknown: bool,
+    /// This journal ever intended a pause of its own (open or closed, acked or not).
+    pub ever_ours: bool,
+}
+
 /// r30 round 9: fold the pause-episode log. `legacy_paused`: an older agent's journal whose agent demonstrably paused
-/// (an open episode of ours before every journaled event). Returns (latest open episode is ours, latest open episode is
-/// someone else's, this journal ever paused the producer itself).
-pub fn pause_episodes(events: &[PauseEvent], legacy_paused: bool) -> (bool, bool, bool) {
-    // (ours, open)
-    let mut eps: Vec<(bool, bool)> = Vec::new();
-    if legacy_paused {
-        eps.push((true, true));
+/// (an open episode of ours before every journaled event). `acks_tracked` (round 10): own intents need their
+/// `source_pause_ack` to count as ours; false for journals armed before round 10 (an intent counts as ours, as before).
+pub fn pause_episodes(events: &[PauseEvent], legacy_paused: bool, acks_tracked: bool) -> Episodes {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Owner {
+        Ours,
+        External,
+        Unknown,
     }
+    // (owner, open)
+    let mut eps: Vec<(Owner, bool)> = Vec::new();
+    if legacy_paused {
+        eps.push((Owner::Ours, true));
+    }
+    let mut ever_ours = legacy_paused;
     for e in events {
         match e {
-            PauseEvent::Pause { ours } => eps.push((*ours, true)),
+            PauseEvent::Pause { ours: true } => {
+                ever_ours = true;
+                eps.push((if acks_tracked { Owner::Unknown } else { Owner::Ours }, true));
+            }
+            PauseEvent::Pause { ours: false } => eps.push((Owner::External, true)),
+            PauseEvent::Ack => {
+                if let Some(ep) = eps.iter_mut().rev().find(|(_, open)| *open) {
+                    if ep.0 == Owner::Unknown {
+                        ep.0 = Owner::Ours;
+                    }
+                }
+            }
             PauseEvent::Resume => {
                 if let Some(ep) = eps.iter_mut().rev().find(|(_, open)| *open) {
                     ep.1 = false;
                 }
             }
             PauseEvent::Release => match eps.iter_mut().rev().find(|(_, open)| *open) {
-                Some(ep) => ep.0 = true,
-                None => eps.push((true, true)),
+                Some(ep) => ep.0 = Owner::Ours,
+                None => eps.push((Owner::Ours, true)),
             },
         }
     }
-    let latest_open = eps.iter().rev().find(|(_, open)| *open).map(|(ours, _)| *ours);
-    (latest_open == Some(true), latest_open == Some(false), eps.iter().any(|(ours, _)| *ours))
+    let latest_open = eps.iter().rev().find(|(_, open)| *open).map(|(o, _)| *o);
+    Episodes {
+        ours: latest_open == Some(Owner::Ours),
+        external: latest_open == Some(Owner::External),
+        unknown: latest_open == Some(Owner::Unknown),
+        ever_ours,
+    }
 }
 
 impl Journal {
@@ -486,6 +531,9 @@ impl Journal {
                 if st == State::Armed && out.undo_tracking.is_none() && entry.data.get("mode").is_some() {
                     out.undo_tracking = Some(entry.data.get("undo_tracking").and_then(|v| v.as_bool()) == Some(true));
                 }
+                if st == State::Armed && out.pause_ack_tracking.is_none() && entry.data.get("mode").is_some() {
+                    out.pause_ack_tracking = Some(entry.data.get("pause_ack").and_then(|v| v.as_bool()) == Some(true));
+                }
                 if entry.state == State::Frozen.as_str() {
                     out.frozen_ts_ms = Some(entry.ts_ms);
                 }
@@ -533,6 +581,9 @@ impl Journal {
             }
             if entry.data.get("snapshot_scheduled_at").and_then(|v| v.as_u64()).is_some() {
                 out.scheduled = true;
+            }
+            if entry.data.get("source_pause_ack").is_some() {
+                out.pause_events.push(PauseEvent::Ack);
             }
             if let Some(se) = entry.data.get("side_effect").and_then(|v| v.as_str()) {
                 match se {

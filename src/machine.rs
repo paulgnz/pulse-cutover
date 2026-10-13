@@ -125,6 +125,11 @@ pub struct Machine<'a, O: ChainOps> {
     legacy_paused: bool,
     /// r30 round 9: this journal ever paused the producer itself (any own episode, open or closed).
     ever_paused_by_us: bool,
+    /// r30 round 10: own pause intents need their `source_pause_ack` to count as ours (journals armed by round 10+).
+    acks_tracked: bool,
+    /// r30 round 10 (model checker, class B): the latest open episode is an own pause intent without its ack (a crash
+    /// between the intent and the confirmed pause): ownership unknown, never resumed.
+    pause_unknown: bool,
     /// r30 round 9 (Codex R9-1/R9-3): the current journal segment, and whether this run already started a new one.
     segment: u64,
     segment_started: bool,
@@ -345,8 +350,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // r30 round 7: an operator's forced release of an adopted external pause makes that pause ours to resume.
         let adopted_released = started("external_pause_release");
         // r30 round 9 (Codex R9-2): ownership is the LATEST open pause episode, never "some pause of ours ever".
-        let (paused_by_us, pause_adopted, ever_paused_by_us) =
-            crate::journal::pause_episodes(&recovered.pause_events, legacy_paused);
+        // r30 round 10: journals armed by round 10+ record a pause ack; an own intent without it is ownership unknown.
+        // A journal with no arming record yet (None) is new: this run arms it with acks.
+        let acks_tracked = recovered.pause_ack_tracking != Some(false);
+        let eps = crate::journal::pause_episodes(&recovered.pause_events, legacy_paused, acks_tracked);
+        let (paused_by_us, pause_adopted, ever_paused_by_us, pause_unknown) =
+            (eps.ours, eps.external, eps.ever_ours, eps.unknown);
         let writes_closed_by_us = legacy_froze || recovered.writes_closed;
         let strand_intent = recovered.strand_intent;
         let create_chain_started = recovered.side_effects.iter().any(|s| s == "create_chain") || joining;
@@ -401,6 +410,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             pause_events: recovered.pause_events.clone(),
             legacy_paused,
             ever_paused_by_us,
+            acks_tracked,
+            pause_unknown,
             segment: recovered.segment,
             segment_started: false,
             observed_paused: None,
@@ -627,10 +638,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         if !self.pause_adopted {
             let episode = self.next_episode();
-            self.journal.evidence(self.state, json!({"side_effect": "source_pause", "adopted": true, "by": "external",
+            // r30 round 10: when the latest open episode is an own intent without its ack (a crash between the intent
+            // and the confirmed pause), this pause may be ours or someone else's: it is adopted all the same (never
+            // resumed by this ceremony), and the record says ownership is unknown.
+            let unknown = self.pause_unknown;
+            self.journal.evidence(self.state, json!({"side_effect": "source_pause", "adopted": true,
+                "by": if unknown { "unknown" } else { "external" },
+                "pause_ownership_unknown": unknown,
                 "episode": episode,
-                "note": "the producer was paused by someone else after this ceremony froze writes: adopted for the cut; \
-                         this ceremony never resumes it, and writes reopen only into a producing chain"}))?;
+                "note": "the producer was paused by someone else after this ceremony froze writes (or ownership is \
+                         unknown after a crash between this ceremony's pause intent and its confirmed pause): adopted \
+                         for the cut; this ceremony never resumes it, and writes reopen only into a producing chain"}))?;
             self.push_pause_event(crate::journal::PauseEvent::Pause { ours: false });
         }
         Ok(true)
@@ -651,10 +669,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// re-derive ownership from the episode log.
     fn push_pause_event(&mut self, e: crate::journal::PauseEvent) {
         self.pause_events.push(e);
-        let (ours, external, ever) = crate::journal::pause_episodes(&self.pause_events, self.legacy_paused);
-        self.paused_by_us = ours;
-        self.pause_adopted = external;
-        self.ever_paused_by_us = ever;
+        let eps = crate::journal::pause_episodes(&self.pause_events, self.legacy_paused, self.acks_tracked);
+        self.paused_by_us = eps.ours;
+        self.pause_adopted = eps.external;
+        self.ever_paused_by_us = eps.ever_ours;
+        self.pause_unknown = eps.unknown;
     }
 
     /// r30 round 9 (review R9-F1/F2): a fresh producer-paused read, retried on ERRORS only (a definite answer is returned
@@ -705,7 +724,22 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.journal.evidence(self.state, json!({"side_effect": "source_pause", "episode": episode}))?;
             self.push_pause_event(crate::journal::PauseEvent::Pause { ours: true });
         }
-        self.ops.pause() // ungated: this IS the gate
+        self.ops.pause()?; // ungated: this IS the gate
+        // r30 round 10 (model checker, class B): the intent alone does not make the pause ours: a crash between the
+        // intent and the RPC, then someone else pausing, would otherwise let a rollback resume THEIR pause. Ours only
+        // once the RPC succeeded AND a (retried) read confirms the producer paused: then the ack is journaled.
+        if self.pause_unknown && self.acks_tracked {
+            // An unreadable or "producing" answer leaves the episode unacknowledged (ownership unknown, never
+            // resumed): the callers' own confirmation read decides what happens next.
+            if self.read_paused_retrying(PAUSE_READ_RETRY_MS, "confirming this ceremony's pause before acknowledging it")
+                == Ok(true)
+            {
+                let episode = self.current_episode();
+                self.journal.evidence(self.state, json!({"source_pause_ack": episode}))?;
+                self.push_pause_event(crate::journal::PauseEvent::Ack);
+            }
+        }
+        Ok(())
     }
 
     /// r30 round 8, the reopen invariant: writes reopen (on_abort) only when this journal froze them AND a fresh read
@@ -935,6 +969,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 json!({
                     "mode": format!("{:?}", self.cfg.ceremony.mode),
                     "undo_tracking": true,
+                    "pause_ack": true,
                     "freeze_height": self.cfg.ceremony.freeze_height,
                     "resolved_h": resolved_h,
                     "simulate_freeze": self.cfg.ceremony.simulate_freeze,
