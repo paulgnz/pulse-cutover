@@ -17,6 +17,7 @@ pub mod report;
 pub mod sanitize;
 pub mod scan;
 pub mod secrets;
+pub mod shadow;
 pub mod state;
 pub mod upstream;
 pub mod verify;

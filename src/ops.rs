@@ -78,6 +78,15 @@ pub trait ChainOps {
     }
     /// Bind values for `{name}` placeholders in the target RPC URL and the ignite command (the
     /// upstream backend learns `blockchain_id` only when it creates the chain). Default: no-op.
+    /// Shadow mode (docs/DESIGN-shadow.md): the network id the target metalgo reports
+    /// (`info.getNetworkID` under `base`/ext/info). None = not answered (the shadow check fails closed).
+    fn metal_network_id(&self, _base: &str) -> Result<Option<u64>, String> {
+        Ok(None)
+    }
+    /// Shadow mode: the source's `get_producer_schedule` answer. None = not answered (fails closed).
+    fn source_producer_schedule(&self) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
     fn bind_target(&self, _vars: &[(String, String)]) {}
     fn ignite(&self) -> Result<String, String>;
     /// Hooks and operator commands: killed after the configured hook timeout.
@@ -729,6 +738,21 @@ impl ChainOps for HttpOps {
         )?;
         let rows = v.get("rows").and_then(|r| r.as_array()).ok_or_else(|| format!("get_table_rows eosio/producers: no rows in {v}"))?;
         Ok(rows.iter().find(|r| r["owner"].as_str() == Some(producer)).cloned())
+    }
+
+    fn metal_network_id(&self, base: &str) -> Result<Option<u64>, String> {
+        let v = self.post(
+            &format!("{}/ext/info", base.trim_end_matches('/')),
+            Some(json!({"jsonrpc": "2.0", "id": 1, "method": "info.getNetworkID", "params": {}})),
+            None,
+        )?;
+        let n = &v["result"]["networkID"];
+        Ok(n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok())))
+    }
+
+    fn source_producer_schedule(&self) -> Result<Option<Value>, String> {
+        let v = self.post(&format!("{}/v1/chain/get_producer_schedule", self.source_rpc), Some(json!({})), None)?;
+        Ok(v.get("active").is_some().then_some(v))
     }
 
     fn bind_target(&self, vars: &[(String, String)]) {

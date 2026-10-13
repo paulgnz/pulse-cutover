@@ -359,7 +359,15 @@ export function projectReport(r) {
     interval_secs: r.interval_secs === 0 ? null : Math.min(int(r.interval_secs, 'interval_secs', { min: 1, max: 3600 }) ?? 0, 200) || null,
     mode: str(r.mode, 'mode', { max: 16, nullable: true, re: /^[a-z]+$/ }),
     ready: bool(r.ready, 'ready', { nullable: false }),
+    // r30: SHADOW cutover label (docs/DESIGN-shadow.md); null outside a shadow.
+    shadow: r.shadow == null ? null : (isObj(r.shadow) && typeof r.shadow.label === 'string'
+      ? { label: redact(r.shadow.label, 64), metal_network_id: r.shadow.metal_network_id == null ? null
+          : int(r.shadow.metal_network_id, 'shadow.metal_network_id', { min: 0, max: 4294967295 }) }
+      : bad('shadow', 'must be null or {label, metal_network_id}')),
   };
+  // A shadow chain carries the mainnet chain_id: its evidence must never land on the mainnet board (the agent
+  // refuses such a config; the relay refuses the report too).
+  if (out.shadow && out.network === 'mainnet') bad('shadow', 'a SHADOW ceremony never reports on the mainnet network');
   if (!Array.isArray(r.checks)) bad('checks', 'must be an array');
   if (r.checks.length > 40) bad('checks', 'more than 40 entries');
   out.checks = r.checks.map((c, i) => {

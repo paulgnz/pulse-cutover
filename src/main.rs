@@ -692,6 +692,11 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     } else {
         println!("rehearsal_overrides: ACTIVE (REHEARSAL ONLY, never a real cut): {}", overrides.join("; "));
     }
+    if cfg.is_shadow() {
+        let l = pulse_cutover::shadow::label(&cfg);
+        println!("ceremony: SHADOW {} on private Metal network {} (never a real cut; the chain keeps the source chain_id, \
+                  so never sign on it with a real key)", l["label"].as_str().unwrap_or(""), cfg.target.metal_network_id.unwrap_or(0));
+    }
     if cfg.ceremony.rehearsal {
         println!("ceremony: REHEARSAL (ceremony.rehearsal = true; never a real cut); relaxations: {}",
             if cfg.production_problems().is_empty() { "none".to_string() } else { cfg.production_problems().join("; ") });
