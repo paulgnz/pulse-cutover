@@ -185,7 +185,8 @@ The full list, with owners and evidence, is the [risk register](RISK-REGISTER.md
 
 1. **Upstream PulseVM:** the compare passes on mainnet state (#109); the new chain signs with the source chain_id
    and enforces TAPOS (#108); CPU is billed in the units imported accounts expect (#106); each producer signs
-   with its own key (#107); a sealed start exists (#113). The agent's built-in mainnet refusal names these.
+   with its own key (#107); a sealed start exists (#113); a producer election can no longer halt the chain (#122).
+   The agent's built-in mainnet refusal names these.
 2. **Metal:** mainnet validators run a MetalGo that speaks PulseVM v1.0.0's plugin protocol (45; MetalGo
    1.14.x); every producer has a registered, funded validator.
 3. **Tests:** rungs 4–8 above done and clean, on the release that will be used.

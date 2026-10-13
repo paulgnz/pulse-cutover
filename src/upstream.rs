@@ -918,6 +918,9 @@ pub fn ignite_pending_reasons() -> Vec<&'static str> {
         "a fleet-wide commit point: the target must not produce or admit transactions until \
          a fleet-signed COMMIT exists (#113, sealed start; docs/DESIGN-authority-boundary.md), \
          or a partial abort can leave two writable chains",
+        "a producer election must not be able to halt the chain (#122: the migrated system contract \
+         keeps electing the schedule; one that leaves out every validator's producer means nobody \
+         can build again, and kickbp, unregprod or a vote change can trigger it)",
     ]
 }
 
@@ -1372,8 +1375,8 @@ mod tests {
         let reasons = ignite_pending_reasons().join(" ");
         assert!(reasons.contains("chain_id") && reasons.contains("TAPOS"));
         // RISK-REGISTER blockers B-1 (#106), B-2 (#107) and A-1 (#113) are refusals too.
-        assert!(reasons.contains("#106") && reasons.contains("#107") && reasons.contains("#113"));
-        assert_eq!(ignite_pending_reasons().len(), 5);
+        assert!(reasons.contains("#106") && reasons.contains("#107") && reasons.contains("#113") && reasons.contains("#122"));
+        assert_eq!(ignite_pending_reasons().len(), 6);
     }
 
     /// The stage-2 rig's real cut block (XPR testnet 408461570, 6 receipts) and the anchor the

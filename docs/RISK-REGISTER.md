@@ -21,9 +21,10 @@ found; never delete one, mark it closed with its evidence.*
 *BPs* = block producers · *coord* = the cutover coordinator and governance · *ecosystem* = exchanges,
 wallets, apps, API and history providers.
 
-**Summary (2026-10-13), 86 risks:** 6 BLOCKER · 47 OPEN · 10 PARTIAL · 10 DECISION · 12 MITIGATED · 1 CLOSED.
-The six blockers: A-1 split brain (sealed start), A-6 compare fails on mainnet state, A-9 source chain_id
-for signing, B-1 CPU units, B-2 per-producer keys, C-1 MetalGo 1.14 on Metal mainnet.
+**Summary (2026-10-13), 88 risks:** 7 BLOCKER · 47 OPEN · 10 PARTIAL · 11 DECISION · 12 MITIGATED · 1 CLOSED.
+The seven blockers: A-1 split brain (sealed start, #113), A-6 compare fails on mainnet state (#109), A-9 source chain_id
+for signing (#108), B-1 CPU units (#106), B-2 per-producer keys (#107), C-1 MetalGo 1.14 on Metal mainnet, C-7 an
+election can halt the chain (#122).
 
 ---
 
@@ -80,10 +81,12 @@ for signing, B-1 CPU units, B-2 per-producer keys, C-1 MetalGo 1.14 on Metal mai
 | C-4 | Who becomes a validator, with what weight; DPoS votes no longer pick producers | — | — | DECISION | coord | governance decision published |
 | C-5 | Creating the chain at the cut needs the subnet owner's key on the P-Chain | creation hook | ~11 s in rehearsal | DECISION | coord | key holder and procedure named and rehearsed |
 | C-6 | Liveness threshold rises: Snowman needs a large supermajority of validator weight online (roughly 75–80% with default parameters), DPoS needed 2/3+1; a few flaky producers can halt XPR | — | the 5-validator fleet stalled with 4 of 5 (r4) | OPEN | coord + Metal | validator count, weights and uptime requirements chosen with this in mind; tested in the shadow program |
-| C-7 | The migrated system contract keeps re-electing the top producers by votes every round; a node not in that schedule refuses to build, and an elected producer without a Metal validator cannot build | — | #107 | OPEN | upstream + coord | the schedule frozen at the cut or fed from the validator set; decided with C-4 |
+| C-7 | **A producer election can halt the chain permanently.** The migrated system contract keeps electing the top producers; a schedule that leaves out every validator's producer name means nobody can build, and the repairing `regproducer` can never be included. Triggers: `kickbp`, `unregprod`, `rmvproducer`, ordinary vote changes | — | reproduced twice on the 5-BP fleet (runs f1 2026-10-08, g2 2026-10-10): head frozen, mempool full, nothing built; upstream #122 | **BLOCKER** | upstream + coord | signing authorized by the validator set (or the schedule frozen at the cut) and the refusal logged; decided with C-4 |
 | C-8 | Every future node boots from the migration checkpoint (2.1 GB), manifest and genesis; if they are lost, no new validator can join | — | no state sync | OPEN | coord + upstream | the artifacts archived in several places with published hashes; a new node joining after the cut rehearsed |
 | C-9 | XPR becomes dependent on Metal's upgrade schedule: a mandatory MetalGo upgrade missed by enough producers halts XPR | — | — | OPEN | Metal + BPs | upgrade process and notice period agreed with Metal |
 | C-10 | The PulseVM v1.0.0 release binaries need glibc 2.35 (built on Ubuntu 22.04); a producer on Ubuntu 20.04 cannot run them, although pulse-cutover itself supports 20.04 | — | v1.0.0 release notes | OPEN | BPs | every roster host on Ubuntu 22.04+ (or a PulseVM build for its glibc), checked by `doctor` |
+| C-11 | Block pay (bpay) no longer reaches the elected producers: `onblock` credits whichever validator built the block, under its configured name; elected producers without a validator earn nothing new | — | f1: 133 producers' `unpaid_blocks` frozen for 40 min while the building identity gained one per block | DECISION | coord | rewards model decided (for example bpay by validator uptime) and the contract change rehearsed |
+| C-12 | No producer order: a stake-weighted validator builds each block, only when there are transactions (f1: 339 blocks in 40 min, mean 7 s, median 2.5 s); "missed rounds", explorers' producer column and BP monitoring stop meaning anything | — | f1 | OPEN | ecosystem + coord | BPs, explorers and monitoring told before the cut |
 
 ## D. The ceremony tooling
 
