@@ -1289,3 +1289,48 @@ fn r5_drills_on_the_same_producer_exclude_each_other_across_journal_directories(
         "producer_api_url = \"http://other-node:8888\"", 1)).unwrap();
     assert_ne!(drill::producer_lock_base(&cfg_a), drill::producer_lock_base(&cfg_c));
 }
+
+/// R7-3 (Codex): a drill released its locks and then cleaned up the producer's work marker by reading `latest.json`;
+/// a newer drill could have written ITS marker in between (latest.json still naming the old, finished drill), and the
+/// old drill's cleanup deleted it. Now every marker names its drill (`drill_id`, also in that drill's latest.json),
+/// only that drill removes it, under its locks; and a marker whose drill never published and is not running is
+/// UNKNOWN (it blocks a ceremony anywhere until `drill --clear-marker` verifies its work gone), never "done".
+#[test]
+fn r7_a_drill_cleans_up_only_its_own_work_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let d = dir.path().display().to_string();
+    let with_lock_dir = |t: String| t.replacen("[ceremony]\n", &format!("[ceremony]\nlock_dir = \"{d}/locks\"\n"), 1);
+    let cfg = drill_config_edit(dir.path(), MAINNET, "", with_lock_dir).unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+    drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).unwrap();
+    assert!(!drill::work_marker_path(&cfg).exists(), "drill A removed its own marker");
+    let a_id = latest(&cfg)["drill_id"].as_str().unwrap().to_string();
+    assert_eq!(a_id.len(), 32);
+
+    // Drill B (alive: this process) has written its marker; latest.json still names the finished drill A.
+    let me = std::process::id();
+    let jd = std::fs::canonicalize(dir.path()).unwrap();
+    let b_marker = |pid_start: &str| serde_json::json!({"kind": "readiness_drill_work", "journal_dir": jd, "h": 1_100,
+        "drill_id": "b".repeat(32), "export_container": "pulse-drill-1100-bbbbbbbbbbbb", "pid": me, "pid_start": pid_start});
+    let start = pulse_cutover::ops::process_start(me).unwrap();
+    std::fs::write(drill::work_marker_path(&cfg), b_marker(&start).to_string()).unwrap();
+    // A's (late) cleanup must not touch B's marker.
+    drill::clear_work_marker_if_done(&cfg, &a_id);
+    assert!(drill::work_marker_path(&cfg).exists(), "drill A's cleanup deleted drill B's marker");
+    assert!(matches!(drill::marker_work(&cfg), drill::MarkerWork::Live { h: 1_100, .. }), "{:?}", drill::marker_work(&cfg));
+
+    // B died without publishing: its export may exist. The marker is UNKNOWN, never done, and blocks a ceremony on the
+    // same producer under ANOTHER journal directory.
+    std::fs::write(drill::work_marker_path(&cfg), b_marker("a process that is gone").to_string()).unwrap();
+    assert!(matches!(drill::marker_work(&cfg), drill::MarkerWork::Unknown(_)), "{:?}", drill::marker_work(&cfg));
+    let other = tempfile::tempdir().unwrap();
+    let other_cfg_text = std::fs::read_to_string(dir.path().join("drill.toml")).unwrap()
+        .replace(&format!("journal_path = \"{d}/journal.jsonl\""), &format!("journal_path = \"{}/journal.jsonl\"", other.path().display()));
+    let p = other.path().join("c.toml");
+    std::fs::write(&p, other_cfg_text).unwrap();
+    let other_cfg = Config::load(&p).unwrap();
+    assert!(drill::foreign_marker_blocker(&other_cfg).unwrap().contains("clear-marker"));
+    // And a new drill on this producer refuses while it is unknown.
+    assert!(drill::run(&cfg, &chain, &DrillOptions { height: 1_200, keep_work: false }).unwrap_err().contains("unreadable"));
+}

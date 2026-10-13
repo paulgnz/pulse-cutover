@@ -670,10 +670,58 @@ pub enum MarkerWork {
     None,
     /// A drill (under `journal_dir`) whose work is alive or cannot be shown stopped.
     Live { journal_dir: PathBuf, h: u64, pid: Option<u32>, group: Option<u32> },
-    /// A marker that cannot be read or parsed: unknown is never "stopped".
+    /// A marker that cannot be read or parsed, or whose drill cannot be shown finished: unknown is never "stopped".
     Unknown(String),
-    /// The marker's drill is verified finished (its work is gone): a leftover marker.
-    Done { journal_dir: PathBuf },
+    /// The marker's drill is verified finished (its work is gone): a leftover marker. `drill_id`: the drill that
+    /// wrote it (r30 round 7), None for a marker from before round 7.
+    Done { journal_dir: PathBuf, drill_id: Option<String> },
+}
+
+/// The work marker's raw fields (r30 round 7): who wrote it and what work it may have left.
+#[derive(Debug, Clone, Default)]
+pub struct MarkerRecord {
+    pub journal_dir: Option<PathBuf>,
+    pub h: Option<u64>,
+    pub drill_id: Option<String>,
+    pub pid: Option<u32>,
+    pub pid_start: Option<String>,
+    pub container: Option<String>,
+}
+
+/// Read the producer's work marker. Ok(None): no marker. Err: present but unreadable.
+pub fn read_marker(cfg: &Config) -> Result<Option<MarkerRecord>, String> {
+    if !lock_dir(cfg).is_dir() {
+        return Ok(None);
+    }
+    let path = work_marker_path(cfg);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    Ok(Some(MarkerRecord {
+        journal_dir: v["journal_dir"].as_str().map(PathBuf::from),
+        h: v["h"].as_u64(),
+        drill_id: v["drill_id"].as_str().map(str::to_string),
+        pid: v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+        pid_start: v["pid_start"].as_str().map(str::to_string),
+        container: v["export_container"].as_str().map(str::to_string),
+    }))
+}
+
+/// The marker's own drill process is alive (same pid AND the same start time).
+fn marker_process_alive(m: &MarkerRecord) -> bool {
+    match (m.pid.filter(|p| *p > 1), m.pid_start.as_deref()) {
+        (Some(p), Some(want)) => crate::ops::process_start(p).as_deref() == Some(want),
+        _ => false,
+    }
+}
+
+/// The drill id `latest.json` under `journal_dir` names, if any.
+fn latest_drill_id_at(journal_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(journal_dir.join("drill").join("latest.json")).ok()?;
+    serde_json::from_str::<Value>(&text).ok()?["drill_id"].as_str().map(str::to_string)
 }
 
 pub fn marker_work(cfg: &Config) -> MarkerWork {
@@ -692,19 +740,43 @@ pub fn marker_work(cfg: &Config) -> MarkerWork {
         Ok(v) => v,
         Err(e) => return MarkerWork::Unknown(format!("parse {}: {e}", path.display())),
     };
-    let (Some(dir), Some(_)) = (v["journal_dir"].as_str(), v["h"].as_u64()) else {
+    let (Some(dir), Some(mh)) = (v["journal_dir"].as_str(), v["h"].as_u64()) else {
         return MarkerWork::Unknown(format!("{} names no journal_dir / h", path.display()));
     };
     let journal_dir = PathBuf::from(dir);
+    let marker_id = v["drill_id"].as_str().map(str::to_string);
+    // r30 round 7 (Codex R7-3): the marker is judged by ITS drill. Only when `latest.json` names the same drill id
+    // does its state speak for the marker; a marker whose drill has not published (or published under another id)
+    // is live while that drill's process or pipeline group is, and UNKNOWN otherwise (never "done": its container may
+    // exist). A marker from before round 7 (no id) keeps the old reading.
+    if let Some(id) = &marker_id {
+        if latest_drill_id_at(&journal_dir).as_deref() != Some(id.as_str()) {
+            let rec = MarkerRecord {
+                pid: v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+                pid_start: v["pid_start"].as_str().map(str::to_string),
+                ..Default::default()
+            };
+            let group = group_not_proven_gone_at(&journal_dir, mh);
+            if marker_process_alive(&rec) || group.is_some() {
+                return MarkerWork::Live { journal_dir, h: mh, pid: rec.pid.filter(|_| marker_process_alive(&rec)), group };
+            }
+            return MarkerWork::Unknown(format!(
+                "the work marker's drill {id} at H = {mh} under {} is not running and never published its result: its                  export may have started; verify and remove it with `pulse-cutover drill --clear-marker`",
+                journal_dir.display()));
+        }
+    }
     match activity_at(&journal_dir) {
         DrillActivity::Running { h, pid, group } => MarkerWork::Live { journal_dir, h, pid, group },
-        _ => MarkerWork::Done { journal_dir },
+        _ => MarkerWork::Done { journal_dir, drill_id: marker_id },
     }
 }
 
-fn write_work_marker(cfg: &Config, h: u64) -> Result<(), String> {
+fn write_work_marker(cfg: &Config, h: u64, drill_id: &str, container: &str) -> Result<(), String> {
     let me = std::process::id();
+    // r30 round 7: the marker names its drill (`drill_id`, also in that drill's latest.json) and the export container
+    // it will start, so it is cleaned up only by its own drill and can be verified gone without that drill's config.
     let body = json!({"kind": "readiness_drill_work", "journal_dir": canonical(&journal_dir_of(cfg)), "h": h,
+        "drill_id": drill_id, "export_container": container,
         "pid": me, "pid_start": crate::ops::process_start(me), "producer_resource": producer_resource_key(cfg)});
     let path = work_marker_path(cfg);
     // Replace a leftover marker of THIS producer only after checking it is done (the caller holds the producer lock).
@@ -713,21 +785,43 @@ fn write_work_marker(cfg: &Config, h: u64) -> Result<(), String> {
         MarkerWork::Live { journal_dir, h, .. } => return Err(format!(
             "a readiness drill's work at H = {h} under {} is still running on this producer: stop it first \
              (`pulse-cutover drill --cancel` with that config)", journal_dir.display())),
-        MarkerWork::Unknown(why) => return Err(format!("this producer's drill work marker is unreadable ({why}): \
-             check it by hand before another drill")),
+        MarkerWork::Unknown(why) => return Err(format!("this producer's drill work marker is unreadable or its drill \
+             cannot be shown finished ({why}): verify and remove it with `pulse-cutover drill --clear-marker` before \
+             another drill")),
     }
     crate::ops::write_fresh_in(&lock_dir(cfg), &path, body.to_string().as_bytes())
         .map_err(|e| format!("cannot write the drill work marker {}: {e}", path.display()))
 }
 
-/// Remove this config's work marker once its drill's work is verified gone (never someone else's live one).
-pub fn clear_work_marker_if_done(cfg: &Config) {
-    let mine = canonical(&journal_dir_of(cfg));
-    if let MarkerWork::Done { journal_dir } = marker_work(cfg) {
-        if canonical(&journal_dir) == mine {
-            let _ = std::fs::remove_file(work_marker_path(cfg));
-        }
+/// Remove the work marker once ITS drill's work is verified gone (r30 round 7: only the marker whose `drill_id` is
+/// `drill_id`; never a newer drill's). The caller holds the producer lock, so no other drill can write a marker
+/// between the check and the removal. Called by the drill itself (or by `--cancel` for it): when its latest.json
+/// never named this id, the drill failed before any work started and the marker is removed; otherwise only once
+/// that record is not running (its pipeline group and export container verified gone).
+pub fn clear_work_marker_if_done(cfg: &Config, drill_id: &str) {
+    let Ok(Some(m)) = read_marker(cfg) else { return };
+    if m.drill_id.as_deref() != Some(drill_id) {
+        return; // someone else's marker (or one from before round 7): never ours to remove
     }
+    let jd = journal_dir_of(cfg);
+    if m.journal_dir.as_ref().map(|d| canonical(d)) != Some(canonical(&jd)) {
+        return;
+    }
+    let published = latest_drill_id_at(&jd).as_deref() == Some(drill_id);
+    if !published || !matches!(activity_at(&jd), DrillActivity::Running { .. }) {
+        let _ = std::fs::remove_file(work_marker_path(cfg));
+    }
+}
+
+/// A fresh, random drill id (32 hex).
+fn new_drill_id() -> String {
+    let mut b = [0u8; 16];
+    if getrandom_fill(&mut b).is_err() {
+        use sha2::{Digest, Sha256};
+        let d = Sha256::digest(format!("{}:{:?}", std::process::id(), std::time::SystemTime::now()).as_bytes());
+        b.copy_from_slice(&d[..16]);
+    }
+    hex::encode(b)
 }
 
 /// A ceremony's view: Some(why it must not ARM) while another directory's drill work on this producer is live or
@@ -965,8 +1059,8 @@ pub fn run<O: ChainOps>(cfg: &Config, ops: &O, opts: &DrillOptions) -> Result<Dr
 /// [`run`] with a caller-made guard. Any violation the guard recorded during the run (or before it) fails the
 /// drill, even when the run itself returned Ok.
 pub fn run_with_guard<O: ChainOps>(cfg: &Config, guard: &DrillGuard<'_, O>, opts: &DrillOptions) -> Result<DrillOutcome, String> {
+    // r30 round 7: the work marker is cleaned up inside run_guarded, while the drill still holds the producer lock.
     let res = run_guarded(cfg, guard, opts);
-    clear_work_marker_if_done(cfg);
     let v = guard.violations.borrow().clone();
     if !v.is_empty() {
         // Defense in depth: the guard already refused each call; a drill that even tried is a bug to report.
@@ -1008,8 +1102,19 @@ fn run_guarded<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillO
         ));
     }
     let h = opts.height;
-    // Round 6: the work marker, before any work starts (the producer lock is held).
-    write_work_marker(cfg, h)?;
+    // Round 6: the work marker, before any work starts (the producer lock is held). Round 7: bound to this drill.
+    let drill_id = new_drill_id();
+    let container = format!("pulse-drill-{h}-{}", container_suffix(h, ops.now_ms()));
+    write_work_marker(cfg, h, &drill_id, &container)?;
+    let res = run_marked(cfg, ops, opts, &drill_id, &container);
+    // Still under the journal, drill-root and producer locks (they drop when this function returns).
+    clear_work_marker_if_done(cfg, &drill_id);
+    res
+}
+
+fn run_marked<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillOptions, drill_id: &str, container: &str)
+    -> Result<DrillOutcome, String> {
+    let h = opts.height;
     let info = ops.source_info()?;
     if let Some(pinned) = &cfg.ceremony.chain_id {
         if !pinned.eq_ignore_ascii_case(&info.chain_id) {
@@ -1049,6 +1154,8 @@ fn run_guarded<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillO
         view: json!({
             "kind": DRILL_KIND,
             "drill": true,
+            "drill_id": drill_id,
+            "planned_export_container": container,
             "h": h,
             "state": "RUNNING",
             "stage": "scheduled",
@@ -1209,7 +1316,9 @@ fn drive<O: ChainOps>(
     up.golden_state_root = None;
     // r30 round 4: no shell anywhere. The export is a fixed `docker run` vector from the validated explicit fields;
     // the tools run by argument vector; the guard allows exactly these four programs.
-    let container_name = format!("pulse-drill-{h}-{}", container_suffix(h, started));
+    // r30 round 7: the name the work marker already recorded (so the marker alone can verify it gone).
+    let container_name = log.view["planned_export_container"].as_str().map(str::to_string)
+        .unwrap_or_else(|| format!("pulse-drill-{h}-{}", container_suffix(h, started)));
     let export = upstream::DrillExport {
         image: up.export_image.clone().ok_or("upstream.export_image is required for a drill")?,
         tools_dir: up.export_tools_dir.clone().ok_or("upstream.export_tools_dir is required for a drill")?,
@@ -1468,11 +1577,8 @@ fn wait_until_not_running(cfg: &Config, wait: std::time::Duration) -> bool {
 ///    recorded, on the producer API it recorded, and only while that request is still the single-block request at
 ///    the recorded H (never by height alone), and mark it FAILED.
 pub fn cancel<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> Result<String, String> {
-    let r = cancel_inner(cfg, ops, wait);
-    if r.is_ok() {
-        clear_work_marker_if_done(cfg); // round 6: only once the drill's work is verified gone
-    }
-    r
+    // r30 round 7: the marker is cleared inside cancel_inner, under the locks, and only for the cancelled drill's id.
+    cancel_inner(cfg, ops, wait)
 }
 
 fn cancel_inner<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> Result<String, String> {
@@ -1590,6 +1696,9 @@ fn cancel_inner<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -
     log.publish(json!({"state": "FAILED",
         "error": "cancelled by `pulse-cutover drill --cancel` (the drill process was not running)",
         "finished_ts_ms": now}))?;
+    if let Some(id) = log.view["drill_id"].as_str() {
+        clear_work_marker_if_done(cfg, id); // the locks are held (`_locks`)
+    }
     Ok(format!("readiness drill at H = {h} marked cancelled; its process was not running ({killed_s})"))
 }
 
