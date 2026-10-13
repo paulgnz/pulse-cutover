@@ -999,6 +999,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     "by": std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "unknown".into())}))?;
             } else if self.state == State::Stranded || self.state == State::Aborted {
                 if let Err(why) = self.resume_guard()? {
+                    if self.state == State::Stranded && !self.ensure_source_paused()? {
+                        return Err(format!("refusing to roll back a STRANDED ceremony: {why}. The source producer could NOT \
+                            be confirmed paused (UNSEALED): pause it by hand now. Nothing else was changed."));
+                    }
                     return Err(format!(
                         "refusing to roll back a {} ceremony: {why}. Nothing was changed. If the fleet went LIVE, \
                          use `pulse-cutover join`; after a fleet-wide decision to resume the old chain, re-run with \
@@ -1011,10 +1015,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 let reason = "operator rollback (pulse-cutover rollback)";
                 let detail = json!({"by": "operator_rollback", "state_before": self.state.as_str()});
                 if let Err(why) = self.resume_guard()? {
-                    self.strand(reason, detail, &why)?;
-                    return Err(format!("refusing to resume the old chain: {why}. The node is now STRANDED (sealed, \
-                        writes stay frozen). If the fleet went LIVE, use `pulse-cutover join`; after a fleet-wide decision \
-                        to resume the old chain, re-run with --force-stranded --i-understand."));
+                    self.strand(reason, detail.clone(), &why)?;
+                    return Err(self.operator_strand_message(&why));
                 }
                 self.journal.evidence(self.state, json!({"rollback_requested": true, "by": "operator_rollback"}))?;
                 self.rollback_pending = true;
@@ -1022,10 +1024,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     "note": "withdrawing this node's VERIFIED report before resuming the old chain"}))?;
                 self.wait_own_report_withdrawn()?;
                 if let Err(why) = self.resume_guard()? {
-                    self.strand(reason, detail, &why)?;
-                    return Err(format!("refusing to resume the old chain: {why}. The node is now STRANDED (sealed, \
-                        writes stay frozen). If the fleet went LIVE, use `pulse-cutover join`; after a fleet-wide decision \
-                        to resume the old chain, re-run with --force-stranded --i-understand."));
+                    self.strand(reason, detail.clone(), &why)?;
+                    return Err(self.operator_strand_message(&why));
                 }
             }
         }
@@ -1405,15 +1405,26 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             Ok(false) => return Ok(Some("the source producer is not paused".into())),
             Err(e) => return Ok(Some(format!("cannot confirm the source producer is paused ({e})"))),
         }
-        if let Some(paused) = self.head_at_pause {
-            match self.ops.source_info() {
-                Ok(i) if i.head_block_num > paused => return Ok(Some(format!(
-                    "the source head moved past the pause head ({} > {paused})", i.head_block_num))),
-                Ok(_) => {}
-                Err(e) => return Ok(Some(format!("cannot read the source head ({e})"))),
-            }
+        let Some(paused) = self.head_at_pause else {
+            return Ok(Some("no journaled pause head (the cut was not audited by this journal)".into()));
+        };
+        // Strict: even an empty block from a peer after the audited quiescence window refuses (conservative; the
+        // fleet's pause should have stopped every producer).
+        match self.ops.source_info() {
+            Ok(i) if i.head_block_num > paused => Ok(Some(format!(
+                "the source head moved past the pause head ({} > {paused})", i.head_block_num))),
+            Ok(_) => Ok(None),
+            Err(e) => Ok(Some(format!("cannot read the source head ({e})"))),
         }
-        Ok(None)
+    }
+
+    /// The operator rollback's refusal after it stranded the node: sealed only if the pause is confirmed.
+    fn operator_strand_message(&self, why: &str) -> String {
+        let sealed = self.cfg.ceremony.mode != Mode::Producer || matches!(self.ops.producer_paused(), Ok(true));
+        format!("refusing to resume the old chain: {why}. The node is now STRANDED ({}). If the fleet went LIVE, use \
+            `pulse-cutover join`; after a fleet-wide decision to resume the old chain, re-run with --force-stranded --i-understand.",
+            if sealed { "sealed: producer paused, writes stay frozen" }
+            else { "UNSEALED: the source producer could NOT be confirmed paused; pause it by hand now. Writes stay frozen" })
     }
 
     fn stranded_message(&self) -> String {
@@ -2104,6 +2115,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.cut_block_id = Some(snap.head_block_id.clone());
         self.last_source_block_time = Some(cut_block_time.clone());
         self.snapshot_file = Some(host_path.display().to_string());
+        self.head_at_pause = Some(at_pause.head_block_num);
         self.state = State::Snapshotted;
         self.journal.transition(
             State::Snapshotted,
@@ -2628,6 +2640,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // Last pre-boundary check: a signed abort (or an unreachable relay) stops here, while
             // resuming the source is still safe.
             if !self.require_no_abort("chain creation")? {
+                return Ok(false);
+            }
+            // rc.29: the old chain must still be sealed at the cut at the creation boundary itself (the fleet gate and
+            // the authorization wait before it can take minutes).
+            if let Some(why) = self.source_sealed_problem()? {
+                self.abort(&format!("refusing to create the target: {why}"), json!({"head_at_pause": self.head_at_pause}))?;
                 return Ok(false);
             }
             let cmd = self.cfg.target.create_chain_cmd.clone().expect("validated: ignite configured");

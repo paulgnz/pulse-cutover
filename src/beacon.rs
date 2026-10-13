@@ -391,6 +391,9 @@ struct Acc {
     /// rc.23 review #3: an abort intent was journaled (the agent is about to resume the old chain once
     /// the guard passes again): peers' gates must not count this node's VERIFIED any more.
     aborting: bool,
+    /// rc.29: a STRANDED node whose producer pause could not be confirmed is UNSEALED (Some(false)); a later
+    /// confirmed pause (`source_pause_enforced: true`) seals it.
+    sealed: Option<bool>,
 }
 
 static JOURNALS: Mutex<Option<HashMap<PathBuf, Acc>>> = Mutex::new(None);
@@ -506,6 +509,9 @@ fn apply_line(acc: &mut Acc, v: &Value) {
     if d["reverified"].as_bool() == Some(true) {
         put_verified(&mut acc.ev, d);
     }
+    if let (Some(ok), Some(_)) = (d["source_pause_enforced"].as_bool(), acc.sealed) {
+        acc.sealed = Some(acc.sealed == Some(true) || ok);
+    }
     if d["rollback_intent_cancelled"].as_bool() == Some(true) {
         acc.rollback_pending = false;
         // rc.29: the withdrawal ends with the intent (an `abort_intent` may have announced it to the fleet).
@@ -519,6 +525,7 @@ fn apply_line(acc: &mut Acc, v: &Value) {
             acc.state = v["state"].clone();
             acc.degraded = None;
             acc.aborting = false;
+            acc.sealed = (v["state"].as_str() == Some("STRANDED")).then(|| d["sealed"].as_bool() != Some(false));
             // A resumed old chain is about the last ABORTED; any later state (e.g. a join) is not on it.
             acc.source_resumed = v["state"].as_str() == Some("ABORTED")
                 && (acc.source_resumed || d["source_producer_resumed"].as_bool() == Some(true) || d.get("source_restarted").is_some());
@@ -633,7 +640,8 @@ pub fn journal_summary(path: &Path) -> Value {
            "degraded": acc.degraded.is_some(),
            "degraded_reason": acc.degraded.as_deref().map(sanitize_short),
            "joined": acc.joined,
-           "aborting": acc.aborting})
+           "aborting": acc.aborting,
+           "sealed": acc.sealed})
 }
 
 /// Coordination status for the report, with free-text fields sanitized.

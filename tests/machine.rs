@@ -52,6 +52,8 @@ struct MockOps {
     paused: Cell<bool>,
     /// rc.29: `pause()` answers Ok but the producer keeps producing.
     pause_ignored: Cell<bool>,
+    /// rc.29: the paused source gains one block once the snapshot was taken (after the quiescence audit).
+    move_after_snapshot: Cell<bool>,
     resumes: Cell<u32>,
     ignited: Cell<bool>,
     target_polls: Cell<u64>,
@@ -200,6 +202,7 @@ impl MockOps {
             head: Cell::new(start_head),
             paused: Cell::new(false),
             pause_ignored: Cell::new(false),
+            move_after_snapshot: Cell::new(false),
             resumes: Cell::new(0),
             ignited: Cell::new(false),
             target_polls: Cell::new(0),
@@ -304,6 +307,10 @@ impl ChainOps for MockOps {
     }
 
     fn source_block_id(&self, block_num: u64) -> Result<(String, String), String> {
+        // Called once the quiescence window passed: a late block from a peer lands after the audit.
+        if self.move_after_snapshot.replace(false) {
+            self.head.set(self.head.get() + 1);
+        }
         Ok((self.block_id(block_num), "2024-01-01T00:00:00.000".into()))
     }
 
@@ -984,7 +991,7 @@ fn resume_from_snapshotted_journal_skips_freeze_and_completes() {
             "data": {"chain_id": hex::encode(CHAIN_ID), "head_at_freeze": 120}}),
         serde_json::json!({"seq": 2, "ts_ms": 3, "ts": "t", "kind": "transition", "state": "SNAPSHOTTED",
             "data": {"snapshot_file": snapshot_path.display().to_string(), "cut_height": cut,
-                     "cut_block_id": hex::encode(m.head_id()),
+                     "cut_block_id": hex::encode(m.head_id()), "head_at_pause": cut,
                      "last_source_block_time": "2024-01-01T00:00:00.000"}}),
     ];
     let lines: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
@@ -5918,4 +5925,31 @@ fn rc29_cancelling_a_rollback_intent_ends_the_withdrawal_on_the_beacon() {
     let s = pulse_cutover::beacon::journal_summary(&cfg.journal_path);
     assert_ne!(s["aborting"].as_bool(), Some(true), "{s}");
     assert_ne!(s["rollback_pending"].as_bool(), Some(true), "{s}");
+}
+
+#[test]
+fn rc29_an_uninterrupted_run_refuses_creation_when_the_source_moved_past_the_pause_head() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = test_config(d.path(), 120);
+    let ops = MockOps::new(d.path(), 110);
+    // One block lands after the audited quiescence window (the mock's paused head moves once, late).
+    ops.move_after_snapshot.set(true);
+    let st = run_machine(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("the source head moved past the pause head"), "{st:?} {text}");
+    assert!(!text.contains("ignite_started"));
+}
+
+#[test]
+fn rc29_the_beacon_reports_an_unsealed_strand_until_a_pause_is_confirmed() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = test_config(d.path(), 120);
+    let line = |seq: u64, kind: &str, state: &str, data: serde_json::Value| serde_json::json!({"seq": seq, "ts_ms": seq + 1, "ts": "t", "kind": kind, "state": state, "data": data}).to_string();
+    let mut text = [line(0, "transition", "VERIFIED", serde_json::json!({})),
+        line(1, "transition", "STRANDED", serde_json::json!({"sealed": false, "source_paused": false}))].join("\n") + "\n";
+    std::fs::write(&cfg.journal_path, &text).unwrap();
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["sealed"], serde_json::json!(false));
+    text += &(line(2, "evidence", "STRANDED", serde_json::json!({"source_pause_enforced": true})) + "\n");
+    std::fs::write(&cfg.journal_path, &text).unwrap();
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["sealed"], serde_json::json!(true));
 }

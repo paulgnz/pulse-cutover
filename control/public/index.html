@@ -731,7 +731,7 @@ function render() {
       DEGRADED: 'a target chain may be running, but no quorum is LIVE on one chain yet', PENDING: 'no roster member has started chain creation or ignition',
       ABORTED: 'every reporting roster member aborted before chain creation',
       STALLED: 'a quorum is LIVE on one chain but it stopped building blocks while the workload probe fails: the new chain is not taking transactions',
-      STRANDED: 'the fleet stopped before chain creation and is sealed (source paused, writes frozen): an operator decides — `pulse-cutover rollback` (re-runs the guard) or `join` a LIVE quorum', SPLIT: 'FLEET SPLIT: do not reopen writes anywhere until resolved' }[fv.verdict] || '';
+      STRANDED: (fv.warnings || []).some((w) => w.startsWith('UNSEALED')) ? 'the fleet stopped before chain creation, but a member is UNSEALED (its source producer could not be confirmed paused, see below): pause it by hand first; then an operator decides — `pulse-cutover rollback` (re-runs the guard) or `join` a LIVE quorum' : 'the fleet stopped before chain creation and is sealed (source paused, writes frozen): an operator decides — `pulse-cutover rollback` (re-runs the guard) or `join` a LIVE quorum', SPLIT: 'FLEET SPLIT: do not reopen writes anywhere until resolved' }[fv.verdict] || '';
     const items = [...fv.alarms, ...(fv.warnings || []), ...(fv.verdict !== 'SPLIT' ? fv.not_live : [])];
     const html = `<b class="v">FLEET ${esc(fv.verdict)}</b>${esc(fv.event_id)} · ${what}${fv.detail ? ` · ${esc(fv.detail)}` : ''}${items.length ? `<ul>${items.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}`;
     fb.className = `fleet ${fv.verdict}`; fb.hidden = false; if (fb.dataset.sig !== html) { fb.innerHTML = html; fb.dataset.sig = html; }

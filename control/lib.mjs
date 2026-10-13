@@ -354,7 +354,8 @@ export function projectReport(r) {
     profile: r.profile == null ? null : (PROFILES.includes(r.profile) ? r.profile : bad('profile', `must be one of ${PROFILES.join('|')}`)),
     agent_version: str(r.agent_version, 'agent_version', { max: 32, re: /^[0-9A-Za-z.+-]+$/ }),
     ts: tsStr(r.ts, 'ts', false),
-    interval_secs: r.interval_secs === 0 ? null : int(r.interval_secs, 'interval_secs', { min: 1, max: 3600 }),
+    // rc.29: at most 200 s, so 3 × the interval fits the relay's 600 s silence cap (agents refuse more at load).
+    interval_secs: r.interval_secs === 0 ? null : int(r.interval_secs, 'interval_secs', { min: 1, max: 200 }),
     mode: str(r.mode, 'mode', { max: 16, nullable: true, re: /^[a-z]+$/ }),
     ready: bool(r.ready, 'ready', { nullable: false }),
   };
@@ -417,6 +418,8 @@ export function projectReport(r) {
       joined: bool(ce.joined, 'ceremony.joined'),
       // rc.23 review #3: the agent journaled an abort intent; it is withdrawing its VERIFIED report.
       aborting: bool(ce.aborting, 'ceremony.aborting'),
+      // rc.29: STRANDED with the producer pause NOT confirmed (false) is UNSEALED: the old chain may still be producing.
+      sealed: bool(ce.sealed, 'ceremony.sealed'),
       target: targetView(ce.target),
     };
   }
@@ -631,7 +634,7 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}) {
     return { producer, state: ce?.state || null, fresh: !!s && !s.silent, conflict: mine.length > 0 && !usable.length,
       missing: !s, target: ce?.target || null, resumed: resumedOldChain(ce), past: pastCreate(ce) || markPast || anyPast || loggedPast, foreign_past: foreignPast,
       degraded: ce?.degraded === true,
-      joined: ce?.joined === true, source_head: s?.report?.source?.head ?? null, head_at_pause: ce?.evidence?.head_at_pause ?? null,
+      joined: ce?.joined === true, unsealed: ce?.state === 'STRANDED' && ce?.sealed === false, source_head: s?.report?.source?.head ?? null, head_at_pause: ce?.evidence?.head_at_pause ?? null,
       // rc.27: the beacon's post-LIVE watch (idle beyond post_live_max_idle_secs with the workload probe failing).
       target_live: (s?.report?.checks || []).find((c) => c?.name === 'target_live') || null,
       cut: ce?.evidence?.cut_height ?? null };
@@ -736,6 +739,9 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}) {
   // rc.29: like STRANDED, a fleet-wide ABORTED needs every member present and fresh.
   else if (members.length && !members.some((m) => m.foreign_past) && members.every((m) => !m.missing && m.fresh && m.state === 'ABORTED')) verdict = 'ABORTED';
   else verdict = 'PENDING';
+  // rc.29: a STRANDED member that could not confirm its producer pause may still be producing old-chain blocks (a
+  // warning listed first; the movement rule raises a SPLIT if the old chain does move after creation).
+  for (const m of members.filter((x) => x.unsealed)) warnings.unshift(`UNSEALED: ${m.producer} is STRANDED but its source producer could NOT be confirmed paused: pause it by hand now`);
   const unaccounted = members.filter((m) => m.missing || !m.fresh).map((m) => `${m.producer}: ${m.missing ? 'no report' : `silent (${m.state || '?'})`}`);
   const notLive = !liveChain && verdict !== 'SPLIT' ? unaccounted : liveChain ? members.filter((m) => !liveChain.members.includes(m.producer)).map((m) => `${m.producer}: ${m.missing ? 'no report' : m.conflict ? 'identity conflict' : !m.fresh ? `silent (${m.state || '?'})` : m.state}`) : [];
   return { event_id: ev.event_id, h: ev.h ?? null, roster: roster ? roster.length : null, quorum, verdict, alarms, warnings,

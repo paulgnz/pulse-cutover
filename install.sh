@@ -376,6 +376,8 @@ install_agent_source(){
   # (or the operator opts in), never whatever happens to be checked out.
   want=$(agent_release_tag "$(mget_opt '.artifacts.agent_release_tag')" "$AGENT_RELEASE_DEFAULT") || return 1
   at=$(cd "$repo" && git describe --tags --exact-match 2>/dev/null || true)
+  # The tag names HEAD, not the working tree: tracked files must be unmodified too.
+  if [ -n "$at" ] && [ -n "$(cd "$repo" && git status --porcelain --untracked-files=no 2>/dev/null)" ]; then at="$at (modified)"; fi
   if [ "$at" != "$want" ] && [ "${PULSE_CUTOVER_ALLOW_SOURCE_BUILD:-}" != "1" ]; then
     echo "  not building from source: this checkout is ${at:-not a release tag}, the pinned release is $want"
     echo "  (git checkout $want, or set PULSE_CUTOVER_ALLOW_SOURCE_BUILD=1 to build this checkout anyway)"

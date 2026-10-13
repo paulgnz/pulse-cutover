@@ -287,3 +287,11 @@ test('rc.29: a beacon cannot stretch its own silence window past 10 minutes', ()
   assert.equal(silentAfterMs({ interval_secs: 10 }), 45e3);
   assert.equal(silentAfterMs({ interval_secs: 60 }), 180e3);
 });
+
+test('rc.29: an UNSEALED stranded member is surfaced first in the warnings', () => {
+  const rep = (state, sealed) => ({ coord: { event_id: 'ev-3' }, ceremony: { state, sealed, evidence: { h: CUT } }, interval_secs: 10 });
+  const by = Object.fromEntries(BPS.map((p, i) => [p, [{ report: rep('STRANDED', i === 0 ? false : true), silent: false, conflict: false }]]));
+  const v = fleetVerdict({ event_id: 'ev-3', h: CUT, roster: BPS.map((producer) => ({ producer })), quorum: 4 }, by);
+  assert.equal(v.verdict, 'STRANDED');
+  assert.match(v.warnings[0], /^UNSEALED: bpa/);
+});
