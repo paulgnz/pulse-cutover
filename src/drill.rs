@@ -1733,16 +1733,107 @@ fn binding_problem(cfg: &Config, view: &Value, h: u64) -> Option<String> {
     }
 }
 
+/// `pulse-cutover drill --clear-marker` (r30 round 7): remove an orphaned work marker (its drill died, or the docker
+/// daemon was down when it ended) WITHOUT that drill's config: any config on the same producer (same lock_dir and
+/// snapshot.dir) will do. It takes the journal, drill-root and producer locks, refuses next to a ceremony in progress,
+/// and removes the marker only when it can PROVE the marker's work is gone: the drill process is not running, its
+/// recorded pipeline process group has no members, and the pinned docker CLI on the local socket says the recorded
+/// export container does not exist. Anything unknown refuses (nothing changed). The removal is recorded in this
+/// config's drill directory.
+pub fn clear_marker<O: ChainOps>(cfg: &Config, ops: &O) -> Result<String, String> {
+    let marker = read_marker(cfg).map_err(|e| format!("clear-marker refused, nothing changed: the work marker cannot be \
+        read ({e}); inspect {} and remove it by hand only after checking no drill work runs", work_marker_path(cfg).display()))?;
+    let Some(m) = marker else { return Ok("no drill work marker on this producer".into()) };
+    let (Some(jd), Some(h), Some(id)) = (m.journal_dir.clone(), m.h, m.drill_id.clone()) else {
+        return Err("clear-marker refused, nothing changed: the marker is from before round 7 (no drill id) or names no \
+            journal_dir / h: run `pulse-cutover drill --cancel` with that drill's config".into());
+    };
+    let overlap = path_overlap_problems(cfg, h);
+    if !overlap.is_empty() {
+        return Err(format!("clear-marker refused, nothing changed: {}", overlap.join("; ")));
+    }
+    let _j = Journal::lock(&cfg.journal_path)
+        .map_err(|e| format!("clear-marker refused, nothing changed: a ceremony or a drill holds this journal ({e})"))?;
+    let _r = Journal::lock(&root_lock_base(cfg))
+        .map_err(|e| format!("clear-marker refused, nothing changed: a readiness drill holds the drill directory ({e})"))?;
+    let _p = Journal::lock(&producer_lock_base(cfg)).map_err(|e| format!(
+        "clear-marker refused, nothing changed: a ceremony or a drill on this producer holds its lock ({e})"))?;
+    if let Some(why) = ceremony_conflict(cfg)? {
+        return Err(format!("clear-marker refused, nothing changed: {why}"));
+    }
+    // Re-read under the producer lock: the marker cannot change from here on.
+    let Some(m2) = read_marker(cfg).map_err(|e| format!("clear-marker refused, nothing changed: {e}"))? else {
+        return Ok("no drill work marker on this producer".into());
+    };
+    if m2.drill_id.as_deref() != Some(id.as_str()) {
+        return Err("clear-marker refused, nothing changed: the marker changed while the locks were taken; run it again".into());
+    }
+    if marker_process_alive(&m2) {
+        return Err(format!("clear-marker refused, nothing changed: the marker's drill {id} (pid {}) is still running: \
+            stop it with `pulse-cutover drill --cancel` using its config", m2.pid.unwrap_or(0)));
+    }
+    if let Some(g) = group_not_proven_gone_at(&jd, h) {
+        return Err(format!("clear-marker refused, nothing changed: the drill's pipeline process group {g} is alive or \
+            cannot be inspected"));
+    }
+    let Some(container) = m2.container.clone() else {
+        return Err("clear-marker refused, nothing changed: the marker records no export container".into());
+    };
+    let up = cfg.upstream.as_ref().ok_or("clear-marker refused, nothing changed: no [upstream] section to reach docker")?;
+    let docker = up.docker_bin.as_ref().ok_or("clear-marker refused, nothing changed: upstream.docker_bin is not configured")?;
+    let guard = DrillGuard::new(ops);
+    allow_pinned_programs(&guard, up).map_err(|e| format!("clear-marker refused, nothing changed: {e}"))?;
+    let prefix = upstream::drill_docker_prefix(docker, &docker_socket(up));
+    match container_status(&guard, &prefix, &container) {
+        ContainerStatus::Gone => {}
+        other => return Err(format!("clear-marker refused, nothing changed: the export container {container} is not \
+            verified gone ({other:?}); stop it (`docker rm -f {container}` on the local daemon) and run this again")),
+    }
+    let v = guard.violations.borrow().clone();
+    if !v.is_empty() {
+        return Err(format!("clear-marker refused, nothing changed: forbidden operations attempted: {}", v.join(", ")));
+    }
+    std::fs::create_dir_all(drill_root(cfg)).map_err(|e| format!("create {}: {e}", drill_root(cfg).display()))?;
+    let record = json!({"kind": DRILL_KIND, "event": "work_marker_cleared", "ts_ms": ops.now_ms(), "drill_id": id, "h": h,
+        "journal_dir": jd, "export_container": container, "verified": {"process": "not running", "pipeline_group": "none",
+        "export_container": "gone (docker inspect on the local socket)"}});
+    write_fresh(&drill_root(cfg).join(format!("marker-cleared-{id}.json")), record.to_string().as_bytes())?;
+    std::fs::remove_file(work_marker_path(cfg)).map_err(|e| format!("remove {}: {e}", work_marker_path(cfg).display()))?;
+    Ok(format!("drill work marker of drill {id} (H = {h}) removed: its process, pipeline group and export container are \
+        verified gone"))
+}
+
+/// The producer's work marker as the beacon and `status` show it (r30 round 7), before any event.
+pub fn marker_summary(cfg: &Config) -> Option<Value> {
+    let m = match read_marker(cfg) {
+        Ok(Some(m)) => Some(m),
+        Ok(None) => return None,
+        Err(_) => None,
+    };
+    let state = match marker_work(cfg) {
+        MarkerWork::None => return None,
+        MarkerWork::Live { .. } => "live",
+        MarkerWork::Unknown(_) => "unknown",
+        MarkerWork::Done { .. } => "done",
+    };
+    let id = m.as_ref().and_then(|m| m.drill_id.clone()).filter(|s| s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit()));
+    Some(json!({"state": state, "h": m.as_ref().and_then(|m| m.h), "drill_id": id}))
+}
+
 // ----------------------------------------------------------------------------------------------- views ----
 
 /// What the beacon publishes about the latest drill (None when this box never ran one). Only short, typed
 /// values: hashes, heights, table names, millisecond timings, a sanitized error.
 pub fn beacon_view(cfg: &Config) -> Option<Value> {
-    let text = std::fs::read_to_string(latest_path(cfg)).ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
-    if v["kind"].as_str() != Some(DRILL_KIND) {
-        return None;
-    }
+    // r30 round 7: an orphaned or live work marker on this producer is shown even when this box has no drill record.
+    let marker = marker_summary(cfg);
+    let latest = std::fs::read_to_string(latest_path(cfg)).ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(|v| v["kind"].as_str() == Some(DRILL_KIND));
+    let Some(v) = latest else {
+        let m = marker?;
+        return Some(json!({"kind": DRILL_KIND, "h": m["h"].as_u64(), "state": null, "work_marker": m}));
+    };
     let hex = |k: &str| v[k].as_str().filter(|s| (16..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit()))
         .map(str::to_ascii_lowercase);
     let tables: Vec<Value> = v["compare_failing_tables"].as_array().map(|a| {
@@ -1776,6 +1867,7 @@ pub fn beacon_view(cfg: &Config) -> Option<Value> {
         // Round 5: the exact programs the drill ran, so mission control only calls producers in agreement when they
         // ran identical tools on identical state.
         "tools": tools_view(&v["tools"]),
+        "work_marker": marker,
     }))
 }
 

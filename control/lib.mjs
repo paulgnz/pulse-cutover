@@ -520,6 +520,19 @@ export function projectDrill(d) {
     error: d.error == null ? null : (typeof d.error === 'string' && d.error.length <= 400 ? redact(d.error, 120) : bad('drill.error', 'must be a string ≤ 400')),
     finished_ts_ms: int(d.finished_ts_ms, 'drill.finished_ts_ms'),
     tools: projectDrillTools(d.tools),
+    work_marker: projectWorkMarker(d.work_marker),
+  };
+}
+
+/** r30 round 7: the producer's drill work marker (an orphan blocks a fresh ARM until `drill --clear-marker`). */
+function projectWorkMarker(w) {
+  if (w === undefined || w === null) return null;
+  if (!isObj(w)) bad('drill.work_marker', 'must be an object');
+  if (!['live', 'unknown', 'done'].includes(w.state)) bad('drill.work_marker.state', 'must be live|unknown|done');
+  return {
+    state: w.state,
+    h: int(w.h, 'drill.work_marker.h'),
+    drill_id: str(w.drill_id, 'drill.work_marker.drill_id', { max: 32, nullable: true, re: /^[0-9a-f]{32}$/ }),
   };
 }
 

@@ -250,6 +250,7 @@ EXAMPLES
 const HELP_DRILL: &str = "\
 pulse-cutover drill --config ceremony.toml --height H [--keep-work]
 pulse-cutover drill --config ceremony.toml --cancel
+pulse-cutover drill --config ceremony.toml --clear-marker
 
 A readiness drill with no state or write impact (rung 4 of the mainnet test ladder): every producer runs it with the SAME
 H, on the live chain, and mission control compares the results.
@@ -306,6 +307,13 @@ drill process is gone it takes the drill's locks, refuses next to a ceremony in 
 recorded snapshot request (on the producer API it was made on, at its recorded H: run --cancel with the
 drill's own config) and marks the drill FAILED (cancelled). Every check runs before anything is written; a
 refused cancel writes nothing. A drill never writes through a symlink or a hard link.
+
+--clear-marker (r30 round 7): removes an orphaned drill work marker (its drill died, or the docker daemon was down
+when it ended), which otherwise blocks a fresh ARM on this producer, using ANY config on the same producer (same
+lock_dir and snapshot.dir). It takes the locks, refuses next to a ceremony in progress, and removes the marker only
+when the marker's drill process is not running, its pipeline process group has no members, and the pinned docker CLI
+on the local socket says the recorded export container does not exist; anything unknown refuses. Every marker names
+its drill (drill_id), and only that drill, or this command, removes it. `status` and the beacon show the marker.
 
 Exit codes: 0 = evidence complete and the compare matched; 5 = evidence complete, the compare did NOT
 match (the finding a drill exists to surface; the fingerprint is still reported); 1 = the drill failed.";
@@ -773,6 +781,12 @@ fn cmd_drill(args: &[String]) -> Result<(), String> {
         println!("{msg}");
         return Ok(());
     }
+    if flag(args, "--clear-marker") {
+        let ops = HttpOps::new(&cfg.source.rpc_url, &cfg.source.producer_api_url, "", "false", cfg.source.snapshot_timeout_secs);
+        let msg = pulse_cutover::drill::clear_marker(&cfg, &ops)?;
+        println!("{msg}");
+        return Ok(());
+    }
     let height: u64 = arg(args, "--height")
         .ok_or("missing --height H (the agreed drill height, the same on every producer)")?
         .parse()
@@ -808,6 +822,13 @@ fn print_drill_status(cfg: &pulse_cutover::config::Config) {
             d["h"], d["state"].as_str().unwrap_or("?"), d["compare"].as_str().unwrap_or("-"),
             d["fingerprints_digest"].as_str().unwrap_or("-")
         );
+        if let Some(w) = d.get("work_marker").filter(|w| !w.is_null()) {
+            println!(
+                "drill work marker on this producer: state={} H={} drill_id={}{}",
+                w["state"].as_str().unwrap_or("?"), w["h"], w["drill_id"].as_str().unwrap_or("-"),
+                if w["state"] == "unknown" { " (blocks a fresh ARM: `pulse-cutover drill --clear-marker` verifies its work gone and removes it)" } else { "" }
+            );
+        }
     }
 }
 

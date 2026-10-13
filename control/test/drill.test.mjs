@@ -121,3 +121,12 @@ test('r30 round 5: producers that ran different (or unpinned) tools are never in
   assert.equal(projectDrill(drill()).tools.tools_digest, '66'.repeat(32));
 });
 
+
+test('r30 round 7: the drill work marker is projected strictly (state, h, drill id) and shown without a drill record', () => {
+  const p = projectDrill({ kind: 'readiness_drill', h: 1100, state: null, work_marker: { state: 'unknown', h: 1100, drill_id: 'c'.repeat(32) } });
+  assert.deepEqual(p.work_marker, { state: 'unknown', h: 1100, drill_id: 'c'.repeat(32) });
+  assert.equal(projectDrill({ ...drill() }).work_marker, null);
+  assert.throws(() => projectDrill({ ...drill(), work_marker: { state: 'gone', h: 1 } }), /work_marker.state/);
+  assert.throws(() => projectDrill({ ...drill(), work_marker: { state: 'live', h: 1, drill_id: '<x>' } }), /work_marker.drill_id/);
+  assert.throws(() => projectDrill({ ...drill(), work_marker: 'live' }), /work_marker/);
+});

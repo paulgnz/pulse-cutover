@@ -607,3 +607,12 @@ work starts and removes it only once its work is verified gone, so a ceremony in
 sees an export container or pipeline group that outlived the drill process: it refuses to ARM next to it, and after
 its freeze asks it to stop and warns. `loop` fails closed on a source that does not answer (unless
 `reset_when_source_down`, refused for mainnet) and holds the producer lock through `reset_cmd`.
+
+**Work markers belong to their drill** (rc.30 round 7). Every work marker names its drill (`drill_id`, also in that
+drill's `latest.json`) and the export container it starts. A drill removes only its own marker, while it still holds
+the journal, drill-root and producer locks, so a newer drill's marker can never be deleted by an older drill's
+cleanup. A marker whose drill never published and is not running is **unknown**, never "done": it blocks a fresh ARM
+on that producer from any journal directory. `pulse-cutover drill --clear-marker`, run with any config on the same
+producer, removes such an orphan only when the drill process, its pipeline group and its export container (asked
+through the pinned docker CLI on the local socket) are all proven gone, and records the removal; anything unknown
+refuses with nothing changed. `status` and the beacon show the marker before an event.

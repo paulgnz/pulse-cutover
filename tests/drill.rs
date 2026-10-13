@@ -44,6 +44,8 @@ struct LiveChain {
     container_sticky: RefCell<bool>,
     /// `docker run` is "killed" mid-export: the CLI returns as cancelled, the container stays.
     cancel_export: RefCell<bool>,
+    /// r30 round 7: the docker daemon cannot be reached (every docker call fails, not "no such object").
+    docker_down: RefCell<bool>,
 }
 
 impl LiveChain {
@@ -66,6 +68,7 @@ impl LiveChain {
             real_sleep_ms: 0,
             containers: RefCell::new(Default::default()),
             container_sticky: RefCell::new(false),
+            docker_down: RefCell::new(false),
             cancel_export: RefCell::new(false),
         }
     }
@@ -210,6 +213,9 @@ impl ChainOps for LiveChain {
             assert!(argv[2].starts_with("unix://"));
             let sub = argv[3].as_str();
             let last = argv.last().cloned().unwrap_or_default();
+            if *self.docker_down.borrow() {
+                return Err("`docker` exited 1: Cannot connect to the Docker daemon at unix:///x/docker.sock".into());
+            }
             match sub {
                 "inspect" => {
                     return if self.containers.borrow().contains(&last) {
@@ -1333,4 +1339,65 @@ fn r7_a_drill_cleans_up_only_its_own_work_marker() {
     assert!(drill::foreign_marker_blocker(&other_cfg).unwrap().contains("clear-marker"));
     // And a new drill on this producer refuses while it is unknown.
     assert!(drill::run(&cfg, &chain, &DrillOptions { height: 1_200, keep_work: false }).unwrap_err().contains("unreadable"));
+}
+
+/// R7-F3 (reviewer): an orphaned work marker (the drill died, or docker was down when it ended) blocked a fresh mainnet
+/// ARM forever, and only that drill's own config could clear it. `drill --clear-marker` works from ANY config on the
+/// producer: under the locks, it removes the marker only when the drill process, its pipeline group and its export
+/// container are all proven gone; anything unknown refuses with nothing changed. `status`/the beacon show the marker.
+#[test]
+fn r7_clear_marker_removes_an_orphan_only_when_its_work_is_proven_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let d = dir.path().display().to_string();
+    let cfg = drill_config_edit(dir.path(), MAINNET, "",
+        |t: String| t.replacen("[ceremony]\n", &format!("[ceremony]\nlock_dir = \"{d}/locks\"\n"), 1)).unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+    std::fs::create_dir_all(format!("{d}/locks")).unwrap();
+    // An orphan: drill X died before publishing (dead pid), container name recorded, journal dir elsewhere.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let name = "pulse-drill-1100-cccccccccccc";
+    let orphan = serde_json::json!({"kind": "readiness_drill_work", "journal_dir": elsewhere.path(), "h": 1_100,
+        "drill_id": "c".repeat(32), "export_container": name, "pid": std::process::id(), "pid_start": "gone"});
+    std::fs::write(drill::work_marker_path(&cfg), orphan.to_string()).unwrap();
+    assert!(matches!(drill::marker_work(&cfg), drill::MarkerWork::Unknown(_)));
+    // Shown before the event.
+    let view = drill::beacon_view(&cfg).expect("the marker is shown even without a drill record here");
+    assert_eq!(view["work_marker"]["state"], "unknown");
+    assert_eq!(view["work_marker"]["h"], 1_100);
+
+    // 1. The container still exists: refused, marker kept.
+    chain.containers.borrow_mut().insert(name.into());
+    let e = drill::clear_marker(&cfg, &chain).unwrap_err();
+    assert!(e.contains("not verified gone") && e.contains("nothing changed"), "{e}");
+    assert!(drill::work_marker_path(&cfg).exists());
+    // 2. The daemon cannot be reached: unknown, refused, marker kept.
+    chain.containers.borrow_mut().clear();
+    *chain.docker_down.borrow_mut() = true;
+    let e = drill::clear_marker(&cfg, &chain).unwrap_err();
+    assert!(e.contains("Unknown"), "{e}");
+    assert!(drill::work_marker_path(&cfg).exists());
+    *chain.docker_down.borrow_mut() = false;
+    // 3. Its drill process is alive: refused (that is --cancel's job).
+    let mut live = orphan.clone();
+    live["pid_start"] = serde_json::json!(pulse_cutover::ops::process_start(std::process::id()).unwrap());
+    std::fs::write(drill::work_marker_path(&cfg), live.to_string()).unwrap();
+    assert!(drill::clear_marker(&cfg, &chain).unwrap_err().contains("still running"));
+    std::fs::write(drill::work_marker_path(&cfg), orphan.to_string()).unwrap();
+    // 4. A ceremony holds this journal: refused.
+    let held = pulse_cutover::journal::Journal::lock(&cfg.journal_path).unwrap();
+    assert!(drill::clear_marker(&cfg, &chain).unwrap_err().contains("holds this journal"));
+    drop(held);
+    // 5. Everything proven gone: removed, recorded, and a ceremony is no longer blocked.
+    let msg = drill::clear_marker(&cfg, &chain).unwrap();
+    assert!(msg.contains("removed"), "{msg}");
+    assert!(!drill::work_marker_path(&cfg).exists());
+    assert!(drill::drill_root(&cfg).join(format!("marker-cleared-{}.json", "c".repeat(32))).exists());
+    assert!(drill::foreign_marker_blocker(&cfg).is_none());
+    assert!(chain.argvs.borrow().iter().all(|a| a[0].ends_with("/docker") && a[3] == "inspect"), "only `docker inspect` ran");
+    for f in FORBIDDEN {
+        assert!(!chain.called(f), "clear-marker called {f}");
+    }
+    // Nothing to clear: a no-op.
+    assert!(drill::clear_marker(&cfg, &chain).unwrap().contains("no drill work marker"));
 }
