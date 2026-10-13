@@ -1,0 +1,103 @@
+{
+  "_about": [
+    "Example ceremony manifest for the README walkthrough: sudo ./install.sh --mode api --manifest ceremony.json",
+    "JSON has no comments, so every key starting with '_' is documentation; install.sh and cutover.sh ignore them.",
+    "Public values are filled in (XPR testnet chain id, the Tahoe network, the pulse-cutover release tag, the edge and",
+    "federator pins from that same tag). Values a ceremony coordinator publishes are REPLACE-ME: install.sh refuses a",
+    "manifest that still contains one (it lists the paths). Field by field: README, 'The ceremony.json manifest'.",
+    "Which files this becomes on the box: README, 'What ends up where on the box'."
+  ],
+
+  "mode": "api",
+  "_mode": "api | bp | hyperion; must equal install.sh --mode. bp = block producer; hyperion = api + /v2 history.",
+
+  "ceremony": {
+    "_about": "WHAT is migrated and WHEN. install.sh writes these into [ceremony] of /etc/pulse-cutover/ceremony.toml.",
+    "rehearsal": true,
+    "_rehearsal": "true relaxes the production profile (README 'Production profile') and marks the run REHEARSAL everywhere; a real cut omits it. Refused for XPR mainnet.",
+    "chain_id": "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd",
+    "_chain_id": "XPR testnet. install.sh refuses a nodeos serving anything else.",
+    "freeze_height": 0,
+    "freeze_margin": 240,
+    "_freeze_height": "Real event: the coordinator's H, and no freeze_margin. Rehearsal: 0 + freeze_margin derives H = last final block + margin at arm (install.sh then writes derive_h_at_arm = true).",
+    "simulate_freeze": true,
+    "_simulate_freeze": "api-mode rehearsal against a live chain that will not stop: proceed once LIB >= H. A real event omits it (the producers freeze the chain).",
+    "import_cpu_scale": 143,
+    "_import_cpu_scale": "Fork import backend only (chain identity; same value on every operator). Ignored, with a warning, by import_backend = upstream.",
+    "_boundary_path": "Optional: where a producer-mode agent writes the history boundary file for a federating router."
+  },
+
+  "source": {
+    "_about": "YOUR nodeos. Detected by doctor, never installed or changed by install.sh.",
+    "rpc_url": "http://127.0.0.1:8888",
+    "producer_api_url": "http://127.0.0.1:8888",
+    "_producer_api_url": "Must stay on 127.0.0.1: the producer API can pause your chain (R10). install.sh refuses one that answers from the internet.",
+    "_stop_cmd": "api/hyperion mode: how to retire nodeos AFTER the flip is healthy. Optional: install.sh derives it from the detected systemd unit or docker container (or generates a reviewed stop script for a script-managed nodeos). Declare it here only when doctor cannot.",
+    "_start_cmd": "Optional mirror of stop_cmd, used only if an aborted ceremony must bring nodeos back after it was stopped.",
+    "_snapshot_path_map_from": "docker nodeos only: the snapshots path INSIDE the container, with snapshot_path_map_to = the same directory on the host."
+  },
+
+  "snapshot": {
+    "_about": "All optional. dir = where nodeos writes scheduled snapshots (detected from config.ini / data-dir when absent; required for an exact-H cut without simulate_freeze). golden_roots = the coordinator's published fingerprint file (verify); without it the agent captures its own (rehearsal). expected_sha256 = whole-file hash of the cut snapshot (strict tier, R3). prescan_path = a staged snapshot to scan for stubbed intrinsics at arm (advisory)."
+  },
+
+  "target": {
+    "_about": "The PulseVM chain on Metal. The ids and the shared producer identity come from the coordinator's bundle (there is no PulseVM chain for XPR testnet yet: mission control's manifest shows null until one exists).",
+    "network_id": "tahoe",
+    "_network_id": "Metal network for metalgo's network-id: tahoe (XPR testnet) or mainnet (XPR mainnet); a private rehearsal network uses its numeric id.",
+    "subnet_id": "REPLACE-ME-subnet-id-from-the-coordinator",
+    "blockchain_id": "REPLACE-ME-blockchain-id-from-the-coordinator",
+    "vm_id": "REPLACE-ME-vm-id-from-the-coordinator",
+    "producer_name": "REPLACE-ME-producer-name-from-the-coordinator",
+    "producer_key": "REPLACE-ME-PRIVATE-producer-key-from-the-coordinator",
+    "_producer_key": "PRIVATE. The fork plugin seeds the post-cut schedule from the node config, so every validator of a rehearsal runs the same producer name and key (README field note 6). Never commit a real key; keep this file mode 600.",
+    "_staking_dir": "Optional: a directory holding staker.crt, staker.key and signer.key to reuse an existing Metal node identity (tools/metal-install.sh keeps them in /var/lib/metalgo/staking). Without it metalgo generates a fresh identity.",
+    "_post_live_probe_cmd": "Optional, production profile: a probe the beacon runs after LIVE (exit 0 = healthy), e.g. a script that checks a recent transaction was included."
+  },
+
+  "flip": {
+    "_about": "api/hyperion mode: the ONLY user-visible step. install.sh templates the flip/revert scripts from the detected nginx or haproxy routes.",
+    "public_host": "REPLACE-ME-public-ip-or-domain",
+    "_public_host": "What clients use (no scheme): the agent health-checks http://<public_host>/v1/chain/get_info after the flip.",
+    "edge": "auto",
+    "_edge": "nginx | haproxy | auto. auto picks the one edge that routes /v1 to your nodeos; when both do, declare it."
+  },
+
+  "gateway": {
+    "mode": "edge",
+    "_mode": "edge (PulseVM v1.0.0+: artifacts.edge, Leap 5 /v1 polyfills) | native (node's own /v1/chain only, no artifact) | legacy (translating gateway from artifacts.gateway, for builds without an in-node API)."
+  },
+
+  "artifacts": {
+    "_about": "Everything determinism-critical is pinned by URL + sha256 and verified before anything is installed (fail closed). The edge and federator pins below are the files of this repository at the release tag; recompute with: git show <tag>:gateway/server.js | sha256sum",
+    "agent_release_tag": "v0.5.0-rc.28",
+    "_agent_release_tag": "The pulse-cutover release to install: static musl binary + sha256sums.txt from that GitHub release. Never 'latest' (refused). Alternatively pin artifacts.agent = {url, sha256} to a coordinator-hosted binary; that wins.",
+    "plugin": {
+      "url": "REPLACE-ME-https-url-of-the-coordinator-pinned-pulsevm-plugin-binary",
+      "sha256": "REPLACE-ME-sha256-of-that-plugin-binary"
+    },
+    "_plugin": "The PulseVM plugin binary, installed as /opt/pulsevm/plugins/<vm_id>. Its rpcchainvm protocol must match the metalgo below (v1.14.2-tahoe speaks protocol 45).",
+    "metalgo": {
+      "url": "REPLACE-ME-https-url-of-the-extracted-metalgo-binary",
+      "sha256": "REPLACE-ME-sha256-of-that-metalgo-binary"
+    },
+    "_metalgo": "install.sh expects the extracted metalgo BINARY (installed as /opt/metalgo/metalgo), not Metal's release tarball; the coordinator hosts it. The official release TARBALL checksums for v1.14.2-tahoe are pinned in tools/metal-install.sh, which is the normal way to install metalgo on a producer box.",
+    "edge": {
+      "url": "https://raw.githubusercontent.com/paulgnz/pulse-cutover/v0.5.0-rc.28/gateway/server.js",
+      "sha256": "6f0d676dc3649c16c173a7693dcbbb1addb9c31ec3599c5e33b0bc9581d73f7f"
+    },
+    "federator": {
+      "url": "https://raw.githubusercontent.com/paulgnz/pulse-cutover/v0.5.0-rc.28/federator/server.js",
+      "sha256": "bc6ef537445273acae46c13229a1e07a8a0853d1957f3d64cde3bd622d6d91bd"
+    },
+    "_federator": "hyperion mode only (ignored in api mode). hyperion mode also needs artifacts.hyperion = {url, sha256} (the hyperion-rs binary) and a 'hyperion' section: legacy_url (the /v2 archive that keeps answering pre-cut history), es_heap (default 2g), es_image, ship_ws (default ws://127.0.0.1:9090).",
+    "_gateway": "legacy gateway mode only: artifacts.gateway = {url, sha256} of the translating gateway."
+  },
+
+  "paths": {
+    "work_dir": "/var/lib/pulse-cutover",
+    "_work_dir": "Journal (journal.jsonl), doctor survey (doctor.json), the staged snapshot (snapshot-cut.bin, absent until VERIFIED) and captured fingerprints live here. tools/beacon-install.sh points the readiness beacon at the same journal path."
+  },
+
+  "_hooks": "Optional 'hooks' section: on_freeze, post_ignite, on_live, on_abort, on_halt (commands). Producer mode's production profile requires the first four; api mode's flip machinery replaces them."
+}

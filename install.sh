@@ -22,6 +22,12 @@
 # and it is exactly what makes the ceremony flip itself reload-free.)
 set -euo pipefail
 
+# The pulse-cutover release this installer fetches when the manifest pins no agent artifact and no
+# `artifacts.agent_release_tag`. Bumped by the release process together with tools/beacon-install.sh
+# (VERSION_DEFAULT); the two must agree (tools/test/run.sh checks). Never "latest": GitHub's
+# "latest release" alias skips pre-releases, so it resolved to a six-week-old v0.4.0 for every rc.
+AGENT_RELEASE_DEFAULT="v0.5.0-rc.28"
+
 MODE=""
 MANIFEST=""
 while [ $# -gt 0 ]; do
@@ -46,8 +52,9 @@ if [ "$MODE" = "api" ] || [ "$MODE" = "hyperion" ]; then API_LIKE=true; fi
 MANIFEST="${MANIFEST:-ceremony.json}"
 [ -f "$MANIFEST" ] || {
   echo "ABORT: manifest '$MANIFEST' not found. The manifest is the ceremony.json describing"
-  echo "       the event — in a real event the coordinator publishes it; for a rehearsal ask"
-  echo "       in the Telegram group for the current bundle, or see examples/ in the repo."
+  echo "       the event — in a real event the coordinator publishes it. Start from"
+  echo "       examples/ceremony.json (every field documented; the public values are filled in,"
+  echo "       the coordinator's values are marked REPLACE-ME) and fill it in from the rehearsal bundle."
   exit 2
 }
 [ "$(id -u)" = 0 ] || { echo "ABORT: this installer stages system services, so it must run as root: sudo ./install.sh --mode $MODE --manifest $MANIFEST"; exit 2; }
@@ -59,7 +66,40 @@ command -v jq >/dev/null || { apt-get update -qq >/dev/null; apt-get install -y 
 mget(){ jq -er "$1" "$MANIFEST"; }
 mget_opt(){ jq -r "$1 // empty" "$MANIFEST"; }
 
+# ---------- pure helpers (tools/test/run.sh extracts and tests these) ----------
+# agent_release_tag MANIFEST_TAG DEFAULT -> the release tag to fetch, or fails with the reason.
+# An empty manifest value means the default; "latest" (any case) is refused outright.
+agent_release_tag(){
+  local tag="${1:-}" dflt="$2"
+  case "$(printf '%s' "$tag" | tr '[:upper:]' '[:lower:]')" in
+    "") printf '%s\n' "$dflt";;
+    latest)
+      echo "ABORT: artifacts.agent_release_tag = \"$tag\" is refused: GitHub's releases/latest ignores pre-releases" >&2
+      echo "       and would install an old agent. Pin an exact tag (e.g. $dflt) or pin artifacts.agent." >&2
+      return 1;;
+    *)
+      if printf '%s' "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then printf '%s\n' "$tag"
+      else echo "ABORT: artifacts.agent_release_tag = \"$tag\" is not a release tag (expected vX.Y.Z[-rc.N])" >&2; return 1; fi;;
+  esac
+}
+# manifest_placeholders MANIFEST -> prints the JSON path of every string still carrying the
+# "REPLACE-ME" marker the example manifest uses (empty when the manifest is filled in).
+# Keys starting with "_" are documentation (JSON has no comments) and are not checked.
+manifest_placeholders(){
+  jq -r '[paths(strings) as $p
+          | select(($p | map(tostring) | any(startswith("_"))) | not)
+          | select(getpath($p) | test("REPLACE-ME"))
+          | ($p | map(tostring) | join("."))] | .[]' "$1"
+}
+
 # ---------- read manifest ----------
+PLACEHOLDERS=$(manifest_placeholders "$MANIFEST")
+if [ -n "$PLACEHOLDERS" ]; then
+  echo "ABORT: $MANIFEST still has placeholder values (REPLACE-ME) at:"
+  printf '%s\n' "$PLACEHOLDERS" | sed 's/^/  - /'
+  echo "       Fill them in from the coordinator's published values (see examples/ceremony.json)."
+  exit 2
+fi
 M_MODE=$(mget '.mode')
 [ "$M_MODE" = "$MODE" ] || { echo "ABORT: manifest declares mode '$M_MODE' but --mode $MODE given"; exit 1; }
 CHAIN_ID=$(mget '.ceremony.chain_id')
@@ -302,40 +342,39 @@ mkdir -p "$WORK" /opt/pulsevm/plugins /opt/metalgo /etc/pulse-cutover /opt/pulse
 #   1. manifest-pinned artifact (ceremony-grade: URL + sha256, fail-closed);
 #   2. GitHub release binary — STATIC musl build, so it runs on any glibc
 #      (the bookworm-built binary failing on a glibc-2.31 box is why),
-#      verified against the release's sha256sums.txt;
+#      verified against the release's sha256sums.txt. The tag is the manifest's
+#      `artifacts.agent_release_tag`, else AGENT_RELEASE_DEFAULT; never "latest";
 #   3. cargo build from this checkout (slowest; needs rustup + build deps).
 install_agent_release(){
-  local arch tag base sums bin
+  local arch tag base sums bin tmp
   case "$(uname -m)" in
     x86_64) arch=x86_64;;
     aarch64|arm64) arch=aarch64;;
     *) echo "  release binaries cover x86_64/aarch64 only (this box: $(uname -m))"; return 1;;
   esac
   bin="pulse-cutover-$arch-unknown-linux-musl"
-  tag=$(mget_opt '.artifacts.agent_release_tag')
-  if [ -n "$tag" ]; then
-    base="https://github.com/paulgnz/pulse-cutover/releases/download/$tag"
-  else
-    base="https://github.com/paulgnz/pulse-cutover/releases/latest/download"
-  fi
-  echo "  fetching release binary $bin (${tag:-latest}) ..."
-  curl -fsSL "$base/sha256sums.txt" -o /tmp/pulse-cutover.sums || { echo "  no release sums reachable"; return 1; }
-  curl -fsSL "$base/$bin" -o /tmp/pulse-cutover.bin || { echo "  no release binary for $arch"; return 1; }
-  sums=$(grep " $bin\$" /tmp/pulse-cutover.sums | awk '{print $1}')
-  [ -n "$sums" ] || { echo "  sha256sums.txt has no entry for $bin"; return 1; }
-  echo "$sums  /tmp/pulse-cutover.bin" | sha256sum -c - >/dev/null || {
+  # A refused tag ("latest", not a tag) is a manifest error, not a reason to fall through to a source build.
+  tag=$(agent_release_tag "$(mget_opt '.artifacts.agent_release_tag')" "$AGENT_RELEASE_DEFAULT") || exit 1
+  base="https://github.com/paulgnz/pulse-cutover/releases/download/$tag"
+  echo "  fetching release binary $bin ($tag) ..."
+  tmp=$(mktemp -d)   # private temp dir: never fixed names under /tmp as root
+  curl -fsSL "$base/sha256sums.txt" -o "$tmp/sha256sums.txt" || { echo "  no release sums reachable for $tag"; rm -rf "$tmp"; return 1; }
+  curl -fsSL "$base/$bin" -o "$tmp/$bin" || { echo "  no release binary $bin for $tag"; rm -rf "$tmp"; return 1; }
+  sums=$(grep " $bin\$" "$tmp/sha256sums.txt" | awk '{print $1}')
+  [ -n "$sums" ] || { echo "  sha256sums.txt of $tag has no entry for $bin"; rm -rf "$tmp"; return 1; }
+  echo "$sums  $tmp/$bin" | sha256sum -c - >/dev/null || {
     echo "  ABORT-worthy: release binary does not match its published sha256 — not installing it"
-    rm -f /tmp/pulse-cutover.bin; return 1
+    rm -rf "$tmp"; return 1
   }
-  install -m 0755 /tmp/pulse-cutover.bin /usr/local/bin/pulse-cutover
-  rm -f /tmp/pulse-cutover.bin /tmp/pulse-cutover.sums
-  echo "  verified + installed: pulse-cutover ($bin, sha256 $sums)"
+  install -m 0755 "$tmp/$bin" /usr/local/bin/pulse-cutover
+  rm -rf "$tmp"
+  echo "  verified + installed: pulse-cutover $tag ($bin, sha256 $sums)"
 }
 install_agent_source(){
   local repo; repo=$(cd "$(dirname "$0")" && pwd)
   command -v cargo >/dev/null || { echo "  no cargo either — install rustup (see README Step 1) or add artifacts.agent to the manifest"; return 1; }
   echo "  building from source in $repo (this takes a few minutes) ..."
-  (cd "$repo" && cargo build --release) || return 1
+  (cd "$repo" && cargo build --release --locked) || return 1
   install -m 0755 "$repo/target/release/pulse-cutover" /usr/local/bin/pulse-cutover
   echo "  built + installed: pulse-cutover (source build)"
 }

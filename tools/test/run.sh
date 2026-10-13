@@ -21,10 +21,22 @@ expect_die "flags: --open-port --dry-run conflict"          parse_args --open-po
 expect_die "flags: --build with --method binary"            parse_args --method binary --build
 expect_die "flags: --uninstall with --dry-run"              parse_args --uninstall --dry-run
 expect_die "flags: --metal must be tahoe|mainnet"           parse_args --metal fuji
-expect_die "flags: --allow-unpinned refused on mainnet"     parse_args --metal mainnet --allow-unpinned
+expect_die "flags: --no-manifest refused on mainnet"        parse_args --metal mainnet --no-manifest
+expect_die "flags: --allow-unpinned (alias) refused on mainnet" parse_args --metal mainnet --allow-unpinned
+expect_ok  "flags: --no-manifest on testnet"                parse_args --metal tahoe --no-manifest
 expect_die "flags: unknown option"                          parse_args --yolo
 expect_ok  "flags: --check alone"                           parse_args --check
 expect_ok  "flags: --dry-run alone"                         parse_args --dry-run
+# the pin override: both halves, well-formed, binary method only, never with --check/--uninstall
+expect_die "flags: --metalgo-version without --metalgo-sha256"      parse_args --metalgo-version v1.14.2-tahoe
+expect_die "flags: --metalgo-sha256 without --metalgo-version"      parse_args --metalgo-sha256 "$(rep a 64)"
+expect_die "flags: --metalgo-sha256 must be 64 hex"                 parse_args --metalgo-version v1.14.2-tahoe --metalgo-sha256 nothex
+expect_die "flags: --metalgo-version must be a release tag"         parse_args --metalgo-version 'latest; rm -rf x' --metalgo-sha256 "$(rep a 64)"
+expect_die "flags: override with --method docker refused"           parse_args --metalgo-version v1.14.2-tahoe --metalgo-sha256 "$(rep a 64)" --method docker
+expect_die "flags: override with --build refused"                   parse_args --metalgo-version v1.14.2-tahoe --metalgo-sha256 "$(rep a 64)" --build
+expect_die "flags: override with --check refused"                   parse_args --check --metalgo-version v1.14.2-tahoe --metalgo-sha256 "$(rep a 64)"
+expect_ok  "flags: override accepted (binary)"                      parse_args --metalgo-version v1.14.2-tahoe --metalgo-sha256 "$(rep a 64)"
+expect_ok  "flags: override accepted with --method binary"          parse_args --metalgo-version v1.14.2-tahoe --metalgo-sha256 "$(rep a 64)" --method binary
 
 good() { cat <<J
 {"xpr_network":"testnet","xpr_chain_id":"$TESTNET","network":"tahoe","network_id":5,"metalgo_version":"v1.14.2-tahoe",
@@ -47,6 +59,34 @@ good | sed 's/"metalgo_version":"v1.14.2-tahoe"/"metalgo_version":"latest; rm -r
 echo '<html>nope</html>' > "$T/b6.json"; expect_die "manifest: HTML rejected" manifest_validate "$T/b6.json" testnet "$TESTNET" ""
 good | sed 's/"docker_image"/"docker_image_digest":"latest","docker_image"/' > "$T/b7.json"; expect_die "manifest: mutable docker digest rejected" manifest_validate "$T/b7.json" testnet "$TESTNET" ""
 builtin_manifest > "$T/bi.json"; expect_ok "manifest: built-in testnet pins validate" manifest_validate "$T/bi.json" testnet "$TESTNET" tahoe
+good | python3 -c 'import json,sys; m=json.load(sys.stdin); [m.pop(k) for k in list(m) if k.startswith(("metalgo_","sha256_","compat_","docker_","rpcchainvm"))]; print(json.dumps(m))' > "$T/ids.json"
+expect_ok  "manifest: ids-only manifest (no version fields) accepted" manifest_validate "$T/ids.json" testnet "$TESTNET" tahoe
+
+# --- pins: the script is the trust root; the manifest can agree, say nothing, or be refused ------------------
+# pins_in: eval the validated manifest FILE, load the pins for NET, resolve for arch A; prints the effective values.
+pins_in() { local f=$1 net=$2; shift 2; eval "$(manifest_validate "$f" testnet "$TESTNET" "")"; pins_load "$net"; A=${A_OVERRIDE:-amd64}; OVR_VERSION=${1:-}; OVR_SHA=${2:-}; pins_resolve >/dev/null 2>&1 || return 1; echo "$PIN_SOURCE|$MF_VERSION|$MF_SHA_AMD|$MF_SHA_ARM|$MF_COMMIT|$MF_PROTOCOL|$MF_IMAGE_DIGEST"; }
+pins_load tahoe
+[ -n "$PIN_VERSION" ] && [ -n "$PIN_SHA_AMD" ] && [ -n "$PIN_SHA_ARM" ] && [ -n "$PIN_COMMIT" ] && [ -n "$PIN_PROTOCOL" ] && [ -n "$PIN_IMAGE_DIGEST" ] && [ -n "$PIN_COMPAT_URL" ] && [ -n "$PIN_COMPAT_SHA" ] \
+  && ok "pins: tahoe pins all present in the script" || bad "pins: tahoe pins incomplete"
+for v in "$PIN_SHA_AMD" "$PIN_SHA_ARM" "$PIN_COMPAT_SHA" "$PIN_COMMIT"; do printf '%s' "$v" | grep -qE '^[0-9a-f]{40}([0-9a-f]{24})?$' || bad "pins: '$v' is not hex"; done
+printf '%s' "$PIN_IMAGE_DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$' && ok "pins: image digest well-formed" || bad "pins: image digest malformed"
+WANT="script|$PIN_VERSION|$PIN_SHA_AMD|$PIN_SHA_ARM|$PIN_COMMIT|$PIN_PROTOCOL|$PIN_IMAGE_DIGEST"
+out=$(pins_in "$T/bi.json" tahoe) && [ "$out" = "$WANT" ] && ok "pins: a manifest that agrees resolves to the script's pins" || bad "pins: agreeing manifest ($out)"
+out=$(pins_in "$T/ids.json" tahoe) && [ "$out" = "$WANT" ] && ok "pins: an ids-only manifest resolves to the script's pins" || bad "pins: ids-only manifest ($out)"
+expect_die "pins: manifest sha256 that differs from the pin is refused"   pins_in "$T/m.json" tahoe
+builtin_manifest | sed "s/\"metalgo_version\":\"$PIN_VERSION\"/\"metalgo_version\":\"v9.9.9-tahoe\"/" > "$T/p1.json"
+expect_die "pins: manifest metalgo_version that differs from the pin is refused" pins_in "$T/p1.json" tahoe
+builtin_manifest | sed "s/\"metalgo_commit\":\"[0-9a-f]*\"/\"metalgo_commit\":\"$(rep b 40)\"/" > "$T/p2.json"
+expect_die "pins: manifest metalgo_commit that differs from the pin is refused" pins_in "$T/p2.json" tahoe
+builtin_manifest | sed "s/\"docker_image_digest\":\"sha256:[0-9a-f]*\"/\"docker_image_digest\":\"sha256:$(rep c 64)\"/" > "$T/p3.json"
+expect_die "pins: manifest docker digest that differs from the pin is refused" pins_in "$T/p3.json" tahoe
+expect_die "pins: a network this script does not pin (mainnet) is refused without an override" pins_in "$T/ids.json" mainnet
+out=$(pins_in "$T/p1.json" tahoe v9.9.9-tahoe "$(rep d 64)") && [ "$out" = "override|v9.9.9-tahoe|$(rep d 64)||||" ] \
+  && ok "pins: override installs the typed version + sha256 (amd64) and pins nothing else" || bad "pins: override amd64 ($out)"
+out=$(A_OVERRIDE=arm64 pins_in "$T/ids.json" mainnet v9.9.9 "$(rep e 64)") && [ "$out" = "override|v9.9.9||$(rep e 64)|||" ] \
+  && ok "pins: override on arm64 pins the arm64 sha and unblocks an unpinned network" || bad "pins: override arm64 ($out)"
+unset A_OVERRIDE
+grep -q 'raw.githubusercontent.com/paulgnz/pulse-cutover/main' "$HERE/metal-install.sh" && bad "metal-install: still tells operators to curl the script from main" || ok "metal-install: no curl-from-main instructions"
 expect_ok  "version: metalgo/1.14.2 matches v1.14.2-tahoe"  version_matches "metalgo/1.14.2 [database=v1.4.5, rpcchainvm=45]" v1.14.2-tahoe
 expect_die "version: metalgo/1.13.5 differs from v1.14.2-tahoe" version_matches "metalgo/1.13.5 [x]" v1.14.2-tahoe
 NODEID=NodeID-B7Af7jpSQN1Wq7iz7sKhyCmvKLVeMkucC; BLSPUB=0x$(rep a 96); BLSPOP=0x$(rep b 192)
@@ -310,6 +350,55 @@ if command -v node >/dev/null; then
   for f in gateway/server.js federator/server.js tools/capture-static.mjs; do
     if node --check "$ROOT/$f" 2>/dev/null; then ok "node --check $f"; else bad "node --check $f"; fi
   done
+fi
+
+echo "install.sh (release tag + manifest placeholders)"
+# install.sh must never fetch releases/latest: GitHub resolves it to the newest NON-pre-release, which for a
+# project whose releases are all rc pre-releases is a stale v0.4.0 (sha-verified against its own sums).
+eval "$(sed -n '/^agent_release_tag(){/,/^}/p;/^manifest_placeholders(){/,/^}/p' "$ROOT/install.sh")"
+AGENT_DEFAULT=$(sed -n 's/^AGENT_RELEASE_DEFAULT="\(v[0-9][^"]*\)"$/\1/p' "$ROOT/install.sh")
+BEACON_DEFAULT=$(sed -n 's/^VERSION_DEFAULT="\(v[0-9][^"]*\)"$/\1/p' "$HERE/beacon-install.sh")
+if [ -n "$AGENT_DEFAULT" ] && [ "$AGENT_DEFAULT" = "$BEACON_DEFAULT" ]; then ok "release tag: install.sh AGENT_RELEASE_DEFAULT ($AGENT_DEFAULT) = beacon-install VERSION_DEFAULT"
+else bad "release tag: install.sh pins '$AGENT_DEFAULT' but beacon-install pins '$BEACON_DEFAULT' (bump both in the release commit)"; fi
+[ "$(agent_release_tag "" "$AGENT_DEFAULT" 2>/dev/null)" = "$AGENT_DEFAULT" ] && ok "release tag: no manifest tag -> the pinned default" || bad "release tag: default"
+[ "$(agent_release_tag v0.5.0-rc.99 "$AGENT_DEFAULT" 2>/dev/null)" = v0.5.0-rc.99 ] && ok "release tag: manifest agent_release_tag wins over the default" || bad "release tag: manifest tag"
+expect_die "release tag: \"latest\" refused"                 agent_release_tag latest "$AGENT_DEFAULT"
+expect_die "release tag: \"LATEST\" refused (any case)"      agent_release_tag LATEST "$AGENT_DEFAULT"
+expect_die "release tag: a branch name is refused"           agent_release_tag main "$AGENT_DEFAULT"
+expect_die "release tag: injection-looking value refused"    agent_release_tag 'v1; rm -rf /' "$AGENT_DEFAULT"
+grep -q 'releases/latest/' "$ROOT/install.sh" && bad "install.sh: still references releases/latest/" || ok "install.sh: no releases/latest/ URL anywhere"
+grep -qE '/tmp/pulse-cutover\.(bin|sums)' "$ROOT/install.sh" && bad "install.sh: fixed /tmp file names (symlink/TOCTOU as root)" || ok "install.sh: release download uses mktemp, no fixed /tmp names"
+grep -q 'cargo build --release --locked' "$ROOT/install.sh" && ok "install.sh: source build uses --locked" || bad "install.sh: source build without --locked"
+if command -v jq >/dev/null; then
+  jq -e . "$ROOT/examples/ceremony.json" >/dev/null 2>&1 && ok "example manifest: valid JSON" || bad "example manifest: invalid JSON"
+  [ "$(jq -r .mode "$ROOT/examples/ceremony.json")" = api ] && ok "example manifest: mode api (the README walkthrough)" || bad "example manifest: mode"
+  [ "$(jq -r .artifacts.agent_release_tag "$ROOT/examples/ceremony.json")" = "$AGENT_DEFAULT" ] && ok "example manifest: agent_release_tag = the pinned default" || bad "example manifest: agent_release_tag ($(jq -r .artifacts.agent_release_tag "$ROOT/examples/ceremony.json"))"
+  P=$(manifest_placeholders "$ROOT/examples/ceremony.json")
+  echo "$P" | grep -q '^target\.subnet_id$' && echo "$P" | grep -q '^target\.producer_key$' && ok "example manifest: coordinator-only values are REPLACE-ME placeholders (detected: $(echo "$P" | wc -l | tr -d ' '))" || bad "example manifest: placeholders not detected ($P)"
+  echo "$P" | grep -q '^_' && bad "example manifest: a documentation key carries REPLACE-ME (would be flagged as a path)" || ok "example manifest: documentation keys carry no placeholder marker"
+  jq 'del(.. | ._about?, ._notes?)' "$ROOT/examples/ceremony.json" | python3 -c '
+import json,sys
+def fill(v):
+    if isinstance(v,dict): return {k:fill(x) for k,x in v.items()}
+    if isinstance(v,list): return [fill(x) for x in v]
+    if isinstance(v,str) and "REPLACE-ME" in v: return "filled"
+    return v
+json.dump(fill(json.load(sys.stdin)), open(sys.argv[1],"w"))' "$T/filled.json"
+  [ -z "$(manifest_placeholders "$T/filled.json")" ] && ok "placeholders: a filled-in manifest passes" || bad "placeholders: filled manifest flagged"
+  # every key install.sh / cutover.sh read with a required `mget` is present in the example (optional ones may be absent)
+  MISSING=""
+  for k in .mode .ceremony.chain_id .ceremony.import_cpu_scale .ceremony.freeze_height .source.rpc_url .source.producer_api_url \
+           .target.subnet_id .target.blockchain_id .target.vm_id .target.network_id .target.producer_name .target.producer_key \
+           .paths.work_dir .artifacts.plugin.url .artifacts.plugin.sha256 .artifacts.metalgo.url .artifacts.metalgo.sha256 \
+           .artifacts.edge.url .artifacts.edge.sha256 .flip.public_host; do
+    jq -e "$k" "$ROOT/examples/ceremony.json" >/dev/null 2>&1 || MISSING="$MISSING $k"
+  done
+  [ -z "$MISSING" ] && ok "example manifest: every required install.sh key present" || bad "example manifest: missing$MISSING"
+  for k in $(grep -o "mget '[^']*'" "$ROOT/install.sh" | sed "s/mget '\(.*\)'/\1/" | sort -u); do
+    case "$k" in .artifacts.gateway.*|.artifacts.hyperion.*|.artifacts.federator.*|.hyperion.*|.artifacts.agent.sha256) continue;; esac   # mode-specific
+    jq -e "$k" "$ROOT/examples/ceremony.json" >/dev/null 2>&1 || bad "example manifest: install.sh requires $k (mget) but the example lacks it"
+  done
+  ok "example manifest: cross-checked against install.sh's required reads"
 fi
 
 echo; echo "$PASS passed, $FAIL failed"; [ "$FAIL" = 0 ]
