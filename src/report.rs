@@ -59,7 +59,7 @@ impl Collected {
     }
 
     fn add_cmd(&mut self, name: &str, cmd: &str) {
-        match run_shell(cmd) {
+        match run_shell(cmd) { // ungated: report bundle collects read-only diagnostics (ps/df/journalctl class)
             Ok(out) if !out.is_empty() => self.add(name, &out),
             Ok(_) => self.notes.push(format!("{name}: empty output from `{cmd}`")),
             Err(e) => self.notes.push(format!("{name}: {e}")),
@@ -241,7 +241,7 @@ pub fn run(opts: &ReportOptions) -> Result<(), String> {
             if opts.paranoid { "host".into() } else { survey.hostname.replace('/', "-") }
         ))
     });
-    run_shell(&format!(
+    run_shell(&format!( // ungated: packs the report bundle into a local tarball, never touches the chain
         "tar -czf '{}' -C '{}' pulse-cutover-report",
         out.display(),
         staging_root.display()

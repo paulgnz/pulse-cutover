@@ -282,7 +282,7 @@ pub struct DoctorReport {
 /// Run a read-only shell probe; None on any failure. Probes must never
 /// mutate — commands here are ps/df/ls/grep/systemctl show/docker ps class.
 fn sh(cmd: &str) -> Option<String> {
-    run_shell(cmd).ok().filter(|s| !s.is_empty())
+    run_shell(cmd).ok().filter(|s| !s.is_empty()) // ungated: doctor probes are read-only (ps/df/ls/grep class)
 }
 
 fn http_json(url: &str, body: Option<Value>) -> Option<Value> {

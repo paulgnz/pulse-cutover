@@ -460,17 +460,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(());
         };
         let cancel_file = crate::drill::cancel_path(self.cfg, dh);
-        let cancel_written = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new().write(true).create(true).truncate(true)
-                    .custom_flags(libc::O_NOFOLLOW).open(&cancel_file)
-                    .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{}\n", self.ops.now_ms()).as_bytes()))
-            }
-            #[cfg(not(unix))]
-            { std::fs::write(&cancel_file, format!("{}\n", self.ops.now_ms())) }
-        };
+        // Round 5 (Codex R5-5): a fresh inode inside the journal directory, never written through a symlink or a hard
+        // link (a planted hard link to this journal must not truncate the journal).
+        let journal_dir = self.cfg.journal_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let cancel_written = crate::ops::write_fresh_in(journal_dir, &cancel_file, format!("{}\n", self.ops.now_ms()).as_bytes());
         let killed = crate::ops::kill_recorded_hook_group_keep_evidence(&crate::drill::pgid_file(self.cfg, dh),
                                                                          std::time::Duration::from_secs(10));
         let wait_ms = (self.cfg.poll_ms.max(1) * 120).min(60_000);

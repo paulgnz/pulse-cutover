@@ -557,4 +557,7 @@ typed by each operator; a signed coordinator drill event is a possible follow-up
 arm while a drill holds the drill lock or is running. A ceremony resumed **after its freeze** is never refused: it
 stops the drill (cancel file, then a kill of the drill's recorded process group that keeps the record unless the group
 is proven gone), re-takes the lock and journals `readiness_drill_stopped_for_the_cut`, or a loud
-`readiness_drill_not_stopped` if it cannot confirm the drill stopped. A cut in progress is never stranded by a drill.
+`readiness_drill_not_stopped` if it cannot confirm the drill stopped. A cut in progress is never stranded by a drill. The
+cancel file is written as a fresh inode inside the journal directory (whatever name sits there, a symlink or a hard
+link to the journal, is unlinked first, never truncated through; every directory on the way must be a real directory;
+round 5).
