@@ -25,6 +25,9 @@
 //!   release_sha256  the PulseVM plugin build; rejected if `target.plugin_path` hashes differently
 //!                   or is not set (an unverifiable plugin refuses the event)
 //!   snapshot_sha256 the expected cut snapshot hash, once known (becomes snapshot.expected_sha256)
+//! XPR mainnet (RISK-REGISTER D-10): the event must name `chain_id` and `h`; at a fresh ARM the agent re-fetches
+//! it from the relay, re-verifies the signature and the payload hash, and requires it to bind this node's source
+//! chain, H, roster and quorum (`mainnet_event_problems`). Events without chain_id still load elsewhere.
 //! Arm binding: an arm must carry `event_hash` = sha256 of the accepted event's exact signed payload
 //! string (the relay enforces this too; the agent checks it itself in `check_arm`). An event is
 //! identified by id AND payload hash: a different body under the same id is validated from scratch.
@@ -153,6 +156,92 @@ pub fn carries_event(doc: &Value, keys: &[String], network: &str, event_id: &str
     let Ok(p) = verify(m, keys) else { return false };
     p["type"] == "event" && p["network"].as_str() == Some(network) && p["event_id"].as_str() == Some(event_id)
         && event_hash.is_none_or(|h| payload_hash(m).is_some_and(|x| x.eq_ignore_ascii_case(h)))
+}
+
+/// RISK-REGISTER D-10 (XPR mainnet, checked at a fresh ARM before anything freezes): the relay's answer `doc`
+/// must carry the signed event this config was derived from, and that signed payload must bind this ceremony.
+/// Checks, all fail-closed (an empty list means authenticated and bound):
+/// - the event verifies against `coordinator_keys` and sha256(payload) == `coordination.event_hash`;
+/// - type, network and event_id equal the config's;
+/// - `chain_id` is present and equals the source chain this node reports;
+/// - `h` is present and equals `ceremony.freeze_height`;
+/// - the signed roster equals the config's roster (producer + instance_id, as a set; both empty in api mode is
+///   fine), and when a roster is signed, its quorum (default: every member) equals `coordination.fleet_quorum`.
+/// A relay that does not answer, or answers without our event, is NOT "no problem": the caller passes `None`.
+pub fn mainnet_event_problems(doc: Option<&Value>, cfg: &Config, source_chain_id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(co) = cfg.coordination.as_ref() else {
+        out.push("no [coordination] section: the signed event cannot be checked".into());
+        return out;
+    };
+    let (Some(event_id), Some(event_hash)) = (co.event_id.as_deref(), co.event_hash.as_deref()) else {
+        out.push("coordination.event_id / event_hash missing: run the config `pulse-cutover await` derived".into());
+        return out;
+    };
+    let Some(doc) = doc.filter(|d| d.is_object()) else {
+        out.push("the coordinator relay did not answer: the signed event cannot be authenticated (unknown is never yes)".into());
+        return out;
+    };
+    let Some(msg) = doc.get("event").filter(|m| !m.is_null()) else {
+        out.push(format!("the relay does not serve a signed event for {}: the event cannot be authenticated", co.network));
+        return out;
+    };
+    let ev = match verify(msg, &co.coordinator_keys) {
+        Ok(ev) => ev,
+        Err(e) => {
+            out.push(format!("the relay's event does not verify against coordinator_keys: {e}"));
+            return out;
+        }
+    };
+    match payload_hash(msg) {
+        Some(h) if h.eq_ignore_ascii_case(event_hash) => {}
+        _ => {
+            out.push("the relay's signed event is not the payload this config was derived from (event_hash differs)".into());
+            return out;
+        }
+    }
+    if ev["type"] != "event" {
+        out.push("the signed message is not an event".into());
+    }
+    if ev["network"].as_str() != Some(co.network.as_str()) {
+        out.push(format!("the signed event's network {} is not coordination.network {}", ev["network"], co.network));
+    }
+    if ev["event_id"].as_str() != Some(event_id) {
+        out.push(format!("the signed event's event_id {} is not coordination.event_id {event_id}", ev["event_id"]));
+    }
+    match ev["chain_id"].as_str() {
+        Some(c) if c.eq_ignore_ascii_case(source_chain_id) => {}
+        Some(c) => out.push(format!("the signed event is for chain_id {c}, but this source is {source_chain_id}")),
+        None => out.push("the signed event names no chain_id: a mainnet event must bind the chain it cuts".into()),
+    }
+    match ev["h"].as_u64() {
+        Some(h) if h == cfg.ceremony.freeze_height => {}
+        Some(h) => out.push(format!("the signed event's H {h} is not ceremony.freeze_height {}", cfg.ceremony.freeze_height)),
+        None => out.push("the signed event names no H".into()),
+    }
+    let norm = |m: &[crate::config::RosterMember]| -> std::collections::BTreeSet<(String, Option<String>)> {
+        m.iter().map(|r| (r.producer.clone(), r.instance_id.as_ref().map(|i| i.to_lowercase()))).collect()
+    };
+    let signed_roster: Vec<crate::config::RosterMember> = match ev.get("roster").filter(|r| !r.is_null()) {
+        None => Vec::new(),
+        Some(r) => match serde_json::from_value(r.clone()) {
+            Ok(m) => m,
+            Err(e) => {
+                out.push(format!("the signed event's roster is malformed: {e}"));
+                return out;
+            }
+        },
+    };
+    if norm(&signed_roster) != norm(&co.roster) {
+        out.push("the signed event's roster differs from coordination.roster".into());
+    }
+    if !signed_roster.is_empty() {
+        let q = ev["quorum"].as_u64().unwrap_or(signed_roster.len() as u64);
+        if q as usize != co.fleet_quorum {
+            out.push(format!("the signed event's quorum {q} is not coordination.fleet_quorum {}", co.fleet_quorum));
+        }
+    }
+    out
 }
 
 /// True when `doc` carries a valid signed `complete` for `event_id` (the coordinator closed an event that ran).

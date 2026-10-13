@@ -537,7 +537,25 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // RISK-REGISTER D-10: a mainnet ceremony is coordinated, whether chain_id was configured (checked at load,
         // section only) or discovered here; at ARM the signed event, roster and quorum must be in place.
         if crate::config::is_xpr_mainnet(&info.chain_id) {
-            problems.extend(self.cfg.mainnet_coordination_problems(true));
+            let missing = self.cfg.mainnet_coordination_problems(true);
+            let has_event = self.cfg.coordination.as_ref().is_some_and(|co| co.event_id.is_some());
+            // D-10, Codex review: field presence is not authorization. On a fresh ARM the relay must serve the
+            // signed event this config was derived from, and its payload must bind this chain, H, roster and
+            // quorum. A relay that does not answer refuses (unknown is never yes). On a resume the event was
+            // authenticated at the fresh ARM (journaled), and a relay outage must not strand a running cut.
+            if missing.is_empty() && has_event && !resumed {
+                let co = self.cfg.coordination.as_ref().expect("checked above");
+                let url = format!("{}/api/coord/{}", co.url.trim_end_matches('/'), co.network);
+                let doc = self.ops.get_json(&url).ok().flatten();
+                let bound = crate::coord::mainnet_event_problems(doc.as_ref(), &self.cfg, &info.chain_id);
+                if bound.is_empty() {
+                    self.journal.evidence(State::Armed, json!({"mainnet_event_verified": {
+                        "event_id": co.event_id, "event_hash": co.event_hash, "chain_id": info.chain_id,
+                        "h": self.cfg.ceremony.freeze_height, "roster": co.roster.len(), "quorum": co.fleet_quorum}}))?;
+                }
+                problems.extend(bound.into_iter().map(|p| format!("XPR MAINNET signed event: {p}")));
+            }
+            problems.extend(missing);
         }
         match self.ops.producer_paused() {
             // api mode: this node does not produce; we only need producer_api
