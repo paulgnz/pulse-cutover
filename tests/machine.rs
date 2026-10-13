@@ -6204,3 +6204,33 @@ fn r30_shadow_goes_past_the_mainnet_ignite_refusal_labelled_everywhere() {
     // ...as a SETUP check: a shadow node's own label never excludes it from the shadow fleet's gate.
     assert!(!pulse_cutover::beacon::has_failing_health(&serde_json::json!({"checks": [{"name": "shadow", "ok": false}]})));
 }
+
+#[test]
+fn r30_a_fresh_ceremony_refuses_to_arm_while_a_readiness_drill_is_running() {
+    // Review: drill/ceremony exclusion ran one way only. A drill RUNNING on this box (its own process, same
+    // start time) makes a fresh ceremony's ARM preflight refuse before anything freezes.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let drill_root = pulse_cutover::drill::drill_root(&cfg);
+    std::fs::create_dir_all(&drill_root).unwrap();
+    let me = std::process::id();
+    std::fs::write(pulse_cutover::drill::latest_path(&cfg), serde_json::json!({"kind": "readiness_drill", "h": 99,
+        "state": "RUNNING", "pid": me, "pid_start": pulse_cutover::ops::process_start(me)}).to_string()).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("readiness drill at H = 99 is RUNNING"), "{err}");
+    let e = journal_entries(&cfg);
+    assert!(transition(&e, "FROZEN").is_none(), "nothing froze");
+    assert!(!ops.paused.get(), "the producer was never paused");
+
+    // A stale record (the drill process is gone) is journaled, never blocking.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    std::fs::create_dir_all(pulse_cutover::drill::drill_root(&cfg)).unwrap();
+    std::fs::write(pulse_cutover::drill::latest_path(&cfg), serde_json::json!({"kind": "readiness_drill", "h": 99,
+        "state": "RUNNING", "pid": me, "pid_start": "another process"}).to_string()).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("readiness_drill_stale"));
+}

@@ -432,7 +432,14 @@ export function projectReport(r) {
       target: targetView(ce.target),
     };
   }
-  out.drill = projectDrill(r.drill);
+  // r30 review (d): drill telemetry is display-only. An invalid drill field drops the drill, never the report:
+  // otherwise one bad field would make a producer look silent and change fleet decisions.
+  try {
+    out.drill = projectDrill(r.drill);
+  } catch (e) {
+    out.drill = null;
+    out.drill_invalid = String(e?.message ?? e).slice(0, 200);
+  }
   const co = r.coord ?? null;
   if (co === null) out.coord = null;
   else {
@@ -512,21 +519,25 @@ export function drillComparison(reports) {
     byH.get(d.h).push({ producer, d });
   }
   return [...byH.entries()].sort((a, b) => b[0] - a[0]).slice(0, 5).map(([h, rows]) => {
+    // r30 review (e): a DONE drill counts toward agreement only with complete evidence (block id at H, snapshot
+    // hash and fingerprint digest); one that lacks any is listed as incomplete and blocks `agree`.
+    const complete = (d) => d.state === 'DONE' && !!d.block_id_at_h && !!d.snapshot_sha256 && !!d.fingerprints_digest;
     const group = (key) => {
       const g = {};
-      for (const { producer, d } of rows) if (d.state === 'DONE' && d[key]) (g[d[key]] ||= []).push(producer);
+      for (const { producer, d } of rows) if (complete(d)) (g[d[key]] ||= []).push(producer);
       return Object.entries(g).map(([value, producers]) => ({ value, producers }));
     };
     const done = rows.filter((r) => r.d.state === 'DONE');
+    const incomplete = done.filter((r) => !complete(r.d)).map((r) => r.producer);
     const roots = group('fingerprints_digest');
     return {
-      h, producers: rows.length, done: done.length,
+      h, producers: rows.length, done: done.length, incomplete,
       running: rows.filter((r) => r.d.state === 'RUNNING').map((r) => r.producer),
       failed: rows.filter((r) => r.d.state === 'FAILED').map((r) => ({ producer: r.producer, error: r.d.error })),
       block_id_at_h: group('block_id_at_h'), snapshot_sha256: group('snapshot_sha256'), fingerprints_digest: roots,
       compare: group('compare'),
       // Identical state on every producer that finished, and at least two of them.
-      agree: done.length >= 2 && roots.length === 1 && group('block_id_at_h').length === 1,
+      agree: done.length >= 2 && incomplete.length === 0 && roots.length === 1 && group('block_id_at_h').length === 1,
       timings: rows.map((r) => ({ producer: r.producer, ...r.d.timings_ms })),
     };
   });

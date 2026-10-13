@@ -42,6 +42,12 @@ pub trait ChainOps {
     /// Best-effort schedule_snapshot at a specific height (Leap 4+ snapshot
     /// scheduler). Err if unsupported — callers fall back to create_snapshot.
     fn schedule_snapshot(&self, height: u64) -> Result<(), String>;
+    /// Remove a pending single-block snapshot request at exactly `height` (Leap's producer API
+    /// `get_snapshot_requests` + `unschedule_snapshot`). Ok(true) when one was removed, Ok(false) when none
+    /// was pending (already written, or never scheduled) or this ChainOps cannot unschedule.
+    fn unschedule_snapshot(&self, _height: u64) -> Result<bool, String> {
+        Ok(false)
+    }
     /// getInfo against the target pulsevm chain; Ok(None) while unreachable
     /// (still bootstrapping / chain not yet initialized).
     fn target_info(&self) -> Result<Option<ChainInfo>, String>;
@@ -215,6 +221,11 @@ fn recorded_live_group(pgid_file: &Path) -> Option<u32> {
     let text = std::fs::read_to_string(pgid_file).ok()?;
     let pgid: u32 = text.lines().next()?.trim().parse().ok()?;
     (pgid > 1 && !group_members(pgid).is_empty()).then_some(pgid)
+}
+
+/// The live process group recorded in `pgid_file` (first line), if any member is still running.
+pub fn live_recorded_group(pgid_file: &Path) -> Option<u32> {
+    recorded_live_group(pgid_file)
 }
 
 /// A process's start time as `ps -o lstart=` prints it (same on Linux procps and macOS), used
@@ -659,6 +670,31 @@ impl ChainOps for HttpOps {
             None,
         )
         .map(|_| ())
+    }
+
+    fn unschedule_snapshot(&self, height: u64) -> Result<bool, String> {
+        let reqs = self.post(&format!("{}/v1/producer/get_snapshot_requests", self.producer_api), Some(json!({})), None)?;
+        let ids: Vec<u64> = reqs["snapshot_requests"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|r| {
+                        r["start_block_num"].as_u64() == Some(height)
+                            && r["end_block_num"].as_u64() == Some(height)
+                            && r["block_spacing"].as_u64().unwrap_or(0) == 0
+                    })
+                    .filter_map(|r| r["snapshot_request_id"].as_u64())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in &ids {
+            self.post(
+                &format!("{}/v1/producer/unschedule_snapshot", self.producer_api),
+                Some(json!({"snapshot_request_id": id})),
+                None,
+            )?;
+        }
+        Ok(!ids.is_empty())
     }
 
     fn target_protocol(&self) -> Result<Option<Value>, String> {

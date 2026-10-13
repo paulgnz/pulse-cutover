@@ -70,3 +70,31 @@ test('r30: a drill never feeds the fleet verdict', () => {
   const withDrill = fleetVerdict(ev, base({ drill: drill({ h: 100 }) }));
   assert.deepEqual(withDrill, without);
 });
+
+test('r30 review (d): an invalid drill drops only the drill, never the beacon report', () => {
+  const good = projectReport({ ...fixture(), producer: 'bpa', network: 'mainnet' });
+  for (const bad of [drill({ h: null }), drill({ kind: 'ceremony' }), drill({ state_root: '<script>' }), 'not-an-object']) {
+    const r = projectReport({ ...fixture(), producer: 'bpa', network: 'mainnet', drill: bad });
+    assert.equal(r.drill, null);
+    assert.match(r.drill_invalid, /drill/);
+    assert.deepEqual(r.ceremony, good.ceremony);
+    assert.equal(r.producer, good.producer);
+  }
+});
+
+test('r30 review (e): a DONE drill without complete evidence never counts toward agreement', () => {
+  for (const missing of ['fingerprints_digest', 'block_id_at_h', 'snapshot_sha256']) {
+    const c = drillComparison([
+      { producer: 'bpa', report: { drill: drill() } },
+      { producer: 'bpb', report: { drill: drill({ [missing]: null }) } },
+    ]);
+    assert.equal(c[0].agree, false, missing);
+    assert.deepEqual(c[0].incomplete, ['bpb'], missing);
+  }
+  const ok = drillComparison([
+    { producer: 'bpa', report: { drill: drill() } },
+    { producer: 'bpb', report: { drill: drill() } },
+  ]);
+  assert.equal(ok[0].agree, true);
+  assert.deepEqual(ok[0].incomplete, []);
+});

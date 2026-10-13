@@ -510,6 +510,20 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 reference
             ));
         }
+        // A readiness drill running on this box would compete for CPU, RAM and disk in the cut window
+        // (docs/DESIGN.md §7): a fresh ceremony refuses to ARM next to one; a stale record is only reported.
+        if !resumed {
+            match crate::drill::activity(&self.cfg) {
+                crate::drill::DrillActivity::Running { .. } => {
+                    problems.extend(crate::drill::ceremony_blocker(&self.cfg));
+                }
+                crate::drill::DrillActivity::Stale { h: dh } => {
+                    self.journal.evidence(self.state, json!({"readiness_drill_stale": {"h": dh,
+                        "note": "drill/latest.json says RUNNING but no drill process or pipeline group is alive; not blocking"}}))?;
+                }
+                crate::drill::DrillActivity::Idle => {}
+            }
+        }
         if let Some(expected) = &self.cfg.ceremony.chain_id {
             if expected != &info.chain_id {
                 problems.push(format!(
