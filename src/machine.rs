@@ -89,6 +89,12 @@ pub struct Machine<'a, O: ChainOps> {
     /// When the fleet view first stopped showing a quorum during a degraded wait (None = it shows one).
     fleet_unhealthy_since: Option<u64>,
     degraded_note: String,
+    /// The `shadow` value of this journal's ARMED record (None: not armed yet); every later run, join and rollback
+    /// must present the same shadow identity (docs/DESIGN-shadow.md).
+    armed_shadow: Option<serde_json::Value>,
+    /// The full shadow identity proof passed in THIS run, right before chain creation / ignition: the only thing that
+    /// lets a shadow go past the XPR mainnet ignite refusal (never the config flag alone).
+    shadow_verified: bool,
 }
 
 /// What `pulse-cutover rollback` did. `failed` lists every step that did not succeed; the
@@ -308,6 +314,37 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             fleet_head: (0, 0),
             fleet_unhealthy_since: None,
             degraded_note: String::new(),
+            armed_shadow: recovered.armed_shadow,
+            shadow_verified: false,
+        }
+    }
+
+    /// A SHADOW that cannot prove its identity may be pointed at a REAL producer (one its peers may have paused for a real
+    /// cut): it ends without touching the source. No resume, no hooks, no unstage; the journal records ABORTED with a
+    /// completed (empty) rollback so a later `rollback` cannot resume anything either. Past chain creation it halts.
+    fn shadow_refuse(&mut self, reason: &str, detail: serde_json::Value) -> Result<(), String> {
+        if self.past_point_of_no_return() {
+            return self.halt(reason, detail);
+        }
+        let from = self.state;
+        self.journal.error(from, reason, json!({"detail": detail, "shadow_refused": true}))?;
+        self.state = State::Aborted;
+        self.journal.transition(State::Aborted, json!({"reason": reason, "from": from.as_str(), "shadow_refused": true,
+            "source_untouched": true,
+            "note": "SHADOW identity not proven: refused without touching the source (no resume, no hooks). If this \
+                     agent paused a producer, it stays paused: check by hand which chain that node belongs to"}))?;
+        self.journal.evidence(State::Aborted, json!({"rollback_done": true, "shadow_refused": true,
+            "note": "nothing rolled back on purpose: an unproven shadow must not resume a node that may be real"}))?;
+        self.aborted_rollback_complete = true;
+        eprintln!("SHADOW REFUSED: {reason} (the source was NOT touched)");
+        Ok(())
+    }
+
+    /// A config flipped to or from shadow (or a shadow's label, network or keys changed) since ARM: refused.
+    fn check_shadow_binding(&self) -> Result<(), String> {
+        match crate::shadow::journal_mismatch(self.cfg, self.armed_shadow.as_ref()) {
+            Some(why) => Err(format!("{why}. Journal: {}", self.journal.path().display())),
+            None => Ok(()),
         }
     }
 
@@ -320,6 +357,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     pub fn run(&mut self) -> Result<State, String> {
         // Defense in depth (main.rs checks too): a readiness-only config never drives anything.
         self.cfg.ensure_ceremony_profile()?;
+        self.check_shadow_binding()?;
         if self.rollback_pending {
             return Err("refusing to run: a rollback (`pulse-cutover rollback`, or this agent's own abort) was started \
                  on this journal and did not finish (it recorded `rollback_requested` but never reached ABORTED). \
@@ -441,7 +479,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     "rehearsal_overrides": self.cfg.rehearsal_overrides(),
                     "rehearsal": self.cfg.ceremony.rehearsal,
                     "production_profile": if self.cfg.ceremony.rehearsal { json!(self.cfg.production_problems()) } else { json!("met") },
-                    "shadow": crate::shadow::label(&self.cfg),
+                    "shadow": crate::shadow::identity(&self.cfg),
                 }),
             )?;
             if self.cfg.is_shadow() {
@@ -544,7 +582,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // SHADOW (docs/DESIGN-shadow.md): before anything freezes, prove the target is the configured private
         // network and the source signs only with shadow keys (a shadow config on a real mainnet node refuses here).
         if self.cfg.is_shadow() && pre_verify {
-            for p in crate::shadow::runtime_problems(&self.cfg, self.ops) {
+            for p in crate::shadow::identity_problems(&self.cfg, self.ops) {
                 problems.push(format!("SHADOW identity: {p}"));
             }
         }
@@ -689,6 +727,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             Ok(())
         } else {
             let what = if resumed { "resume preflight failed" } else { "preflight failed" };
+            if problems.iter().any(|p| p.starts_with("SHADOW identity:")) {
+                // A shadow that cannot prove it is a shadow may be pointed at a REAL node: touch nothing.
+                self.shadow_refuse(what, json!({"problems": problems}))?;
+                return Err(format!("{what}: {}", problems.join("; ")));
+            }
             self.abort(what, json!({"problems": problems}))?;
             Err(format!("{what}: {}", problems.join("; ")))
         }
@@ -748,9 +791,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let mainnet = self.cfg.mainnet_refusals_apply(self.chain_id.as_deref());
         let problems = self.cfg.production_problems();
         if self.cfg.is_shadow() {
-            let shadow_problems = crate::shadow::runtime_problems(&self.cfg, self.ops);
+            let shadow_problems = crate::shadow::identity_problems(&self.cfg, self.ops);
             if !shadow_problems.is_empty() {
-                self.abort("SHADOW identity not verified before the freeze", json!({"problems": shadow_problems}))?;
+                self.shadow_refuse("SHADOW identity not verified before the freeze", json!({"problems": shadow_problems}))?;
                 return Ok(false);
             }
             self.journal.evidence(State::Armed, json!({"shadow_identity": "verified before the freeze"}))?;
@@ -1021,6 +1064,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// resumed) only if the resume guard passes now, or with
     /// `force_stranded` (an operator's record of a fleet-wide decision, journaled).
     pub fn operator_rollback_opts(&mut self, force: bool, force_stranded: bool) -> Result<RollbackOutcome, String> {
+        self.check_shadow_binding()?;
         let mut notes: Vec<String> = vec![];
         // FIRST, on every path (including "already rolled back", and since rc.29 before the fleet guard, whose strand
         // runs on_halt): an agent killed mid-hook or mid pipeline step leaves that process group running (they run in their own group). Stop it
@@ -2635,7 +2679,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let up = self.cfg.upstream.clone().expect("validated: upstream section");
         let source_chain = self.chain_id.clone().unwrap_or_default();
         let pending = upstream::ignite_pending_reasons();
-        if crate::config::is_xpr_mainnet(&source_chain) && !pending.is_empty() && self.cfg.is_shadow() {
+        if crate::config::is_xpr_mainnet(&source_chain) && !pending.is_empty() && self.cfg.is_shadow() && self.shadow_verified {
             self.journal.evidence(self.state, json!({"shadow_ignite_pending": pending,
                 "note": "SHADOW: a real mainnet ignition is refused for these; the shadow goes on to find out what happens"}))?;
         } else if crate::config::is_xpr_mainnet(&source_chain) && !pending.is_empty() {
@@ -2812,6 +2856,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// joins only if the result (snapshot sha256, state fingerprints, migration genesis — all three required) equals
     /// the LIVE quorum's. A failed re-verification changes nothing on either chain.
     pub fn join_with(&mut self, event_id: &str, reverify: bool) -> Result<State, String> {
+        self.check_shadow_binding()?;
         self.cfg.ensure_ceremony_profile()?;
         let co = self.cfg.coordination.clone().ok_or("join needs the event's [coordination] config (the one `await` derived)")?;
         if co.event_id.as_deref() != Some(event_id) {
@@ -3106,6 +3151,19 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// chain at the cut height.
     fn step_verified(&mut self) -> Result<(), String> {
         let upstream_backend = self.cfg.ceremony.import_backend == ImportBackend::Upstream;
+        // SHADOW: re-prove the identity right before chain creation / ignition (and on every resume or join that comes
+        // through here). Only this run's positive proof lets a shadow past the mainnet ignite refusal.
+        self.shadow_verified = false;
+        if self.cfg.is_shadow() {
+            let problems = crate::shadow::identity_problems(&self.cfg, self.ops);
+            if !problems.is_empty() {
+                // shadow_refuse() halts instead when chain creation or ignition already started.
+                self.shadow_refuse("SHADOW identity not verified before chain creation / ignition", json!({"problems": problems}))?;
+                return Ok(());
+            }
+            self.shadow_verified = true;
+            self.journal.evidence(self.state, json!({"shadow_identity": "verified before chain creation / ignition"}))?;
+        }
         if upstream_backend && !self.upstream_ignite_preflight()? {
             return Ok(()); // aborted inside, with evidence
         }
@@ -3113,7 +3171,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // The same-chain-id gaps are PulseVM's, whatever imported the state: the fork backend
             // gets the same hard XPR-mainnet refusal as the upstream one.
             let pending = upstream::ignite_pending_reasons();
-            if self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet) && !pending.is_empty() && self.cfg.is_shadow() {
+            if self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet) && !pending.is_empty() && self.cfg.is_shadow() && self.shadow_verified {
                 self.journal.evidence(self.state, json!({"shadow_ignite_pending": pending}))?;
             } else if self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet) && !pending.is_empty() {
                 self.abort("ignite refused for XPR MAINNET (fork backend): a same-chain-id mainnet cutover still has unsolved prerequisites",
@@ -3256,6 +3314,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(());
             }
         };
+        if self.cfg.is_shadow() {
+            let problems = crate::shadow::target_network_problems(&self.cfg, self.ops);
+            if !problems.is_empty() {
+                self.shadow_refuse("SHADOW: after ignition the target metalgo is not the configured private network", json!({"problems": problems}))?;
+                return Ok(());
+            }
+        }
         self.reached_ignited = true;
         self.state = State::Ignited;
         self.journal.transition(

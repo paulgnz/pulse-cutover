@@ -120,6 +120,9 @@ pub struct Recovered {
     /// rc.23: when the first post-ignition degraded symptom was seen (patience counts from there,
     /// across a crash and resume).
     pub degraded_since_ms: Option<u64>,
+    /// The `shadow` value of the ARMED (arming) record: Null for a real ceremony, the shadow identity for a shadow
+    /// (docs/DESIGN-shadow.md). None = no arming record yet. Journals from before shadow mode read as Null.
+    pub armed_shadow: Option<Value>,
 }
 
 impl Journal {
@@ -392,6 +395,10 @@ impl Journal {
                     out.rollback_steps_done.clear();
                 }
                 out.state = Some(st);
+                // The arming record (it carries "mode"; an unhalt returning to ARMED does not): bind the shadow identity.
+                if st == State::Armed && out.armed_shadow.is_none() && entry.data.get("mode").is_some() {
+                    out.armed_shadow = Some(entry.data.get("shadow").cloned().unwrap_or(Value::Null));
+                }
                 if entry.state == State::Frozen.as_str() {
                     out.frozen_ts_ms = Some(entry.ts_ms);
                 }

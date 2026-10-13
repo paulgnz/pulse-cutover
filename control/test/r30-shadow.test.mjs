@@ -31,3 +31,19 @@ test('r30 a shadow report on the mainnet network is refused', () => {
   r.network = 'rehearsal';
   assert.throws(() => projectReport(r), /shadow/);
 });
+
+test('r30 shadow-fix: a shadow report lands only on a shadow board, judged by its chain_id too', async () => {
+  const { shadowBoardProblem } = await import('../lib.mjs');
+  const MAIN = '384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0';
+  const nets = [{ id: 'mainnet', chain_id: MAIN }, { id: 'xpr-main', chain_id: MAIN }, { id: 'shadow-sneaky', chain_id: MAIN },
+    { id: 'rehearsal', chain_id: 'aa'.repeat(32) }, { id: 'shadow-a', chain_id: null }, { id: 'shadow-b' }];
+  const rep = (network) => ({ network, shadow: { label: 'x', metal_network_id: 4242 } });
+  assert.match(shadowBoardProblem(rep('mainnet'), nets), /XPR MAINNET chain_id/);
+  assert.match(shadowBoardProblem(rep('xpr-main'), nets), /XPR MAINNET chain_id/, 'a mainnet board under another name');
+  assert.match(shadowBoardProblem(rep('shadow-sneaky'), nets), /XPR MAINNET chain_id/, 'a "shadow" name on a mainnet board');
+  assert.match(shadowBoardProblem(rep('rehearsal'), nets), /not a shadow board/);
+  assert.match(shadowBoardProblem(rep('nowhere'), nets), /configured shadow board/);
+  assert.equal(shadowBoardProblem(rep('shadow-a'), nets), null);
+  assert.equal(shadowBoardProblem(rep('shadow-b'), nets), null);
+  assert.equal(shadowBoardProblem({ network: 'mainnet', shadow: null }, nets), null, 'a normal report is not judged here');
+});
