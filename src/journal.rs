@@ -176,10 +176,20 @@ pub enum PauseEvent {
     /// the latest open own intent becomes ours. Without it (a crash between the intent and the RPC, then someone else
     /// pausing) the episode's ownership is UNKNOWN and nothing resumes it.
     Ack,
-    /// A journaled resume (a rollback's `resume` step): closes the latest open episode.
+    /// A journaled resume (a rollback's `resume` step, or `resumed_production_for_snapshot`): closes the latest open
+    /// episode.
     Resume,
     /// The operator's journaled release of an external pause (`rollback --force-stranded --i-understand`).
     Release,
+    /// r30 round 11 (Codex R10-1): this ceremony is ABOUT to resume its own pause (`side_effect: source_resume`, written
+    /// before the resume RPC). It gives up ownership at once: the episode is CLOSING. If the resume's outcome is never
+    /// journaled (a crash, or a lost response that a read could not settle), the episode stays closing = ownership
+    /// unknown, never resumed again on this ceremony's own authority (the producer may have resumed and someone else
+    /// paused it since).
+    ResumeIntent,
+    /// r30 round 11: the resume RPC failed and a fresh read showed the producer still paused (`source_resume_cancelled`):
+    /// the resume did not happen, the closing episode is ours again.
+    ResumeCancel,
 }
 
 /// r30 round 9/10: the folded pause-episode log.
@@ -189,7 +199,8 @@ pub struct Episodes {
     pub ours: bool,
     /// The latest open episode is someone else's (adopted) pause.
     pub external: bool,
-    /// The latest open episode is an own pause INTENT without its ack: ownership unknown, never resumed (round 10).
+    /// The latest open episode is an own pause INTENT without its ack (round 10), or an own pause whose resume was
+    /// started but never settled (round 11, closing): ownership unknown, never resumed.
     pub unknown: bool,
     /// This journal ever intended a pause of its own (open or closed, acked or not).
     pub ever_ours: bool,
@@ -204,6 +215,8 @@ pub fn pause_episodes(events: &[PauseEvent], legacy_paused: bool, acks_tracked: 
         Ours,
         External,
         Unknown,
+        /// r30 round 11: an own pause whose resume was started (intent journaled) and not settled.
+        Closing,
     }
     // (owner, open)
     let mut eps: Vec<(Owner, bool)> = Vec::new();
@@ -234,13 +247,27 @@ pub fn pause_episodes(events: &[PauseEvent], legacy_paused: bool, acks_tracked: 
                 Some(ep) => ep.0 = Owner::Ours,
                 None => eps.push((Owner::Ours, true)),
             },
+            PauseEvent::ResumeIntent => {
+                if let Some(ep) = eps.iter_mut().rev().find(|(_, open)| *open) {
+                    if ep.0 == Owner::Ours {
+                        ep.0 = Owner::Closing;
+                    }
+                }
+            }
+            PauseEvent::ResumeCancel => {
+                if let Some(ep) = eps.iter_mut().rev().find(|(_, open)| *open) {
+                    if ep.0 == Owner::Closing {
+                        ep.0 = Owner::Ours;
+                    }
+                }
+            }
         }
     }
     let latest_open = eps.iter().rev().find(|(_, open)| *open).map(|(o, _)| *o);
     Episodes {
         ours: latest_open == Some(Owner::Ours),
         external: latest_open == Some(Owner::External),
-        unknown: latest_open == Some(Owner::Unknown),
+        unknown: matches!(latest_open, Some(Owner::Unknown) | Some(Owner::Closing)),
         ever_ours,
     }
 }
@@ -585,12 +612,21 @@ impl Journal {
             if entry.data.get("source_pause_ack").is_some() {
                 out.pause_events.push(PauseEvent::Ack);
             }
+            // r30 round 11: a resume that was started and then found not to have happened.
+            if entry.data.get("source_resume_cancelled").is_some() {
+                out.pause_events.push(PauseEvent::ResumeCancel);
+            }
+            // r30 round 11 (Codex R10-2): the pause_at_h recovery resume closes its episode like a rollback's resume.
+            if entry.data.get("resumed_production_for_snapshot").and_then(|v| v.as_bool()) == Some(true) {
+                out.pause_events.push(PauseEvent::Resume);
+            }
             if let Some(se) = entry.data.get("side_effect").and_then(|v| v.as_str()) {
                 match se {
                     "source_pause" => out.pause_events.push(PauseEvent::Pause {
                         ours: entry.data.get("adopted").and_then(|v| v.as_bool()) != Some(true),
                     }),
                     "external_pause_release" => out.pause_events.push(PauseEvent::Release),
+                    "source_resume" => out.pause_events.push(PauseEvent::ResumeIntent),
                     "write_freeze" => out.writes_closed = true,
                     _ => {}
                 }
