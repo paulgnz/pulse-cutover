@@ -444,7 +444,10 @@ before a real event: rehearsals use rehearsal nodes, a drill uses each producer'
    script path behind a variable) is refused. Before creating anything, refuse when any path the drill writes
    overlaps (after resolving symlinks) `snapshot.staged_path`, the journal, `upstream.work_dir` or `snapshot.dir`:
    the whole drill root (each drill's work files, `latest.json` and its temp file, the cancel and lock files) and
-   the journal's lock file. Then take the ceremony's own exclusive journal lock (`<journal>.lock`) AND the drill
+   the journal's lock file; and (round 3) refuse when any of those paths already exists as a symlink or a file with
+   other names (a hard link), since writing through it could overwrite a protected file. The drill never writes
+   through a link: its log is opened with `O_NOFOLLOW`, and `latest.json.tmp`, the cancel file and the copied evidence
+   are written as fresh inodes (any old name unlinked first, then `O_EXCL | O_NOFOLLOW`). Then take the ceremony's own exclusive journal lock (`<journal>.lock`) AND the drill
    root's lock (`drill/drill.lock`, because configs that share a journal directory share `latest.json` whatever
    their journal file names), and hold both for the whole drill, so a ceremony and a drill, or two drills, exclude
    each other atomically. Refuse while the ceremony journal is in progress, sealed, unfinished or LIVE
@@ -452,7 +455,8 @@ before a real event: rehearsals use rehearsal nodes, a drill uses each producer'
    for H < head + 20, and for an H already drilled on this box (the
    `drill/<H>` directory is claimed with an atomic create).
 2. `schedule_snapshot(H)` (the same producer-API call ARM makes), recording the producer API's
-   `snapshot_request_id` in the drill log and `latest.json`. No freeze, no pause, no burn-off gate: the chain
+   `snapshot_request_id` in the drill log and `latest.json` together with the producer API it was made on
+   (normalised) and its height: a producer-local id means nothing on another node (round 3). No freeze, no pause, no burn-off gate: the chain
    keeps producing, and the blocks after H are recorded as information only.
 3. Wait for LIB ≥ H, pin H's block id, pick up `snapshot-<id of H>.bin`, hash it.
 4. Run `upstream::run_pipeline` unchanged (export → import → compare → fingerprint) in
@@ -473,9 +477,11 @@ it by hand).
 
 **What it cannot vouch for.** The guard covers every call the agent makes; it cannot sandbox shell. The
 conversion commands (`upstream.export_cmd`, `import_bin`, `compare_bin`, `fingerprint_bin`) run as configured, so
-the drill is only as harmless as those commands. The textual check above catches the obvious mistake (a
-conversion command or wrapper that calls a hook, a stop or a chain-creation command); it cannot prove what an
-arbitrary binary does. Operators must use the published conversion commands.
+the drill is only as harmless as those commands. The check above catches the obvious mistake (a conversion command
+or wrapper that calls a hook, a stop or a chain-creation command): by text, and (round 3) by RESOLVED path, so quoting
+(`on-'freeze'.sh`), `.`/`..` components, a `cd` followed by a relative path, and a symlink to a hook are caught too;
+a `cd` to anything but an absolute path, and a `~` path, are refused because the drill cannot know where they lead.
+It cannot prove what an arbitrary binary does. Operators must use the published conversion commands.
 
 **Both ways exclusive.** A fresh ceremony's ARM preflight refuses while `drill/latest.json` is RUNNING with a live
 drill process (same pid and start time) or a live pipeline process group; a RUNNING record with nothing alive is
@@ -487,6 +493,21 @@ failed or the group is still alive, the cancel is INCOMPLETE: nothing is marked 
 so a ceremony's ARM keeps refusing) and the command exits non-zero. If no drill process is left, it takes the same
 two locks a drill takes (a ceremony or another drill holding them refuses the cancel), refuses next to a ceremony
 in progress, removes only the snapshot request id that drill recorded, and marks it FAILED (cancelled).
+
+Round 3: `--cancel` makes every check before writing anything (the output-path overlap and link checks; for a drill
+whose process is not alive, the two locks, the ceremony check, and the request's binding: it must have been made on
+this config's producer API, for this drill's H). A refused cancel writes nothing. An incomplete cancel KEEPS the
+pipeline's process-group record (it is removed only when the group is verified gone), so the drill keeps showing as
+RUNNING and a ceremony's ARM keeps refusing until the work is really gone. The request is removed only while it is
+still the single-block request at the recorded H on that node.
+
+**The ceremony holds the drill-root lock too** (round 3). Configs that share a journal directory share
+`drill/latest.json` but lock different journal files, so a drill under another journal name could start next to a
+ceremony (or be starting, not yet RUNNING in `latest.json`, when the ceremony's ARM checked). A ceremony's run takes
+`drill/drill.lock` before its drill check and holds it for the whole run: a fresh ARM refuses when it is held; a
+resumed ceremony is never refused for it mid-cut (it journals `readiness_drill_lock_busy` and continues). Lock order
+everywhere: the journal lock, then the drill-root lock (drill, `drill --cancel`, ceremony), so there is no cycle;
+every acquisition is a bounded try-lock.
 
 **Why it cannot change anything.** The drill never holds the raw `ChainOps`: every call goes through `DrillGuard`,
 which passes read-only calls, `schedule_snapshot` and the pipeline's commands, and refuses (and records) pause,

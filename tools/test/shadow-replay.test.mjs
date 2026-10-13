@@ -77,6 +77,16 @@ test('round 2: a receipt without a status is unknown, never a match', () => {
   assert.equal(sum.result.match, undefined);
 });
 
+test('round 3: only Leap statuses are outcomes; equal unsupported statuses are unknown, never a match', () => {
+  for (const s of [9, -1, 1.5, 'status_9', 'new_status', '', null, undefined]) assert.equal(statusName(s), 'unknown', String(s));
+  assert.equal(statusName(' Executed '), 'executed');
+  for (const s of ['status_9', 'new_status', '']) {
+    const r = compareOutcome({ replayable: true, status: s }, { accepted: true, included: true, included_status: s });
+    assert.equal(r.result, 'unknown', s);
+  }
+  assert.equal(compareOutcome({ replayable: true, status: 'executed' }, { accepted: true, included: true, included_status: 'status_9' }).result, 'unknown');
+});
+
 test('classifyError buckets the usual rejections', () => {
   assert.equal(classifyError('expired_tx_exception: Expired Transaction'), 'expired');
   assert.equal(classifyError('invalid_ref_block_exception: Transaction\'s reference block did not match'), 'tapos');
@@ -152,8 +162,8 @@ test('compareOutcome: only hard_fail and expired may match a rejection, with a c
   assert.deepEqual(c('soft_fail', inc('soft_fail')), { result: 'match', category: 'match' });
   // executed: unchanged
   assert.deepEqual(c('executed', rej('Expired Transaction')), { result: 'mismatch', category: 'expired' });
-  // an unknown mainnet status never matches a rejection
-  assert.equal(c('status_9', rej('assertion failure')).result, 'mismatch');
+  // an unknown mainnet status never matches a rejection: it is unknown (inconclusive, round 3), never a match
+  assert.equal(c('status_9', rej('assertion failure')).result, 'unknown');
 });
 
 test('compareOutcome and summarise', () => {
@@ -267,5 +277,39 @@ test('end to end: refuses when lineage cannot be proven (no shadow H+1, failed H
     // a blocks file without --source-chain-id
     r = await run(['--blocks-file', file, ...base]);
     assert.equal(r.code, 2, r.err); assert.match(r.err, /source chain_id is unknown/); assert.equal(sent.length, 0);
+  } finally { source.close(); target.close(); }
+});
+
+test('end to end (round 3): unknown outcomes are inconclusive: exit 3 unless --allow-inconclusive', async () => {
+  const cutBlock = { block_num: H, id: 'cutid', transactions: [] };
+  const source = await mock((url, b) => {
+    if (url.endsWith('/get_info')) return [200, { chain_id: XPR_MAINNET_CHAIN_ID, head_block_num: 1002 }];
+    if (url.endsWith('/get_block')) { const n = Number(b.block_num_or_id); return [200, n === H ? cutBlock : BLOCKS.find((x) => x.block_num === n)]; }
+    return [404, {}];
+  });
+  let head = H + 1; const shadowBlocks = { [H]: cutBlock, [H + 1]: { block_num: H + 1, id: 'shadow-own-1001', transactions: [] } };
+  const target = await mock((url, b) => {
+    if (url.endsWith('/get_info')) return [200, { chain_id: XPR_MAINNET_CHAIN_ID, head_block_num: head }];
+    if (url.endsWith('/get_block')) { const blk = shadowBlocks[Number(b.block_num_or_id)]; return blk ? [200, blk] : [400, { error: { what: 'unknown block' } }]; }
+    if (url.endsWith('/send_transaction')) {
+      const id = packedTrxId(b.packed_trx, b.compression);
+      // Every transaction lands, with a status Leap does not have: nothing about its outcome is known.
+      head += 1; shadowBlocks[head] = { block_num: head, id: `shadow-${head}`, transactions: [{ status: 'status_9', trx: { id } }] };
+      return [202, { transaction_id: id }];
+    }
+    return [404, {}];
+  });
+  const S = `http://127.0.0.1:${source.address().port}`, T = `http://127.0.0.1:${target.address().port}`;
+  const dir = mkdtempSync(join(tmpdir(), 'shadow-replay-'));
+  try {
+    const base = ['--source', S, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2', '--target', T, '--send', '--shadow-i-understand', '--rate', '0', '--inclusion-timeout', '5'];
+    const r = await run([...base, '--out', join(dir, 'a.json')]);
+    const rep = JSON.parse(readFileSync(join(dir, 'a.json'), 'utf8'));
+    assert.equal(rep.summary.result.match ?? 0, 0, 'no unknown outcome counts as a match');
+    // ID3 failed on mainnet: its unknown shadow status is unknown too, so nothing mismatches and nothing matches.
+    assert.equal(rep.verdict, 'inconclusive');
+    assert.equal(r.code, 3, r.err);
+    const allowed = await run([...base, '--allow-inconclusive']);
+    assert.equal(allowed.code, 0, allowed.err);
   } finally { source.close(); target.close(); }
 });

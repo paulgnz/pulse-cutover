@@ -200,11 +200,13 @@ impl<O: ChainOps> ChainOps for DrillGuard<'_, O> {
         // By height it could remove someone else's request at the same height (a ceremony's): never.
         self.refuse(&format!("unschedule_snapshot({height}) by height (a drill only removes its own request, by id)"))
     }
-    fn unschedule_snapshot_request(&self, id: u64) -> Result<bool, String> {
-        if !matches!(*self.scheduled.borrow(), Some((_, Some(mine))) if mine == id) {
-            return self.refuse(&format!("unschedule_snapshot_request({id}) of a request this drill did not schedule"));
+    fn unschedule_snapshot_request(&self, id: u64, height: u64) -> Result<bool, String> {
+        if !matches!(*self.scheduled.borrow(), Some((mh, Some(mine))) if mine == id && mh == height) {
+            return self.refuse(&format!(
+                "unschedule_snapshot_request({id} at {height}) of a request this drill did not schedule"
+            ));
         }
-        self.inner.unschedule_snapshot_request(id)
+        self.inner.unschedule_snapshot_request(id, height)
     }
     fn target_info(&self) -> Result<Option<ChainInfo>, String> {
         self.refuse("target_info")
@@ -464,21 +466,135 @@ fn pipeline_texts(cfg: &Config) -> (Vec<(String, String)>, Vec<String>) {
 
 /// r30 review (a): the guard cannot sandbox shell. A drill runs the configured conversion commands as they are;
 /// it refuses when any of them (or a small script it names) references a configured side-effect command.
+///
+/// Round 3: a raw-text search was bypassed by quoting (`/opt/hooks/on-'freeze'.sh`), `.` components, `cd` plus a
+/// relative path, `~`, and symlinks. So the words of every conversion text are also RESOLVED the way the shell
+/// would see them (quotes removed, relative to the last `cd`, `.`/`..` folded, symlinks followed) and compared with
+/// the resolved paths of every side-effect command. A `cd` to anything but an absolute path, and a `~` path, are
+/// refused: the drill cannot know where they lead.
 fn pipeline_side_effect_problems(cfg: &Config) -> Vec<String> {
     let effects = side_effect_commands(cfg);
+    let effect_paths: Vec<(&'static str, PathBuf)> = effects
+        .iter()
+        .flat_map(|(key, cmd)| {
+            text_words(cmd)
+                .into_iter()
+                .filter(|w| is_pathlike(w))
+                .map(move |w| (*key, canonical(&lexical(Path::new(&w), None))))
+        })
+        .collect();
     let (texts, mut p) = pipeline_texts(cfg);
     for (where_, text) in texts {
         for (key, cmd) in &effects {
             if let Some(n) = command_needles(cmd).into_iter().find(|n| text.contains(n.as_str())) {
-                p.push(format!(
-                    "{where_} references {key} (`{n}`): a drill runs the conversion commands as configured and must \
-                     never reach a freeze, flip, stop, chain-creation or ignition command; use the published \
-                     conversion commands"
-                ));
+                p.push(side_effect_message(&where_, key, &n));
             }
         }
+        let words = text_words(&text);
+        let mut cwd: Option<PathBuf> = None;
+        let mut i = 0;
+        while i < words.len() {
+            let w = &words[i];
+            if w == "cd" || w == "pushd" {
+                match words.get(i + 1) {
+                    Some(t) if t.starts_with('/') && !t.contains('$') => cwd = Some(lexical(Path::new(t), None)),
+                    other => p.push(format!(
+                        "{where_} changes directory to `{}`: a drill only follows `cd` to an absolute path (it must \
+                         know what every relative path names); use absolute paths",
+                        other.map_or("", |s| s.as_str())
+                    )),
+                }
+                i += 2;
+                continue;
+            }
+            if w.starts_with('~') {
+                p.push(format!(
+                    "{where_} names `{w}`, a path relative to a home directory: a drill cannot know where it leads; use \
+                     an absolute path"
+                ));
+            } else if let Some(resolved) = resolve_word(w, cwd.as_deref()) {
+                for (key, ep) in &effect_paths {
+                    if &resolved == ep {
+                        p.push(side_effect_message(&where_, key, &format!("{w} → {}", resolved.display())));
+                    }
+                }
+            }
+            i += 1;
+        }
     }
+    p.sort();
+    p.dedup();
     p
+}
+
+fn side_effect_message(where_: &str, key: &str, what: &str) -> String {
+    format!(
+        "{where_} references {key} (`{what}`): a drill runs the conversion commands as configured and must never \
+         reach a freeze, flip, stop, chain-creation or ignition command; use the published conversion commands"
+    )
+}
+
+/// The words of a command or a script body, quotes removed. A body that does not tokenize as a whole is read line
+/// by line (comment lines skipped), falling back to whitespace for a line that does not tokenize either.
+fn text_words(text: &str) -> Vec<String> {
+    if let Ok(w) = all_shell_words(text) {
+        return w;
+    }
+    let mut out = vec![];
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        match all_shell_words(t) {
+            Ok(w) => out.extend(w),
+            Err(_) => out.extend(t.split_whitespace().map(|w| w.trim_matches(|c| "'\";&|()<>".contains(c)).to_string())),
+        }
+    }
+    out
+}
+
+/// A word that names a file: it contains `/` and is not a generic interpreter/wrapper.
+fn is_pathlike(w: &str) -> bool {
+    const GENERIC: &[&str] = &["sh", "bash", "dash", "zsh", "env", "sudo", "nohup", "setsid", "timeout", "docker",
+        "python", "python3", "node", "perl", "exec", "systemd-run"];
+    let base = w.rsplit('/').next().unwrap_or(w);
+    w.contains('/') && !w.contains('$') && !w.contains('{') && !w.chars().any(char::is_whitespace) && !GENERIC.contains(&base)
+}
+
+/// `p` made absolute (relative to `cwd`, else the process's directory) with `.` and `..` folded lexically.
+fn lexical(p: &Path, cwd: Option<&Path>) -> PathBuf {
+    use std::path::Component;
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.map(Path::to_path_buf).unwrap_or_else(|| std::env::current_dir().unwrap_or_default()).join(p)
+    };
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// What a word names on disk, if it can name a file: a path-like word (relative ones against the last `cd`), or a
+/// bare word that exists in the `cd` directory (`cd /opt/hooks && sh on-freeze.sh`).
+fn resolve_word(w: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    if w.is_empty() || w.contains('$') {
+        return None;
+    }
+    if w.contains('/') {
+        return Some(canonical(&lexical(Path::new(w), cwd)));
+    }
+    let c = cwd?;
+    let p = c.join(w);
+    p.exists().then(|| canonical(&p))
 }
 
 /// `p` made absolute with symlinks resolved, also when it (or its tail) does not exist yet: the longest existing
@@ -515,7 +631,7 @@ pub fn root_lock_base(cfg: &Config) -> PathBuf {
 /// staged snapshot, journal, work dir or nodeos's snapshot dir: the whole drill root (each drill's work files,
 /// which are rewritten and deleted, `latest.json` and its temp file, the cancel and lock files) and the journal's
 /// lock file the drill takes. Checked before the drill creates anything.
-pub fn path_overlap_problems(cfg: &Config, _h: u64) -> Vec<String> {
+pub fn path_overlap_problems(cfg: &Config, h: u64) -> Vec<String> {
     let drill = canonical(&drill_root(cfg));
     let journal_lock = canonical(Path::new(&format!("{}.lock", cfg.journal_path.display())));
     let overlaps = |other: &Path| {
@@ -543,6 +659,54 @@ pub fn path_overlap_problems(cfg: &Config, _h: u64) -> Vec<String> {
     if let Some(d) = &cfg.snapshot.dir {
         check("snapshot.dir", d);
     }
+    p.extend(linked_output_problems(cfg, h));
+    p
+}
+
+/// r30 round 3: resolving the drill root is not enough: a file BENEATH it (`latest.json.tmp`, the log, the cancel
+/// or lock file) can itself be a symlink (or a hard link) to a protected file and be written through. Every path a
+/// drill or `--cancel` writes or opens for writing must be absent, or a plain single-named file / directory.
+fn linked_output_problems(cfg: &Config, h: u64) -> Vec<String> {
+    let root = drill_root(cfg);
+    let dir = drill_dir(cfg, h);
+    let mut paths = vec![
+        root.join("latest.json"),
+        root.join("latest.json.tmp"),
+        PathBuf::from(format!("{}.lock", root_lock_base(cfg).display())),
+        PathBuf::from(format!("{}.lock", cfg.journal_path.display())),
+        dir.clone(),
+        dir.join("drill.jsonl"),
+        dir.join("cancel"),
+        dir.join("work"),
+        pgid_file(cfg, h),
+    ];
+    for name in [format!("compare-report-{h}.json"), format!("checkpoint-{h}.bin.manifest.json")] {
+        paths.push(dir.join(name));
+    }
+    let mut p = vec![];
+    for path in paths {
+        let Ok(m) = std::fs::symlink_metadata(&path) else { continue };
+        if m.file_type().is_symlink() {
+            p.push(format!(
+                "{} is a symlink (to {}): a drill never writes through a link (it could overwrite a protected file); \
+                 remove it",
+                path.display(),
+                std::fs::read_link(&path).map(|t| t.display().to_string()).unwrap_or_else(|_| "?".into())
+            ));
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if m.is_file() && m.nlink() > 1 {
+                p.push(format!(
+                    "{} has {} names (a hard link): a drill never writes a file that may be another path's; remove it",
+                    path.display(),
+                    m.nlink()
+                ));
+            }
+        }
+    }
     p
 }
 
@@ -564,6 +728,67 @@ pub fn ceremony_conflict(cfg: &Config) -> Result<Option<String>, String> {
     })
 }
 
+// ------------------------------------------------------------------------------------------- safe writes ----
+
+/// r30 round 3: a drill never writes THROUGH a link. A path a drill writes may already exist as a symlink (or a
+/// hard link) to a protected file (the staged snapshot, the journal); following it would overwrite that file.
+#[cfg(unix)]
+fn nofollow(o: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    o.custom_flags(libc::O_NOFOLLOW)
+}
+#[cfg(not(unix))]
+fn nofollow(o: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    o
+}
+
+/// A fresh file at `path` with `bytes`: whatever name was there (a stale file, a symlink, a hard link) is unlinked
+/// first, which never touches the file it pointed at, then a NEW inode is created (O_EXCL, O_NOFOLLOW) and fsynced.
+fn write_fresh(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    if std::fs::symlink_metadata(path).is_ok() {
+        std::fs::remove_file(path).map_err(|e| format!("replace {}: {e}", path.display()))?;
+    }
+    let mut f = nofollow(std::fs::OpenOptions::new().write(true).create_new(true))
+        .open(path)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
+    f.write_all(bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+    f.sync_all().map_err(|e| format!("fsync {}: {e}", path.display()))
+}
+
+/// Append to the drill's own log without following a link, and refuse a file with other names (a hard link).
+fn append_nofollow(path: &Path, line: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut f = nofollow(std::fs::OpenOptions::new().create(true).append(true))
+        .open(path)
+        .map_err(|e| format!("open drill log {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = f.metadata().map_err(|e| format!("stat drill log {}: {e}", path.display()))?;
+        if m.nlink() > 1 {
+            return Err(format!("drill log {} has other names (a hard link): refused", path.display()));
+        }
+    }
+    writeln!(f, "{line}").map_err(|e| format!("write drill log: {e}"))?;
+    f.sync_all().map_err(|e| format!("fsync drill log: {e}"))
+}
+
+/// The producer API a snapshot request was made on, normalised for comparison (scheme, host, port, path; no
+/// trailing slash). A request id is only meaningful on the node that issued it (r30 round 3).
+pub fn normalized_endpoint(url: &str) -> String {
+    match url::Url::parse(url.trim()) {
+        Ok(u) => format!(
+            "{}://{}{}{}",
+            u.scheme(),
+            u.host_str().unwrap_or("").to_ascii_lowercase(),
+            u.port_or_known_default().map(|p| format!(":{p}")).unwrap_or_default(),
+            u.path().trim_end_matches('/')
+        ),
+        Err(_) => url.trim().trim_end_matches('/').to_string(),
+    }
+}
+
 // ------------------------------------------------------------------------------------------------ run ----
 
 /// The drill's own append-only record (`<drill dir>/<H>/drill.jsonl`): one JSON line per step, fsynced.
@@ -575,16 +800,8 @@ struct DrillLog {
 
 impl DrillLog {
     fn record(&mut self, now_ms: u64, stage: &str, data: Value) -> Result<(), String> {
-        use std::io::Write;
         let line = json!({"kind": DRILL_KIND, "ts_ms": now_ms, "stage": stage, "data": data});
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|e| format!("open drill log {}: {e}", self.path.display()))?;
-        writeln!(f, "{line}").map_err(|e| format!("write drill log: {e}"))?;
-        f.sync_all().map_err(|e| format!("fsync drill log: {e}"))?;
-        Ok(())
+        append_nofollow(&self.path, &line.to_string())
     }
 
     /// Rewrite `latest.json` (the beacon's view) atomically.
@@ -594,9 +811,10 @@ impl DrillLog {
                 v.insert(k.clone(), val.clone());
             }
         }
+        // A fresh temp inode (never written through a link), then rename: rename replaces the NAME `latest.json`,
+        // never a file a symlink there pointed at.
         let tmp = self.latest.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&self.view).unwrap_or_default())
-            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        write_fresh(&tmp, &serde_json::to_vec_pretty(&self.view).unwrap_or_default())?;
         std::fs::rename(&tmp, &self.latest).map_err(|e| format!("rename {}: {e}", self.latest.display()))
     }
 }
@@ -743,7 +961,7 @@ fn unschedule_if_pending<O: ChainOps>(ops: &DrillGuard<'_, O>, h: u64, log: &mut
             "why": "the producer API reported no request id: a drill never removes a request by height (a ceremony may hold one at the same height); remove it by hand if it is still pending"}));
         return;
     };
-    let rec = match ops.unschedule_snapshot_request(id) {
+    let rec = match ops.unschedule_snapshot_request(id, h) {
         Ok(true) => json!({"unscheduled": true, "snapshot_request_id": id}),
         Ok(false) => json!({"unscheduled": false, "snapshot_request_id": id, "why": "that request is no longer pending (or the producer API cannot unschedule)"}),
         Err(e) => json!({"unscheduled": false, "snapshot_request_id": id, "error": e}),
@@ -768,8 +986,12 @@ fn drive<O: ChainOps>(
     // 1. Schedule the snapshot at exactly H (the same producer-API call the ceremony makes at ARM).
     let request_id = ops.schedule_snapshot_request(h).map_err(|e| format!("schedule_snapshot({h}) failed: {e}"))?;
     // The request id is persisted so `--cancel` of a dead drill removes exactly this request, never by height.
-    log.record(ops.now_ms(), "snapshot_scheduled", json!({"h": h, "snapshot_request_id": request_id}))?;
-    log.publish(json!({"stage": "waiting_for_h", "snapshot_request_id": request_id}))?;
+    // ...bound to the producer API it was made on and its height (round 3: an id means nothing on another node).
+    let endpoint = normalized_endpoint(&cfg.source.producer_api_url);
+    log.record(ops.now_ms(), "snapshot_scheduled", json!({"h": h, "snapshot_request_id": request_id,
+        "snapshot_request_endpoint": endpoint}))?;
+    log.publish(json!({"stage": "waiting_for_h", "snapshot_request_id": request_id, "snapshot_request_h": h,
+        "snapshot_request_endpoint": endpoint}))?;
 
     // 2. Wait for H to be produced and then final. The chain keeps running: nothing is frozen.
     let head_now = ops.source_info()?.head_block_num;
@@ -900,8 +1122,8 @@ fn drive<O: ChainOps>(
     let evidence_dir = work.parent().unwrap_or(work).to_path_buf();
     for name in [format!("compare-report-{h}.json"), format!("checkpoint-{h}.bin.manifest.json")] {
         let src = work.join(&name);
-        if src.exists() {
-            let _ = std::fs::copy(&src, evidence_dir.join(&name));
+        if let Ok(bytes) = std::fs::read(&src) {
+            let _ = write_fresh(&evidence_dir.join(&name), &bytes);
         }
     }
     if !opts.keep_work {
@@ -945,40 +1167,65 @@ fn wait_until_not_running(cfg: &Config, wait: std::time::Duration) -> bool {
 
 /// `pulse-cutover drill --cancel`: stop this box's running drill and record why.
 ///
-/// 1. Write the cancel file the drill polls (while waiting for H, and as the pipeline's cancel check, which
-///    stops the running tool). A live drill then fails itself, removes its own pending snapshot request and
-///    publishes FAILED.
+/// Round 3: every check comes BEFORE anything is written: the drill's output paths (overlap with protected paths,
+/// and no symlink or hard link at any of them), and, when the drill process is not alive to finish its own record,
+/// the same locks a drill takes (the journal's and the drill root's; a ceremony or another drill holding them
+/// refuses), a ceremony in progress, and the snapshot request's binding (the producer API it was made on must be
+/// this config's). A refused cancel writes nothing.
+///
+/// 1. A live drill: write the cancel file it polls (while waiting for H, and as the pipeline's cancel check, which
+///    stops the running tool); it then fails itself, removes its own pending snapshot request and publishes FAILED.
 /// 2. If it has not stopped within `wait`, or its process is gone, stop the pipeline tool's recorded process
 ///    group (start-time checked; pgid 0 and 1 are never signalled), and verify the group is gone. If it is not,
-///    the cancel is INCOMPLETE: nothing is marked finished (the record stays RUNNING, so a ceremony's ARM still
-///    sees live work) and the command fails.
-/// 3. If no drill process is left to finish its own record, take the same locks a drill takes (the journal's and
-///    the drill root's: a ceremony or another drill holding them refuses the cancel), refuse when a ceremony is in
-///    progress, then remove ONLY the snapshot request id that drill recorded (never by height: a ceremony may
-///    hold a request at the same height), and mark it FAILED.
+///    the cancel is INCOMPLETE: the process-group record is KEPT and nothing is marked finished (the drill keeps
+///    showing as RUNNING, so a ceremony's ARM keeps refusing) and the command fails.
+/// 3. If no drill process is left to finish its own record, remove ONLY the snapshot request id that drill
+///    recorded, on the producer API it recorded, and only while that request is still the single-block request at
+///    the recorded H (never by height alone), and mark it FAILED.
 pub fn cancel<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> Result<String, String> {
     let (h, live_pid) = match activity(cfg) {
         DrillActivity::Idle => return Ok("no readiness drill is running on this box".into()),
         DrillActivity::Running { h, pid, .. } => (h, pid),
         DrillActivity::Stale { h } => (h, None),
     };
-    let dir = drill_dir(cfg, h);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    std::fs::write(cancel_path(cfg, h), format!("{}\n", ops.now_ms()))
-        .map_err(|e| format!("write {}: {e}", cancel_path(cfg, h).display()))?;
+    let overlap = path_overlap_problems(cfg, h);
+    if !overlap.is_empty() {
+        return Err(format!("cancel refused, nothing changed: {}", overlap.join("; ")));
+    }
     let read_view = || {
         std::fs::read_to_string(latest_path(cfg)).ok()
             .and_then(|t| serde_json::from_str::<Value>(&t).ok())
             .filter(Value::is_object)
             .unwrap_or_else(|| json!({"kind": DRILL_KIND, "drill": true, "h": h}))
     };
+    // The drill process is not alive (dead, or only its pipeline group is): nothing holds the locks, so take them
+    // now, before writing anything.
+    let mut locks: Option<(std::fs::File, std::fs::File)> = None;
+    let take_locks = || -> Result<(std::fs::File, std::fs::File), String> {
+        let j = Journal::lock(&cfg.journal_path)
+            .map_err(|e| format!("cancel refused, nothing changed: a ceremony or a drill holds this journal ({e})"))?;
+        let r = Journal::lock(&root_lock_base(cfg))
+            .map_err(|e| format!("cancel refused, nothing changed: another readiness drill holds the drill directory ({e})"))?;
+        if let Some(why) = ceremony_conflict(cfg)? {
+            return Err(format!("cancel refused, nothing changed: {why}"));
+        }
+        binding_problem(cfg, &read_view(), h).map_or(Ok((j, r)), Err)
+    };
+    if live_pid.is_none() {
+        locks = Some(take_locks()?);
+    }
+    let dir = drill_dir(cfg, h);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let mut log = DrillLog { path: dir.join("drill.jsonl"), latest: latest_path(cfg), view: read_view() };
+    if live_pid.is_some() {
+        write_fresh(&cancel_path(cfg, h), format!("{}\n", ops.now_ms()).as_bytes())?;
+    }
     log.record(ops.now_ms(), "cancel_requested", json!({"pid": live_pid}))?;
 
     if live_pid.is_some() && wait_until_not_running(cfg, wait) {
         return Ok(format!("readiness drill at H = {h} cancelled: it stopped itself (see {})", dir.join("drill.jsonl").display()));
     }
-    let killed = crate::ops::kill_recorded_hook_group(&pgid_file(cfg, h), std::time::Duration::from_secs(10));
+    let killed = crate::ops::kill_recorded_hook_group_keep_evidence(&pgid_file(cfg, h), std::time::Duration::from_secs(10));
     let killed_s = match &killed {
         Ok(Some(d)) => d.clone(),
         Ok(None) => "no live pipeline process group".to_string(),
@@ -988,14 +1235,16 @@ pub fn cancel<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> 
     if live_pid.is_some() && wait_until_not_running(cfg, wait) {
         return Ok(format!("readiness drill at H = {h} cancelled after stopping its pipeline ({killed_s})"));
     }
-    // Round 2: success only when the pipeline group is verified gone. A failed kill, or a group still alive, is
-    // an incomplete cancel: the record stays RUNNING (a ceremony's ARM keeps refusing) and the command fails.
+    // Success only when the pipeline group is verified gone. A failed kill, or a group still alive, is an
+    // incomplete cancel: the record stays RUNNING (a ceremony's ARM keeps refusing), the group record is kept, and
+    // the command fails.
     let group_left = crate::ops::live_recorded_group(&pgid_file(cfg, h));
     if killed.is_err() || group_left.is_some() {
         log.record(ops.now_ms(), "cancel_incomplete", json!({"result": killed_s, "live_group": group_left}))?;
         return Err(format!(
-            "cancel INCOMPLETE for the readiness drill at H = {h}: its pipeline process group is still alive ({killed_s}{}); \
-             it was not marked cancelled. Stop it by hand, then run `pulse-cutover drill --cancel` again",
+            "cancel INCOMPLETE for the readiness drill at H = {h}: its pipeline process group is still alive or could \
+             not be proven gone ({killed_s}{}); it was not marked cancelled. Stop it by hand, then run \
+             `pulse-cutover drill --cancel` again",
             group_left.map_or(String::new(), |g| format!(", group {g}"))
         ));
     }
@@ -1004,15 +1253,12 @@ pub fn cancel<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> 
             "the drill process {p} is still running after the cancel request ({killed_s}); check it by hand"
         ));
     }
-    // Nobody is left to finish the drill's record. Take the locks a drill takes: a ceremony or another drill that
-    // holds them now refuses this cleanup; then refuse next to a ceremony in progress.
-    let _lock = Journal::lock(&cfg.journal_path)
-        .map_err(|e| format!("cancel refused: a ceremony or a drill holds this journal ({e})"))?;
-    let _root_lock = Journal::lock(&root_lock_base(cfg))
-        .map_err(|e| format!("cancel refused: another readiness drill holds the drill directory ({e})"))?;
-    if let Some(why) = ceremony_conflict(cfg)? {
-        return Err(format!("cancel refused, nothing changed: {why}"));
+    // Nobody is left to finish the drill's record. A drill that was alive at the start has died since: take the
+    // locks now (a ceremony or another drill holding them refuses this cleanup).
+    if locks.is_none() {
+        locks = Some(take_locks()?);
     }
+    let _locks = locks;
     log.view = read_view();
     let guard = DrillGuard::new(ops);
     match log.view["snapshot_request_id"].as_u64() {
@@ -1031,6 +1277,37 @@ pub fn cancel<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> 
         "error": "cancelled by `pulse-cutover drill --cancel` (the drill process was not running)",
         "finished_ts_ms": now}))?;
     Ok(format!("readiness drill at H = {h} marked cancelled; its process was not running ({killed_s})"))
+}
+
+/// Round 3: a recorded snapshot request may only be cleaned up through the producer API it was made on, at the
+/// height it was made for. Some(why) refuses the cancel (nothing changed).
+fn binding_problem(cfg: &Config, view: &Value, h: u64) -> Option<String> {
+    view["snapshot_request_id"].as_u64()?;
+    let here = normalized_endpoint(&cfg.source.producer_api_url);
+    match view["snapshot_request_endpoint"].as_str() {
+        Some(ep) if ep == here => {}
+        Some(ep) => {
+            return Some(format!(
+                "cancel refused, nothing changed: the drill's snapshot request was made on {ep}, but this config's \
+                 producer API is {here}; a request id only means something on the node that issued it. Run \
+                 `drill --cancel` with the config the drill used"
+            ))
+        }
+        None => {
+            return Some(
+                "cancel refused, nothing changed: the drill recorded a snapshot request id without the producer API it \
+                 was made on; remove the request by hand (get_snapshot_requests / unschedule_snapshot on that node)"
+                    .into(),
+            )
+        }
+    }
+    match view["snapshot_request_h"].as_u64() {
+        Some(rh) if rh == h => None,
+        other => Some(format!(
+            "cancel refused, nothing changed: the drill's snapshot request is recorded for height {other:?}, not this \
+             drill's H = {h}"
+        )),
+    }
 }
 
 // ----------------------------------------------------------------------------------------------- views ----
