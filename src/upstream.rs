@@ -774,6 +774,15 @@ pub fn ignite_pending_reasons() -> Vec<&'static str> {
         "same-chain-id cutover: PulseVM must enforce TAPOS (block-summary ring seeded \
          at the cut, checked at admission and block application) so transactions \
          signed on a leftover source chain cannot replay onto the target",
+        "imported accounts must be billed CPU in the units their limits are in (#106: \
+         PulseVM v1.0.0 bills metering points against microsecond limits, so accounts run \
+         out of CPU within seconds of the cut)",
+        "every producer must sign with its own registered key (#107: the migrated system \
+         contract re-elects producers at the first onblock and a node whose key differs \
+         stops producing; rehearsals shared one key)",
+        "a fleet-wide commit point: the target must not produce or admit transactions until \
+         a fleet-signed COMMIT exists (#113, sealed start; docs/DESIGN-authority-boundary.md), \
+         or a partial abort can leave two writable chains",
     ]
 }
 
@@ -1227,7 +1236,9 @@ mod tests {
     fn ignite_pending_reasons_name_only_the_mainnet_gaps() {
         let reasons = ignite_pending_reasons().join(" ");
         assert!(reasons.contains("chain_id") && reasons.contains("TAPOS"));
-        assert_eq!(ignite_pending_reasons().len(), 2);
+        // RISK-REGISTER blockers B-1 (#106), B-2 (#107) and A-1 (#113) are refusals too.
+        assert!(reasons.contains("#106") && reasons.contains("#107") && reasons.contains("#113"));
+        assert_eq!(ignite_pending_reasons().len(), 5);
     }
 
     /// The stage-2 rig's real cut block (XPR testnet 408461570, 6 receipts) and the anchor the

@@ -1433,7 +1433,7 @@ fn ceremony_journals_advisory_stubbed_intrinsic_scan() {
     assert_eq!(scan["advisory"], serde_json::json!(true));
     assert_eq!(scan["code_objects"], serde_json::json!(0));
     assert_eq!(scan["at_risk"], serde_json::json!(0));
-    assert_eq!(scan["served_imports"], serde_json::json!(169));
+    assert_eq!(scan["served_imports"], serde_json::json!(183));
 
     // The table is persisted beside the journal for `pulse-cutover report`.
     let table = std::fs::read_to_string(dir.path().join("scan-contracts.txt")).unwrap();

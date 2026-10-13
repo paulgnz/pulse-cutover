@@ -39,6 +39,7 @@ The agent has also changed since most of these runs. The main differences, noted
 | [Hyperion and bp mode](#hyperion-mode-and-bp-mode-2026-08-21-second-session) | 2026-08-21 | same | Tahoe (hyperion), local 1-node network (bp, loop) | hyperion, producer (`schedule_at_h`) | hyperion: 1 correct abort, 1 LIVE; bp: LIVE at exactly H; loop 22/22 |
 | [Multi-producer rehearsal](#multi-producer-rehearsal-5-bps-september-2026) | 2026-09-28/29 | Leap 5.0.3, 5 producers | private 5-validator Metal network | producer, 5 BPs | run 1 aborted on all 5; runs 2–6 LIVE on all 5 |
 | [Linux fault injection](#linux-fault-injection-rc9-and-rc10) | 2026-09-29/30 | stubbed nodeos | stubbed metalgo | producer and api | rc.9: 83/83 with a shim, critical BUG-1 found; rc.10: 49/49 with no shim |
+| [Upstream-stack fleet runs](#upstream-stack-fleet-runs-october-2026) | 2026-10-06 to 10-10 | XPR testnet state (rewritten test keys), 5-BP Leap 5.0.3 mesh, 21 scheduled names | upstream PulseVM v1.0.0, metalgo 1.14.2, private 5-validator Metal network | producer, 5 BPs, signed events, rc.22–rc.27 | 18 runs: happy paths, split (r4), stranding, join, partition, crash, schedule checks |
 | [Mainnet conversion](#mainnet-conversion-2026-10-13) | 2026-10-13 | a real XPR mainnet snapshot | none (conversion only) | the upstream pipeline, timed per stage | 9.6 min, 13.7 GB peak; compare fails on 3 tables |
 
 ---
@@ -401,6 +402,36 @@ through this suite.
 
 ---
 
+## Upstream-stack fleet runs (October 2026)
+
+**Setup.** Five BPs (4 vCPU, 8 GB each; Sydney, Singapore, Los Angeles, New Jersey, Frankfurt), each running a Leap
+5.0.3 producer of a private mesh restored from **XPR testnet state** (32,513 accounts; test keys rewritten so the
+fleet could sign; the 21 scheduled producer names spread round-robin over the five boxes) and a metalgo v1.14.2
+validator of a **private** 5-validator Metal network with **upstream PulseVM v1.0.0**. Every event was signed and
+relayed by mission control with a roster of all five. Rehearsal-only pieces on every run: the #106 CPU
+redenomination patch in the importer, the compare allowlist for `contract_index_double` and `global_property`
+(#109), the target chain_id change (#108), and **one shared producer key** (#107). No run used mainnet state, real
+per-BP keys or Tahoe.
+
+| Run | Agent | Scenario | Result |
+|---|---|---|---|
+| r1–r6 | rc.22 | happy paths, a partition, a crash at FROZEN and at IGNITED+2 s, mission control unreachable for 10–15 min | every BP cut exactly H, verified and agreed 5/5; identical dapp state at H on all 5 and against a reference nodeos (197 tables); but every healthy run ended with **LIVE and HALTED BPs on one chain** (each judged liveness alone on a slow WAN target: ~1.35 s per accepted block, 11–39 s gaps). **r4: a BP that lost the relay before its chain creation aborted and resumed the old chain while four peers had ignited: 33 writes landed after H.** Crash runs resumed from the journal; the partition healed with no divergence |
+| c1–c5 | rc.24 | happy path; r4 replayed; a broken compare; a forced resume (SPLIT control); a signed abort with one beacon silent | the relay-loss case now **strands** (0 writes after H, vs 33 in r4) and `join` brought the BP onto the LIVE chain; the forced resume latched a SPLIT alarm within ~4 s (7 writes landed before the manual fence); found F1–F6 (halt cascades, a BP that could not join, a silent member resuming) |
+| d1–d3 | rc.25 | c3a, c2 and c5 replayed | 4 LIVE with no halt cascade; relay-loss BP stranded and joined (5/5 LIVE); signed abort with a silent beacon: all 5 stranded, then a guarded rollback to ABORTED. 0 transactions after H on the old chain in all three |
+| e1 | rc.26 | a BP whose own compare failed | stranded, then `join --reverify` re-verified and joined the same chain: 5/5 LIVE, identical evidence on all five, 0 transactions after H |
+| g1, g1b, g2 | rc.27 | protocol-upgrade schedule equal / different on one BP; a halted target | equal schedule: 5/5 LIVE; different schedule: that BP never agreed and stranded, the other four LIVE; g2 found a false STALLED verdict (fixed in rc.28) |
+
+**Proves:** the exact-H cut, conversion and fleet gate on real testnet state with signed events; the failure paths
+added in rc.23–rc.27 (STRANDED, `join`, `--reverify`, degraded waiting, the SPLIT alarm) doing what they claim on
+real boxes; 0 transactions on the old chain after H in every run except r4 and the deliberate c4.
+
+**Does not prove:** fleet-wide all-or-nothing (r4 shows why it is needed; the fixes are local and read unsigned
+relay reports); anything with per-BP producer keys, the source chain_id kept for signing, or without the
+rehearsal patch and allowlist; mainnet state or a mainnet-sized validator set; rc.28 and rc.29 changes, which were
+tested in CI and review, not on the fleet.
+
+---
+
 ## Mainnet conversion (2026-10-13)
 
 The upstream conversion pipeline, run once per stage exactly as the agent's upstream backend invokes it
@@ -434,8 +465,9 @@ likely cause is the compare tool's coverage (upstream #109) rather than lost dat
 state has no deferred transactions, so no rehearsal exercised this table.
 
 **Proves:** the official pipeline runs on full XPR mainnet state; its duration (about 9.6 minutes on this
-hardware, roughly linear in state size: 8.2× the snapshot, 8.5× the time); its memory need (32 GB per node;
-`doctor` now checks it for mainnet).
+hardware, roughly linear in state size: 8.2× the snapshot, 8.5× the time); the conversion's peak memory (13.7 GB
+in one process, on a host where nothing else ran). The 32 GB per node that `doctor` now asks for on mainnet is a
+provisioning requirement with headroom for the producer's own nodeos and validator, not a measured minimum.
 
 **Does not prove:** that the converted state is correct (the gate fails); the time to write the snapshot at
 H on a mainnet producer, or the finality wait on mainnet; anything about ignition or the new chain; faster

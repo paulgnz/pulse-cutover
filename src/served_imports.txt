@@ -1,3 +1,6 @@
+# PulseVM v1.0.0 (tag v1.0.0 = 4a43d8bb) env host functions: the imports! table in
+# crates/pulsevm_core/src/chain/wasm_runtime.rs (lines 1611-1813). 183 names. Extracted 2026-10-13.
+# v1.0.0 has NO stub fallback: a module importing any other env name fails Instance::new on every action.
 __addtf3
 __ashlti3
 __ashrti3
@@ -14,6 +17,7 @@ __fixtfsi
 __fixtfti
 __fixunsdfti
 __fixunssfti
+__fixunstfdi
 __fixunstfsi
 __fixunstfti
 __floatditf
@@ -42,12 +46,16 @@ __umodti3
 __unordtf2
 abort
 action_data_size
+alt_bn128_add
+alt_bn128_mul
+alt_bn128_pair
 assert_recover_key
 assert_ripemd160
 assert_sha1
 assert_sha224
 assert_sha256
 assert_sha512
+cancel_deferred
 check_permission_authorization
 check_transaction_authorization
 current_receiver
@@ -120,17 +128,23 @@ expiration
 get_account_creation_time
 get_action
 get_active_producers
+get_block_num
 get_blockchain_parameters_packed
+get_code_hash
 get_context_free_data
 get_permission_last_used
 get_resource_limits
+get_sender
 has_auth
 is_account
+is_feature_activated
 is_privileged
 memcmp
 memcpy
 memmove
 memset
+mod_exp
+preactivate_feature
 printdf
 printhex
 printi
@@ -142,6 +156,7 @@ prints_l
 printsf
 printui
 printui128
+publication_time
 pulse_assert
 pulse_assert_code
 pulse_assert_message
@@ -154,11 +169,13 @@ require_auth2
 require_recipient
 ripemd160
 send_context_free_inline
+send_deferred
 send_inline
 set_action_return_value
 set_blockchain_parameters_packed
 set_privileged
 set_proposed_producers
+set_proposed_producers_ex
 set_resource_limits
 sha1
 sha224
