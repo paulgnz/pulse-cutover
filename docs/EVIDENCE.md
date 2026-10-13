@@ -464,7 +464,8 @@ side). The importer reports all 34 deferred transactions and all 104 `index_doub
 likely cause was the compare tool's coverage (upstream #109). The testnet state has no deferred transactions, so
 no rehearsal exercised this table.
 
-**Diagnosis (same day).** The compare was rebuilt from the v1.0.0 tag with two diagnostic switches, off by default:
+**Diagnosis (same day).** The compare was rebuilt from upstream commit `298969ec` (its chaindb, database and snapshot
+crates are identical to the v1.0.0 release commit `4a43d8bb`) with two diagnostic switches, off by default:
 (1) frame all 19 Leap 5 SHiP tables (v1.0.0's serializer collects them but frames only 16, so
 `contract_index_double`, `contract_index_long_double` and `generated_transaction` never reach the compare), and
 (2) serialize `global_property` in Leap 5's full 157-byte shape (v1.0.0 drops the empty proposed-schedule envelope,
@@ -472,7 +473,7 @@ no rehearsal exercised this table.
 both, **all 21 tables match nodeos on mainnet and on testnet**: `contract_index_double` (104 rows) sha256
 `860fee6b…`, `generated_transaction` (34 rows) `31e29136…`, `global_property` `fbfb5acb…`, equal on both sides.
 Without them the rebuilt tool fails exactly like the official binary. So the imported state is complete; the gap
-is serialization, and live SHiP after the cut shares the same serializer. Not covered: a snapshot taken while a
+is serialization, and live SHiP after the cut shares the same serializer. Reported upstream on #109. Not covered: a snapshot taken while a
 producer-schedule change is pending (the compare would then fail, the safe direction).
 
 **Proves:** the official pipeline runs on full XPR mainnet state; its duration (about 9.6 minutes on this
