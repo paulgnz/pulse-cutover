@@ -12,7 +12,8 @@ pulse-cutover moves a running Antelope chain (XPR Network) onto the PulseVM
 engine while keeping the **same public URL, the same chain_id and the same
 account state**. One binary drives the ceremony — freeze, snapshot, verify,
 ignite, flip — and records every step, with evidence, in a journal you can hand
-to anyone. Writes pause for the cut (71–114 s in the unattended rehearsals);
+to anyone. Writes pause for the cut: 71–114 s in the unattended rehearsals on a small
+chain, about 15 minutes for XPR mainnet (its state conversion alone measured 9.6 min, 2026-10-13);
 reads keep being served. A producer that aborts before ignition resumes its
 existing node; a fleet-wide rollback guarantee is **not yet implemented** (see
 the status box below).
@@ -28,6 +29,9 @@ the status box below).
 >   run ended with LIVE *and* HALTED BPs on one target chain, and in one run a BP resumed the old chain after its peers
 >   had ignited (33 writes landed after H). rc.23–rc.29 make the agents fleet-aware (STRANDED, `join`, degraded waits,
 >   a fleet verdict and creation-evidence log on mission control); they do not make the cut fleet-decided.
+> - **Mainnet conversion measured** (2026-10-13): the official v1.0.0 pipeline on a real XPR mainnet snapshot takes
+>   9.6 min and 13.7 GB RAM on a 6-vCPU host, and its table compare fails on 3 tables (upstream #109)
+>   ([EVIDENCE.md](docs/EVIDENCE.md#mainnet-conversion-2026-10-13)).
 > - **Not done yet**: fleet-wide all-or-nothing (no authority boundary; a partial abort can still split the network),
 >   exact H in API mode and on restart under a real freeze, per-validator producer keys, crash recovery on a fleet,
 >   validator registration/funding, and any run on Tahoe itself (the public Metal testnet) rather than a private
@@ -42,7 +46,9 @@ the status box below).
 > The running beacon only observes; installing it writes a binary, a readiness-only config, a token and a systemd
 > service (it never touches nodeos). It detects your network and account and prints one line to send us.
 
-**New here? → [docs/PROCESS.md](docs/PROCESS.md)**: the whole cutover, step by step, with diagrams: who does what, the timeline around the cut, every gate, what apps see, and how rollback works.
+**Start here → [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md)**: the whole cutover in plain terms, the measured mainnet numbers, what is proven and what is not, and how it gets proven before mainnet. Every known risk, its safeguard, evidence and owner: **[docs/RISK-REGISTER.md](docs/RISK-REGISTER.md)**.
+
+**In more detail → [docs/PROCESS.md](docs/PROCESS.md)**: the whole cutover, step by step, with diagrams: who does what, the timeline around the cut, every gate, what apps see, and how rollback works.
 
 **How atomic is the cut today? → [ATOMICITY.md](ATOMICITY.md)**: five properties, the gate or tool for each, the recorded evidence, and what is still open.
 

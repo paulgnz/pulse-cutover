@@ -806,6 +806,10 @@ pub fn resolve_against_cwd(path: &str, cwd: Option<&str>) -> String {
 
 const RAM_MIN_API_MB: u64 = 7_500;
 const RAM_MIN_FULL_MB: u64 = 15_000;
+/// XPR mainnet, every mode (each one converts the cut snapshot): the official v1.0.0 conversion of a
+/// real mainnet snapshot (1.52 GB, 2026-10-13) peaked at 13.7 GB RSS in the table compare and 11.2 GB
+/// in the import, on top of the running nodeos. MemTotal of a nominal 32 GB host reads ~31 GB.
+const RAM_MIN_XPR_MAINNET_MB: u64 = 30_000;
 const DISK_MIN_GB: u64 = 50;
 
 pub fn compute_verdicts(r: &DoctorReport) -> BTreeMap<String, Verdict> {
@@ -831,13 +835,28 @@ pub fn compute_verdicts(r: &DoctorReport) -> BTreeMap<String, Verdict> {
         }
 
         // Resources.
-        let ram_min = if mode == "api" { RAM_MIN_API_MB } else { RAM_MIN_FULL_MB };
+        let mainnet = r.nodeos.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet);
+        let ram_min = if mainnet {
+            RAM_MIN_XPR_MAINNET_MB
+        } else if mode == "api" {
+            RAM_MIN_API_MB
+        } else {
+            RAM_MIN_FULL_MB
+        };
         if r.host.ram_mb > 0 && r.host.ram_mb < ram_min {
-            needs.push(format!(
-                "{}GB+ RAM for {mode} mode (found {:.1}GB)",
-                ram_min / 1000,
-                r.host.ram_mb as f64 / 1024.0
-            ));
+            if mainnet {
+                needs.push(format!(
+                    "32GB+ RAM for an XPR mainnet cutover in {mode} mode (found {:.1}GB): converting the \
+                     mainnet snapshot peaked at 13.7GB on top of nodeos (measured 2026-10-13)",
+                    r.host.ram_mb as f64 / 1024.0
+                ));
+            } else {
+                needs.push(format!(
+                    "{}GB+ RAM for {mode} mode (found {:.1}GB)",
+                    ram_min / 1000,
+                    r.host.ram_mb as f64 / 1024.0
+                ));
+            }
         }
         let disk_ok = r.host.disks.iter().any(|d| d.avail_gb >= DISK_MIN_GB);
         if !r.host.disks.is_empty() && !disk_ok {
@@ -2049,6 +2068,25 @@ LISTEN 0      4096   *:9650          *:*"#;
         // 8GB clears api mode's RAM bar but not hyperion's.
         assert!(!v["api"].needs.iter().any(|n| n.contains("RAM")));
         assert!(v["hyperion"].needs.iter().any(|n| n.contains("RAM")));
+    }
+
+    #[test]
+    fn verdict_xpr_mainnet_needs_32gb_in_every_mode() {
+        let mut r = ready_report();
+        r.nodeos.chain_id = Some(crate::config::XPR_MAINNET_CHAIN_ID.into());
+        r.host.ram_mb = 15_884; // a 16 GB host: enough for the testnet, not for the mainnet conversion
+        let v = compute_verdicts(&r);
+        for mode in ["bp", "api", "hyperion"] {
+            assert_eq!(v[mode].status, "NEEDS", "{mode}");
+            assert!(v[mode].needs.iter().any(|n| n.contains("32GB+ RAM for an XPR mainnet cutover")), "{mode}");
+        }
+        r.host.ram_mb = 31_300; // MemTotal of a nominal 32 GB host
+        let v = compute_verdicts(&r);
+        assert!(!v["bp"].needs.iter().any(|n| n.contains("RAM")));
+        // The testnet keeps its own bar: 16 GB is still READY there.
+        r.nodeos.chain_id = Some("71ee83bc".into());
+        r.host.ram_mb = 15_884;
+        assert_eq!(compute_verdicts(&r)["bp"].status, "READY");
     }
 
     #[test]

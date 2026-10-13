@@ -68,7 +68,7 @@ qualify their retry, TAPOS/expiry, finality and inclusion handling against the c
 |---|---|
 | chain_id, accounts, keys, permissions, balances, contracts, table rows | the engine producing blocks (Leap DPoS → PulseVM on Metal/Avalanche consensus) |
 | block numbering (H+1 follows H) | who finalizes blocks (Metal validators) |
-| public API URLs and the `/v1/chain` API | a write pause during the switch (71–114 s in the unattended rehearsal runs; measured per qualified stack) |
+| public API URLs and the `/v1/chain` API | a write pause during the switch (71–114 s in the unattended rehearsal runs on a small chain; about 15 min for XPR mainnet, see [HOW-IT-WORKS.md](HOW-IT-WORKS.md#3-the-ceremony-step-by-step)) |
 
 ---
 
@@ -101,7 +101,12 @@ flowchart TB
 ## 3. The timeline
 
 What happens around H, with the durations measured in the 5-producer rehearsal
-(0.5 s blocks):
+(0.5 s blocks).
+
+> [!WARNING]
+> These durations come from a small rehearsal chain and the fork backend. On XPR mainnet state the
+> upstream verification step alone takes about 9.6 minutes (measured 2026-10-13), so the write pause is
+> about 15 minutes, not 1–2. Mainnet numbers: [HOW-IT-WORKS.md](HOW-IT-WORKS.md#3-the-ceremony-step-by-step).
 
 ```mermaid
 flowchart LR

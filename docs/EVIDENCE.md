@@ -39,6 +39,7 @@ The agent has also changed since most of these runs. The main differences, noted
 | [Hyperion and bp mode](#hyperion-mode-and-bp-mode-2026-08-21-second-session) | 2026-08-21 | same | Tahoe (hyperion), local 1-node network (bp, loop) | hyperion, producer (`schedule_at_h`) | hyperion: 1 correct abort, 1 LIVE; bp: LIVE at exactly H; loop 22/22 |
 | [Multi-producer rehearsal](#multi-producer-rehearsal-5-bps-september-2026) | 2026-09-28/29 | Leap 5.0.3, 5 producers | private 5-validator Metal network | producer, 5 BPs | run 1 aborted on all 5; runs 2–6 LIVE on all 5 |
 | [Linux fault injection](#linux-fault-injection-rc9-and-rc10) | 2026-09-29/30 | stubbed nodeos | stubbed metalgo | producer and api | rc.9: 83/83 with a shim, critical BUG-1 found; rc.10: 49/49 with no shim |
+| [Mainnet conversion](#mainnet-conversion-2026-10-13) | 2026-10-13 | a real XPR mainnet snapshot | none (conversion only) | the upstream pipeline, timed per stage | 9.6 min, 13.7 GB peak; compare fails on 3 tables |
 
 ---
 
@@ -397,6 +398,48 @@ upstream import pipeline (`import_backend = "upstream"`, not stubbable); Ubuntu 
 3.3.16 directly; the LOW-1 fix (needs a container without init; not re-exercised); faults
 between records other than the constructed mid-hook and torn-tail cases. rc.11 has not been
 through this suite.
+
+---
+
+## Mainnet conversion (2026-10-13)
+
+The upstream conversion pipeline, run once per stage exactly as the agent's upstream backend invokes it
+(`export.sh` in the Leap 5.0.3 sidecar image → `xpr_import_check` → `xpr_19_table_compare` →
+`xpr_state_fingerprint`; the v1.0.0 tool builds the 2026-10-06 fleet runs used), on one cloud host:
+6 vCPU (2.0 GHz Broadwell), 16 GB RAM. Two inputs on the same host:
+
+- **XPR mainnet**: the public BloxProd `latest-snapshot.bin` of 2026-10-13, 1,522,296,904 bytes, sha256
+  `6283db6418671cff…`, block 408,328,634, chain_id `384da888…` (checked from the export's sidecar).
+- **XPR testnet**: the snapshot the fleet rehearsals used, 184,796,064 bytes, block 408,461,570.
+
+| Stage | Mainnet | Peak RSS | Testnet |
+|---|---|---|---|
+| export (Leap → SHiP log + sidecar) | 168.9 s | 29 MB (the container's nodeos is not counted) | 19.6 s |
+| import (→ Arena checkpoint) | 191.6 s | 11.2 GB | 26.5 s |
+| 21-table compare | 140.4 s | 13.7 GB | 13.4 s |
+| state fingerprint | 71.6 s | 7.7 GB | 7.9 s |
+| **total** | **572.5 s** | | **67.4 s** |
+
+Mainnet sizes: SHiP log 605 MB, sidecar 245 MB, checkpoint 2.06 GB, 9.7 GB of work files per run.
+Imported: 885,878 accounts, 1,779,884 permissions, 479 code objects, 2,779,720 contract tables,
+7,606,833 contract rows, 1,713,856 / 160,921 / 825,725 / 104 index64 / index128 / index256 / index_double
+rows, 34 deferred transactions, 2,779 recent-transaction (dedupe) entries. Mainnet state root
+`42b0a70fa12998bd…`; testnet `ce8062296d3678d9…`.
+
+**Compare result.** Testnet: 19 of 21 tables equal; `contract_index_double` (arena side missing) and
+`global_property` (one row differs) fail, the two known v1.0.0 gaps the fleet rehearsals allow-listed.
+Mainnet: the same two plus **`generated_transaction`** (34 rows on the nodeos side, none read on the Arena
+side). The importer reports all 34 deferred transactions and all 104 `index_double` rows imported, so the
+likely cause is the compare tool's coverage (upstream #109) rather than lost data; not verified. The testnet
+state has no deferred transactions, so no rehearsal exercised this table.
+
+**Proves:** the official pipeline runs on full XPR mainnet state; its duration (about 9.6 minutes on this
+hardware, roughly linear in state size: 8.2× the snapshot, 8.5× the time); its memory need (32 GB per node;
+`doctor` now checks it for mainnet).
+
+**Does not prove:** that the converted state is correct (the gate fails); the time to write the snapshot at
+H on a mainnet producer, or the finality wait on mainnet; anything about ignition or the new chain; faster
+hardware's timings.
 
 ---
 
