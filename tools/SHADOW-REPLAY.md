@@ -61,7 +61,10 @@ on one host are one voice; the source's and the target's hostnames never vote), 
 `--cut-id` at H:
 
 - for the XPR mainnet chain_id, **only the built-in pinned list of public mainnet APIs vouches** (the same hosts as
-  the deny list). `--mainnet-endpoint URL` (repeatable, or comma-separated) adds endpoints that are asked and
+  the deny list), and only by **exact URL** (round 6): an answer counts only when its endpoint, normalized (scheme and
+  host lowercased, default port and trailing slash ignored; userinfo, query or fragment never match), is one of the
+  built-in `https://` URLs. A `--mainnet-endpoint` on a pinned hostname with another scheme, port or path is an added
+  endpoint like any other: compared, never vouching. `--mainnet-endpoint URL` (repeatable, or comma-separated) adds endpoints that are asked and
   compared, but they **never count toward the two**: an added endpoint can only make the check refuse (any
   disagreement refuses), never make it pass. With every pinned endpoint unreachable the tool refuses, whatever the
   added endpoints say. A shadow replay therefore needs outbound HTTPS to at least two pinned hosts;

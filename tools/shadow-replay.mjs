@@ -136,9 +136,10 @@ export function classifyError(text) {
 /**
  * Authenticate the reference chain's blocks at H and H+1 from independent endpoints, never from --source.
  * answers: [{endpoint, host (hostname), chain_id, block_at_cut_id, block_after_cut_id, error}]. excludeHosts: hostnames
- * that may not vouch (the source's and the target's). authorities: when given (XPR mainnet: the pinned hostnames), only
- * answers from those hostnames count toward the quorum; every other valid answer is still compared and can only
- * refuse. A valid answer reports the expected chain_id and both blocks. Fail-closed:
+ * that may not vouch (the source's and the target's). authorities: when given (XPR mainnet: the exact pinned https
+ * URLs), only answers whose normalized endpoint IS one of those URLs count toward the quorum (one voice per hostname);
+ * every other valid answer, including one on a pinned hostname with another scheme, port or path, is still compared
+ * and can only refuse. A valid answer reports the expected chain_id and both blocks. Fail-closed:
  *  - fewer than `minAgree` vouching answers on distinct hostnames → refuse;
  *  - any two valid answers that disagree on H or H+1 → refuse (ambiguity is never resolved by majority);
  *  - a valid answer whose block at H is not --cut-id → refuse (the cut is not this chain's H).
@@ -148,31 +149,42 @@ export function decideReference({ answers, chainId, cutId, minAgree = MIN_REFERE
   const lc = (v) => (v == null ? null : String(v).toLowerCase());
   const reasons = [];
   const excluded = new Set(excludeHosts.map(lc).filter(Boolean));
-  const vouchers = authorities ? new Set(authorities.map(lc).filter(Boolean)) : null;
-  const seen = new Set();
+  // Round 6: authority is EXACT provenance, never a hostname. An answer vouches only when its endpoint, strictly
+  // normalized, IS one of the authority URLs (XPR mainnet: the built-in pinned https URLs). An added endpoint on a
+  // pinned hostname (another scheme, port or path) is compared like any other answer, so it can refuse, but never vouches.
+  const vouchers = authorities ? new Set(authorities.map(normalizeUrl).filter(Boolean)) : null;
   const valid = [];
   const notes = [];
   for (const a of answers) {
-    const host = lc(a.host);
+    // The hostname comes from the endpoint URL itself, never from a field the answer carries.
+    const host = hostOf(a.endpoint) ?? lc(a.host);
     if (a.error) { notes.push(`${a.endpoint}: ${a.error}`); continue; }
+    if (!host) { notes.push(`${a.endpoint}: not a URL`); continue; }
     if (excluded.has(host)) { notes.push(`${a.endpoint}: is the source or the target, so it cannot vouch independently`); continue; }
     if (lc(a.chain_id) !== lc(chainId)) { notes.push(`${a.endpoint}: reports chain_id ${a.chain_id ?? 'none'}, not ${chainId}`); continue; }
     if (!a.block_at_cut_id || !a.block_after_cut_id) { notes.push(`${a.endpoint}: did not show its blocks at H and H+1`); continue; }
-    if (seen.has(host)) continue; // one vote per host
-    seen.add(host);
-    valid.push(a);
+    valid.push({ ...a, host });
   }
+  // Every valid answer is compared, vouching or not: any disagreement refuses.
   const afterIds = new Set(valid.map((a) => lc(a.block_after_cut_id)));
   const atIds = new Set(valid.map((a) => lc(a.block_at_cut_id)));
   if (afterIds.size > 1 || atIds.size > 1) {
-    reasons.push(`reference endpoints disagree on the blocks at H/H+1 (${valid.map((a) => `${a.host}: ${a.block_at_cut_id}/${a.block_after_cut_id}`).join('; ')}): refusing rather than guessing`);
+    reasons.push(`reference endpoints disagree on the blocks at H/H+1 (${valid.map((a) => `${a.endpoint}: ${a.block_at_cut_id}/${a.block_after_cut_id}`).join('; ')}): refusing rather than guessing`);
   }
   if (cutId && valid.some((a) => lc(a.block_at_cut_id) !== lc(cutId))) {
     reasons.push(`the reference chain's block at H is not --cut-id ${cutId}: the cut is not block H of chain ${chainId}`);
   }
-  const counted = vouchers ? valid.filter((a) => vouchers.has(lc(a.host))) : valid;
+  // Count vouching answers: provenance first, then one voice per hostname.
+  const seen = new Set();
+  const counted = [];
+  for (const a of valid) {
+    if (vouchers && !vouchers.has(normalizeUrl(a.endpoint))) continue;
+    if (seen.has(a.host)) continue;
+    seen.add(a.host);
+    counted.push(a);
+  }
   if (counted.length < minAgree) {
-    reasons.push(`only ${counted.length} ${vouchers ? 'pinned ' : ''}reference endpoint(s) on distinct hostnames answered for chain ${chainId} (need ${minAgree} that agree${vouchers ? '; an added --mainnet-endpoint never counts' : ''})${notes.length ? `: ${notes.join('; ')}` : ''}`);
+    reasons.push(`only ${counted.length} ${vouchers ? 'pinned ' : ''}reference endpoint(s) on distinct hostnames answered for chain ${chainId} (need ${minAgree} that agree${vouchers ? '; only the exact built-in pinned https URLs vouch, an added --mainnet-endpoint never counts, whatever its hostname' : ''})${notes.length ? `: ${notes.join('; ')}` : ''}`);
   }
   const ok = reasons.length === 0;
   return { ok, block_after_cut_id: ok ? lc(counted[0].block_after_cut_id) : null, agreeing: counted.map((a) => a.host), reasons, notes };
@@ -332,14 +344,32 @@ const argAllOf = (argv) => (k) => argv.flatMap((v, i) => (v === `--${k}` && argv
 export const hostOf = (u) => { try { return new URL(u).hostname.toLowerCase().replace(/^\[|\]$/g, '') || null; } catch { return null; } };
 
 /**
+ * Strict URL normalization for provenance (round 6): lowercase scheme and host, default port elided, trailing slash
+ * ignored; a URL with userinfo, a query or a fragment, or that does not parse, normalizes to null (it can never match).
+ */
+export function normalizeUrl(u) {
+  let x;
+  try { x = new URL(String(u)); } catch { return null; }
+  if (x.username || x.password || x.search || x.hash) return null;
+  if (x.protocol !== 'https:' && x.protocol !== 'http:') return null;
+  const host = x.hostname.toLowerCase();
+  if (!host) return null;
+  const path = x.pathname.replace(/\/+$/, '');
+  return `${x.protocol}//${host}${x.port ? `:${x.port}` : ''}${path}`;
+}
+
+/**
  * Which endpoints are asked about chain `chainId`'s blocks at H and H+1, and which of them may vouch. XPR mainnet: the
- * pinned list vouches (authorities = its hostnames); added --mainnet-endpoint answers are compared but never vouch.
+ * pinned list vouches (authorities = its exact normalized https URLs, never its hostnames); added --mainnet-endpoint
+ * answers are compared but never vouch, even on a pinned hostname.
  * Any other chain_id: the user-given --reference-endpoint list vouches (no authority list). `pinned` exists for tests
  * that call run() in-process; the CLI never sets it, and no environment variable can change it.
  */
 export function referenceEndpoints({ chainId, mainnetAdded = [], referenceGiven = [], pinned = MAINNET_REFERENCE_ENDPOINTS }) {
   if (String(chainId || '').toLowerCase() === XPR_MAINNET_CHAIN_ID) {
-    return { endpoints: [...pinned, ...mainnetAdded], authorities: pinned.map(hostOf).filter(Boolean), pinned: true };
+    // Only https pinned URLs can vouch, by exact (normalized) URL: provenance, not hostname (round 6).
+    const authorities = pinned.map(normalizeUrl).filter((u) => u && u.startsWith('https://'));
+    return { endpoints: [...pinned, ...mainnetAdded], authorities, pinned: true };
   }
   return { endpoints: referenceGiven, authorities: null, pinned: false };
 }

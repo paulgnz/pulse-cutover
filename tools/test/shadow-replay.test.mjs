@@ -3,14 +3,14 @@
 // (127.0.0.1 only; nothing leaves the machine).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
-import {
+import { normalizeUrl,
   extractTxs, extractBlockIds, refBlockNumber, classifyError, checkTargetSafety, compareOutcome, summarise,
   packedTrxId, statusName, XPR_MAINNET_CHAIN_ID, decideReference, referenceEndpoints, hostOf,
   MAINNET_REFERENCE_ENDPOINTS, postJson, run as runTool,
@@ -208,16 +208,16 @@ test('round 5: only pinned mainnet endpoints vouch; added ones can only refuse; 
   assert.ok(m.pinned);
   for (const e of MAINNET_REFERENCE_ENDPOINTS) assert.ok(m.endpoints.includes(e), e);
   assert.ok(m.endpoints.includes('https://extra.example'), 'added endpoints are still asked');
-  assert.ok(!m.authorities.includes('extra.example'), 'but never vouch');
-  assert.deepEqual(m.authorities, MAINNET_REFERENCE_ENDPOINTS.map(hostOf));
-  assert.ok(new Set(m.authorities).size >= 2, 'the pinned list spans at least two hostnames');
+  assert.ok(!m.authorities.some((u) => u.includes('extra.example')), 'but never vouch');
+  assert.deepEqual(m.authorities, MAINNET_REFERENCE_ENDPOINTS.map(normalizeUrl));
+  assert.ok(new Set(m.authorities.map(hostOf)).size >= 2, 'the pinned list spans at least two hostnames');
   // the old test-only environment override is gone: setting it changes nothing
   const before = process.env.PULSE_SHADOW_REPLAY_TEST_ONLY_LOOPBACK_REFERENCES;
   process.env.PULSE_SHADOW_REPLAY_TEST_ONLY_LOOPBACK_REFERENCES = '1';
   try {
     const e = referenceEndpoints({ chainId: XPR_MAINNET_CHAIN_ID, mainnetAdded: ['http://127.0.0.1:8001', 'http://127.0.0.1:8002'] });
     assert.ok(e.pinned && MAINNET_REFERENCE_ENDPOINTS.every((x) => e.endpoints.includes(x)));
-    assert.deepEqual(e.authorities, MAINNET_REFERENCE_ENDPOINTS.map(hostOf));
+    assert.deepEqual(e.authorities, MAINNET_REFERENCE_ENDPOINTS.map(normalizeUrl));
   } finally {
     if (before === undefined) delete process.env.PULSE_SHADOW_REPLAY_TEST_ONLY_LOOPBACK_REFERENCES;
     else process.env.PULSE_SHADOW_REPLAY_TEST_ONLY_LOOPBACK_REFERENCES = before;
@@ -228,7 +228,7 @@ test('round 5: only pinned mainnet endpoints vouch; added ones can only refuse; 
   assert.deepEqual(o.endpoints, ['https://r1', 'https://r2']); assert.equal(o.authorities, null);
 
   const A = (host, over = {}) => ({ endpoint: `https://${host}`, host, chain_id: XPR_MAINNET_CHAIN_ID, block_at_cut_id: 'cut', block_after_cut_id: 'mainnet-1001', ...over });
-  const auth = ['pin-a.example', 'pin-b.example'];
+  const auth = ['https://pin-a.example', 'https://pin-b.example'];
   const d = (answers) => decideReference({ answers, chainId: XPR_MAINNET_CHAIN_ID, cutId: 'cut', authorities: auth });
   // every pinned endpoint down, two custom ports on one box agreeing: refused
   const custom = d([A('pin-a.example', { error: 'HTTP 0' }), A('pin-b.example', { error: 'HTTP 0' }), A('127.0.0.1'), A('127.0.0.1')]);
@@ -239,13 +239,13 @@ test('round 5: only pinned mainnet endpoints vouch; added ones can only refuse; 
   assert.ok(!d([A('pin-a.example'), A('c1.example')]).ok);
   // two pinned agreeing: ok, and only they are reported as vouching
   const two = d([A('pin-a.example'), A('pin-b.example'), A('c1.example')]);
-  assert.ok(two.ok, JSON.stringify(two)); assert.deepEqual(two.agreeing, auth);
+  assert.ok(two.ok, JSON.stringify(two)); assert.deepEqual(two.agreeing, auth.map(hostOf));
   // any disagreement refuses, including from an added endpoint
   assert.ok(!d([A('pin-a.example'), A('pin-b.example'), A('c1.example', { block_after_cut_id: 'other' })]).ok);
   assert.ok(!d([A('pin-a.example'), A('pin-b.example', { block_after_cut_id: 'other' })]).ok);
   // independence is per hostname: one pinned host on two ports is one voice
   assert.ok(!decideReference({ answers: [A('pin-a.example'), { ...A('pin-a.example'), endpoint: 'https://pin-a.example:8443' }],
-    chainId: XPR_MAINNET_CHAIN_ID, cutId: 'cut', authorities: ['pin-a.example'] }).ok);
+    chainId: XPR_MAINNET_CHAIN_ID, cutId: 'cut', authorities: ['https://pin-a.example'] }).ok);
   assert.equal(hostOf('http://127.0.0.1:8001'), hostOf('http://127.0.0.1:8002'));
 });
 
@@ -546,4 +546,72 @@ test('CLI: the child process keeps its exit codes (usage error, dry run)', async
     const dry = await runCli(['--source', `http://127.0.0.1:${source.address().port}`, '--cut-height', String(H), '--cut-id', 'cutid', '--blocks', '2']);
     assert.equal(dry.code, 0, dry.err); assert.match(dry.out, /dry-run/);
   } finally { source.close(); }
+});
+
+test('round 6: authority is exact pinned-URL provenance, never a hostname (Codex R6-2)', () => {
+  const pinned = ['https://pin-a.example', 'https://pin-b.example'];
+  const refs = referenceEndpoints({ chainId: XPR_MAINNET_CHAIN_ID, pinned,
+    mainnetAdded: ['http://pin-a.example', 'http://pin-b.example', 'https://pin-a.example:8443', 'https://pin-b.example/other'] });
+  assert.deepEqual(refs.authorities, pinned, 'only the exact https pinned URLs are authorities');
+  const A = (endpoint, over = {}) => ({ endpoint, host: hostOf(endpoint), chain_id: XPR_MAINNET_CHAIN_ID, block_at_cut_id: 'cut', block_after_cut_id: 'shadow-1001', ...over });
+  const d = (answers) => decideReference({ answers, chainId: XPR_MAINNET_CHAIN_ID, cutId: 'cut', authorities: refs.authorities });
+  // pinned https down + two added http:// URLs on the pinned hostnames agreeing: refused (the Codex reproduction)
+  const attack = d([A('https://pin-a.example', { error: 'HTTP 0' }), A('https://pin-b.example', { error: 'HTTP 0' }),
+    A('http://pin-a.example'), A('http://pin-b.example')]);
+  assert.ok(!attack.ok && attack.reasons.some((r) => r.includes('exact built-in pinned')), JSON.stringify(attack));
+  // added https URLs on a pinned hostname but another port / path never count
+  assert.ok(!d([A('https://pin-a.example', { error: 'x' }), A('https://pin-b.example', { error: 'x' }),
+    A('https://pin-a.example:8443'), A('https://pin-b.example/other')]).ok);
+  // an answer claiming a pinned host in its `host` field does not borrow that host's authority
+  assert.ok(!d([A('https://pin-a.example', { error: 'x' }), A('https://pin-b.example', { error: 'x' }),
+    { ...A('http://evil.example'), host: 'pin-a.example' }, { ...A('http://evil2.example'), host: 'pin-b.example' }]).ok);
+  // two distinct pinned URLs agreeing: ok; normalization tolerates case, a trailing slash and the default port
+  const ok = d([A('HTTPS://PIN-A.example/'), A('https://pin-b.example:443')]);
+  assert.ok(ok.ok, JSON.stringify(ok));
+  // two pinned URLs on ONE hostname count once
+  assert.ok(!decideReference({ answers: [A('https://pin-a.example'), A('https://pin-a.example/v1')], chainId: XPR_MAINNET_CHAIN_ID,
+    cutId: 'cut', authorities: ['https://pin-a.example', 'https://pin-a.example/v1'] }).ok);
+  // an added endpoint on a pinned hostname that disagrees still refuses
+  assert.ok(!d([A('https://pin-a.example'), A('https://pin-b.example'), A('http://pin-a.example', { block_after_cut_id: 'other' })]).ok);
+  // userinfo / query / fragment never normalize (never match a pinned URL)
+  for (const u of ['https://x@pin-a.example', 'https://pin-a.example/?q=1', 'https://pin-a.example/#f', 'ftp://pin-a.example', 'not a url'])
+    assert.equal(normalizeUrl(u), null, u);
+  // a non-https pinned URL is never an authority
+  assert.deepEqual(referenceEndpoints({ chainId: XPR_MAINNET_CHAIN_ID, pinned: ['http://pin-a.example', 'https://pin-b.example'] }).authorities, ['https://pin-b.example']);
+});
+
+test('round 6 end to end: the Codex reproduction (pinned down, added http URLs on pinned hostnames vouching for a swap) sends nothing', async () => {
+  const cutBlock = { block_num: H, id: 'cutid', transactions: [] };
+  const shadowAfter = { block_num: H + 1, id: 'shadow-own-1001', transactions: [] };
+  // The supplied source is really a shadow; the target is "real mainnet".
+  const source = await mock((url, b) => {
+    if (url.endsWith('/get_info')) return [200, { chain_id: XPR_MAINNET_CHAIN_ID, head_block_num: 1002 }];
+    if (url.endsWith('/get_block')) { const n = Number(b.block_num_or_id); return [200, n === H ? cutBlock : n === H + 1 ? shadowAfter : BLOCKS.find((x) => x.block_num === n)]; }
+    return [404, {}];
+  });
+  const sent = [];
+  const realAfter = BLOCKS.find((x) => x.block_num === H + 1);
+  const target = await mock((url, b) => {
+    if (url.endsWith('/get_info')) return [200, { chain_id: XPR_MAINNET_CHAIN_ID, head_block_num: 1002 }];
+    if (url.endsWith('/get_block')) { const n = Number(b.block_num_or_id); return [200, n === H ? cutBlock : n === H + 1 ? realAfter : BLOCKS.find((x) => x.block_num === n)]; }
+    if (url.endsWith('/send_transaction')) { sent.push(b); return [202, { transaction_id: 'x' }]; }
+    return [404, {}];
+  });
+  const S = `http://127.0.0.1:${source.address().port}`, T = `http://127.0.0.1:${target.address().port}`;
+  const pinnedReferenceEndpoints = ['https://ref-a.example', 'https://ref-b.example'];
+  // Pinned https down; the attacker's added http:// URLs on the pinned hostnames vouch for the shadow's H+1.
+  const referenceFetcher = async (endpoints) => endpoints.map((endpoint) => (endpoint.startsWith('https://')
+    ? { endpoint, host: hostOf(endpoint), error: 'HTTP 0' }
+    : { endpoint, host: hostOf(endpoint), chain_id: XPR_MAINNET_CHAIN_ID, block_at_cut_id: cutBlock.id, block_after_cut_id: shadowAfter.id }));
+  const dir = mkdtempSync(join(tmpdir(), 'shadow-replay-r6-'));
+  try {
+    const code = await run(['node', TOOL, '--source', S, '--cut-height', String(H), '--cut-id', cutBlock.id, '--blocks', '2',
+      '--target', T, '--send', '--shadow-i-understand', '--rate', '50',
+      '--mainnet-endpoint', 'http://ref-a.example', '--mainnet-endpoint', 'http://ref-b.example',
+      '--out', join(dir, 'r.json')], { pinnedReferenceEndpoints, referenceFetcher });
+    assert.notEqual(code, 0, 'the run is refused');
+    assert.equal(sent.length, 0, 'nothing reached the target');
+    const rep = JSON.parse(readFileSync(join(dir, 'r.json'), 'utf8'));
+    assert.equal(rep.reference.ok, false, JSON.stringify(rep.reference));
+  } finally { source.close(); target.close(); rmSync(dir, { recursive: true, force: true }); }
 });
