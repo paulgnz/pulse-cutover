@@ -12,7 +12,7 @@ serde_json = "1"
 toml = "0.8"
 sha2 = "0.10"
 hex = "0.4"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex = "1"
