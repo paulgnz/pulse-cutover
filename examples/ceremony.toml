@@ -1,92 +1,257 @@
 # =============================================================================
-# REFERENCE config — every knob of the ceremony agent in one file, in the
-# original single-node/rehearsal shape (producer mode, pause_at_h).
+# REFERENCE config — EVERY field of the ceremony agent's config, in one file,
+# with its default and when it applies. The active values are a single-node
+# producer-mode rehearsal (pause_at_h); every optional field and every
+# mode-specific section is present but commented out with its documentation.
+# `src/config.rs` is the source of truth; tools/test/run.sh checks that every
+# field there appears here.
 #
 # Start from the mode-specific examples instead:
-#   ceremony-api.toml      API provider (public /v1 continuity)  — fully commented
-#   ceremony-bp.toml       block producer (freeze + produce the new chain)
-#   ceremony-hyperion.toml API provider + /v2 history continuity
+#   ceremony-api.toml                 API provider (public /v1 continuity) — fully commented
+#   ceremony-bp.toml                  block producer (freeze + produce the new chain), with the
+#                                     [coordination] + [beacon] sections a coordinated event needs
+#   ceremony-hyperion.toml            API provider + /v2 history continuity
+#   ceremony-upstream.toml            verify-only run of the official import pipeline
+#   ceremony-upstream-rehearsal.toml  full upstream-backend ceremony on PulseVM v1.0.0 (rehearsal)
+#   ceremony.json                     the install.sh manifest this file is generated from on a box
 #
-# In a real multi-operator event the [ceremony] block is declared by msig on
-# the source chain and this file is generated from that on-chain row; with
-# install.sh it is generated from ceremony.json. Jargon → README glossary:
-# https://github.com/paulgnz/pulse-cutover#glossary
+# In a real multi-operator event H and the event bindings come from the signed
+# coordinator event (`pulse-cutover await` writes them into a derived config);
+# with install.sh the file is generated from ceremony.json. Jargon → README
+# glossary: https://github.com/paulgnz/pulse-cutover#glossary
 # =============================================================================
 
-journal_path = "/root/cutover-rehearsal/journal.jsonl"  # evidence log; a re-run resumes from it
-poll_ms = 250                                           # chain poll interval, ms
+journal_path = "/root/cutover-rehearsal/journal.jsonl"  # REQUIRED. Append-only JSONL evidence log; a re-run resumes from it
+poll_ms = 250                                           # chain poll interval while waiting for H, ms (default 500)
 
+# -----------------------------------------------------------------------------
+# [ceremony] — WHAT is migrated, WHEN, and HOW the freeze happens. In a
+# coordinated event the signed event supplies H (and checks chain_id, the
+# freeze lead and the cpu scale against these values).
+# -----------------------------------------------------------------------------
 [ceremony]
-rehearsal = true             # REHEARSAL config: relaxes the production profile (see README "Production profile");
+# profile = "ceremony"       # "ceremony" (default) | "readiness". readiness = the beacon-only config
+                             # beacon-install.sh writes: beacon/doctor/status work, run/loop/await REFUSE it.
+mode = "producer"            # "producer" (default; you produce the source chain) | "api" (you serve /v1; the
+                             # flip is the user-visible act; requires [flip] and source.stop_cmd)
+rehearsal = true             # REHEARSAL config: relaxes the production profile (README "Production profile");
                              # a real cut drops this line and must load without it. Refused for XPR mainnet.
-# The block where the old chain stops accepting writes. The agent freezes as
-# soon as head >= this. (Or set freeze_margin to derive it at start.)
+# The block where the old chain stops accepting writes (H). The agent freezes
+# as soon as head >= H (producer) or LIB >= H (api). 0 = take H from the signed
+# coordinator event (`await`), or, rehearsals only, derive it (freeze_margin).
 freeze_height = 12345
-
+# freeze_margin = 240        # rehearsal/loop only, with freeze_height = 0: H := LIB at ARM + margin
+# derive_h_at_arm = false    # rehearsal/loop only: explicit opt-in for freeze_height = 0 + freeze_margin
+# allow_inexact_cut = false  # rehearsal only: accept a snapshot that is not exactly H (journaled loudly)
+# simulate_freeze = false    # api-mode rehearsal against a live chain that will not stop: proceed at LIB >= H
 # Pin the chain being migrated; the agent refuses a node serving anything
-# else. If omitted, the discovered chain_id is journaled instead.
-# chain_id = "71ee83bc..."
-
-# CPU-billing conversion between engines — part of chain identity; must
-# match the staged PulseVM chain config exactly.
+# else. If omitted, the discovered chain_id is journaled and enforced from ARM.
+# chain_id = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
+# CPU-billing conversion between engines (default 1). FORK backend: part of
+# chain identity, must equal the staged PulseVM chain config on every node.
+# UPSTREAM backend: ignored on the target (warns); still compared with an
+# event that carries it.
 import_cpu_scale = 143
-
 # How the freeze happens:
-#   "pause_at_h"    pause the producer when head reaches H, snapshot after
-#                   (single-node rehearsals)
+#   "pause_at_h"    (default) pause the producer when head reaches H, snapshot
+#                   after (single-node rehearsals)
 #   "schedule_at_h" pre-order the snapshot at exactly block H from nodeos
-#                   (multi-BP ceremonies — everyone cuts the same block)
+#                   (multi-BP ceremonies — everyone cuts the same block; needs snapshot.dir)
 freeze_strategy = "pause_at_h"
-
+# freeze_lead_blocks = 24    # schedule_at_h: close writes this many blocks BEFORE H (the cut stays H)
 # After pausing: the head must hold still for this many consecutive polls
 # before the cut is trusted (late blocks are detected and absorbed).
 quiescence_polls = 6
-quiescence_timeout_secs = 120   # abort if the source never stops producing after the pause
+quiescence_timeout_secs = 120   # abort if the source never stops producing after the pause (must be > 0)
+# import_backend = "fork"    # "fork" (default; the interim importer, boots from snapshot_path) |
+                             # "upstream" (the official MetalBlockchain/pulsevm#61 pipeline; needs [upstream])
+# rehearsal_allow_chain_id_change = false   # REHEARSAL ONLY, upstream backend: the target may sign with
+                             # metalgo's blockchain id instead of the source chain_id. Refused for mainnet.
+# boundary_path = "/etc/pulse-cutover/boundary.json"   # producer mode (or api without [hyperion]): where the
+                             # history boundary file for a federating router is written before LIVE
 
+# -----------------------------------------------------------------------------
+# [source] — YOUR nodeos. Detected by doctor, never installed or changed.
+# -----------------------------------------------------------------------------
 [source]
-rpc_url = "http://127.0.0.1:8888"            # your nodeos chain API
-producer_api_url = "http://127.0.0.1:8888"   # pause/snapshot API — keep on 127.0.0.1 ONLY
-snapshot_timeout_secs = 600                  # max wait for the snapshot write
+rpc_url = "http://127.0.0.1:8888"            # REQUIRED. nodeos chain API (get_info / get_block)
+producer_api_url = "http://127.0.0.1:8888"   # REQUIRED. pause/snapshot API — keep on 127.0.0.1 ONLY (R10)
+snapshot_timeout_secs = 600                  # max wait for the snapshot write (default 600)
+# stop_cmd = "systemctl stop nodeos"         # api mode (required there): retire nodeos AFTER the flip is healthy
+# start_cmd = "systemctl start nodeos"       # api mode, optional: bring nodeos back if an abort follows the stop
+# quiesce_cmd = "/root/quiesce.sh"           # producer mode, single-node rehearsal only: runs right after the
+                                             # pause to emulate "every producer paused" (sever p2p). Not production.
 
+# -----------------------------------------------------------------------------
+# [snapshot] — where the cut lands, how it is verified.
+# -----------------------------------------------------------------------------
 [snapshot]
-# Where the VERIFIED snapshot is staged for PulseVM to boot from. Must match
-# the PulseVM chain config's snapshot_path, and must NOT exist beforehand
-# (a stale file would pin the new chain to an old cut — preflight refuses).
+# REQUIRED. Where the VERIFIED snapshot is staged for PulseVM to boot from
+# (fork backend). Must match the chain config's snapshot_path and must NOT
+# exist beforehand (a stale file would pin the new chain to an old cut, R12).
 staged_path = "/root/cutover-rehearsal/snapshot-cut.bin"
-
 # docker nodeos: it reports snapshot paths inside the container; map them to
-# where the same files appear on the host.
+# where the same files appear on the host (set both or neither).
 path_map_from = "/data/snapshots"
 path_map_to = "/root/cutover-rehearsal/nodeos-data/snapshots"
-
+# dir = "/root/nodeos/data/snapshots"        # schedule_at_h (and api mode): the host directory nodeos writes
+                                             # snapshot-<block_id_at_H>.bin into; picked up by exact name
 # Multi-operator event: verify this box computes EXACTLY the published state
-# fingerprints (abort on any difference):
-# expected_sha256 = "..."                                # whole-file hash of the snapshot
+# fingerprints (abort on any difference). golden_roots and capture_roots are
+# mutually exclusive.
+# expected_sha256 = "..."                    # whole-file hash of the snapshot (strict tier, R3)
 # golden_roots = "/root/cutover-rehearsal/golden-roots.txt"
 # First node / rehearsal: capture the fingerprints (with provenance) instead:
 capture_roots = "/root/cutover-rehearsal/captured-roots.txt"
-# Upstream alignment (MetalBlockchain/pulsevm#61): once the official
-# `xpr_state_fingerprint` tool ships, point at it here and it runs at verify
-# time alongside our 19-table check — both reports land in the journal.
-# Missing binary = clean journaled no-op; advisory, never a gate.
+# prescan_path = "/root/rehearsal-snapshot.bin"   # advisory: a staged snapshot to scan-contracts at ARM
+# Legacy knob: run an xpr_state_fingerprint-compatible binary at verify time
+# alongside the fork check (journaled; clean no-op when absent; never a gate).
 # upstream_fingerprint_bin = "/usr/local/bin/xpr_state_fingerprint"
-# upstream_fingerprint_args = ["{snapshot}"]   # {snapshot}/{staged} expand to paths
+# upstream_fingerprint_args = ["{snapshot}"]   # {snapshot}/{staged} expand to paths (default ["{snapshot}"])
 
+# -----------------------------------------------------------------------------
+# [target] — the PulseVM node on Metal.
+# -----------------------------------------------------------------------------
 [target]
-# stop_cmd = "systemctl stop metalgo-pulse && ! systemctl is-active --quiet metalgo-pulse"
+metalgo_unit = "metalgo-cutover"     # REQUIRED. systemd unit of the PulseVM node (ignition = restart of it)
+# ignite_cmd = "systemctl restart metalgo-cutover"   # override for ignition (default: restart metalgo_unit)
+rpc_url = "http://127.0.0.1:9652/ext/bc/CHAIN_ID_HERE/rpc"   # REQUIRED. the new chain's local RPC
+                                     # ({blockchain_id} expands once create_chain_cmd printed it)
+live_blocks = 1                      # LIVE = head at least this far past the cut (default 1)
+quorum_timeout_secs = 600            # new chain not up in time -> abort + rollback (default 600)
+auto_rollback = true                 # on abort BEFORE ignition: resume the source producer (default true)
+# live_sustain_secs = 60             # LIVE needs this long of continued production (default 60; 0 = off, rehearsal)
+# live_max_gap_secs = 20             # ... with no block gap longer than this (default 20)
+# require_lineage_check = true       # the target's block id AT H must equal the source's (default true)
+# plugin_path = "/opt/pulsevm/plugins/<vm_id>"   # with a coordinated event that pins release_sha256, await
+                                     # rejects the event unless this file hashes to it
+# stop_cmd = "systemctl stop metalgo-cutover && ! systemctl is-active --quiet metalgo-cutover"
 #   Local fence for `pulse-cutover rollback --force-after-ignite` (coordinator's fleet-wide order only):
 #   stops THIS box's target before the source is resumed. Default = stop metalgo_unit as above. Set it
 #   if the target runs elsewhere or under another supervisor. Runs under hooks.timeout_secs.
-metalgo_unit = "metalgo-cutover"     # systemd unit of the PulseVM node
-rpc_url = "http://127.0.0.1:9652/ext/bc/CHAIN_ID_HERE/rpc"   # the new chain's local RPC
-live_blocks = 1                      # LIVE = head at least this far past the cut
-quorum_timeout_secs = 600            # new chain not up in time -> abort + rollback
-auto_rollback = true                 # on abort: resume the source producer
+# create_chain_cmd = "/root/create-chain --genesis {genesis}"   # upstream backend: creates the subnet +
+                                     # blockchain after VERIFIED; must print BLOCKCHAIN_ID=<id>
+# chain_config_dir = "/root/.metalgo/configs/chains"   # upstream backend: metalgo --chain-config-dir
+# post_live_max_idle_secs = 60       # post-LIVE watch: target_live fails after this long without a block
+                                     # (default 60; 0 = off, rehearsal)
+# post_live_probe_cmd = "/root/probe-inclusion.sh {blockchain_id}"   # post-LIVE workload probe the beacon
+                                     # runs (exit 0 = healthy); the production profile requires one
+# metal_network_id = 5               # the Metal network the target runs on (default: derived from the source
+                                     # chain: XPR mainnet -> 1, XPR testnet -> Tahoe 5); set for a private
+                                     # rehearsal network (a rehearsal override, refused for XPR mainnet)
 
+# -----------------------------------------------------------------------------
+# [flip] — api mode only (required there): the /v1 URL swap, health-checked.
+# -----------------------------------------------------------------------------
+# [flip]
+# cmd = "/opt/pulse-cutover/flip-to-pulsevm.sh"   # REQUIRED. performs the swap (e.g. nginx upstream + reload)
+# public_url = "http://api.example.org"          # REQUIRED. what clients use; /v1/chain/get_info is appended
+# revert_cmd = "/opt/pulse-cutover/flip-revert.sh"   # undo the swap on abort / forced rollback
+# health_polls = 4                               # consecutive good public answers required (default 4)
+# head_tolerance = 8                             # public head may lag the target RPC by this many blocks (default 8)
+# health_timeout_secs = 120                      # give up on the public health check after this (default 120)
+
+# -----------------------------------------------------------------------------
+# [hyperion] — hyperion mode = api mode + this section: /v2 history continuity.
+# -----------------------------------------------------------------------------
+# [hyperion]
+# start_cmd = "/opt/pulse-cutover/hyperion-start.sh {first_post_cut_block}"   # stands up hyperion-rs after IGNITED
+# health_url = "http://127.0.0.1:7000/v2/health"   # REQUIRED. local hyperion-rs health (hydration gate)
+# hydration_timeout_secs = 900                     # default 900
+# max_lag_blocks = 0                               # indexer lag tolerated by the hydration gate (default 0)
+# boundary_path = "/etc/pulse-cutover/boundary.json"   # the cut facts for the federating router
+# flip_cmd = "/opt/pulse-cutover/flip-v2.sh"       # REQUIRED. swaps the public /v2 to the federating router
+# revert_cmd = "/opt/pulse-cutover/flip-v2-revert.sh"
+# public_health_url = "http://api.example.org/v2/health"   # FLIPPED gate: federation.local.ok must be true
+
+# -----------------------------------------------------------------------------
+# [upstream] — the official import pipeline (import_backend = "upstream").
+# -----------------------------------------------------------------------------
+# [upstream]
+# work_dir = "/root/cutover-rehearsal/upstream"   # REQUIRED. export/import scratch root
+# export_cmd = "docker run --rm ... export.sh --snapshot {snapshot} --work-dir {export_dir}/work ..."   # REQUIRED
+# import_bin = "/root/pulsevm/target/release/examples/xpr_import_check"          # REQUIRED
+# fingerprint_bin = "/root/pulsevm/target/release/examples/xpr_state_fingerprint"   # REQUIRED
+# compare_bin = "/root/pulsevm/target/release/examples/xpr_19_table_compare"    # the verification gate
+                                                 # (the production profile requires it)
+# golden_state_root = "..."                      # multi-node: the published state_root this node must reproduce
+# fork_audit = false                             # dev/audit only: also journal the fork importer's fingerprints
+# rehearsal_allow_compare_mismatch = []          # REHEARSAL ONLY: tables the compare may fail on (known v1.0.0
+                                                 # differences only: contract_index_double, global_property)
+# protocol_upgrades_file = "/etc/pulse-cutover/upgrade.json"   # the new chain's protocol upgrade schedule
+# protocol_upgrade_margin_blocks = 100000        # no activation within this many blocks after H (default 100000)
+# genesis_base = "/root/genesis-base.json"       # ignition: base migration genesis (with target.create_chain_cmd)
+# chain_config_base = "/root/chain-config-base.json"   # ignition: base PulseVM chain config (producer_key here)
+# source_block_rpc_url = "https://api.example.org"     # where to fetch the FULL cut block (default source.rpc_url)
+
+# -----------------------------------------------------------------------------
+# [loop] — `pulse-cutover loop`: N ceremonies back to back on a rehearsal box.
+# -----------------------------------------------------------------------------
+# [loop]
+# reset_cmd = "/root/cutover-rehearsal/reset.sh"   # REQUIRED. returns both sides to a pre-ARM state (R12)
+# settle_secs = 10                                 # wait after reset before ARMing (default 0)
+# metrics_path = "/root/cutover-rehearsal/metrics.jsonl"   # REQUIRED. per-run metrics
+
+# -----------------------------------------------------------------------------
+# [hooks] — shell commands at key moments. Producer mode's production profile
+# requires on_freeze, post_ignite, on_live and on_abort.
+# -----------------------------------------------------------------------------
 [hooks]
-# Optional shell commands at key moments. on_freeze is where a real API edge
-# starts rejecting writes (reads continue); on_abort should undo it.
-on_freeze = "/root/cutover-rehearsal/freeze-writes.sh"
-post_ignite = "/root/cutover-rehearsal/repoint-traffic.sh"
-on_live = "echo 'flip gateway upstreams here'"
-on_abort = "echo 'page the operator'"
+on_freeze = "/root/cutover-rehearsal/freeze-writes.sh"   # BEFORE the snapshot: close writes at the edge (R2)
+post_ignite = "/root/cutover-rehearsal/repoint-traffic.sh"   # after IGNITED: first transactions (blocks on demand)
+on_live = "echo 'flip gateway upstreams here'"           # after the LIVE gate, before LIVE is journaled
+on_abort = "echo 'page the operator'"                    # on ABORT after rollback: reopen writes, page
+# on_halt = "/root/page.sh"                              # on HALTED (sealed): page a human; must not undo anything
+# timeout_secs = 300                                     # every hook/flip/stop/start command is killed after this (default 300)
+
+# -----------------------------------------------------------------------------
+# [beacon] — `pulse-cutover beacon`: readiness checks + ceremony evidence
+# reported to mission control. Optional; the ceremony never depends on it,
+# BUT a coordinated producer needs it: the fleet gate and the resume guard
+# only count nodes whose reports the relay can see (config warns otherwise).
+# -----------------------------------------------------------------------------
+# [beacon]
+# url = "https://control.example/api/report"   # report endpoint, https only (http only to localhost);
+                                               # "" + `beacon --once` prints the report instead of sending it
+# producer = "youraccount"                     # REQUIRED. your account as in the producer schedule (and the roster)
+# network = "testnet"                          # REQUIRED. network id as mission control knows it (networks.json)
+# node = "producer"                            # this server's label on the board (default: its hostname; one per server)
+# role = "producer"                            # "producer" | "api" | "history" | "seed" (default: "producer" in
+                                               # producer mode, else "api")
+# token_file = "/etc/pulse-cutover/beacon.token"   # one line, mode 600; never the token itself in the config
+# interval_secs = 5                            # report interval (default 5)
+
+# -----------------------------------------------------------------------------
+# [coordination] — `pulse-cutover await` (signed arming) and the pre-ignite
+# fleet gate. Without it the agent arms from this file alone (freeze_height)
+# and ignites on its own checks only.
+# -----------------------------------------------------------------------------
+# [coordination]
+# url = "https://control.example"              # REQUIRED. mission control base URL: relays signed coordinator
+                                               # messages (GET /api/coord/<network>) and beacon reports; trusts nothing itself
+# network = "testnet"                          # REQUIRED. network id, as in mission control's networks.json
+# coordinator_keys = ["<ed25519 public key, hex>"]   # whose signatures this node accepts. Empty = trust nobody.
+# auto_arm = false                             # false (default): a signed ARM also needs the local file
+                                               # confirm-<event_id> next to the journal
+# min_lead_blocks = 120                        # reject events whose H is fewer blocks ahead of head (default 120)
+# fleet_quorum = 0                             # before igniting, wait until this many producers (this one included)
+                                               # report VERIFIED with the same snapshot hash and fingerprints.
+                                               # 0 = no fleet gate; with a roster it must be 1..=roster size
+# fleet_timeout_secs = 300                     # give up waiting for the quorum after this (default 300)
+# report_max_age_secs = 60                     # a roster member's report older than this does not count (default 60)
+# degraded_patience_secs = 900                 # after ignition: how long a local liveness symptom is waited out
+                                               # as DEGRADED while a quorum reports the same target (default 900)
+# degraded_retry_secs = 10                     # first retry delay for a failing post-ignition hook while degraded
+                                               # (doubles, at most 120; default 10)
+# fleet_stall_secs = 300                       # while degraded, the fleet's highest target head must move at least
+                                               # this often or the ceremony halts (default 300)
+# Written by `await` into the DERIVED config from the signed event (never typed in):
+# event_id = "..."                             # the event this ceremony belongs to (enables signed aborts)
+# event_hash = "..."                           # sha256 of the accepted event's exact signed payload (rc.29): before
+                                               # chain creation and ignition the relay's answer counts as "no abort"
+                                               # only when it carries this signed event
+# [[coordination.roster]]                      # the servers that MUST agree before ignition (fleet gate counts only
+# producer = "bp1"                             #   these, with fresh reports); matched by instance_id when given,
+# instance_id = "<32-hex beacon.instance>"     #   else by producer account. Each member once.
+# [[coordination.roster]]
+# producer = "bp2"

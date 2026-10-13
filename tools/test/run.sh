@@ -401,4 +401,21 @@ json.dump(fill(json.load(sys.stdin)), open(sys.argv[1],"w"))' "$T/filled.json"
   ok "example manifest: cross-checked against install.sh's required reads"
 fi
 
+echo "examples/ceremony.toml (the full config format)"
+# README claims examples/ceremony.toml documents the full agent config format: every `pub` field of every
+# section struct in src/config.rs must appear there, active or commented out, and every section header too.
+REF="$ROOT/examples/ceremony.toml"; MISSING=""
+for s in ceremony source snapshot target flip hyperion upstream loop hooks beacon coordination; do
+  grep -qE "^#? ?\[$s\]" "$REF" || MISSING="$MISSING [$s]"
+done
+for f in $(grep -oE '^[[:space:]]*pub (r#)?[a-z_0-9]+:' "$ROOT/src/config.rs" | sed -E 's/^[[:space:]]*pub (r#)?//; s/://' | sort -u); do
+  case "$f" in ceremony|source|snapshot|target|flip|hyperion|upstream|loop|hooks|beacon|coordination) continue;; esac
+  grep -qE "^[[:space:]]*#?[[:space:]]*(\[\[[a-z]+\.)?$f([[:space:]]*=|\]\])" "$REF" || MISSING="$MISSING $f"
+done
+[ -z "$MISSING" ] && ok "ceremony.toml: every src/config.rs field and section is documented" || bad "ceremony.toml: missing$MISSING"
+for f in ceremony.toml ceremony-bp.toml; do
+  grep -qE '^\[coordination\]|^# \[coordination\]' "$ROOT/examples/$f" && grep -qE '^\[beacon\]|^# \[beacon\]' "$ROOT/examples/$f" \
+    && ok "$f: [coordination] and [beacon] present" || bad "$f: [coordination]/[beacon] missing"
+done
+
 echo; echo "$PASS passed, $FAIL failed"; [ "$FAIL" = 0 ]
