@@ -693,6 +693,7 @@ const CHECKS = {
   metal_synced: ['setup', 'Metal node synced', 'the Metal P-Chain has finished bootstrapping'],
   metal_reachable: ['setup', 'Staking port open', 'peers can reach port 9651/tcp from the internet'],
   producer_api_private: ['setup', 'Producer API private', '/v1/producer/* (pause, resume, snapshots) does not answer from the internet'],
+  shadow: ['setup', 'SHADOW', 'shadow cutover: the full ceremony on a PRIVATE network from real mainnet state with the mainnet chain_id; never a real cut, and nothing may be signed on it with a real key'],
   rehearsal_overrides: ['setup', 'REHEARSAL', 'rehearsal only: this node runs a REHEARSAL ceremony (ceremony.rehearsal = true) or relaxes cutover gates (table-compare allowlist / target chain_id change); never a real cut'],
 };
 const kind = (c) => (CHECKS[c.name] || ['health'])[0];
@@ -996,7 +997,7 @@ const ICP = {
 const ic = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICP[n] || ICP.server}</svg>`;
 const CHECK_ICON = { source_api: 'globe', chain_id: 'key', producer_api: 'cpu', freeze_height: 'lock', freeze_lead_blocks: 'lock',
   staged_snapshot_absent: 'camera', disk_free: 'hdd', hook_on_freeze: 'lock', hook_post_ignite: 'zap', hook_on_live: 'arrow',
-  hook_on_abort: 'undo', validator_running: 'hex', metal_synced: 'hex', metal_reachable: 'radio', producer_api_private: 'lock', rehearsal_overrides: 'wrench',
+  hook_on_abort: 'undo', shadow: 'wrench', validator_running: 'hex', metal_synced: 'hex', metal_reachable: 'radio', producer_api_private: 'lock', rehearsal_overrides: 'wrench',
   target_live: 'activity' };
 const ROLE_ICON = { producer: 'cpu', history: 'db', api: 'globe', seed: 'link', query: 'db', full: 'globe' };
 const ROLE_NAME = { producer: 'Block producer node', history: 'History / Hyperion node', api: 'Public API node' };

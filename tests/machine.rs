@@ -158,6 +158,10 @@ struct MockOps {
     target_protocol_edit: RefCell<Option<(std::path::PathBuf, String)>>,
     /// source_block (full get_block) calls fail.
     source_block_fails: Cell<bool>,
+    /// r30 shadow: what the target metalgo reports for info.getNetworkID (None = no answer).
+    shadow_network_id: Cell<Option<u64>>,
+    /// r30 shadow: the source's get_producer_schedule answer (None = no answer).
+    shadow_schedule: RefCell<Option<serde_json::Value>>,
     /// Placeholder values bound via bind_target, and the ones in force when ignite ran.
     bound: RefCell<Vec<(String, String)>>,
     ignite_vars: RefCell<Vec<(String, String)>>,
@@ -254,6 +258,8 @@ impl MockOps {
             target_protocol: RefCell::new(None),
             target_protocol_edit: RefCell::new(None),
             source_block_fails: Cell::new(false),
+            shadow_network_id: Cell::new(None),
+            shadow_schedule: RefCell::new(None),
             bound: RefCell::new(Vec::new()),
             ignite_vars: RefCell::new(Vec::new()),
             coord_doc_when_abort_file: RefCell::new(None),
@@ -286,6 +292,12 @@ impl MockOps {
 }
 
 impl ChainOps for MockOps {
+    fn metal_network_id(&self, _base: &str) -> Result<Option<u64>, String> {
+        Ok(self.shadow_network_id.get())
+    }
+    fn source_producer_schedule(&self) -> Result<Option<serde_json::Value>, String> {
+        Ok(self.shadow_schedule.borrow().clone())
+    }
     fn source_info(&self) -> Result<ChainInfo, String> {
         self.source_calls.set(self.source_calls.get() + 1);
         if self.stopped.get() {
@@ -5978,4 +5990,129 @@ fn rc29_a_hashless_stranded_run_still_retries_the_pause_and_the_latest_check_win
     ops.pause_ignored.set(true);
     assert!(run_machine_result(&cfg, &ops).is_err());
     assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["sealed"], serde_json::json!(false));
+}
+
+
+// ---------------------------------------------------------------- r30: shadow cutovers --
+
+const SHADOW_KEY: &str = "PUB_K1_shadowkey1";
+
+/// The production upstream config turned into a SHADOW of XPR mainnet on private Metal network 4242.
+fn shadow_config(dir: &std::path::Path, edit: impl Fn(String) -> String) -> Result<Config, String> {
+    let _ = upstream_production_config(dir)?;
+    let path = dir.join("ceremony-upstream-ignite.toml");
+    let text = std::fs::read_to_string(&path).unwrap()
+        .replace("[ceremony]\n", &format!("[ceremony]\nchain_id = \"{MAINNET}\"\nshadow = true\n"))
+        .replace("[target]\n", "[target]\nmetal_network_id = 4242\n")
+        + &format!("\n[shadow]\nlabel = \"shadow-test-a\"\nproducer_keys = [\"{SHADOW_KEY}\"]\n\
+                    i_understand_signatures_are_valid_on_mainnet = true\n");
+    std::fs::write(&path, edit(text)).unwrap();
+    Config::load(&path)
+}
+
+fn shadow_ops(dir: &std::path::Path, keys: &[&str], network: Option<u64>) -> MockOps {
+    let ops = upstream_ops(dir);
+    ops.schedule_ok.set(true);
+    *ops.chain_id.borrow_mut() = MAINNET.into();
+    ops.shadow_network_id.set(network);
+    let producers: Vec<serde_json::Value> = keys.iter().enumerate().map(|(i, k)| serde_json::json!({
+        "producer_name": format!("bp{}", i + 1),
+        "authority": [0, {"threshold": 1, "keys": [{"key": k, "weight": 1}]}]})).collect();
+    *ops.shadow_schedule.borrow_mut() = Some(serde_json::json!({"active": {"version": 1, "producers": producers}}));
+    ops
+}
+
+#[test]
+fn r30_shadow_config_is_explicit_and_private() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    assert!(shadow_config(dir.path(), |t| t).is_ok(), "{:?}", shadow_config(dir.path(), |t| t).err());
+    for (edit, needle) in [
+        (Box::new(|t: String| t.replace("shadow = true\n", "")) as Box<dyn Fn(String) -> String>, "ceremony.shadow is not true"),
+        (Box::new(|t: String| t.split("\n[shadow]").next().unwrap().to_string()), "needs a [shadow] section"),
+        (Box::new(|t: String| t.replace("metal_network_id = 4242", "metal_network_id = 1")), "public Metal network"),
+        (Box::new(|t: String| t.replace("metal_network_id = 4242\n", "")), "PRIVATE Metal network"),
+        (Box::new(|t: String| t.replace("valid_on_mainnet = true", "valid_on_mainnet = false")), "must be true"),
+        (Box::new(|t: String| t.replace(&format!("[\"{SHADOW_KEY}\"]"), "[]")), "producer_keys is empty"),
+        (Box::new(|t: String| t.replace("label = \"shadow-test-a\"", "label = \" \"")), "label is empty"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        stage_fake_upstream_tools(dir.path(), 0);
+        let err = shadow_config(dir.path(), edit).unwrap_err();
+        assert!(err.contains(needle), "{needle}: {err}");
+    }
+    // Never on the mainnet board, never served publicly by the agent's flip.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let err = shadow_config(dir.path(), |t| t + "\n[beacon]\nproducer = \"bp1\"\nnetwork = \"mainnet\"\ntoken_file = \"/nonexistent\"\n").unwrap_err();
+    assert!(err.contains("mainnet board"), "{err}");
+    assert!(pulse_cutover::shadow::is_private_url("http://10.0.0.5") && !pulse_cutover::shadow::is_private_url("https://api.example.org"));
+}
+
+#[test]
+fn r30_without_shadow_mainnet_refusals_are_unchanged() {
+    // The same overrides the shadow may use stay refused for mainnet in a normal config.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let err = upstream_ignite_config(dir.path(), &format!("chain_id = \"{MAINNET}\""), r#"rehearsal_allow_compare_mismatch = ["global_property"]"#).unwrap_err();
+    assert!(err.contains("MAINNET"), "{err}");
+    // ...and with shadow = true they load (labelled), because the shadow identity is checked at run time.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = shadow_config(dir.path(), |t| t.replace("shadow = true\n", "shadow = true\nrehearsal = true\nrehearsal_allow_chain_id_change = true\n")).unwrap();
+    assert!(cfg.is_shadow() && !cfg.mainnet_refusals_apply(Some(MAINNET)));
+}
+
+#[test]
+fn r30_shadow_on_a_real_mainnet_node_refuses_before_anything_freezes() {
+    for (keys, net, needle) in [
+        (vec!["PUB_K1_realproducerkey"], Some(4242), "not shadow keys"),
+        (vec![SHADOW_KEY], Some(1), "reports network id 1"),
+        (vec![SHADOW_KEY], None, "did not report a network id"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        stage_fake_upstream_tools(dir.path(), 0);
+        let cfg = shadow_config(dir.path(), |t| t).unwrap();
+        let ops = shadow_ops(dir.path(), &keys, net);
+        assert!(run_machine_result(&cfg, &ops).is_err());
+        let e = journal_entries(&cfg);
+        assert!(transition(&e, "FROZEN").is_none(), "{needle}: nothing froze");
+        assert!(e.iter().any(|v| v.to_string().contains(needle)), "{needle}: {e:?}");
+        assert!(!ops.hooks.borrow().iter().any(|h| h == "freeze-writes"));
+        assert!(!dir.path().join("create-chain.calls").exists());
+    }
+    // A schedule that cannot be read is not "fine".
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = shadow_config(dir.path(), |t| t).unwrap();
+    let ops = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+    *ops.shadow_schedule.borrow_mut() = None;
+    assert!(run_machine_result(&cfg, &ops).is_err());
+    assert!(transition(&journal_entries(&cfg), "FROZEN").is_none());
+}
+
+#[test]
+fn r30_shadow_goes_past_the_mainnet_ignite_refusal_labelled_everywhere() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = shadow_config(dir.path(), |t| t).unwrap();
+    let ops = shadow_ops(dir.path(), &[SHADOW_KEY, SHADOW_KEY], Some(4242));
+    assert_eq!(run_machine_result(&cfg, &ops), Ok(State::Live), "the shadow runs the full ceremony to LIVE");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let e = journal_entries(&cfg);
+    let armed = transition(&e, "ARMED").expect("armed");
+    assert_eq!(armed["data"]["shadow"]["label"], "shadow-test-a");
+    assert_eq!(armed["data"]["shadow"]["metal_network_id"], 4242);
+    assert!(text.contains("\"SHADOW\"") && text.contains("shadow_identity"));
+    assert!(upstream_journal_has_verified(&text));
+    // The real-mainnet refusal became a journaled warning; the shadow went on to create the target.
+    assert!(text.contains("shadow_ignite_pending") && text.contains("TAPOS"));
+    assert!(!text.contains("refused for XPR MAINNET"), "{text}");
+    assert!(dir.path().join("create-chain.calls").exists(), "the shadow created its target chain");
+    // The beacon shows it red and labelled.
+    let report = pulse_cutover::beacon::build_report(&cfg, "bp1", "rehearsal");
+    assert_eq!(report["shadow"]["label"], "shadow-test-a");
+    assert!(report["checks"].as_array().unwrap().iter().any(|c| c["name"] == "shadow" && c["ok"] == false));
+    // ...as a SETUP check: a shadow node's own label never excludes it from the shadow fleet's gate.
+    assert!(!pulse_cutover::beacon::has_failing_health(&serde_json::json!({"checks": [{"name": "shadow", "ok": false}]})));
 }

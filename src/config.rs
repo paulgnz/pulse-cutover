@@ -54,6 +54,10 @@ pub struct Config {
     /// Coordinated arming (`pulse-cutover await`) and the pre-ignite fleet gate.
     #[serde(default)]
     pub coordination: Option<Coordination>,
+    /// SHADOW cutover (docs/DESIGN-shadow.md): the full ceremony on a private network from real mainnet
+    /// state with the mainnet chain_id. Required with `ceremony.shadow = true`, refused without it.
+    #[serde(default)]
+    pub shadow: Option<crate::shadow::ShadowCfg>,
     /// Append-only JSONL journal — the ceremony's evidence log and the
     /// resume-after-crash source of truth.
     pub journal_path: PathBuf,
@@ -331,6 +335,12 @@ pub struct Ceremony {
     /// refused for XPR mainnet (at load and at ARM).
     #[serde(default)]
     pub rehearsal: bool,
+    /// SHADOW cutover (default false; docs/DESIGN-shadow.md): the full ceremony on a PRIVATE Metal network
+    /// from real mainnet state, mainnet chain_id kept. Needs a complete `[shadow]` section; verified against
+    /// the target network id and the source's producer schedule at ARM and before the freeze. Shown as
+    /// SHADOW on the journal, `status`, the beacon and mission control; never a real cut.
+    #[serde(default)]
+    pub shadow: bool,
     /// Where the agent writes the history boundary file for the federating router in producer mode
     /// (or api mode without `[hyperion]`), once the target is verified at the cut and before LIVE.
     /// `[hyperion] boundary_path` does the same in hyperion mode.
@@ -901,6 +911,7 @@ impl Config {
         if config.snapshot.path_map_from.is_some() != config.snapshot.path_map_to.is_some() {
             return Err("snapshot.path_map_from and path_map_to must be set together".into());
         }
+        crate::shadow::check_config(&config)?;
         config.check_rehearsal_overrides()?;
         if enforce_production && config.ceremony.profile == Profile::Ceremony && !config.ceremony.rehearsal {
             let problems = config.production_problems();
@@ -1070,7 +1081,10 @@ impl Config {
                 ));
             }
         }
-        if let (Some(n), Some(want)) = (self.target.metal_network_id, crate::beacon::expected_metal_network(self.ceremony.chain_id.as_deref())) {
+        // A SHADOW runs on a private network by definition (checked by `shadow::check_config` and verified against
+        // the target at ARM): that is its identity, not a relaxation.
+        if let (Some(n), Some(want), false) = (self.target.metal_network_id,
+            crate::beacon::expected_metal_network(self.ceremony.chain_id.as_deref()), self.is_shadow()) {
             if n != want {
                 out.push(format!("target.metal_network_id = {n} (private Metal network; this chain moves to network {want})"));
             }
@@ -1161,7 +1175,7 @@ impl Config {
         if overrides.is_empty() {
             return Ok(());
         }
-        if self.ceremony.chain_id.as_deref().is_some_and(is_xpr_mainnet) {
+        if self.ceremony.chain_id.as_deref().is_some_and(is_xpr_mainnet) && !self.is_shadow() {
             return Err(format!(
                 "rehearsal overrides are refused for XPR MAINNET (ceremony.chain_id {XPR_MAINNET_CHAIN_ID}): {}. \
                  They relax gates a real cut depends on; remove them.",
@@ -1169,6 +1183,17 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    /// A SHADOW ceremony whose config passed `shadow::check_config` (load refuses anything else). The
+    /// runtime half (network id, producer schedule) is checked by the machine at ARM and before the freeze.
+    pub fn is_shadow(&self) -> bool {
+        self.ceremony.shadow && self.shadow.is_some()
+    }
+
+    /// The mainnet refusals apply: the chain is XPR mainnet and this is not a shadow ceremony.
+    pub fn mainnet_refusals_apply(&self, chain_id: Option<&str>) -> bool {
+        chain_id.is_some_and(is_xpr_mainnet) && !self.is_shadow()
     }
 
     /// Mutating commands (`run`, `loop`, `await`) call this first: a readiness-only config

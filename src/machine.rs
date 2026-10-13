@@ -441,8 +441,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     "rehearsal_overrides": self.cfg.rehearsal_overrides(),
                     "rehearsal": self.cfg.ceremony.rehearsal,
                     "production_profile": if self.cfg.ceremony.rehearsal { json!(self.cfg.production_problems()) } else { json!("met") },
+                    "shadow": crate::shadow::label(&self.cfg),
                 }),
             )?;
+            if self.cfg.is_shadow() {
+                self.journal.evidence(State::Armed, json!({"SHADOW": crate::shadow::label(&self.cfg),
+                    "note": "SHADOW cutover on a private network (docs/DESIGN-shadow.md): not a cutover; the chain carries the \
+                             source chain_id, so never sign on it with a real key"}))?;
+                eprintln!("WARNING: SHADOW ceremony ({}): not a cutover", crate::shadow::label(&self.cfg)["label"].as_str().unwrap_or(""));
+            }
             for w in self.cfg.warnings() {
                 self.journal.evidence(State::Armed, json!({"config_warning": w}))?;
                 eprintln!("WARNING: {w}");
@@ -451,6 +458,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.journal.evidence(State::Armed, json!({"REHEARSAL": true, "relaxations": self.cfg.production_problems(),
                     "note": "REHEARSAL ceremony (ceremony.rehearsal = true): not a valid cutover"}))?;
                 eprintln!("WARNING: REHEARSAL ceremony; relaxations: {}", self.cfg.production_problems().join("; "));
+            }
+            if !self.cfg.rehearsal_overrides().is_empty() && self.cfg.is_shadow() {
+                self.journal.evidence(State::Armed, json!({"SHADOW_OVERRIDES_ACTIVE": self.cfg.rehearsal_overrides(),
+                    "note": "shadow override: gates a real cut depends on are relaxed for this shadow; its result is not a clean shadow"}))?;
             }
             if !self.cfg.rehearsal_overrides().is_empty() {
                 self.journal.evidence(State::Armed, json!({"REHEARSAL_OVERRIDES_ACTIVE": self.cfg.rehearsal_overrides(),
@@ -509,12 +520,19 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         // Rehearsal overrides are refused at config load for a configured mainnet chain_id; a
         // config that leaves chain_id to discovery is caught here, before anything freezes.
-        if crate::config::is_xpr_mainnet(&info.chain_id) && (!self.cfg.rehearsal_overrides().is_empty() || self.cfg.ceremony.rehearsal) {
+        if self.cfg.mainnet_refusals_apply(Some(&info.chain_id)) && (!self.cfg.rehearsal_overrides().is_empty() || self.cfg.ceremony.rehearsal) {
             let mut what = self.cfg.rehearsal_overrides();
             if self.cfg.ceremony.rehearsal {
                 what.push("ceremony.rehearsal = true".into());
             }
             problems.push(format!("the source is XPR MAINNET and rehearsal overrides are active ({}): refused", what.join("; ")));
+        }
+        // SHADOW (docs/DESIGN-shadow.md): before anything freezes, prove the target is the configured private
+        // network and the source signs only with shadow keys (a shadow config on a real mainnet node refuses here).
+        if self.cfg.is_shadow() && pre_verify {
+            for p in crate::shadow::runtime_problems(&self.cfg, self.ops) {
+                problems.push(format!("SHADOW identity: {p}"));
+            }
         }
         match self.ops.producer_paused() {
             // api mode: this node does not produce; we only need producer_api
@@ -690,8 +708,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// The production profile, re-checked right before the write freeze (the config may have been
     /// edited, or the source discovered to be mainnet, since load). Ok(false) after aborting.
     fn production_gate(&mut self) -> Result<bool, String> {
-        let mainnet = self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet);
+        let mainnet = self.cfg.mainnet_refusals_apply(self.chain_id.as_deref());
         let problems = self.cfg.production_problems();
+        if self.cfg.is_shadow() {
+            let shadow_problems = crate::shadow::runtime_problems(&self.cfg, self.ops);
+            if !shadow_problems.is_empty() {
+                self.abort("SHADOW identity not verified before the freeze", json!({"problems": shadow_problems}))?;
+                return Ok(false);
+            }
+            self.journal.evidence(State::Armed, json!({"shadow_identity": "verified before the freeze"}))?;
+        }
         if self.cfg.ceremony.rehearsal && !mainnet {
             return Ok(true);
         }
@@ -2572,7 +2598,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let up = self.cfg.upstream.clone().expect("validated: upstream section");
         let source_chain = self.chain_id.clone().unwrap_or_default();
         let pending = upstream::ignite_pending_reasons();
-        if crate::config::is_xpr_mainnet(&source_chain) && !pending.is_empty() {
+        if crate::config::is_xpr_mainnet(&source_chain) && !pending.is_empty() && self.cfg.is_shadow() {
+            self.journal.evidence(self.state, json!({"shadow_ignite_pending": pending,
+                "note": "SHADOW: a real mainnet ignition is refused for these; the shadow goes on to find out what happens"}))?;
+        } else if crate::config::is_xpr_mainnet(&source_chain) && !pending.is_empty() {
             self.abort(
                 "upstream ignite refused for XPR MAINNET: a same-chain-id mainnet cutover still has unsolved \
                  prerequisites (verification completed with the official #61 tools)",
@@ -2769,7 +2798,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         // rc.26 review M1: the mainnet refusal of rehearsal configs runs at load (configured chain_id) and at ARM; a
         // config edited after ARM must not bring one into a join either. The journal knows the source chain.
-        if self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet)
+        if self.cfg.mainnet_refusals_apply(self.chain_id.as_deref())
             && (self.cfg.ceremony.rehearsal || !self.cfg.rehearsal_overrides().is_empty()) {
             return Err("join refused: this journal's source is XPR MAINNET and the config is a rehearsal or carries rehearsal \
                         overrides: refused for mainnet. Nothing was changed.".into());
@@ -3047,7 +3076,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // The same-chain-id gaps are PulseVM's, whatever imported the state: the fork backend
             // gets the same hard XPR-mainnet refusal as the upstream one.
             let pending = upstream::ignite_pending_reasons();
-            if self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet) && !pending.is_empty() {
+            if self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet) && !pending.is_empty() && self.cfg.is_shadow() {
+                self.journal.evidence(self.state, json!({"shadow_ignite_pending": pending}))?;
+            } else if self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet) && !pending.is_empty() {
                 self.abort("ignite refused for XPR MAINNET (fork backend): a same-chain-id mainnet cutover still has unsolved prerequisites",
                     json!({"remaining": pending}))?;
                 return Ok(());

@@ -404,7 +404,7 @@ static JOURNALS: Mutex<Option<HashMap<PathBuf, Acc>>> = Mutex::new(None);
 pub const SETUP_CHECKS: &[&str] = &[
     "hook_on_freeze", "hook_post_ignite", "hook_on_live", "hook_on_abort",
     "validator_running", "metal_synced", "metal_reachable", "producer_api_private",
-    "rehearsal_overrides",
+    "rehearsal_overrides", "shadow",
 ];
 
 /// A report with any failing HEALTH check (a failing setup check does not count).
@@ -743,6 +743,15 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
             if relax.is_empty() { String::new() } else { format!("; relaxations: {}", relax.join("; ")) })));
     }
 
+    // SHADOW cutover: a failing setup check for as long as it is configured, so mission control shows it
+    // red and labelled, never as a node ready for a real cut (docs/DESIGN-shadow.md T3).
+    if cfg.is_shadow() {
+        let l = crate::shadow::label(cfg);
+        checks.push(check("shadow", false, format!(
+            "SHADOW ceremony {} on private Metal network {}: never a real cut (mainnet chain_id kept; never sign on it with a real key)",
+            l["label"].as_str().unwrap_or(""), cfg.target.metal_network_id.unwrap_or(0))));
+    }
+
     // Hooks.
     let hooks = [("on_freeze", &cfg.hooks.on_freeze), ("post_ignite", &cfg.hooks.post_ignite), ("on_live", &cfg.hooks.on_live), ("on_abort", &cfg.hooks.on_abort)];
     for (name, h) in hooks {
@@ -864,6 +873,8 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "mode": format!("{:?}", cfg.ceremony.mode).to_lowercase(),
         "profile": format!("{:?}", cfg.ceremony.profile).to_lowercase(),
+        // SHADOW cutover label (docs/DESIGN-shadow.md); null outside a shadow.
+        "shadow": crate::shadow::label(cfg),
         // Preparation telemetry only — see module docs.
         "ready": ready,
         "checks": checks,
