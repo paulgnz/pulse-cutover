@@ -50,6 +50,8 @@ struct MockOps {
     dir: PathBuf,
     head: Cell<u64>,
     paused: Cell<bool>,
+    /// rc.29: `pause()` answers Ok but the producer keeps producing.
+    pause_ignored: Cell<bool>,
     resumes: Cell<u32>,
     ignited: Cell<bool>,
     target_polls: Cell<u64>,
@@ -197,6 +199,7 @@ impl MockOps {
             dir: dir.to_path_buf(),
             head: Cell::new(start_head),
             paused: Cell::new(false),
+            pause_ignored: Cell::new(false),
             resumes: Cell::new(0),
             ignited: Cell::new(false),
             target_polls: Cell::new(0),
@@ -338,7 +341,9 @@ impl ChainOps for MockOps {
     }
 
     fn pause(&self) -> Result<(), String> {
-        self.paused.set(true);
+        if !self.pause_ignored.get() {
+            self.paused.set(true);
+        }
         Ok(())
     }
 
@@ -2534,7 +2539,7 @@ fn crash_mid_staging_resumes_and_accepts_its_own_staged_snapshot() {
     let rec = Journal::replay(&cfg.journal_path).unwrap();
     assert_eq!(rec.state, Some(State::Snapshotted));
     assert!(rec.staged_sha256.is_some());
-    let ops = MockOps::new(dir.path(), rec_full.cut_height.unwrap() + 3);
+    let ops = MockOps::new(dir.path(), rec_full.head_at_pause.unwrap_or(rec_full.cut_height.unwrap()));
     ops.paused.set(true);
     ops.target_head.set(rec_full.cut_height.unwrap());
     let st = run_machine_result(&cfg, &ops);
@@ -2792,7 +2797,7 @@ fn r3_unhalted_fleet_gated_retry_can_still_agree_and_reach_live() {
         .args(["unhalt", "--config"]).arg(d.path().join("roster.toml")).arg("--i-understand").output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let rec = Journal::replay(&cfg.journal_path).unwrap();
-    let ops2 = MockOps::new(d.path(), rec.cut_height.unwrap() + 3);
+    let ops2 = MockOps::new(d.path(), rec.head_at_pause.unwrap_or(rec.cut_height.unwrap()));
     ops2.paused.set(true);
     ops2.target_head.set(rec.cut_height.unwrap());
     *ops2.status_doc.borrow_mut() = Some(doc);
@@ -2975,7 +2980,7 @@ fn r3_crash_mid_copy_restages_a_truncated_staged_snapshot() {
     std::fs::write(&cfg.journal_path, lines[..=staged].join("\n") + "\n").unwrap();
     let full = std::fs::read(&cfg.snapshot.staged_path).unwrap();
     std::fs::write(&cfg.snapshot.staged_path, &full[..full.len() / 2]).unwrap();
-    let ops = MockOps::new(dir.path(), rec_full.cut_height.unwrap() + 3);
+    let ops = MockOps::new(dir.path(), rec_full.head_at_pause.unwrap_or(rec_full.cut_height.unwrap()));
     ops.paused.set(true);
     ops.target_head.set(rec_full.cut_height.unwrap());
     let st = run_machine_result(&cfg, &ops);
@@ -5769,7 +5774,8 @@ fn rc29_fork_backend_rehashes_the_staged_snapshot_before_ignition() {
     assert!(kept.iter().any(|l| l.contains("\"kind\":\"transition\"") && l.contains("\"state\":\"VERIFIED\"")));
     std::fs::write(&cfg.journal_path, kept.join("\n") + "\n").unwrap();
     std::fs::write(&cfg.snapshot.staged_path, b"another ceremony's snapshot").unwrap();
-    let ops = MockOps::new(dir.path(), 125);
+    let pause_head = open_journal(&cfg.journal_path).1.head_at_pause.unwrap();
+    let ops = MockOps::new(dir.path(), pause_head);
     ops.paused.set(true);
     let st = run_machine(&cfg, &ops);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
@@ -5839,22 +5845,72 @@ fn rc29_a_strand_pauses_a_producer_that_is_still_producing() {
     let (j, rec) = open_journal(&cfg.journal_path);
     assert!(Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).is_err());
     assert!(ops.paused.get(), "a STRANDED producer is paused");
-    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("strand_paused_producer"));
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("\"source_pause_enforced\":true"));
 }
 
 #[test]
-fn rc29_a_config_without_the_event_hash_cannot_authorize_creation() {
+fn rc29_a_config_without_the_event_hash_is_refused_at_load() {
     // A config derived by rc.28 has no event_hash: it cannot tell this event from another payload signed under the
-    // same id (a different H or chain), so before ignition the relay's answer is unknown.
+    // same id (a different H or chain). Refused when loaded, before anything freezes.
     let d = tempfile::tempdir().unwrap();
     let _ = coord_config(d.path(), 120, 0, 60);
     let text = std::fs::read_to_string(d.path().join("ceremony-coord.toml")).unwrap()
         .replace(&format!("event_hash = \"{}\"\n", mock_event_hash()), "");
-    let cfg = load_toml(d.path(), "nohash.toml", &text).unwrap();
-    assert!(cfg.coordination.as_ref().unwrap().event_hash.is_none());
-    let ops = MockOps::new(d.path(), 110);
-    let st = run_machine(&cfg, &ops);
-    assert_ne!(st, State::Live);
+    let err = load_toml(d.path(), "nohash.toml", &text).unwrap_err();
+    assert!(err.contains("has no event_hash") && err.contains("await"), "{err}");
+}
+
+#[test]
+fn rc29_a_verified_restart_with_the_producer_running_never_ignites() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    assert_eq!(run_machine(&cfg, &MockOps::new(dir.path(), 110)), State::Live);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
-    assert!(text.contains("cannot confirm the event is not aborted") && !text.contains("ignite_started"), "{st:?}");
+    let kept: Vec<&str> = text.lines().take_while(|l| !l.contains("ignite_started")).collect();
+    std::fs::write(&cfg.journal_path, kept.join("\n") + "\n").unwrap();
+    // nodeos restarted while the agent was down: the producer is no longer paused.
+    let pause_head = open_journal(&cfg.journal_path).1.head_at_pause.unwrap();
+    let ops = MockOps::new(dir.path(), pause_head);
+    let st = run_machine(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("refusing to create or ignite the target: the source producer is not paused"), "{st:?}");
+    assert!(!text.contains("ignite_started"));
+}
+
+#[test]
+fn rc29_a_strand_whose_pause_does_not_take_is_reported_unsealed() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    rc29_killed_at_verified(d.path(), &cfg, &ops);
+    ops.paused.set(false);
+    ops.pause_ignored.set(true);
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert!(Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).is_err());
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("STRANDED but UNSEALED") && text.contains("\"sealed\":false") && text.contains("\"source_pause_enforced\":false"), "{text}");
+    // Every later run retries the pause.
+    ops.pause_ignored.set(false);
+    assert!(run_machine_result(&cfg, &ops).unwrap_err().starts_with("STRANDED"));
+    assert!(ops.paused.get(), "the retry took");
+}
+
+#[test]
+fn rc29_cancelling_a_rollback_intent_ends_the_withdrawal_on_the_beacon() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = test_config(d.path(), 120);
+    let lines = [
+        serde_json::json!({"seq": 0, "ts_ms": 1, "ts": "t", "kind": "transition", "state": "VERIFIED", "data": {}}),
+        serde_json::json!({"seq": 1, "ts_ms": 2, "ts": "t", "kind": "evidence", "state": "VERIFIED", "data": {"rollback_requested": true, "by": "agent_abort"}}),
+        serde_json::json!({"seq": 2, "ts_ms": 3, "ts": "t", "kind": "evidence", "state": "VERIFIED", "data": {"abort_intent": true}}),
+    ];
+    std::fs::write(&cfg.journal_path, lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+    let s = pulse_cutover::beacon::journal_summary(&cfg.journal_path);
+    assert_eq!((s["aborting"].as_bool(), s["rollback_pending"].as_bool()), (Some(true), Some(true)), "{s}");
+    let mut text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    text += &(serde_json::json!({"seq": 3, "ts_ms": 4, "ts": "t", "kind": "evidence", "state": "VERIFIED", "data": {"rollback_intent_cancelled": true}}).to_string() + "\n");
+    std::fs::write(&cfg.journal_path, text).unwrap();
+    let s = pulse_cutover::beacon::journal_summary(&cfg.journal_path);
+    assert_ne!(s["aborting"].as_bool(), Some(true), "{s}");
+    assert_ne!(s["rollback_pending"].as_bool(), Some(true), "{s}");
 }

@@ -31,6 +31,18 @@ permissions:
   contents: write
 
 jobs:
+  pins:
+    # rc.29: the installers and the example manifest must pin exactly the release being published.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: installer pins match the tag
+        run: |
+          set -eu
+          t="${GITHUB_REF_NAME}"
+          grep -qx "AGENT_RELEASE_DEFAULT=\"$t\"" install.sh || { echo "install.sh AGENT_RELEASE_DEFAULT is not $t"; exit 1; }
+          grep -qx "VERSION_DEFAULT=\"$t\"" tools/beacon-install.sh || { echo "tools/beacon-install.sh VERSION_DEFAULT is not $t"; exit 1; }
+          grep -q "\"agent_release_tag\": *\"$t\"" examples/ceremony.json || { echo "examples/ceremony.json agent_release_tag is not $t"; exit 1; }
   build:
     runs-on: ubuntu-latest
     strategy:
@@ -61,7 +73,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [pins, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

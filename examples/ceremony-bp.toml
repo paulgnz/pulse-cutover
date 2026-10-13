@@ -116,7 +116,7 @@ on_abort = "/root/bp-cutover/unquiesce.sh"
 # tools/beacon-install.sh; put the same producer here.            [CHANGE producer/network]
 # -----------------------------------------------------------------------------
 [beacon]
-url = "https://control-rehearsal.protonnz.com/api/report"   # https only (plain http only to localhost)
+url = "https://control.example/api/report"   # https only (plain http only to localhost)
 producer = "youraccount"            # your account as in the producer schedule AND the event roster
 network = "testnet"                 # mission control's network id (networks.json)
 node = "producer"                   # this server's label on the board (default: hostname); one per server
@@ -133,7 +133,7 @@ interval_secs = 5
 # roster/quorum; `run` uses that one. Every field: examples/ceremony.toml.
 # -----------------------------------------------------------------------------
 [coordination]
-url = "https://control-rehearsal.protonnz.com"   # relay base URL (signed messages + beacon reports)
+url = "https://control.example"   # relay base URL (signed messages + beacon reports)
 network = "testnet"
 coordinator_keys = ["REPLACE-WITH-THE-COORDINATOR-ED25519-PUBLIC-KEY-HEX"]   # empty = trust nobody  [CHANGE]
 auto_arm = false                    # a signed ARM also needs `touch <journal dir>/confirm-<event_id>`

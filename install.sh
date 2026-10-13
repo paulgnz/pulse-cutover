@@ -26,7 +26,7 @@ set -euo pipefail
 # `artifacts.agent_release_tag`. Bumped by the release process together with tools/beacon-install.sh
 # (VERSION_DEFAULT); the two must agree (tools/test/run.sh checks). Never "latest": GitHub's
 # "latest release" alias skips pre-releases, so it resolved to a six-week-old v0.4.0 for every rc.
-AGENT_RELEASE_DEFAULT="v0.5.0-rc.28"
+AGENT_RELEASE_DEFAULT="v0.5.0-rc.29"
 
 MODE=""
 MANIFEST=""
@@ -371,7 +371,16 @@ install_agent_release(){
   echo "  verified + installed: pulse-cutover $tag ($bin, sha256 $sums)"
 }
 install_agent_source(){
-  local repo; repo=$(cd "$(dirname "$0")" && pwd)
+  local repo want at; repo=$(cd "$(dirname "$0")" && pwd)
+  # rc.29: the source build is a fallback for the PINNED release only: the checkout must be exactly that tag
+  # (or the operator opts in), never whatever happens to be checked out.
+  want=$(agent_release_tag "$(mget_opt '.artifacts.agent_release_tag')" "$AGENT_RELEASE_DEFAULT") || return 1
+  at=$(cd "$repo" && git describe --tags --exact-match 2>/dev/null || true)
+  if [ "$at" != "$want" ] && [ "${PULSE_CUTOVER_ALLOW_SOURCE_BUILD:-}" != "1" ]; then
+    echo "  not building from source: this checkout is ${at:-not a release tag}, the pinned release is $want"
+    echo "  (git checkout $want, or set PULSE_CUTOVER_ALLOW_SOURCE_BUILD=1 to build this checkout anyway)"
+    return 1
+  fi
   command -v cargo >/dev/null || { echo "  no cargo either — install rustup (see README Step 1) or add artifacts.agent to the manifest"; return 1; }
   echo "  building from source in $repo (this takes a few minutes) ..."
   (cd "$repo" && cargo build --release --locked) || return 1

@@ -749,7 +749,7 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     // An operator rollback that started and did not finish blocks `run` until it is finished
     // (re-run `rollback`) or, if no step ran yet, cancelled (`rollback --cancel-intent`).
     let rollback = if recovered.rollback_pending {
-        "pending (an operator rollback started and did not finish: re-run `pulse-cutover rollback`)"
+        "pending (a rollback, the operator's or the agent's own abort, started and did not finish: re-run `pulse-cutover rollback`)"
     } else if recovered.state == Some(state::State::Aborted) {
         if recovered.aborted_rollback_complete { "complete" } else { "INCOMPLETE (run `pulse-cutover rollback`)" }
     } else {

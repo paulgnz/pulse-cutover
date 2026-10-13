@@ -18,7 +18,7 @@ existing node; a fleet-wide rollback guarantee is **not yet implemented** (see
 the status box below).
 
 > [!IMPORTANT]
-> **Status (2026-10-13, v0.5.0-rc.28)**
+> **Status (2026-10-13, v0.5.0-rc.29)**
 > - **Proven in rehearsal** (September, 5 BPs on a private Metal network, fork plugin): same cut block, snapshot hash and
 >   fingerprints on every BP; zero transactions after H; a symmetric abort where every BP resumed the old chain.
 > - **Demonstrated on a sample**: state equality on 19 accounts / 5 contracts / 32 table scopes; a replay canary
@@ -26,7 +26,7 @@ the status box below).
 > - **Run on upstream PulseVM v1.0.0** (2026-10-06, 5 BPs, metalgo 1.14.2, protocol 45, a private Metal network, both
 >   rehearsal overrides on): identical state at H on all 5 and against a reference nodeos in every run, but every healthy
 >   run ended with LIVE *and* HALTED BPs on one target chain, and in one run a BP resumed the old chain after its peers
->   had ignited (33 writes landed after H). rc.23–rc.28 make the agents fleet-aware (STRANDED, `join`, degraded waits,
+>   had ignited (33 writes landed after H). rc.23–rc.29 make the agents fleet-aware (STRANDED, `join`, degraded waits,
 >   a fleet verdict and creation-evidence log on mission control); they do not make the cut fleet-decided.
 > - **Not done yet**: fleet-wide all-or-nothing (no authority boundary; a partial abort can still split the network),
 >   exact H in API mode and on restart under a real freeze, per-validator producer keys, crash recovery on a fleet,
@@ -35,7 +35,7 @@ the status box below).
 
 > **Block producer? Connect your node in 2 minutes → [docs/OPERATOR-QUICKSTART.md](docs/OPERATOR-QUICKSTART.md) · set up your Metal validator and get your NodeID → [docs/METAL-QUICKSTART.md](docs/METAL-QUICKSTART.md)**
 > ```bash
-> V=v0.5.0-rc.28   # a release tag: the script's pins arrive with it (never main, never "latest")
+> V=v0.5.0-rc.29   # a release tag: the script's pins arrive with it (never main, never "latest")
 > curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 > less beacon-install.sh && sudo bash beacon-install.sh
 > ```
@@ -128,7 +128,7 @@ from a **release tag** (never `main`: the tag is what was reviewed and released,
 arrive with it), read it, try it with `--dry-run` first; it changes nothing:
 
 ```sh
-V=v0.5.0-rc.28
+V=v0.5.0-rc.29
 curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 less beacon-install.sh                  # you are about to run it as root: read it
 sudo bash beacon-install.sh --dry-run   # shows what it detected; changes nothing
@@ -149,7 +149,7 @@ mission control authenticates it. See [control/README.md](control/README.md).
 producing node**: compiling takes minutes of full CPU.
 
 ```sh
-V=v0.5.0-rc.28   # an exact release tag. Never "latest": GitHub's alias skips pre-releases and resolves to an old build
+V=v0.5.0-rc.29   # an exact release tag. Never "latest": GitHub's alias skips pre-releases and resolves to an old build
 curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/download/$V/pulse-cutover-x86_64-unknown-linux-musl
 curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/download/$V/sha256sums.txt
 sha256sum -c sha256sums.txt --ignore-missing
@@ -1075,7 +1075,7 @@ are ignored). The shape, abridged:
                 "staking_dir": "/var/lib/metalgo/staking", "post_live_probe_cmd": "…" },
   "flip":     { "public_host": "<public-ip-or-domain>", "edge": "auto" },
   "gateway":  { "mode": "edge" },
-  "artifacts": { "agent_release_tag": "v0.5.0-rc.28",      // or "agent": {"url", "sha256"}, which wins
+  "artifacts": { "agent_release_tag": "v0.5.0-rc.29",      // or "agent": {"url", "sha256"}, which wins
                  "plugin":    {"url": "…", "sha256": "…"},
                  "metalgo":   {"url": "…", "sha256": "…"},
                  "edge":      {"url": "…", "sha256": "…"},    // gateway.mode = edge
@@ -1362,7 +1362,7 @@ what testers get out of it.
 
 ## Status & caveats
 
-- Operator tooling v0.5.0-rc.28 (beacon, installers, mission control) — rehearsal-grade; both installers and
+- Operator tooling v0.5.0-rc.29 (beacon, installers, mission control) — rehearsal-grade; both installers and
   `install.sh` pin an exact released tag (bumped by each release; `latest` is refused).
   The September ceremonies ran the fork plugin (`v0.0.0-arena-mempoolfix.1`
   lineage, metalgo 1.13.5, plugin protocol 43); the 2026-10-06 fleet runs ran upstream

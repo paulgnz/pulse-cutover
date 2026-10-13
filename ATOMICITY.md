@@ -14,7 +14,7 @@ is kept as evidence. Producing evidence automatically is not the same as a manda
 fleet-wide barrier, and run 5 needed a manual step.
 
 > [!IMPORTANT]
-> **Status at a glance (2026-10-13, v0.5.0-rc.28)**
+> **Status at a glance (2026-10-13, v0.5.0-rc.29)**
 > - **Proven in rehearsal** (September; 5 BPs, private Metal network, fork plugin): the same cut block, snapshot hash and
 >   table fingerprints on every BP (A1); zero transactions after H in every successful run (A2); a symmetric abort where
 >   all 5 BPs resumed the old chain (run 1).
@@ -24,7 +24,7 @@ fleet-wide barrier, and run 5 needed a manual step.
 >   both rehearsal overrides on): the exact-H scheduled cut and the upstream import + ignition ran end to end on real
 >   services: identical state at H on all 5 and against a reference nodeos in every run (A1, A3 on the sample). But
 >   **every healthy run ended with LIVE and HALTED BPs on one target chain**, and in one run (r4) **a BP resumed the
->   old chain after its peers ignited** and took 33 writes after H (A5 failed in practice). rc.23–rc.28 respond with
+>   old chain after its peers ignited** and took 33 writes after H (A5 failed in practice). rc.23–rc.29 respond with
 >   STRANDED, `join`, degraded waits, a fleet verdict and a creation-evidence log; what they do not solve: Known limits
 >   #1 and #14.
 > - **Not done**: A5 (fleet-wide all-or-nothing) is not implemented; nothing has run on Tahoe itself (the fleet runs

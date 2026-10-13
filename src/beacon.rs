@@ -508,6 +508,8 @@ fn apply_line(acc: &mut Acc, v: &Value) {
     }
     if d["rollback_intent_cancelled"].as_bool() == Some(true) {
         acc.rollback_pending = false;
+        // rc.29: the withdrawal ends with the intent (an `abort_intent` may have announced it to the fleet).
+        acc.aborting = false;
     }
     if d.get("rollback_incomplete").is_some() {
         acc.rollback_complete = Some(false);
@@ -524,7 +526,8 @@ fn apply_line(acc: &mut Acc, v: &Value) {
                 acc.ignition_started = true;
             }
             acc.forced_rollback = v["state"].as_str() == Some("ABORTED") && d["force_after_ignite"].as_bool() == Some(true);
-            if v["state"].as_str() == Some("ABORTED") {
+            // rc.29: as the journal replay does, STRANDED also ends a pending rollback intent.
+            if matches!(v["state"].as_str(), Some("ABORTED" | "STRANDED")) {
                 acc.rollback_pending = false;
             }
             // An rc.8+ ABORTED (it carries `reverts_ok`) is unfinished until its `rollback_done`

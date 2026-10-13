@@ -357,6 +357,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             ));
         }
         if self.state == State::Stranded {
+            if !self.ensure_source_paused()? {
+                eprintln!("UNSEALED: the source producer could NOT be confirmed paused; pause it by hand now.");
+            }
             return Err(self.stranded_message());
         }
         if self.resumed && self.reached_ignited && !self.unhalted && matches!(self.state, State::Armed | State::Frozen | State::Snapshotted | State::Verified) {
@@ -457,7 +460,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 State::Flipped => self.step_flipped()?,
                 State::Live | State::Aborted => return Ok(self.state),
                 State::Halted => return Err(format!("HALTED at {}", self.state)),
-                State::Stranded => return Err(self.stranded_message()),
+                State::Stranded => {
+                    if !self.ensure_source_paused()? {
+                        eprintln!("UNSEALED: the source producer could NOT be confirmed paused; pause it by hand now.");
+                    }
+                    return Err(self.stranded_message());
+                }
             }
         }
     }
@@ -769,6 +777,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 matches!(c["state"].as_str(), Some("VERIFIED" | "IGNITED" | "FLIPPED" | "LIVE"))
                     // rc.23: a member withdrawing its VERIFIED report before resuming its source never counts.
                     && c["aborting"].as_bool() != Some(true)
+                    // rc.29: a node with a pending rollback (journaled before it announces aborting) is going back.
+                    && c["rollback_pending"].as_bool() != Some(true)
                     && same("snapshot_sha256")
                     && same("fingerprints_digest")
                     // rc.27: one protocol upgrade schedule for the new chain (a different one splits it at activation).
@@ -1221,7 +1231,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     .filter(|r| r["coord"]["event_id"].as_str() == Some(event.as_str()) && r["instance_id"].as_str().is_none_or(|i| i == inst))
                     .collect::<Vec<_>>();
                 if !mine.is_empty() && mine.iter().all(|r| r["ceremony"]["state"].as_str() != Some("VERIFIED")
-                    || r["ceremony"]["aborting"].as_bool() == Some(true)) {
+                    || r["ceremony"]["aborting"].as_bool() == Some(true) || r["ceremony"]["rollback_pending"].as_bool() == Some(true)) {
                     self.journal.evidence(self.state, json!({"own_report_withdrawn": "the relay shows this node aborting"}))?;
                     // Re-check #2: a peer that journaled create_chain just before may not have REPORTED it yet.
                     // Wait one beacon cycle (its interval, at least 10 s) before the second guard pass.
@@ -1359,6 +1369,44 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
     }
 
+    /// rc.29: a producer-mode node that must not produce old-chain blocks: confirm the pause, pausing if needed.
+    /// Ok(true) = confirmed paused (or not a producer); Ok(false) = could not confirm (journaled).
+    fn ensure_source_paused(&mut self) -> Result<bool, String> {
+        if self.cfg.ceremony.mode != Mode::Producer {
+            return Ok(true);
+        }
+        if matches!(self.ops.producer_paused(), Ok(true)) {
+            return Ok(true);
+        }
+        let r = self.ops.pause().and_then(|_| self.ops.producer_paused());
+        let ok = matches!(r, Ok(true));
+        self.journal.evidence(self.state, json!({"source_pause_enforced": ok, "result": format!("{r:?}")}))?;
+        Ok(ok)
+    }
+
+    /// rc.29: before chain creation and ignition the old chain must still be sealed at the cut: the producer
+    /// confirmed paused and its head not past the journaled pause head (a restarted agent, or an operator, may
+    /// have resumed it; the target would then be igniting from a cut the old chain has moved past).
+    fn source_sealed_problem(&mut self) -> Result<Option<String>, String> {
+        if self.cfg.ceremony.mode != Mode::Producer || self.joining {
+            return Ok(None);
+        }
+        match self.ops.producer_paused() {
+            Ok(true) => {}
+            Ok(false) => return Ok(Some("the source producer is not paused".into())),
+            Err(e) => return Ok(Some(format!("cannot confirm the source producer is paused ({e})"))),
+        }
+        if let Some(paused) = self.head_at_pause {
+            match self.ops.source_info() {
+                Ok(i) if i.head_block_num > paused => return Ok(Some(format!(
+                    "the source head moved past the pause head ({} > {paused})", i.head_block_num))),
+                Ok(_) => {}
+                Err(e) => return Ok(Some(format!("cannot read the source head ({e})"))),
+            }
+        }
+        Ok(None)
+    }
+
     fn stranded_message(&self) -> String {
         format!(
             "STRANDED (journaled): this producer stopped before its own chain creation but could not prove that no \
@@ -1377,18 +1425,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.journal.error(self.state, reason, detail.clone())?;
         // rc.29: sealed means not producing old-chain blocks either (a strand before the pause, e.g. an operator
         // rollback from FROZEN, would otherwise keep producing past H and trip every peer's quiescence window).
-        if self.cfg.ceremony.mode == Mode::Producer && !matches!(self.ops.producer_paused(), Ok(true)) {
-            let r = self.ops.pause().and_then(|_| self.ops.producer_paused());
-            self.journal.evidence(self.state, json!({"strand_paused_producer": format!("{r:?}")}))?;
-        }
+        let source_paused = self.ensure_source_paused()?;
         self.rollback_pending = false;
         self.state = State::Stranded;
         self.journal.transition(State::Stranded, json!({
             "stranded_from": from.as_str(), "reason": reason, "detail": detail,
-            "message": format!("STRANDED: {reason}; peers may have ignited ({why}): refusing to resume the source"),
-            "guard": why, "sealed": true, "source_resumed": false, "writes_reopened": false,
+            "message": if source_paused {
+                format!("STRANDED: {reason}; peers may have ignited ({why}): refusing to resume the source")
+            } else {
+                format!("STRANDED but UNSEALED: {reason}; peers may have ignited ({why}); the source producer could NOT be \
+                    confirmed paused: pause it by hand now")
+            },
+            "guard": why, "sealed": source_paused, "source_paused": source_paused, "source_resumed": false, "writes_reopened": false,
             "clear_with": "pulse-cutover join --config <file> --event <id> (fleet LIVE) | pulse-cutover rollback --config <file> [--force-stranded]"}))?;
         eprintln!("STRANDED at {from}: {reason}; peers may have ignited ({why}); refusing to resume the source");
+        if !source_paused {
+            eprintln!("UNSEALED: the source producer could NOT be confirmed paused. Pause it by hand now \
+                (POST /v1/producer/pause); every `run`/`rollback` on this journal retries the pause.");
+        }
         if let Some(hook) = &self.cfg.hooks.on_halt {
             let result = self.ops.run_hook(hook);
             self.journal.evidence(State::Stranded, json!({"on_halt_hook": format!("{result:?}")}))?;
@@ -2968,6 +3022,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(());
             }
         }
+        if let Some(why) = self.source_sealed_problem()? {
+            self.abort(&format!("refusing to create or ignite the target: {why}"), json!({"head_at_pause": self.head_at_pause}))?;
+            return Ok(());
+        }
         if !self.joining && !self.fleet_gate()? {
             return Ok(()); // aborted inside, with evidence
         }
@@ -2979,6 +3037,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // A join tracks a chain a quorum already runs LIVE: an abort is not honoured after ignition, and
         // the join checked the fleet itself.
         if !self.joining && !self.require_no_abort("ignition")? {
+            return Ok(());
+        }
+        if let Some(why) = self.source_sealed_problem()? {
+            self.abort(&format!("refusing to ignite the target: {why}"), json!({"head_at_pause": self.head_at_pause}))?;
             return Ok(());
         }
         if !upstream_backend {

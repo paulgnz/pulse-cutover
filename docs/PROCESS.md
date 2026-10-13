@@ -9,13 +9,13 @@ what is implemented and rehearsed today is marked where it differs, and the full
 status is in [ATOMICITY.md](../ATOMICITY.md).
 
 > [!IMPORTANT]
-> **Implemented vs intended (v0.5.0-rc.28).** Rehearsed: same cut on every producer, zero transactions
+> **Implemented vs intended (v0.5.0-rc.29).** Rehearsed: same cut on every producer, zero transactions
 > after H, a symmetric abort (September, fork plugin); the exact-H scheduled cut, the block-id-at-H
 > lineage check and the upstream import + ignition on PulseVM v1.0.0 (2026-10-06 fleet runs, private
 > Metal network, both rehearsal overrides on; those runs ended with mixed LIVE/HALTED nodes on one chain
 > and one split, see ATOMICITY). Implemented, not rehearsed under a real freeze: exact H in API mode and
 > across a restart. Sampled only: state equality and exactly-once. Not implemented: a fleet-wide authority
-> boundary (all-or-nothing; designed in `docs/DESIGN-authority-boundary.md`; rc.23–rc.28 add a fleet
+> boundary (all-or-nothing; designed in `docs/DESIGN-authority-boundary.md`; rc.23–rc.29 add a fleet
 > resume guard, STRANDED, `join` and a fleet verdict, all reading unsigned relay reports), per-validator
 > producer keys, validator registration/funding. Nothing has run on Tahoe itself.
 

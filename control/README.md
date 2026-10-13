@@ -122,7 +122,7 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   start, rc.27 `foreign_past` records and ordinary `past_create` marks are migrated into the log; a malformed evidence
   log refuses startup; after a failed state write every later change is refused until a restart. `event_max` in
   `/api/status` also carries a derived `foreign_past` per event for rc.27 agents (the current event's includes the whole
-  rc.28 blocking set). Upgrade every agent to rc.28 before arming an event all the same. A beacon still pointed at an
+  rc.28 blocking set). Upgrade every agent to rc.29 before arming an event all the same. A beacon still pointed at an
   old journal (including a readiness beacon) keeps re-creating its observation: repoint or stop it BEFORE retiring.
   If a state write (server state or coordination store) fails AFTER its rename, the new content may be on disk while
   memory is older: `/healthz` and every `/api/*` request return 503 until mission control is restarted (it reloads both

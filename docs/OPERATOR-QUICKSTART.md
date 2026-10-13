@@ -22,7 +22,7 @@ Log in to the server that runs your **producer** nodeos. Download the installer 
 read it, then run it:
 
 ```bash
-V=v0.5.0-rc.28
+V=v0.5.0-rc.29
 curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 less beacon-install.sh          # you are about to run this as root: read it
 sudo bash beacon-install.sh
@@ -164,11 +164,14 @@ What your agent does with the same view (rc.23, coordinated events only):
   otherwise `pulse-cutover rollback --config …` re-runs the guard and resumes the old chain only if it passes
   (`--force-stranded --i-understand` records a fleet-wide decision instead, journaled with the fleet view it
   overrides). Since rc.29 the same guard runs when you abort a coordinated producer by hand
-  (`./cutover.sh abort` on a journal in FROZEN, SNAPSHOTTED or VERIFIED) and when a rollback is re-run on an
-  ABORTED journal whose paused source was never resumed: the rollback exits 3 and the node is STRANDED if the guard
-  fails. Also since rc.29 the agent treats the relay's answer as "no abort" before chain creation and ignition
-  only when it carries this event's signed payload (the `event_hash` `await` wrote); an empty answer is unknown
-  and the step is refused.
+  (`./cutover.sh abort` on a journal in FROZEN, SNAPSHOTTED or VERIFIED: if the guard fails the rollback exits 3 and
+  the node is STRANDED, producer paused) and when a rollback is re-run on an ABORTED journal that froze but whose
+  source was never resumed (if the guard fails it refuses, exit 3, nothing changed). A producer's `on_abort` (writes
+  reopen) runs only once its source produces again. Also since rc.29 the agent treats the relay's answer as
+  "no abort" before chain creation and ignition only when it carries this event's signed payload (the `event_hash`
+  `await` writes; a derived config without it is refused at load); an empty answer is unknown and the step is
+  refused. Before creating or igniting, the producer must still be paused at its journaled pause head. A STRANDED
+  journal whose pause could not be confirmed says UNSEALED: pause the producer by hand (`run`/`rollback` retry it).
 - **After ignition.** A local symptom (a block gap in the sustained-LIVE window, a slow first block, a failing
   `post_ignite` / `on_live` hook) no longer halts at once while a quorum of the roster reports the same target chain
   with a common block after H and a moving head: the ceremony shows **degraded**, retries hooks with backoff (they
