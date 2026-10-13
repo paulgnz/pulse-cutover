@@ -167,6 +167,9 @@ struct MockOps {
     /// r30 shadow-fix: metal_network_id calls so far, and from which call on it answers this instead.
     metal_calls: Cell<u32>,
     metal_network_from_call: Cell<Option<(u32, Option<u64>)>>,
+    /// round-2 N5: what the proven metalgo's P-Chain says about a blockchain id (None = no answer); default "Validating".
+    metal_chain_status: RefCell<Option<String>>,
+    metal_chain_asked: RefCell<Vec<String>>,
     /// Placeholder values bound via bind_target, and the ones in force when ignite ran.
     bound: RefCell<Vec<(String, String)>>,
     ignite_vars: RefCell<Vec<(String, String)>>,
@@ -268,6 +271,8 @@ impl MockOps {
             public_mainnet: RefCell::new(None),
             metal_calls: Cell::new(0),
             metal_network_from_call: Cell::new(None),
+            metal_chain_status: RefCell::new(Some("Validating".into())),
+            metal_chain_asked: RefCell::new(Vec::new()),
             bound: RefCell::new(Vec::new()),
             ignite_vars: RefCell::new(Vec::new()),
             coord_doc_when_abort_file: RefCell::new(None),
@@ -310,11 +315,20 @@ impl ChainOps for MockOps {
         }
         Ok(self.shadow_network_id.get())
     }
+    fn metal_blockchain_status(&self, base: &str, blockchain_id: &str) -> Result<Option<String>, String> {
+        assert_eq!(base, "http://127.0.0.1:9650", "the chain check must ask the PROVEN metalgo (target.rpc_url's)");
+        self.metal_chain_asked.borrow_mut().push(blockchain_id.to_string());
+        Ok(self.metal_chain_status.borrow().clone())
+    }
     fn public_chain_post(&self, base: &str, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
         assert!(pulse_cutover::shadow::PUBLIC_XPR_MAINNET_APIS.contains(&base), "only the pinned public endpoints: {base}");
         let pm = self.public_mainnet.borrow().clone().ok_or_else(|| format!("{base}: unreachable (mock)"))?;
         match path {
-            "/v1/chain/get_info" => Ok(serde_json::json!({"chain_id": MAINNET, "head_block_num": pm["head"].as_u64().unwrap_or(1u64 << 40)})),
+            // round-2 N2: "head": null = an endpoint whose get_info carries no head_block_num.
+            "/v1/chain/get_info" => Ok(match pm.get("head") {
+                Some(serde_json::Value::Null) => serde_json::json!({"chain_id": MAINNET}),
+                _ => serde_json::json!({"chain_id": MAINNET, "head_block_num": pm["head"].as_u64().unwrap_or(1u64 << 40)}),
+            }),
             "/v1/chain/get_producer_schedule" => {
                 let producers: Vec<serde_json::Value> = pm["keys"].as_array().cloned().unwrap_or_default().iter().enumerate()
                     .map(|(i, k)| serde_json::json!({"producer_name": format!("real{i}"),
@@ -6292,7 +6306,7 @@ fn r30_shadow_config_is_explicit_and_private() {
         (Box::new(|t: String| t.replace("rpc_url = \"http://127.0.0.1:9650/ext/bc/{blockchain_id}/rpc\"", "rpc_url = \"http://127.0.0.1:9650/rpc\"")),
          "not a metalgo /ext/ URL"),
         // shadow-fix (b): identity is read on the node whose producer gets paused.
-        (Box::new(|t: String| t.replace("producer_api_url = \"http://mock\"", "producer_api_url = \"http://other-node\"")), "must be the same node"),
+        (Box::new(|t: String| t.replace("producer_api_url = \"http://mock\"", "producer_api_url = \"http://other-node\"")), "must be the same API base"),
         // shadow-fix #3: a producer-mode shadow keeps the multi-party controls...
         (Box::new(|t: String| t.split("\n[coordination]").next().unwrap().to_string()), "must be coordinated"),
         // ...on a shadow network (#4), never mainnet or a real board.
@@ -6561,4 +6575,242 @@ fn r30_shadow_identity_is_bound_to_the_journal() {
     let rekeyed = shadow_config(dir.path(), |t| t.replace(&format!("[\"{SHADOW_KEY}\"]"), "[\"PUB_K1_otherkey\"]")).unwrap();
     assert!(run_machine_result(&rekeyed, &ops).unwrap_err().contains("fixed at ARM"));
     assert!(pulse_cutover::shadow::journal_mismatch(&real, rec.armed_shadow.as_ref()).unwrap().contains("no longer a shadow"));
+}
+
+// ------------------------------------------------------------------ round-2 review (r30) --
+
+/// Keep the journal up to and including the first record `stop` matches (a crash right after it).
+fn truncate_journal_after(cfg: &Config, stop: impl Fn(&serde_json::Value) -> bool) {
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let mut kept = vec![];
+    for l in text.lines() {
+        kept.push(l);
+        if stop(&serde_json::from_str(l).unwrap()) {
+            std::fs::write(&cfg.journal_path, kept.join("\n") + "\n").unwrap();
+            return;
+        }
+    }
+    panic!("no matching record to truncate after");
+}
+
+/// A shadow journal paused at VERIFIED: the full happy shadow run, cut right after its VERIFIED transition.
+fn shadow_journal_at_verified(dir: &std::path::Path) -> Config {
+    let probe = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(probe.path(), 0);
+    let pcfg = shadow_config(probe.path(), |t| t).unwrap();
+    let pops = shadow_ops(probe.path(), &[SHADOW_KEY], Some(4242));
+    *pops.status_doc.borrow_mut() = Some(shadow_status(serde_json::json!({"state": "ARMED"})));
+    let _ = run_machine_result(&pcfg, &pops);
+    let ours = pulse_cutover::beacon::journal_summary(&pcfg.journal_path)["evidence"].clone();
+    stage_fake_upstream_tools(dir, 0);
+    let cfg = shadow_config(dir, |t| t).unwrap();
+    let ops = shadow_ops(dir, &[SHADOW_KEY], Some(4242));
+    *ops.status_doc.borrow_mut() = Some(shadow_status2(serde_json::json!({"state": "VERIFIED", "evidence": ours.clone()}),
+        serde_json::json!({"state": "VERIFIED", "evidence": ours})));
+    assert_eq!(run_machine_result(&cfg, &ops), Ok(State::Live));
+    truncate_journal_after(&cfg, |v| v["kind"] == "transition" && v["state"] == "VERIFIED");
+    cfg
+}
+
+/// Codex round 2, HIGH 1: the refusal is authoritative from its FIRST durable record. A crash right after it (before the
+/// ABORTED and rollback_done records) must not reopen a rollback that resumes the source or runs on_abort, even if the
+/// identity would pass now.
+#[test]
+fn r30r2_shadow_refusal_is_authoritative_from_its_first_record() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = shadow_config(dir.path(), |t| t).unwrap();
+    let ops = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+    ops.metal_network_from_call.set(Some((3, Some(1)))); // refused after the freeze, before creation
+    let _ = run_machine_result(&cfg, &ops);
+    assert_eq!(ops.resumes.get(), 0);
+    truncate_journal_after(&cfg, |v| v["kind"] == "evidence" && v["data"]["shadow_refused"] == true);
+    let rec = Journal::replay(&cfg.journal_path).unwrap();
+    assert!(rec.shadow_refused, "replay recovers the refusal from its first record");
+    assert_ne!(rec.state, Some(State::Aborted), "the crash cut the ABORTED record off");
+    // The identity would pass now: the refusal still stands.
+    let ops = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback(false).unwrap();
+    assert!(out.notes.iter().any(|n| n.contains("nothing was resumed")), "{:?}", out.notes);
+    assert_eq!(ops.resumes.get(), 0, "rollback resumes nothing");
+    assert!(!ops.hooks.borrow().iter().any(|h| h.contains("reopen-writes")), "no on_abort: {:?}", ops.hooks.borrow());
+    let rec = Journal::replay(&cfg.journal_path).unwrap();
+    assert_eq!(rec.state, Some(State::Aborted));
+    assert!(rec.aborted_rollback_complete, "the refusal's records were finished, nothing rolled back");
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("identity refusal"), "{err}");
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert!(Machine::new(&cfg, &ops, j, rec).join_with("e1", false).unwrap_err().contains("identity refusal"));
+    assert_eq!(ops.resumes.get(), 0);
+    // A crash before even the ABORTED record, then `run`: same.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = shadow_config(dir.path(), |t| t).unwrap();
+    let ops = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+    ops.metal_network_from_call.set(Some((3, Some(1))));
+    let _ = run_machine_result(&cfg, &ops);
+    truncate_journal_after(&cfg, |v| v["kind"] == "error" && v["data"]["detail"]["shadow_refused"] == true);
+    let ops = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+    assert!(run_machine_result(&cfg, &ops).is_err());
+    assert_eq!(ops.resumes.get(), 0);
+    assert!(!ops.hooks.borrow().iter().any(|h| h.contains("reopen-writes")));
+    assert_eq!(Journal::replay(&cfg.journal_path).unwrap().state, Some(State::Aborted));
+}
+
+/// Codex round 2, HIGH 2: a shadow resumed at VERIFIED whose resume preflight fails for an ordinary reason reaches
+/// abort() before step_verified re-proves the identity. With the source now looking real (retargeted), the abort must
+/// refuse without resuming; with the identity intact it re-proves and carries on with the normal abort.
+#[test]
+fn r30r2_shadow_abort_at_verified_reproves_identity_before_resuming() {
+    let poison = |dir: &std::path::Path| {
+        let mut g: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("genesis-base.json")).unwrap()).unwrap();
+        g["note"] = serde_json::json!(pulse_cutover::keys::format_private_k1(&TEST_PRODUCER_SECRET));
+        std::fs::write(dir.join("genesis-base.json"), g.to_string()).unwrap();
+    };
+    // The source now signs with a REAL key (both URLs retargeted to a real producer): refused, untouched.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = shadow_journal_at_verified(dir.path());
+    poison(dir.path());
+    let ops = shadow_ops(dir.path(), &["PUB_K1_realproducerkey"], Some(4242));
+    ops.paused.set(true);
+    let _ = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("genesis_base contains a private key"), "the ordinary preflight failure: {text}");
+    assert!(text.contains("SHADOW identity not re-proven"), "{text}");
+    assert_eq!(ops.resumes.get(), 0, "an unproven shadow never resumes its source");
+    assert!(!ops.hooks.borrow().iter().any(|h| h.contains("reopen-writes")));
+    assert!(Journal::replay(&cfg.journal_path).unwrap().shadow_refused);
+    // Identity intact: the abort re-proves it in this run, then takes the ordinary (guarded) path.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = shadow_journal_at_verified(dir.path());
+    poison(dir.path());
+    let ops = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+    ops.paused.set(true);
+    let _ = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("re-proven before an abort"), "{text}");
+    assert!(!Journal::replay(&cfg.journal_path).unwrap().shadow_refused);
+}
+
+/// Codex round 2, HIGH 4: the identity reads and the producer mutations must hit the same API base, path included.
+#[test]
+fn r30r2_shadow_source_urls_must_share_the_whole_api_base() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let err = shadow_config(dir.path(), |t| t
+        .replace("rpc_url = \"http://mock\"", "rpc_url = \"http://mock/shadow\"")
+        .replace("producer_api_url = \"http://mock\"", "producer_api_url = \"http://mock/mainnet\"")).unwrap_err();
+    assert!(err.contains("must be the same API base"), "{err}");
+}
+
+/// Reviewer N5: the chain about to be ignited must exist on the proven private metalgo.
+#[test]
+fn r30r2_shadow_target_chain_must_exist_on_the_proven_metalgo() {
+    let probe = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(probe.path(), 0);
+    let pcfg = shadow_config(probe.path(), |t| t).unwrap();
+    let pops = shadow_ops(probe.path(), &[SHADOW_KEY], Some(4242));
+    *pops.status_doc.borrow_mut() = Some(shadow_status(serde_json::json!({"state": "ARMED"})));
+    let _ = run_machine_result(&pcfg, &pops);
+    let ours = pulse_cutover::beacon::journal_summary(&pcfg.journal_path)["evidence"].clone();
+    for status in [Some("Unknown"), None] {
+        let dir = tempfile::tempdir().unwrap();
+        stage_fake_upstream_tools(dir.path(), 0);
+        let cfg = shadow_config(dir.path(), |t| t).unwrap();
+        let ops = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+        *ops.status_doc.borrow_mut() = Some(shadow_status2(serde_json::json!({"state": "VERIFIED", "evidence": ours.clone()}),
+            serde_json::json!({"state": "VERIFIED", "evidence": ours.clone()})));
+        *ops.metal_chain_status.borrow_mut() = status.map(str::to_string);
+        let err = run_machine_result(&cfg, &ops).unwrap_err();
+        assert!(err.starts_with("HALTED"), "after chain creation the refusal halts: {err}");
+        let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+        assert!(text.contains("not on the proven private network"), "{text}");
+        assert!(!text.contains("\"ignite_started\""), "never ignited: {text}");
+        assert_eq!(ops.metal_chain_asked.borrow().len(), 1, "asked about the journaled chain");
+        assert_eq!(ops.resumes.get(), 0);
+    }
+}
+
+/// Reviewer N2: a lagging or malformed public endpoint never counts as a block comparison.
+#[test]
+fn r30r2_a_lagging_public_endpoint_proves_nothing() {
+    for head in [serde_json::json!(105u64), serde_json::Value::Null] {
+        let dir = tempfile::tempdir().unwrap();
+        stage_fake_upstream_tools(dir.path(), 0);
+        let cfg = shadow_config(dir.path(), |t| t).unwrap();
+        let ops = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+        // Mainnet's head just below the source's LIB (lagging), or no head at all: nothing compared, fail closed.
+        *ops.public_mainnet.borrow_mut() = Some(serde_json::json!({"keys": ["PUB_K1_realproducerkey"], "same_blocks": false,
+            "head": head}));
+        let probs = pulse_cutover::shadow::public_mainnet_problems(&[SHADOW_KEY.to_string()], &ops);
+        assert!(probs.iter().any(|p| p.contains("could not be consulted")), "{head}: {probs:?}");
+        // ...and the whole proof refuses before anything freezes.
+        assert!(run_machine_result(&cfg, &ops).is_err());
+        assert!(transition(&journal_entries(&cfg), "FROZEN").is_none());
+        assert_eq!(ops.resumes.get(), 0);
+    }
+}
+
+/// Codex round 2, HIGH 3 + reviewer N1: the D-10 authentication cannot be skipped by a crash after ARMED, and a resumed
+/// mainnet journal continues only with the event that was authenticated (offline comparison).
+#[test]
+fn r30r2_mainnet_event_binding_survives_crashes_and_config_edits() {
+    // 1. Crash right after ARMED, before the authentication: the next run authenticates (a wrong event refuses).
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_mainnet_coordinated_config(dir.path());
+    let ops = upstream_ops(dir.path());
+    ops.schedule_ok.set(true);
+    *ops.chain_id.borrow_mut() = MAINNET.into();
+    *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"event": mainnet_event(cfg.ceremony.freeze_height)}));
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp1", serde_json::json!({"state": "VERIFIED", "aborting": true})),
+        ("bp2", serde_json::json!({"state": "ABORTED"}))]));
+    let _ = run_machine_result(&cfg, &ops);
+    let full = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(full.contains("\"mainnet_event_verified\":{") && full.contains("roster_sha256"), "binding journaled");
+    truncate_journal_after(&cfg, |v| v["kind"] == "transition" && v["state"] == "ARMED");
+    let ops2 = upstream_ops(dir.path());
+    ops2.schedule_ok.set(true);
+    *ops2.chain_id.borrow_mut() = MAINNET.into();
+    *ops2.coord_doc.borrow_mut() = Some(serde_json::json!({"event": mainnet_event(cfg.ceremony.freeze_height + 1)}));
+    assert!(run_machine_result(&cfg, &ops2).is_err());
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("XPR MAINNET signed event"), "re-authenticated on resume: {text}");
+    assert!(!text.contains("\"FROZEN\""), "nothing froze");
+
+    // 2. Past ARMED without the binding (the record was never written): refused everywhere, nothing touched.
+    std::fs::write(&cfg.journal_path, &full).unwrap();
+    let no_binding: Vec<&str> = full.lines().filter(|l| !l.contains("mainnet_event_verified")).collect();
+    let frozen_at = no_binding.iter().position(|l| l.contains("\"kind\":\"transition\"") && l.contains("\"FROZEN\"")).unwrap();
+    std::fs::write(&cfg.journal_path, no_binding[..=frozen_at].join("\n") + "\n").unwrap();
+    let ops3 = upstream_ops(dir.path());
+    *ops3.chain_id.borrow_mut() = MAINNET.into();
+    let err = run_machine_result(&cfg, &ops3).unwrap_err();
+    assert!(err.contains("no `mainnet_event_verified`"), "{err}");
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert!(Machine::new(&cfg, &ops3, j, rec).operator_rollback(false).err().unwrap_or_default().contains("mainnet_event_verified"));
+    assert_eq!(ops3.resumes.get(), 0);
+
+    // 3. With the binding, a roster edited between the crash and the resume: refused (run, rollback, join, unhalt).
+    let with_binding: Vec<&str> = full.lines().collect();
+    let frozen_at = with_binding.iter().position(|l| l.contains("\"kind\":\"transition\"") && l.contains("\"FROZEN\"")).unwrap();
+    std::fs::write(&cfg.journal_path, with_binding[..=frozen_at].join("\n") + "\n").unwrap();
+    let text = std::fs::read_to_string(dir.path().join("mainnet-coord.toml")).unwrap()
+        .replace("[[coordination.roster]]\nproducer = \"bp2\"\n", "[[coordination.roster]]\nproducer = \"bp2\"\n\n[[coordination.roster]]\nproducer = \"bp3\"\n");
+    let edited = load_toml(dir.path(), "mainnet-coord-edited.toml", &text).unwrap();
+    let ops4 = upstream_ops(dir.path());
+    *ops4.chain_id.borrow_mut() = MAINNET.into();
+    let err = run_machine_result(&edited, &ops4).unwrap_err();
+    assert!(err.contains("not the XPR MAINNET event that was authenticated") && err.contains("roster_sha256"), "{err}");
+    let (j, rec) = open_journal(&edited.journal_path);
+    assert!(Machine::new(&edited, &ops4, j, rec).operator_rollback(false).err().unwrap_or_default().contains("authenticated"));
+    let (j, rec) = open_journal(&edited.journal_path);
+    assert!(Machine::new(&edited, &ops4, j, rec).join_with("e1", false).unwrap_err().contains("authenticated"));
+    assert_eq!(ops4.resumes.get(), 0);
+    // The unchanged config continues past the check (whatever it does next, it is not refused for the binding).
+    let ops5 = upstream_ops(dir.path());
+    *ops5.chain_id.borrow_mut() = MAINNET.into();
+    let r = run_machine_result(&cfg, &ops5);
+    assert!(!r.as_ref().err().is_some_and(|e| e.contains("authenticated") || e.contains("mainnet_event_verified")), "{r:?}");
 }

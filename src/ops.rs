@@ -97,6 +97,12 @@ pub trait ChainOps {
     fn metal_network_id(&self, _base: &str) -> Result<Option<u64>, String> {
         Ok(None)
     }
+    /// Shadow mode (round-2 review N5): the P-Chain status the target metalgo under `base` reports for `blockchain_id`
+    /// (`platform.getBlockchainStatus`: "Validating", "Created", "Preferred", "Syncing" or "Unknown"). None = not
+    /// answered. Default: not supported (the shadow check fails closed).
+    fn metal_blockchain_status(&self, base: &str, blockchain_id: &str) -> Result<Option<String>, String> {
+        Err(format!("metal_blockchain_status({base}, {blockchain_id}) is not supported by this ChainOps"))
+    }
     /// Shadow mode: the source's `get_producer_schedule` answer. None = not answered (fails closed).
     fn source_producer_schedule(&self) -> Result<Option<Value>, String> {
         Ok(None)
@@ -824,6 +830,16 @@ impl ChainOps for HttpOps {
         )?;
         let n = &v["result"]["networkID"];
         Ok(n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok())))
+    }
+
+    fn metal_blockchain_status(&self, base: &str, blockchain_id: &str) -> Result<Option<String>, String> {
+        let v = self.post(
+            &format!("{}/ext/P", base.trim_end_matches('/')),
+            Some(json!({"jsonrpc": "2.0", "id": 1, "method": "platform.getBlockchainStatus",
+                        "params": {"blockchainID": blockchain_id}})),
+            None,
+        )?;
+        Ok(v["result"]["status"].as_str().map(str::to_string))
     }
 
     fn source_producer_schedule(&self) -> Result<Option<Value>, String> {

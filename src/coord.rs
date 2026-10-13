@@ -119,6 +119,60 @@ pub fn validate_event(ev: &Value, cfg: &Config, network: &str, head: Option<u64>
     Ok(h)
 }
 
+/// Round-2 review (D-10): what a fresh mainnet ARM authenticated, journaled as `mainnet_event_verified` BEFORE anything
+/// freezes, and compared OFFLINE with the config on every later run, join, rollback and unhalt. The roster is
+/// normalised (sorted producer|instance_id, instance ids lowercased) so its hash ignores order.
+pub fn mainnet_binding(cfg: &Config, chain_id: &str) -> Value {
+    use sha2::{Digest, Sha256};
+    let co = cfg.coordination.as_ref();
+    let mut roster: Vec<String> = co
+        .map(|c| c.roster.iter()
+            .map(|r| format!("{}|{}", r.producer, r.instance_id.as_deref().unwrap_or("").to_lowercase()))
+            .collect())
+        .unwrap_or_default();
+    roster.sort_unstable();
+    json!({
+        "event_id": co.and_then(|c| c.event_id.clone()),
+        "event_hash": co.and_then(|c| c.event_hash.as_ref().map(|h| h.to_lowercase())),
+        "network": co.map(|c| c.network.clone()),
+        "chain_id": chain_id.to_lowercase(),
+        "h": cfg.ceremony.freeze_height,
+        "roster_sha256": hex::encode(Sha256::digest(roster.join("\n").as_bytes())),
+        "roster_len": roster.len(),
+        "quorum": co.map(|c| c.fleet_quorum).unwrap_or(0),
+    })
+}
+
+/// Some(why) when a journal of an XPR MAINNET ceremony cannot be continued with this config: the fresh ARM's
+/// `mainnet_event_verified` binding is missing although the ceremony got past ARMED (a crash before the
+/// authentication must never let a resume skip it), or the config's event, chain, H, roster or quorum is not the one
+/// that was authenticated. Offline: no relay is needed. `state` = the journal's state (None: no journal yet).
+pub fn mainnet_binding_problem(cfg: &Config, journal_chain: Option<&str>, state: Option<crate::state::State>,
+                               binding: Option<&Value>) -> Option<String> {
+    let chain = journal_chain.filter(|c| crate::config::is_xpr_mainnet(c))?;
+    if cfg.is_shadow() || state.is_none() {
+        return None;
+    }
+    match binding {
+        None if state == Some(crate::state::State::Armed) => None, // still pre-freeze: the ARM preflight authenticates
+        None => Some("this XPR MAINNET journal has no `mainnet_event_verified` record (the signed event was never \
+                       authenticated before the freeze): refused. Nothing was changed; resolve it with the coordinator \
+                       by hand"
+            .into()),
+        Some(b) => {
+            let now = mainnet_binding(cfg, chain);
+            let fields = ["event_id", "event_hash", "network", "chain_id", "h", "roster_sha256", "quorum"];
+            let diff: Vec<String> = fields.iter()
+                .filter(|f| b.get(**f) != now.get(**f))
+                .map(|f| format!("{f}: authenticated {} vs config {}", b.get(*f).unwrap_or(&Value::Null), now[*f]))
+                .collect();
+            (!diff.is_empty()).then(|| format!(
+                "the config is not the XPR MAINNET event that was authenticated at ARM ({}): refused. Nothing was changed",
+                diff.join("; ")))
+        }
+    }
+}
+
 /// sha256 (hex) of a signed message's exact payload string: the relay's `event_hash`.
 pub fn payload_hash(msg: &Value) -> Option<String> {
     use sha2::{Digest, Sha256};

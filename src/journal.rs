@@ -123,6 +123,13 @@ pub struct Recovered {
     /// The `shadow` value of the ARMED (arming) record: Null for a real ceremony, the shadow identity for a shadow
     /// (docs/DESIGN-shadow.md). None = no arming record yet. Journals from before shadow mode read as Null.
     pub armed_shadow: Option<Value>,
+    /// Round-2 review: a shadow identity refusal was journaled (its first record). Sticky: from then on nothing may
+    /// resume the source or run on_abort on this journal, whatever records follow (a crash between the refusal's
+    /// records must not reopen a rollback that resumes a node which may be real).
+    pub shadow_refused: bool,
+    /// Round-2 review (D-10): the bindings a fresh XPR mainnet ARM authenticated (`mainnet_event_verified`), compared
+    /// offline with the config on every later run, join, rollback and unhalt (coord::mainnet_binding_problem).
+    pub mainnet_event_binding: Option<Value>,
 }
 
 impl Journal {
@@ -413,6 +420,14 @@ impl Journal {
                 out.state = Some(State::Halted);
                 out.reached_ignited = true;
                 out.unhalted = false;
+            }
+            if entry.data.get("shadow_refused").and_then(|v| v.as_bool()) == Some(true)
+                || entry.data.get("detail").and_then(|d| d.get("shadow_refused")).and_then(|v| v.as_bool()) == Some(true)
+            {
+                out.shadow_refused = true;
+            }
+            if let Some(b) = entry.data.get("mainnet_event_verified").filter(|b| b.is_object()) {
+                out.mainnet_event_binding = Some(b.clone());
             }
             if entry.data.get("snapshot_scheduled_at").and_then(|v| v.as_u64()).is_some() {
                 out.scheduled = true;
