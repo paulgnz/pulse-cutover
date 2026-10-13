@@ -460,6 +460,11 @@ pub struct LoopCfg {
     pub settle_secs: u64,
     /// Where per-run metrics JSONL lines are appended.
     pub metrics_path: PathBuf,
+    /// r30 round 6: allow `reset_cmd` while the source does not answer (a reset that must start a stopped node).
+    /// Default false: an unreachable source refuses the reset (its identity cannot be checked). Refused for any
+    /// config whose pinned chain_id is XPR mainnet (including shadows).
+    #[serde(default)]
+    pub reset_when_source_down: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -947,6 +952,12 @@ impl Config {
             return Err("snapshot.golden_roots and snapshot.capture_roots are mutually exclusive: \
                         a node either verifies against published goldens or captures its own"
                 .into());
+        }
+        if config.r#loop.as_ref().is_some_and(|l| l.reset_when_source_down)
+            && config.ceremony.chain_id.as_deref().is_some_and(is_xpr_mainnet)
+        {
+            return Err("loop.reset_when_source_down is refused for an XPR MAINNET chain_id (a reset must always see \
+                        the source it acts on)".into());
         }
         if let Some(d) = &config.ceremony.lock_dir {
             if !d.is_absolute() {

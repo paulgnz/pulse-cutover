@@ -159,6 +159,10 @@ shell command) as a mutation that needs the gate or an explicit `// ungated:` re
 private metalgo (`platform.getBlockchainStatus` under `target.rpc_url`'s base) about the journaled blockchain id (or
 the id in `target.rpc_url`); anything but a known status refuses (upstream backend: after creation, so it halts).
 
+**Round 6.** A shadow `loop` refuses `reset_cmd` when the source does not answer (`reset_when_source_down` is refused
+for the mainnet chain_id a shadow carries), and every ceremony, shadow or not, undoes only what its own journal did:
+a shadow refused at ARM never resumes a producer it did not pause.
+
 ### Manual recovery after a refused shadow
 
 The agent never resumes a source after a shadow refusal, by design: the refusal means it could not prove that the node

@@ -7575,3 +7575,52 @@ fn r30r6_orphan_drill_work_blocks_a_ceremony_in_another_directory() {
     let _ = run_machine_result(&cfg2, &ops);
     assert!(transition(&journal_entries(&cfg2), "FROZEN").is_some());
 }
+
+/// r30 round 6 (Codex R6-3/R6-4): `loop` fails closed when the source does not answer (its chain cannot be checked
+/// before reset_cmd), unless `[loop] reset_when_source_down = true` (refused for a mainnet chain_id), and it takes the
+/// producer's lock: a ceremony or drill on the same producer under another journal directory blocks the reset.
+#[test]
+fn r30r6_loop_gate_fails_closed_and_takes_the_producer_lock() {
+    let shared = tempfile::tempdir().unwrap();
+    let snapdir = shared.path().join("snapshots");
+    std::fs::create_dir_all(&snapdir).unwrap();
+    let locks = shared.path().join("locks");
+    let chain = hex::encode(CHAIN_ID);
+    let loop_text = |dir: &std::path::Path, extra: &str| {
+        let _ = test_config(dir, 120);
+        let marker = dir.join("reset-ran");
+        std::fs::read_to_string(dir.join("ceremony.toml")).unwrap()
+            .replace("freeze_height = 120\n", "freeze_height = 0\nfreeze_margin = 20\nderive_h_at_arm = true\n")
+            .replacen("[ceremony]\n", &format!("[ceremony]\nchain_id = \"{chain}\"\nlock_dir = \"{}\"\n", locks.display()), 1)
+            .replacen("[snapshot]\n", &format!("[snapshot]\ndir = \"{}\"\n", snapdir.display()), 1)
+            + &format!("\n[loop]\nreset_cmd = \"touch '{}'\"\nmetrics_path = \"{}/m.jsonl\"\n{extra}", marker.display(), dir.display())
+    };
+    // 1. The source does not answer: refused, nothing ran.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = load_toml(dir.path(), "loop.toml", &loop_text(dir.path(), "")).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    ops.stopped.set(true);
+    let err = pulse_cutover::looper::loop_gate(&cfg, &ops).unwrap_err();
+    assert!(err.contains("does not answer"), "{err}");
+    let err = pulse_cutover::looper::run_loop(&cfg, &ops, 1).unwrap_err();
+    assert!(err.contains("does not answer"), "{err}");
+    assert!(!dir.path().join("reset-ran").exists(), "reset_cmd ran against an unidentified source");
+    // 2. Explicitly allowed for a non-mainnet chain: the gate passes.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = load_toml(dir.path(), "loop.toml", &loop_text(dir.path(), "reset_when_source_down = true\n")).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    ops.stopped.set(true);
+    assert!(pulse_cutover::looper::loop_gate(&cfg, &ops).is_ok());
+    // ... and refused at load for a mainnet chain_id.
+    let mainnet = loop_text(dir.path(), "reset_when_source_down = true\n").replace(&chain, MAINNET);
+    assert!(load_toml(dir.path(), "m.toml", &mainnet).unwrap_err().contains("reset_when_source_down"));
+    // 3. Another directory's ceremony or drill holds this producer's lock: refused, nothing ran.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = load_toml(dir.path(), "loop.toml", &loop_text(dir.path(), "")).unwrap();
+    let held = pulse_cutover::journal::Journal::lock(&pulse_cutover::drill::producer_lock_base(&cfg)).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    let err = pulse_cutover::looper::run_loop(&cfg, &ops, 1).unwrap_err();
+    assert!(err.contains("holds its lock"), "{err}");
+    assert!(!dir.path().join("reset-ran").exists());
+    drop(held);
+}

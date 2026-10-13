@@ -1283,7 +1283,8 @@ fn r5_drills_on_the_same_producer_exclude_each_other_across_journal_directories(
     assert!(err.contains("producer's lock"), "{err}");
     assert!(!chain.called("schedule_snapshot"));
     drop(held);
-    // Another producer API on the same box has its own lock.
+    // A producer with its own snapshot directory (another nodeos on the box) has its own lock (round 6: keyed on
+    // the canonical snapshot dir, not the producer API spelling).
     let cfg_c = drill_config_edit(b.path(), MAINNET, "", |t| t.replacen("producer_api_url = \"http://mock\"",
         "producer_api_url = \"http://other-node:8888\"", 1)).unwrap();
     assert_ne!(drill::producer_lock_base(&cfg_a), drill::producer_lock_base(&cfg_c));

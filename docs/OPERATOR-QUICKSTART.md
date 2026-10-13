@@ -261,3 +261,13 @@ URLs locally. Fix, with producer and API on the same box: in your nginx server b
 `location ^~ /v1/producer { return 403; }`, and if nodeos also listens publicly on :8888, bind it to
 `http-server-address = 127.0.0.1:8889` and let nginx serve :8888 with the same rule (then point the beacon's
 `rpc_url` and `producer_api_url` at `http://127.0.0.1:8889`).
+
+### One box, several configs: `lock_dir` (rc.30)
+
+A ceremony, a readiness drill (`pulse-cutover drill`) and a `loop` on the same producer exclude each other through a
+per-producer lock and a drill work marker in `[ceremony] lock_dir` (default `/var/lib/pulse-cutover/locks`, else
+`locks/` beside the journal directory), keyed on nodeos's canonical `snapshot.dir`. Nothing is written into nodeos's
+snapshot directory. If the agent, a drill or a loop on one box run as different users, set the same absolute
+`lock_dir` in every config, writable by all of them. Only "another process holds it" refuses an ARM (before
+anything changes); a `lock_dir` the agent cannot use is a journaled warning. A ceremony refused at ARM undoes
+nothing: it never resumes a producer it did not pause or reopens writes it did not close.

@@ -43,6 +43,10 @@ freeze_height = 12345
 # freeze_margin = 240        # rehearsal/loop only, with freeze_height = 0: H := LIB at ARM + margin
 # derive_h_at_arm = false    # rehearsal/loop only: explicit opt-in for freeze_height = 0 + freeze_margin
 # allow_inexact_cut = false  # rehearsal only: accept a snapshot that is not exactly H (journaled loudly)
+# lock_dir = "/var/lib/pulse-cutover/locks"   # agent-owned directory for the per-producer lock and drill work
+                             # markers (keyed on the canonical snapshot.dir). Absolute. Every agent, drill and loop on one
+                             # box must share it. Default: /var/lib/pulse-cutover/locks when writable, else locks/ beside
+                             # the journal directory. Nothing is ever written into nodeos's snapshot.dir.
 # shadow = false             # SHADOW CUTOVER (docs/DESIGN-shadow.md): the full ceremony on a PRIVATE network from a
                              # re-keyed copy of mainnet state, mainnet chain_id kept. Needs the [shadow] section below
                              # and a private target.metal_network_id; checked at load, at ARM and before the freeze.
@@ -207,6 +211,9 @@ auto_rollback = true                 # on abort BEFORE ignition: resume the sour
 # reset_cmd = "/root/cutover-rehearsal/reset.sh"   # REQUIRED. returns both sides to a pre-ARM state (R12)
 # settle_secs = 10                                 # wait after reset before ARMing (default 0)
 # metrics_path = "/root/cutover-rehearsal/metrics.jsonl"   # REQUIRED. per-run metrics
+# reset_when_source_down = false                   # allow reset_cmd while the source does not answer (to start a
+                                                   # stopped node). Default: an unidentifiable source refuses the reset.
+                                                   # Refused for an XPR mainnet chain_id.
 
 # -----------------------------------------------------------------------------
 # [hooks] — shell commands at key moments. Producer mode's production profile
