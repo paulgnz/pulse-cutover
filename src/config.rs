@@ -1163,7 +1163,10 @@ impl Config {
     /// members of the producers' quorum. Readiness configs are not ceremonies and are not checked.
     pub fn mainnet_coordination_problems(&self, at_arm: bool) -> Vec<String> {
         let mut out = Vec::new();
-        if self.ceremony.profile != Profile::Ceremony {
+        // A shadow (docs/DESIGN-shadow.md) is proven private at ARM and before the freeze (the target must
+        // report the configured private Metal network; the source must sign only with the declared shadow
+        // keys), so it can never be a real mainnet cut: coordinating it is optional.
+        if self.ceremony.profile != Profile::Ceremony || self.is_shadow() {
             return out;
         }
         let Some(co) = &self.coordination else {

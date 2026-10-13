@@ -461,8 +461,19 @@ rows, 34 deferred transactions, 2,779 recent-transaction (dedupe) entries. Mainn
 `global_property` (one row differs) fail, the two known v1.0.0 gaps the fleet rehearsals allow-listed.
 Mainnet: the same two plus **`generated_transaction`** (34 rows on the nodeos side, none read on the Arena
 side). The importer reports all 34 deferred transactions and all 104 `index_double` rows imported, so the
-likely cause is the compare tool's coverage (upstream #109) rather than lost data; not verified. The testnet
-state has no deferred transactions, so no rehearsal exercised this table.
+likely cause was the compare tool's coverage (upstream #109). The testnet state has no deferred transactions, so
+no rehearsal exercised this table.
+
+**Diagnosis (same day).** The compare was rebuilt from the v1.0.0 tag with two diagnostic switches, off by default:
+(1) frame all 19 Leap 5 SHiP tables (v1.0.0's serializer collects them but frames only 16, so
+`contract_index_double`, `contract_index_long_double` and `generated_transaction` never reach the compare), and
+(2) serialize `global_property` in Leap 5's full 157-byte shape (v1.0.0 drops the empty proposed-schedule envelope,
+`deferred_trx_expiration_window` and `max_transaction_delay`; the Arena checkpoint still holds those values). With
+both, **all 21 tables match nodeos on mainnet and on testnet**: `contract_index_double` (104 rows) sha256
+`860fee6b…`, `generated_transaction` (34 rows) `31e29136…`, `global_property` `fbfb5acb…`, equal on both sides.
+Without them the rebuilt tool fails exactly like the official binary. So the imported state is complete; the gap
+is serialization, and live SHiP after the cut shares the same serializer. Not covered: a snapshot taken while a
+producer-schedule change is pending (the compare would then fail, the safe direction).
 
 **Proves:** the official pipeline runs on full XPR mainnet state; its duration (about 9.6 minutes on this
 hardware, roughly linear in state size: 8.2× the snapshot, 8.5× the time); the conversion's peak memory (13.7 GB
