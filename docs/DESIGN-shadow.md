@@ -81,8 +81,9 @@ mainnet's from the first block it produces. `[shadow] producer_keys` declares th
 3. `target.metal_network_id` set and **not** a public Metal network (1, 5).
 4. `target.rpc_url` is a metalgo `/ext/` URL: the network proof asks the metalgo **in front of that URL** and no
    other (there is no separate, operator-chosen info endpoint; T6).
-5. `source.rpc_url` and `source.producer_api_url` are the **same node** (scheme, host and port, parsed strictly):
-   the identity is read on the node whose producer the ceremony pauses (T6).
+5. `source.rpc_url` and `source.producer_api_url` are the **same API base** (scheme, host, port **and path**, no query
+   or fragment, parsed strictly): the identity is read on the node whose producer the ceremony pauses, and a
+   path-routing proxy cannot serve the reads for one path and forward the mutations for another (T6).
 6. `[beacon] network` and `[coordination] network` start with `shadow`: shadow evidence never lands on a real
    board and never counts for a real event. Mission control also refuses a shadow report on any board whose
    configured chain_id is XPR mainnet or whose id does not start with `shadow`, judged from `networks.json`, not
@@ -101,9 +102,11 @@ mainnet's from the first block it produces. `[shadow] producer_keys` declares th
 11. **Public mainnet** (a pinned list of public XPR mainnet API endpoints in `shadow::PUBLIC_XPR_MAINNET_APIS`;
     not configurable, T6): every endpoint that answers as XPR mainnet (by its `get_info` chain_id) is asked; the
     proof fails if **any** of them lists a declared shadow key in mainnet's active, pending or proposed producer
-    schedule, or serves **the source's own block id** at the source's LIB. A mainnet that has not reached the
-    source's LIB proves the source is not mainnet. If no endpoint can answer either question, the proof fails:
-    **a shadow run needs outbound HTTPS to at least one of those endpoints**.
+    schedule, or serves **the source's own block id** at the source's LIB. An endpoint without a head, or merely
+    behind the source's LIB, compares nothing (a lagging or syncing endpoint proves nothing); only a source final
+    more than a day of blocks (`FAR_AHEAD_BLOCKS` = 172,800) past mainnet's own head counts as "not mainnet". If no
+    endpoint can answer either question, the proof fails: **a shadow run needs outbound HTTPS to at least one of those
+    endpoints**.
 
 A real mainnet node can pass 10 only by declaring the real keys, which 11 refuses; it can never pass the block-id half
 of 11, whatever is declared.
@@ -117,6 +120,31 @@ the mainnet ignition refusal; the config flag alone never does.
 running any hook or unstaging anything, and journals the rollback as complete-and-empty, so a later `rollback`
 resumes nothing either; a producer this agent paused stays paused and an operator checks by hand which chain that
 node belongs to. After chain creation or ignition it HALTS (sealed), like every failure past the point of no return.
+
+The refusal is **authoritative from its first durable record** (a `shadow_refused` evidence record written before
+anything else): journal replay recovers it, so a crash before the ABORTED or `rollback_done` record cannot reopen a
+rollback; `run` and `rollback` finish the refusal's records without touching anything, and `join` refuses. It is final
+for that journal: a new shadow starts on a fresh journal.
+
+**No abort resumes an unproven shadow.** Every abort and operator rollback of a shadow journal that would resume the
+source first re-proves the identity (parts 9–11) in the same run, unless this run already proved it; otherwise it
+goes through the refusal above. (A resumed run at VERIFIED, for example, can fail an ordinary preflight check before
+the step that re-proves the identity; that failure no longer reaches a resume.)
+
+**The chain about to be ignited must be on the proven network.** Right before ignition the agent asks the proven
+private metalgo (`platform.getBlockchainStatus` under `target.rpc_url`'s base) about the journaled blockchain id (or
+the id in `target.rpc_url`); anything but a known status refuses (upstream backend: after creation, so it halts).
+
+### Manual recovery after a refused shadow
+
+The agent never resumes a source after a shadow refusal, by design: the refusal means it could not prove that the node
+is not a real producer. For a legitimate shadow refused after the freeze (for example all public endpoints were
+unreachable for a moment), the operator:
+
+1. checks by hand that the source node is the re-keyed shadow source (its `get_producer_schedule` keys are the shadow
+   keys; its block at LIB is not mainnet's);
+2. resumes it with `curl -X POST <producer_api>/v1/producer/resume` and reopens writes with the `on_abort` command;
+3. starts the next shadow on a fresh journal.
 
 **The journal binds the identity (T7).** The ARMED record carries `"shadow": {label, metal_network_id,
 producer_keys_sha256}` (or `null` for a real ceremony). `run`, `join`, `rollback` and `unhalt` refuse when the current

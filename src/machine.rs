@@ -95,6 +95,14 @@ pub struct Machine<'a, O: ChainOps> {
     /// The full shadow identity proof passed in THIS run, right before chain creation / ignition: the only thing that
     /// lets a shadow go past the XPR mainnet ignite refusal (never the config flag alone).
     shadow_verified: bool,
+    /// Round-2 review: a shadow identity refusal is journaled (sticky across crashes): nothing may resume the source or
+    /// run on_abort on this journal again.
+    shadow_refused: bool,
+    /// Round-2 review: the shadow identity (parts 1-3) was proven in THIS run; an abort or rollback that would resume
+    /// the source of a shadow journal needs it, else it refuses without touching the source.
+    shadow_proven: bool,
+    /// Round-2 review (D-10): the bindings a fresh XPR mainnet ARM authenticated (journaled `mainnet_event_verified`).
+    mainnet_binding: Option<serde_json::Value>,
 }
 
 /// What `pulse-cutover rollback` did. `failed` lists every step that did not succeed; the
@@ -316,6 +324,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             degraded_note: String::new(),
             armed_shadow: recovered.armed_shadow,
             shadow_verified: false,
+            shadow_refused: recovered.shadow_refused,
+            shadow_proven: false,
+            mainnet_binding: recovered.mainnet_event_binding,
         }
     }
 
@@ -326,18 +337,70 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.past_point_of_no_return() {
             return self.halt(reason, detail);
         }
-        let from = self.state;
-        self.journal.error(from, reason, json!({"detail": detail, "shadow_refused": true}))?;
-        self.state = State::Aborted;
-        self.journal.transition(State::Aborted, json!({"reason": reason, "from": from.as_str(), "shadow_refused": true,
-            "source_untouched": true,
-            "note": "SHADOW identity not proven: refused without touching the source (no resume, no hooks). If this \
-                     agent paused a producer, it stays paused: check by hand which chain that node belongs to"}))?;
-        self.journal.evidence(State::Aborted, json!({"rollback_done": true, "shadow_refused": true,
-            "note": "nothing rolled back on purpose: an unproven shadow must not resume a node that may be real"}))?;
-        self.aborted_rollback_complete = true;
+        if !self.shadow_refused {
+            // Round-2 review: the FIRST durable record makes the refusal authoritative (journal replay recovers it), so a
+            // crash between this and the ABORTED / rollback_done records can never reopen a rollback that resumes the source.
+            self.journal.evidence(self.state, json!({"shadow_refused": true, "reason": reason}))?;
+            self.shadow_refused = true;
+            self.journal.error(self.state, reason, json!({"detail": detail, "shadow_refused": true}))?;
+        }
+        self.finish_shadow_refusal(reason)
+    }
+
+    /// Idempotent tail of a shadow refusal (also run by a later `run` / `rollback` that finds a journaled refusal whose
+    /// ABORTED or rollback_done record is missing): never resumes, never runs a hook, never unstages.
+    fn finish_shadow_refusal(&mut self, reason: &str) -> Result<(), String> {
+        if self.past_point_of_no_return() {
+            return Ok(()); // halted (or halting): a human decides; nothing here resumes anything
+        }
+        if self.state != State::Aborted {
+            let from = self.state;
+            self.state = State::Aborted;
+            self.journal.transition(State::Aborted, json!({"reason": reason, "from": from.as_str(), "shadow_refused": true,
+                "source_untouched": true,
+                "note": "SHADOW identity not proven: refused without touching the source (no resume, no hooks). If this \
+                         agent paused a producer, it stays paused: check by hand which chain that node belongs to \
+                         (docs/DESIGN-shadow.md, manual recovery)"}))?;
+        }
+        if !self.aborted_rollback_complete {
+            self.journal.evidence(State::Aborted, json!({"rollback_done": true, "shadow_refused": true,
+                "note": "nothing rolled back on purpose: an unproven shadow must not resume a node that may be real"}))?;
+            self.aborted_rollback_complete = true;
+        }
+        self.rollback_pending = false;
         eprintln!("SHADOW REFUSED: {reason} (the source was NOT touched)");
         Ok(())
+    }
+
+    /// The journal (or the config, which `check_shadow_binding` keeps equal to it) is a shadow ceremony.
+    fn is_shadow_journal(&self) -> bool {
+        self.cfg.is_shadow() || self.armed_shadow.as_ref().is_some_and(|v| !v.is_null())
+    }
+
+    /// Round-2 review: before anything that resumes the source of a SHADOW journal, the identity must be proven in this
+    /// run. Ok(true) = proven (now or earlier in this run), or not a shadow; Ok(false) = refused, nothing touched.
+    fn shadow_reprove_before_resume(&mut self, why: &str, detail: &serde_json::Value) -> Result<bool, String> {
+        if !self.is_shadow_journal() || self.shadow_proven {
+            return Ok(true);
+        }
+        let problems = crate::shadow::identity_problems(self.cfg, self.ops);
+        if problems.is_empty() {
+            self.shadow_proven = true;
+            self.journal.evidence(self.state, json!({"shadow_identity": format!("re-proven before {why}")}))?;
+            return Ok(true);
+        }
+        self.shadow_refuse(&format!("{why}: SHADOW identity not re-proven, so the source is NOT resumed"),
+            json!({"identity_problems": problems, "detail": detail}))?;
+        Ok(false)
+    }
+
+    /// Round-2 review (D-10): an XPR MAINNET journal continues only with the event its fresh ARM authenticated.
+    fn check_mainnet_binding(&self) -> Result<(), String> {
+        let state = if self.resumed { Some(self.state) } else { None };
+        match crate::coord::mainnet_binding_problem(self.cfg, self.chain_id.as_deref(), state, self.mainnet_binding.as_ref()) {
+            Some(why) => Err(format!("{why}. Journal: {}", self.journal.path().display())),
+            None => Ok(()),
+        }
     }
 
     /// A config flipped to or from shadow (or a shadow's label, network or keys changed) since ARM: refused.
@@ -358,6 +421,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // Defense in depth (main.rs checks too): a readiness-only config never drives anything.
         self.cfg.ensure_ceremony_profile()?;
         self.check_shadow_binding()?;
+        self.check_mainnet_binding()?;
+        if self.shadow_refused {
+            // Round-2 review: a journaled shadow refusal is final for this journal. Finish its records if a crash cut
+            // them short, touch nothing, and stop.
+            self.finish_shadow_refusal("shadow identity refused earlier in this journal")?;
+            return Err(format!("refusing to run: this SHADOW journal recorded an identity refusal; nothing is resumed or \
+                continued on it (the source was not touched). Check by hand which chain the source belongs to \
+                (docs/DESIGN-shadow.md, manual recovery); a new shadow starts on a fresh journal. Journal: {}",
+                self.journal.path().display()));
+        }
         if self.rollback_pending {
             return Err("refusing to run: a rollback (`pulse-cutover rollback`, or this agent's own abort) was started \
                  on this journal and did not finish (it recorded `rollback_requested` but never reached ABORTED). \
@@ -582,7 +655,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // SHADOW (docs/DESIGN-shadow.md): before anything freezes, prove the target is the configured private
         // network and the source signs only with shadow keys (a shadow config on a real mainnet node refuses here).
         if self.cfg.is_shadow() && pre_verify {
-            for p in crate::shadow::identity_problems(&self.cfg, self.ops) {
+            let ip = crate::shadow::identity_problems(&self.cfg, self.ops);
+            self.shadow_proven = ip.is_empty();
+            for p in ip {
                 problems.push(format!("SHADOW identity: {p}"));
             }
         }
@@ -595,15 +670,19 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // signed event this config was derived from, and its payload must bind this chain, H, roster and
             // quorum. A relay that does not answer refuses (unknown is never yes). On a resume the event was
             // authenticated at the fresh ARM (journaled), and a relay outage must not strand a running cut.
-            if missing.is_empty() && has_event && !resumed {
+            // Round-2 review: ARMED is journaled before this check, so a crash in between must not let the next run skip
+            // it: a resume still at ARMED without the binding authenticates again (later states refuse at run start).
+            let authenticate = !resumed || (self.mainnet_binding.is_none() && self.state == State::Armed);
+            if missing.is_empty() && has_event && authenticate {
                 let co = self.cfg.coordination.as_ref().expect("checked above");
                 let url = format!("{}/api/coord/{}", co.url.trim_end_matches('/'), co.network);
                 let doc = self.ops.get_json(&url).ok().flatten();
                 let bound = crate::coord::mainnet_event_problems(doc.as_ref(), &self.cfg, &info.chain_id);
                 if bound.is_empty() {
-                    self.journal.evidence(State::Armed, json!({"mainnet_event_verified": {
-                        "event_id": co.event_id, "event_hash": co.event_hash, "chain_id": info.chain_id,
-                        "h": self.cfg.ceremony.freeze_height, "roster": co.roster.len(), "quorum": co.fleet_quorum}}))?;
+                    // The bindings later runs compare offline (coord::mainnet_binding_problem), journaled before any freeze.
+                    let binding = crate::coord::mainnet_binding(self.cfg, &info.chain_id);
+                    self.journal.evidence(State::Armed, json!({"mainnet_event_verified": binding}))?;
+                    self.mainnet_binding = Some(binding);
                 }
                 problems.extend(bound.into_iter().map(|p| format!("XPR MAINNET signed event: {p}")));
             }
@@ -1065,6 +1144,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// `force_stranded` (an operator's record of a fleet-wide decision, journaled).
     pub fn operator_rollback_opts(&mut self, force: bool, force_stranded: bool) -> Result<RollbackOutcome, String> {
         self.check_shadow_binding()?;
+        self.check_mainnet_binding()?;
         let mut notes: Vec<String> = vec![];
         // FIRST, on every path (including "already rolled back", and since rc.29 before the fleet guard, whose strand
         // runs on_halt): an agent killed mid-hook or mid pipeline step leaves that process group running (they run in their own group). Stop it
@@ -1084,6 +1164,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                      Nothing was rolled back. Stop that process group by hand, then re-run."
                 ));
             }
+        }
+        if self.shadow_refused {
+            // Round-2 review: the journaled shadow refusal stays authoritative, whatever came after it.
+            self.finish_shadow_refusal("operator rollback of a shadow journal whose identity was refused")?;
+            notes.push("SHADOW identity was refused on this journal: nothing was resumed and no hook ran (the source may be \
+                        a real node). Resume it by hand only after checking which chain it belongs to (docs/DESIGN-shadow.md)".into());
+            return Ok(RollbackOutcome { state: self.state, failed: vec![], notes, already: true });
         }
         let guarded = self.operator_rollback_needs_guard();
         if guarded {
@@ -1152,6 +1239,22 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                  uses --force-after-ignite.",
                 self.state
             ));
+        }
+        // Round-2 review: a shadow journal's source is resumed only after its identity is proven in this run.
+        if self.is_shadow_journal() && !self.shadow_proven {
+            let problems = crate::shadow::identity_problems(self.cfg, self.ops);
+            if !problems.is_empty() {
+                let msg = format!("SHADOW identity not re-proven ({}): the source was NOT resumed and no hook ran",
+                                  problems.join("; "));
+                if past {
+                    return Err(format!("refusing to roll back: {msg}. Nothing was changed"));
+                }
+                self.shadow_refuse("operator rollback: SHADOW identity not re-proven, so the source is NOT resumed",
+                    json!({"identity_problems": problems}))?;
+                return Ok(RollbackOutcome { state: self.state, failed: vec![msg], notes, already: false });
+            }
+            self.shadow_proven = true;
+            self.journal.evidence(self.state, json!({"shadow_identity": "re-proven before an operator rollback"}))?;
         }
         // Intent first: if this rollback dies before its ABORTED transition, a later `run` must not
         // resume the ceremony (see `rollback_pending`); re-running `rollback` finishes the job.
@@ -1231,6 +1334,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     fn abort(&mut self, reason: &str, detail: serde_json::Value) -> Result<(), String> {
         if self.past_point_of_no_return() {
             return self.halt(reason, detail);
+        }
+        // Round-2 review: a shadow refusal is final, and a shadow journal's abort resumes its source only after the
+        // identity is proven in this run (a resume preflight failure at VERIFIED, e.g., reaches here first).
+        if self.shadow_refused {
+            return self.shadow_refuse(reason, detail);
+        }
+        if !self.shadow_reprove_before_resume("an abort", &json!({"reason": reason, "detail": detail}))? {
+            return Ok(());
         }
         let perform = self.cfg.target.auto_rollback;
         // rc.23 (fleet run r4): a coordinated producer that froze writes resumes the OLD chain only when the
@@ -2857,6 +2968,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// the LIVE quorum's. A failed re-verification changes nothing on either chain.
     pub fn join_with(&mut self, event_id: &str, reverify: bool) -> Result<State, String> {
         self.check_shadow_binding()?;
+        self.check_mainnet_binding()?;
+        if self.shadow_refused {
+            return Err(format!("refusing to join: this SHADOW journal recorded an identity refusal (the source may be a \
+                real node); a new shadow starts on a fresh journal. Journal: {}", self.journal.path().display()));
+        }
         self.cfg.ensure_ceremony_profile()?;
         let co = self.cfg.coordination.clone().ok_or("join needs the event's [coordination] config (the one `await` derived)")?;
         if co.event_id.as_deref() != Some(event_id) {
@@ -3162,6 +3278,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(());
             }
             self.shadow_verified = true;
+            self.shadow_proven = true;
             self.journal.evidence(self.state, json!({"shadow_identity": "verified before chain creation / ignition"}))?;
         }
         if upstream_backend && !self.upstream_ignite_preflight()? {
@@ -3216,6 +3333,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                            "expected": self.staged_sha256}))?;
                 return Ok(());
             }
+        }
+        if self.cfg.is_shadow() {
+            // Round-2 review (N5): the chain about to be ignited must exist on the PROVEN private metalgo, not merely on
+            // whatever create_chain_cmd talked to (upstream: after creation, so a failure halts).
+            let problems = crate::shadow::target_chain_problems(self.cfg, self.ops, self.target_blockchain_id.as_deref());
+            if !problems.is_empty() {
+                self.shadow_refuse("SHADOW: the target chain is not on the proven private network", json!({"problems": problems}))?;
+                return Ok(());
+            }
+            self.journal.evidence(self.state, json!({"shadow_target_chain": "exists on the proven private metalgo"}))?;
         }
         let started = self.ops.now_ms();
         // Point of no return (locally): journaled BEFORE the command runs. From here any failure

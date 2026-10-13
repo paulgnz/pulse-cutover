@@ -86,11 +86,13 @@ pub fn check_config(cfg: &Config) -> Result<(), String> {
         )),
         Some(_) => {}
     }
-    match (origin(&cfg.source.rpc_url), origin(&cfg.source.producer_api_url)) {
+    // Round-2 review: the WHOLE API base must match (scheme, host, port AND path): a path-routing proxy could otherwise
+    // serve the identity reads for `/shadow` and forward producer mutations for `/mainnet` on the same origin.
+    match (api_base(&cfg.source.rpc_url), api_base(&cfg.source.producer_api_url)) {
         (Some(a), Some(b)) if a == b => {}
         _ => problems.push(format!(
-            "source.rpc_url {} and source.producer_api_url {} must be the same node (same scheme, host and port) in a \
-             shadow: the identity is proven on the node whose producer the ceremony pauses",
+            "source.rpc_url {} and source.producer_api_url {} must be the same API base (same scheme, host, port and \
+             path, no query) in a shadow: the identity is proven on the node whose producer the ceremony pauses",
             cfg.source.rpc_url, cfg.source.producer_api_url
         )),
     }
@@ -151,6 +153,17 @@ fn strict_url(url: &str) -> Option<url::Url> {
 pub fn origin(url: &str) -> Option<(String, String, u16)> {
     let u = strict_url(url)?;
     Some((u.scheme().to_string(), u.host_str()?.to_ascii_lowercase(), u.port_or_known_default()?))
+}
+
+/// The complete API base the HTTP client calls (scheme, host, port, path without trailing slashes), parsed strictly;
+/// None when ambiguous, unparsable, or carrying a query or fragment (the client appends paths to the raw string).
+pub fn api_base(url: &str) -> Option<(String, String, u16, String)> {
+    let u = strict_url(url)?;
+    if u.query().is_some() || u.fragment().is_some() {
+        return None;
+    }
+    let path = u.path().trim_end_matches('/').to_string();
+    Some((u.scheme().to_string(), u.host_str()?.to_ascii_lowercase(), u.port_or_known_default()?, path))
 }
 
 /// Loopback, RFC 1918, link-local, IPv6 loopback / unique-local / link-local, or a reserved private name suffix.
@@ -264,6 +277,31 @@ pub fn target_network_problems<O: ChainOps + ?Sized>(cfg: &Config, ops: &O) -> V
     }
 }
 
+/// One day of 0.5 s blocks (see `public_mainnet_problems`).
+pub const FAR_AHEAD_BLOCKS: u64 = 172_800;
+
+/// Round-2 review (N5): the chain the ceremony is about to ignite must exist on the PROVEN private metalgo (the one
+/// behind `target.rpc_url` whose network id the identity proof read), not merely on whatever `create_chain_cmd`
+/// talked to. `blockchain_id` = the journaled id (upstream backend); otherwise the id in `target.rpc_url`
+/// (`/ext/bc/<id>/...`). Fail-closed.
+pub fn target_chain_problems<O: ChainOps + ?Sized>(cfg: &Config, ops: &O, blockchain_id: Option<&str>) -> Vec<String> {
+    let Some(base) = metal_info_base(cfg) else {
+        return vec![format!("target.rpc_url {} is not a metalgo /ext/ URL (target chain unverified)", cfg.target.rpc_url)];
+    };
+    let from_url = cfg.target.rpc_url.split("/ext/bc/").nth(1).and_then(|r| r.split('/').next())
+        .filter(|id| !id.is_empty() && !id.contains('{')).map(str::to_string);
+    let Some(id) = blockchain_id.map(str::to_string).or(from_url) else {
+        return vec!["no blockchain id is known for the target (neither journaled nor in target.rpc_url): target chain unverified".into()];
+    };
+    match ops.metal_blockchain_status(&base, &id) {
+        Ok(Some(st)) if !st.is_empty() && !st.eq_ignore_ascii_case("unknown") => vec![],
+        Ok(Some(st)) => vec![format!("the proven private metalgo at {base} reports chain {id} as {st:?}: the chain about to be \
+                                      ignited is not on the shadow network")],
+        Ok(None) => vec![format!("the proven private metalgo at {base} did not report a status for chain {id} (target chain unverified)")],
+        Err(e) => vec![format!("cannot ask the proven private metalgo at {base} about chain {id}: {e} (target chain unverified)")],
+    }
+}
+
 /// The full identity proof (module doc). Fail-closed: an unreadable answer is a problem. Empty = this really is a
 /// private shadow, independently of anything the operator declared.
 pub fn identity_problems<O: ChainOps + ?Sized>(cfg: &Config, ops: &O) -> Vec<String> {
@@ -349,10 +387,23 @@ pub fn public_mainnet_problems<O: ChainOps + ?Sized>(declared_keys: &[String], o
             }
             Err(e) => unreachable.push(format!("{base}: get_producer_schedule: {e}")),
         }
-        let mainnet_head = info["head_block_num"].as_u64().unwrap_or(0);
+        // Round-2 review (N2): a missing head is unreadable, never a comparison; and an endpoint merely BEHIND the
+        // source (lagging or syncing) proves nothing. Only a source final FAR past mainnet's own head (more than
+        // FAR_AHEAD_BLOCKS, one day of 0.5 s blocks: no healthy public endpoint lags by a day, and a restored
+        // snapshot never runs ahead of the network it came from by accident) counts as "not mainnet".
+        let Some(mainnet_head) = info["head_block_num"].as_u64() else {
+            unreachable.push(format!("{base}: get_info without head_block_num (block not compared)"));
+            continue;
+        };
         if mainnet_head < src_lib {
-            // A real mainnet node cannot be final past the network's own head: the source is not mainnet.
-            blocks_compared += 1;
+            if src_lib - mainnet_head > FAR_AHEAD_BLOCKS {
+                blocks_compared += 1;
+            } else {
+                unreachable.push(format!(
+                    "{base}: mainnet head {mainnet_head} is behind the source's LIB {src_lib} by less than a day of blocks \
+                     (a lagging endpoint proves nothing; block not compared)"
+                ));
+            }
             continue;
         }
         match ops.public_chain_post(base, "/v1/chain/get_block", json!({"block_num_or_id": src_lib})) {
@@ -429,6 +480,13 @@ mod tests {
         assert_eq!(origin("https://node.internal"), Some(("https".into(), "node.internal".into(), 443)));
         assert!(origin("http://a@127.0.0.1:8888").is_none());
         assert!(origin("http://x\\@127.0.0.1:8888").is_none());
+        // Round-2 review: the path is part of the identity (a path-routing proxy must not split reads and mutations).
+        assert_eq!(api_base("http://gw:8888"), api_base("http://gw:8888/"));
+        assert_eq!(api_base("http://GW:8888/node/"), api_base("http://gw:8888/node"));
+        assert_ne!(api_base("http://gw:8888/shadow"), api_base("http://gw:8888/mainnet"));
+        assert_ne!(api_base("http://gw:8888"), api_base("http://gw:8888/mainnet"));
+        assert!(api_base("http://gw:8888/x?route=mainnet").is_none());
+        assert!(api_base("http://gw:8888/x#frag").is_none());
     }
 
     #[test]
