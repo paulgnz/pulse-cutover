@@ -3906,6 +3906,7 @@ fn r6_forced_rollback_fences_on_every_attempt() {
     let cfg = Config::load(&dir.path().join("ceremony.toml")).unwrap();
     let ops = MockOps::new(dir.path(), 200);
     ops.resume_fails.set(true);
+    ops.paused.set(true); // round 11: the failed resume is settled by a read; the producer is still paused
     let out = rollback_with(&cfg, &ops, true).unwrap();
     assert!(!out.failed.is_empty(), "fixture: the resume failed: {out:?}");
     assert!(ops.events.borrow().iter().any(|e| e == "hook:stop-target"));
@@ -3962,6 +3963,7 @@ fn r6_run_on_an_aborted_journal_with_an_unfinished_rollback_says_so_and_exits_4(
     let cfg = pre_ignite_journal(dir.path());
     let ops = MockOps::new(dir.path(), 200);
     ops.resume_fails.set(true);
+    ops.paused.set(true); // round 11: the failed resume is settled by a read; the producer is still paused
     assert!(!rollback_with(&cfg, &ops, false).unwrap().failed.is_empty(), "fixture: incomplete rollback");
     let out = run_bin(&["run"], &dir.path().join("ceremony.toml"));
     let err = String::from_utf8_lossy(&out.stderr).to_string();
@@ -8540,4 +8542,129 @@ fn r30r10_join_model_finds_no_invariant_violation() {
     eprintln!("JOIN MODEL over {count} scenarios: {finals:?}");
     let report: String = bad.iter().take(10).map(|(s, v, t)| format!("\n=== seed {s}: {}\n    {}", v.join(" | "), t.join("\n    "))).collect();
     assert!(bad.is_empty(), "{} of {count} join scenarios violated an invariant:{report}", bad.len());
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// r30 round 11 (Codex R10-1, R10-2): a resume gives up ownership BEFORE its RPC (`side_effect: source_resume`); an
+// unsettled resume leaves the episode's ownership unknown (never resumed again on this ceremony's own authority), and the
+// pause_at_h snapshot-recovery resume closes its episode like any other.
+// ------------------------------------------------------------------------------------------------------------------
+
+/// Append records to a test journal, as a crashed agent would have left them.
+fn r30r11_append(cfg: &Config, records: &[serde_json::Value]) {
+    let (mut j, rec) = open_journal(&cfg.journal_path);
+    let s = rec.state.unwrap();
+    for r in records {
+        j.evidence(s, r.clone()).unwrap();
+    }
+}
+
+#[test]
+fn r30r11_an_unsettled_resume_never_resumes_a_later_pause() {
+    // A rollback journaled its resume intent, then died (before the RPC, or after it with the response lost). Since
+    // then the producer is paused again: by someone else after our resume took effect, or still ours if the RPC never
+    // left. The agent cannot tell, so it never resumes it on its own authority and never reopens writes into it.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_with_on_abort(dir.path());
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("source_pause_ack"), "fixture: the ceremony paused and acknowledged its pause");
+    r30r11_append(&cfg, &[serde_json::json!({"rollback_requested": true, "force_after_ignite": false}),
+        serde_json::json!({"side_effect": "source_resume", "episode": 1, "during": "rollback"})]);
+    let ops = MockOps::new(dir.path(), 200);
+    ops.paused.set(true);
+    let res = rollback_with(&cfg, &ops, false);
+    let ev = ops.events.borrow().clone();
+    assert!(!ev.iter().any(|e| e == "resume"), "an unsettled resume's episode is never resumed again: {ev:?} {res:?}");
+    assert!(!ev.iter().any(|e| e == "hook:reopen-writes"), "writes never reopen into a paused producer: {ev:?}");
+    match res {
+        Err(e) => assert!(e.contains("refusing to roll back"), "{e}"),
+        Ok(out) => assert_eq!(out.state, State::Stranded, "{out:?}"),
+    }
+    // The operator's explicit release resumes it and reopens writes once the producer produces.
+    let ops2 = MockOps::new(dir.path(), 200);
+    ops2.paused.set(true);
+    let out = rollback_with_stranded(&cfg, &ops2);
+    let ev2 = ops2.events.borrow().clone();
+    assert!(ev2.iter().any(|e| e == "resume") && ev2.iter().any(|e| e == "hook:reopen-writes"), "{ev2:?} {out:?}");
+    assert!(std::fs::read_to_string(&cfg.journal_path).unwrap().contains("external_pause_release"));
+}
+
+#[test]
+fn r30r11_an_unsettled_resume_with_the_producer_producing_reopens_writes_without_resuming() {
+    // Crash after the resume RPC took effect, before its closing record: the producer produces. Nothing to resume (and
+    // nothing is resumed); the reopen invariant's fresh read lets writes reopen.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_with_on_abort(dir.path());
+    r30r11_append(&cfg, &[serde_json::json!({"rollback_requested": true, "force_after_ignite": false}),
+        serde_json::json!({"side_effect": "source_resume", "episode": 1, "during": "rollback"})]);
+    let ops = MockOps::new(dir.path(), 200);
+    ops.paused.set(false);
+    let out = rollback_with(&cfg, &ops, false).unwrap();
+    let ev = ops.events.borrow().clone();
+    assert!(!ev.iter().any(|e| e == "resume"), "{ev:?}");
+    assert!(ev.iter().any(|e| e == "hook:reopen-writes"), "writes reopen into a producing chain: {ev:?}");
+    assert!(out.failed.is_empty() && out.state == State::Aborted, "{out:?}");
+}
+
+#[test]
+fn r30r11_a_crash_inside_the_snapshot_recovery_resume_adopts_instead_of_resuming() {
+    // pause_at_h recovery: a crash after the resume-for-snapshot intent, before its RPC; the producer is paused when
+    // the agent comes back. Ownership is unknown: the pause is adopted for the cut, never resumed by this ceremony.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_journal(dir.path());
+    r30r11_append(&cfg, &[serde_json::json!({"side_effect": "source_resume", "episode": 1,
+        "during": "resuming production for the snapshot"})]);
+    let _ = std::fs::remove_file(dir.path().join("staged.bin")); // the fixture's earlier run staged it
+    let ops = MockOps::new(dir.path(), 200);
+    ops.paused.set(true);
+    let _ = run_machine_result(&cfg, &ops);
+    let ev = ops.events.borrow().clone();
+    assert!(!ev.iter().any(|e| e == "resume"), "an unsettled resume is never retried on our own authority: {ev:?}");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""pause_ownership_unknown":true"#), "adopted with ownership unknown: {text}");
+}
+
+#[test]
+fn r30r11_the_snapshot_recovery_resume_closes_its_episode() {
+    // A crashed pause_at_h run left the producer paused by this ceremony (intent + ack). The re-run resumes it for the
+    // snapshot: that closes the episode, so the next pause needs a fresh intent and ack, and a pause someone else makes
+    // afterwards is never taken for ours.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_journal(dir.path());
+    let before = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let intents_before = before.matches(r#""side_effect":"source_pause""#).count();
+    let _ = std::fs::remove_file(dir.path().join("staged.bin")); // the fixture's earlier run staged it
+    let _ = std::fs::remove_file(dir.path().join("staged.bin"));
+    let ops = MockOps::new(dir.path(), 120); // the crashed run froze at H = 120 (pause_at_h snapshots at H)
+    ops.paused.set(true);
+    let _ = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""resumed_production_for_snapshot":true"#), "{text}");
+    let resumed_at = text.find(r#""resumed_production_for_snapshot":true"#).unwrap();
+    let after = &text[resumed_at..];
+    assert!(after.contains(r#""side_effect":"source_pause""#) && after.contains("source_pause_ack"),
+        "the next pause opened a NEW episode with its own intent and ack: {after}");
+    assert!(text.matches(r#""side_effect":"source_pause""#).count() > intents_before);
+
+    // Replay: once the recovery resume is journaled, the old episode is closed; a pause seen afterwards is not ours.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = pre_ignite_journal(dir.path());
+    r30r11_append(&cfg, &[serde_json::json!({"side_effect": "source_resume", "episode": 1,
+        "during": "resuming production for the snapshot"}),
+        serde_json::json!({"resumed_production_for_snapshot": true, "episode": 1})]);
+    let rec = Journal::replay(&cfg.journal_path).unwrap();
+    let eps = pulse_cutover::journal::pause_episodes(&rec.pause_events, false, true);
+    assert!(!eps.ours && !eps.unknown, "the recovery resume closed the episode: {:?}", rec.pause_events);
+    let _ = std::fs::remove_file(dir.path().join("staged.bin"));
+    let ops = MockOps::new(dir.path(), 200);
+    ops.paused.set(true); // someone else paused it after our resume
+    let _ = run_machine_result(&cfg, &ops);
+    assert!(!ops.events.borrow().iter().any(|e| e == "resume"), "{:?}", ops.events.borrow());
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains(r#""adopted":true"#), "the later pause is adopted, not ours: {text}");
+}
+
+fn rollback_with_stranded(cfg: &Config, ops: &MockOps) -> Result<pulse_cutover::machine::RollbackOutcome, String> {
+    let (j, rec) = open_journal(&cfg.journal_path);
+    Machine::new(cfg, ops, j, rec).operator_rollback_opts(false, true)
 }

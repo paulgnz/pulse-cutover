@@ -156,6 +156,19 @@ stateDiagram-v2
   frozen and seals. The cost is conservative: a kill between a successful pause RPC and its ack leaves that pause to
   the operator (`rollback --force-stranded --i-understand`) instead of an automatic resume. Older journals keep their
   intent-only rule.
+  **Round 11: a resume gives up ownership before its RPC** (the mirror of round 10, Codex R10-1). Every resume (a
+  rollback's, an operator's forced release, the `pause_at_h` recovery resume for the snapshot) first journals a
+  `side_effect: source_resume` intent: the episode becomes CLOSING and is no longer "ours". It closes when the resume's
+  outcome is journaled (`rollback_step: resume`, or `resumed_production_for_snapshot` after a confirming read). A failed
+  RPC is settled at once by a fresh read: producing = it happened (closed, `source_resume_applied_despite_error`);
+  paused = it did not (`source_resume_cancelled`, ours again, the rollback reports the failed step and can be re-run);
+  unreadable = unknown. A closing episode that was never settled (a crash, a lost response) is **ownership unknown**:
+  never resumed again on this ceremony's own authority; with the producer producing there is nothing to undo and R2 may
+  reopen writes; with it paused (still ours, or someone else's pause after our resume took effect: the agent cannot
+  tell) a run adopts it with `pause_ownership_unknown`, and an abort or operator rollback keeps writes frozen (STRANDED,
+  or the operator rollback's refusal) until `--force-stranded --i-understand`. The `pause_at_h` recovery resume (R10-2)
+  now closes its episode, so the next pause needs a fresh intent and ack and a later pause by someone else is adopted,
+  never taken for ours. Journals written before round 11 contain no resume intents and are folded exactly as before.
 - **ABORTED** is reachable only before `create_chain` (upstream) or `ignite_started` is journaled. It resumes the source
   producer (producer mode, if `target.auto_rollback`), restarts the source and reverts flips
   (API mode, if they ran), runs `on_abort`, and moves the staged snapshot aside. The rollback
@@ -340,6 +353,8 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 | A performed rollback would reopen writes this journal froze, but a fresh read shows the producer paused (someone else's pause, or ours still paused) or unreadable | reopen invariant R2 (r30 round 8) | FROZEN–VERIFIED | STRANDED (`writes_kept_frozen`): no `on_abort`, someone else's pause never resumed, `on_halt` pages; `rollback --force-stranded --i-understand` releases an external pause (journaled after its rollback intent), then R2 again; an operator rollback that ends here exits 4 (round 9). A read ERROR after our own resume is retried for up to 30 s first |
 | A `join` re-enters an ABORTED or STRANDED ceremony and dies (inside the re-freeze hook, after its own pause) | journal segment (r30 round 9) | ABORTED / STRANDED | `rollback` undoes what the join's segment did (reopens the re-frozen writes, resumes the join's own pause), never "already rolled back"; the resume guard applies (fleet LIVE: refused, or `--force-stranded`) |
 | The resumed agent cannot read the producer state at the start of FROZEN or right after its pause | bounded retry (r30 round 9) | FROZEN | retried for up to 30 s (journaled), then the run stops with the error (nothing changed) |
+| A resume of this ceremony's pause was started (`source_resume` intent) and its outcome never journaled (a crash, a lost response a read could not settle), then the producer is found paused | resume intent (r30 round 11) | FROZEN–VERIFIED / ABORTED | ownership unknown: never resumed on this ceremony's authority; adopted with `pause_ownership_unknown`; an abort keeps writes frozen (STRANDED), a plain operator rollback refuses; `--force-stranded --i-understand` releases it. Producer found producing instead: nothing to resume, R2 may reopen writes |
+| The resume RPC fails | resume settlement read (r30 round 11) | any rollback / FROZEN | a fresh read decides: producing = the resume happened (episode closed); paused = it did not (`source_resume_cancelled`, the rollback reports the failed step, re-run it); unreadable = ownership unknown (as above) |
 | Head keeps moving after the pause | quiescence window | FROZEN | late blocks journaled; the window waits up to `quiescence_timeout_secs` (default 120), then ABORT (before ignition: `on_abort` reopens writes) |
 | Snapshot block id ≠ chain's block id at H (fork at the cut); chain_id changed | block lookup | FROZEN | abort |
 | Any transaction in H+1…pause, or an unreadable block, or an answer that is not that block with a `transactions` array | burn-off audit (fails closed) | FROZEN | abort |

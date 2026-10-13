@@ -782,10 +782,47 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.hook(hook)
     }
 
-    fn src_resume(&mut self) -> Result<(), String> {
+    /// Resumes this ceremony's own pause (the callers resume only when the latest open episode is ours).
+    ///
+    /// r30 round 11 (Codex R10-1), the mirror of round 10's pause ack: ownership is given up BEFORE the RPC. A
+    /// `side_effect: source_resume` intent is journaled first (the episode becomes CLOSING); the caller journals the
+    /// closing record once the resume succeeded (`rollback_step: resume`, or `resumed_production_for_snapshot`). If the
+    /// outcome is never journaled (a crash, a lost response a read cannot settle), recovery finds the episode closing =
+    /// ownership UNKNOWN and never resumes it again: the producer may have resumed and someone else paused it since. A
+    /// failed RPC is settled by a fresh (retried) read: producing = the resume happened (Ok, the caller closes the
+    /// episode); paused = it did not (`source_resume_cancelled`, the episode is ours again, Err); unreadable = unknown
+    /// (the intent stands, Err). Between a failed RPC and that read someone else could pause the producer: that pause
+    /// would be taken for ours (the same unavoidable window as the pause side), and the reopen invariant still never
+    /// sends writes into a paused chain.
+    fn src_resume(&mut self, what: &str) -> Result<(), String> {
         self.shadow_mutation_gate("resuming the source producer")?;
         self.shadow_producer_gate("resuming the source producer")?;
-        self.ops.resume() // ungated: this IS the gate
+        let episode = self.current_episode();
+        self.journal.evidence(self.state, json!({"side_effect": "source_resume", "episode": episode, "during": what}))?;
+        self.push_pause_event(crate::journal::PauseEvent::ResumeIntent);
+        let err = match self.ops.resume() { // ungated: this IS the gate
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        match self.read_paused_retrying(PAUSE_READ_RETRY_MS, "settling a resume RPC that failed") {
+            Ok(false) => {
+                self.journal.evidence(self.state, json!({"source_resume_applied_despite_error": err, "episode": episode}))?;
+                Ok(())
+            }
+            Ok(true) => {
+                self.journal.evidence(self.state, json!({"source_resume_cancelled": episode, "error": err,
+                    "note": "the resume RPC failed and the producer is still paused: this ceremony's pause stands"}))?;
+                self.push_pause_event(crate::journal::PauseEvent::ResumeCancel);
+                Err(err)
+            }
+            Err(re) => {
+                self.journal.evidence(self.state, json!({"source_resume_outcome_unknown": episode, "error": err,
+                    "read_error": re,
+                    "note": "the resume RPC failed and the producer state cannot be read: ownership of this pause is \
+                             unknown from here on; this ceremony will not resume it again"}))?;
+                Err(format!("{err} (and the producer state could not be read: whether it resumed is unknown)"))
+            }
+        }
     }
 
     /// Runs a hook through the shadow gate (every hook except the paging-only on_halt).
@@ -2292,14 +2329,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     if !self.paused_by_us {
                         // It never paused the producer (a preflight refusal, a pause someone else made or adopted), or
                         // its own pause was already resumed: resuming now would undo another process's pause.
+                        // r30 round 11: or a resume of ours was started and never settled (ownership unknown).
                         rollback["source_producer_resumed"] = if self.step_done("resume") {
                             json!("earlier (journaled)")
+                        } else if self.pause_unknown {
+                            json!("ownership of the current pause is unknown (a pause or resume of this ceremony was \
+                                   interrupted before its outcome was journaled): not resumed")
                         } else {
                             json!("not paused by this ceremony: nothing to resume")
                         };
                     } else {
                         let episode = self.current_episode();
-                        match self.src_resume() {
+                        match self.src_resume("rollback") {
                             Ok(()) => {
                                 rollback["source_producer_resumed"] = json!(true);
                                 self.journal.evidence(self.state, json!({"rollback_step": "resume", "ok": true, "episode": episode}))?;
@@ -2808,11 +2849,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.journal.evidence(State::Frozen, json!({"kept_paused_on_resume": true,
                     "note": "H is already final: the scheduled snapshot needs no more blocks from this producer"}))?;
             } else {
-                self.src_resume()?;
+                // r30 round 11 (Codex R10-2): this resume closes the episode like any other (intent before the RPC,
+                // closing record after a confirming read): the next pause needs a fresh intent and ack, and a pause
+                // someone else makes later is adopted, never taken for ours.
+                let episode = self.current_episode();
+                self.src_resume("resuming production for the snapshot")?;
+                if self.read_paused_retrying(PAUSE_READ_RETRY_MS, "confirming the resume for the snapshot")? {
+                    // The RPC answered but the producer is still paused: our pause stands (no closing record).
+                    self.journal.evidence(State::Frozen, json!({"source_resume_cancelled": episode,
+                        "error": "the resume RPC succeeded but the producer is still paused"}))?;
+                    self.push_pause_event(crate::journal::PauseEvent::ResumeCancel);
+                    return Err("resuming production for the snapshot did not take effect: the producer is still paused \
+                                (re-run to retry)".into());
+                }
                 self.journal.evidence(
                     State::Frozen,
-                    json!({"resumed_production_for_snapshot": true}),
+                    json!({"resumed_production_for_snapshot": true, "episode": episode}),
                 )?;
+                self.push_pause_event(crate::journal::PauseEvent::Resume);
             }
         }
         let started = self.ops.now_ms();
