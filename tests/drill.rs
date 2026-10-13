@@ -343,6 +343,23 @@ fn pin(path: &Path) -> String {
     pulse_cutover::verify::sha256_file(path).map(|(h, _)| h).unwrap_or_else(|_| "0".repeat(64))
 }
 
+/// Round 7 (F2): a drill on XPR mainnet without an explicit `[ceremony] lock_dir` is refused before its work marker
+/// exists, also when the config leaves the chain to discovery.
+#[test]
+fn r7_a_mainnet_drill_needs_an_explicit_lock_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| t.replace(&format!("chain_id = \"{MAINNET}\"\n"), "")).unwrap();
+    assert!(cfg.ceremony.lock_dir.is_none() && cfg.ceremony.chain_id.is_none());
+    let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+    let err = drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).unwrap_err();
+    assert!(err.contains("explicit [ceremony] lock_dir"), "{err}");
+    assert!(!drill::drill_dir(&cfg, 1_050).exists(), "nothing ran");
+    let markers = std::fs::read_dir(drill::lock_dir(&cfg)).map(|d| d.filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".work.json")).count()).unwrap_or(0);
+    assert_eq!(markers, 0, "no work marker was left behind");
+}
+
 fn drill_config(dir: &Path, chain_id: &str, extra_upstream: &str) -> Result<Config, String> {
     drill_config_edit(dir, chain_id, extra_upstream, |t| t)
 }
@@ -394,7 +411,13 @@ compare_bin_sha256 = "{compare_pin}"
         compare_pin = pin(&dir.join("bin/compare")),
     );
     let p = dir.join("drill.toml");
-    std::fs::write(&p, edit(text)).unwrap();
+    let mut text = edit(text);
+    // Round 7 (F2): a drill on XPR mainnet needs an explicit lock_dir; give mainnet fixtures one unless the test
+    // sets its own or removes the pinned chain on purpose.
+    if text.contains(&format!("chain_id = \"{MAINNET}\"")) && !text.contains("lock_dir") {
+        text = text.replacen("[ceremony]\n", &format!("[ceremony]\nlock_dir = \"{d}/locks\"\n"), 1);
+    }
+    std::fs::write(&p, text).unwrap();
     Config::load(&p)
 }
 
@@ -1278,8 +1301,10 @@ fn r5_drills_on_the_same_producer_exclude_each_other_across_journal_directories(
     stage_tools(b.path(), true);
     let shared_snapshots = a.path().join("snapshots");
     let cfg_a = drill_config(a.path(), MAINNET, "").unwrap();
+    // The two configs share the box's lock_dir, as every agent on one box must (mainnet requires it explicitly).
     let cfg_b = drill_config_edit(b.path(), MAINNET, "", |t| t.replace(&format!("{}/snapshots", b.path().display()),
-        &shared_snapshots.display().to_string())).unwrap();
+        &shared_snapshots.display().to_string())
+        .replacen("[ceremony]\n", &format!("[ceremony]\nlock_dir = \"{}/locks\"\n", a.path().display()), 1)).unwrap();
     assert_ne!(drill::drill_root(&cfg_a), drill::drill_root(&cfg_b));
     assert_eq!(drill::producer_lock_base(&cfg_a), drill::producer_lock_base(&cfg_b));
     // A's drill holds the producer lock (as it does for its whole run).
