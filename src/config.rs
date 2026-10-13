@@ -114,6 +114,10 @@ pub struct Coordination {
     /// Set by `await` in the derived config: the event this ceremony belongs to (enables signed aborts).
     #[serde(default)]
     pub event_id: Option<String>,
+    /// Set by `await` in the derived config (rc.29): sha256 of the accepted event's exact signed payload. Before
+    /// chain creation and ignition the relay's answer counts as "no abort" only when it carries this signed event.
+    #[serde(default)]
+    pub event_hash: Option<String>,
     /// Set by `await` from the signed event: the servers that MUST agree before ignition.
     /// When non-empty the fleet gate counts only these members (matched by beacon
     /// `instance_id` when given, else by producer account), only with FRESH reports, and

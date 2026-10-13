@@ -145,6 +145,16 @@ pub fn aborted(doc: &Value, keys: &[String], network: &str, event_id: &str) -> b
         .unwrap_or(false)
 }
 
+/// rc.29: true when `doc` carries the signed `event` for `event_id` on `network` (and, when known, with exactly the
+/// payload `await` accepted). A relay answer without it (an empty store, a restore from backup, another network)
+/// says nothing about aborts: it is "unknown", never "no abort".
+pub fn carries_event(doc: &Value, keys: &[String], network: &str, event_id: &str, event_hash: Option<&str>) -> bool {
+    let Some(m) = doc.get("event").filter(|m| !m.is_null()) else { return false };
+    let Ok(p) = verify(m, keys) else { return false };
+    p["type"] == "event" && p["network"].as_str() == Some(network) && p["event_id"].as_str() == Some(event_id)
+        && event_hash.is_none_or(|h| payload_hash(m).is_some_and(|x| x.eq_ignore_ascii_case(h)))
+}
+
 /// True when `doc` carries a valid signed `complete` for `event_id` (the coordinator closed an event that ran).
 /// `await` records it as a terminal tombstone: a completed event is never accepted or armed again, even by an
 /// agent whose journal directory never saw it run (a new run directory has no "ran" tombstone).
@@ -265,7 +275,7 @@ fn write_state(cfg: &Config, v: &Value) {
 
 /// Derived ceremony config for one event: H, event_id and the event's bindings (roster, quorum,
 /// expected snapshot hash) from the signed event. H derivation is switched OFF: H is the event's.
-pub fn derived_config(src: &Path, ev: &Value, out: &Path) -> Result<(), String> {
+pub fn derived_config(src: &Path, ev: &Value, event_hash: Option<&str>, out: &Path) -> Result<(), String> {
     let h = ev["h"].as_u64().ok_or("event has no H")?;
     let event_id = ev["event_id"].as_str().ok_or("event has no event_id")?;
     let text = std::fs::read_to_string(src).map_err(|e| e.to_string())?;
@@ -275,6 +285,10 @@ pub fn derived_config(src: &Path, ev: &Value, out: &Path) -> Result<(), String> 
     cer.remove("derive_h_at_arm");
     let co = doc["coordination"].as_table_mut().ok_or("config has no [coordination]")?;
     co.insert("event_id".into(), toml::Value::String(event_id.into()));
+    match event_hash {
+        Some(h) => { co.insert("event_hash".into(), toml::Value::String(h.into())); }
+        None => { co.remove("event_hash"); }
+    }
     if let Some(roster) = ev.get("roster").filter(|r| r.is_array()) {
         let t: toml::Value = toml::Value::try_from(roster).map_err(|e| format!("roster: {e}"))?;
         co.insert("roster".into(), t);
@@ -398,7 +412,7 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
                     note(&format!("ARM received for {id} but the source head is unknown; not starting yet"), &mut last_note);
                 } else {
                     let derived = cfg.journal_path.parent().unwrap_or(Path::new(".")).join(format!("ceremony-{id}.toml"));
-                    derived_config(config_path, &accepted_ev, &derived)?;
+                    derived_config(config_path, &accepted_ev, accepted.as_ref().map(|(_, _, hx)| hx.as_str()), &derived)?;
                     write_state(cfg, &json!({"event_id": id, "h": h, "accepted": true, "armed": true, "at": chrono::Utc::now().to_rfc3339()}));
                     eprintln!("await: ARMED by signed coordinator message for {id}: running the ceremony at H = {h}");
                     // Recorded before the run starts: a restarted `await` never arms the same event
@@ -457,7 +471,7 @@ mod tests {
             "roster": [{"producer": "bp1", "instance_id": "aa"}, {"producer": "bp2"}], "quorum": 2,
             "snapshot_sha256": "ff00"});
         let out = dir.path().join("d.toml");
-        derived_config(&src, &ev, &out).unwrap();
+        derived_config(&src, &ev, None, &out).unwrap();
         let d: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(d["ceremony"]["freeze_height"].as_integer(), Some(900));
         assert!(d["ceremony"].get("derive_h_at_arm").is_none(), "H must come from the event, not be derived");

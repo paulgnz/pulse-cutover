@@ -107,7 +107,8 @@ pub fn members(status: &Value, co: &Coordination) -> Vec<MemberView> {
             let obs: Vec<&Value> = match log["blocking"].as_array() {
                 Some(b) => b.iter().collect(),
                 None => log["obs"].as_array().map(|a| a.iter()
-                    .filter(|o| o["event_id"].is_null() || event.is_none_or(|e| o["event_id"].as_str() == Some(e))).collect()).unwrap_or_default(),
+                    .filter(|o| o["event_id"].is_null() || o["h"].as_u64().is_none() || event.is_none_or(|e| o["event_id"].as_str() == Some(e)))
+                    .collect()).unwrap_or_default(),
             };
             if let Some(o) = obs.first() {
                 return Some(format!("{}; creation evidence #{} at H {}{}, relay log", o["state"].as_str().unwrap_or("past creation"),
@@ -196,7 +197,8 @@ pub fn annotate_evidence(status: &mut Value, network: &str, event: Option<&str>,
             let blocking: Vec<Value> = obs.iter().filter(|o| {
                 let (oe, oh) = (o["event_id"].as_str(), o["h"].as_u64());
                 // Unattributed (no event id) is quarantined: blocks every event until retired (rc.28 review).
-                (event.is_some() && oe == event) || oh == Some(h) || oe.is_none()
+                // rc.29: so is an unknown H (`h: null`, e.g. migrated marks): it may be this H.
+                (event.is_some() && oe == event) || oh == Some(h) || oh.is_none() || oe.is_none()
             }).cloned().collect();
             log["blocking"] = Value::Array(blocking);
         }
@@ -464,7 +466,7 @@ mod tests {
     fn co(roster: &[&str], quorum: usize) -> Coordination {
         Coordination {
             url: "http://mc".into(), network: "rehearsal".into(), coordinator_keys: vec![], auto_arm: false, min_lead_blocks: 1,
-            fleet_quorum: quorum, fleet_timeout_secs: 1, event_id: Some("e1".into()),
+            fleet_quorum: quorum, fleet_timeout_secs: 1, event_id: Some("e1".into()), event_hash: None,
             roster: roster.iter().map(|p| RosterMember { producer: p.to_string(), instance_id: None }).collect(),
             report_max_age_secs: 60, degraded_patience_secs: 900, degraded_retry_secs: 10, fleet_stall_secs: 300,
         }
@@ -751,6 +753,9 @@ mod tests {
         assert!(resume_guard(Some(&with(json!({"id": 1, "event_id": "ev-0", "h": 50, "state": "IGNITED"}))), &c, me, true).is_ok());
         assert!(resume_guard(Some(&with(json!({"id": 1, "event_id": null, "h": null, "state": "LIVE"}))), &c, me, true).is_err());
         assert!(resume_guard(Some(&with(json!({"id": 1, "event_id": null, "h": 50, "state": "LIVE"}))), &c, me, true).is_err(), "unattributed: quarantined");
+        // rc.29: another event's observation with an unknown H (a migrated mark) may be at this H: it blocks too.
+        assert!(resume_guard(Some(&with(json!({"id": 1, "event_id": "ev-0", "h": null, "state": "LIVE",
+            "migrated": "rc.27 past_create mark"}))), &c, me, true).is_err(), "unknown H: blocks until retired");
     }
 
     /// Review #2: another box reporting under this producer name (its own instance) does not stand in for this

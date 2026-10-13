@@ -449,8 +449,10 @@ export function projectReport(r) {
 }
 export const isBad = (e) => e instanceof Bad;
 
-/** Heartbeat deadline for a report: 3 × its interval, never under 45 s. */
-export const silentAfterMs = (report) => Math.max(3 * (report?.interval_secs || 10), 45) * 1000;
+/** Heartbeat deadline for a report: 3 × its interval, never under 45 s, never over SILENT_CAP_SECS. */
+export const silentAfterMs = (report) => Math.min(Math.max(3 * (report?.interval_secs || 10), 45), SILENT_CAP_SECS) * 1000;
+/** rc.29: a beacon cannot stretch its own silence window past this (it chose up to 3 h with interval_secs 3600). */
+export const SILENT_CAP_SECS = 600;
 
 // ---- fleet verdict (rc.23) ---------------------------------------------------------------------------------
 // The 5-BP rehearsal on the upstream stack ended every run with a LIVE/HALTED mix on ONE target chain, and once
@@ -581,8 +583,10 @@ export function evidenceFor(log, eventId, h = null) {
   // This event's observations, any event's at the SAME H, and unattributed ones (the agents' rule, src/fleet.rs
   // annotate_evidence).
   // Unattributed observations (no event id) are quarantined: they block every event until retired (review).
+  // rc.29: an observation whose H is unknown (`h: null`, e.g. every mark migrated from rc.27) may be at this H: it
+  // blocks too, until retired (the same-H rule was inert for them).
   const obs = (Array.isArray(log?.obs) ? log.obs : []).filter((o) => o && (o.event_id === eventId
-    || (Number.isInteger(h) && o.h === h) || o.event_id === null || o.event_id === undefined));
+    || (Number.isInteger(h) && o.h === h) || o.h === null || o.h === undefined || o.event_id === null || o.event_id === undefined));
   return { obs, overflow: log?.overflow === true };
 }
 /**
@@ -729,7 +733,8 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}) {
   // Review M3: a fleet-wide claim needs every member present and fresh; otherwise PENDING with who is unaccounted for.
   else if (members.length && !members.some((m) => m.foreign_past) && members.every((m) => !m.missing && m.fresh && ['STRANDED', 'ABORTED'].includes(m.state))
     && members.some((m) => m.state === 'STRANDED')) verdict = 'STRANDED';
-  else if (members.length && !members.some((m) => m.foreign_past) && members.filter((m) => !m.missing).every((m) => m.state === 'ABORTED') && members.some((m) => !m.missing)) verdict = 'ABORTED';
+  // rc.29: like STRANDED, a fleet-wide ABORTED needs every member present and fresh.
+  else if (members.length && !members.some((m) => m.foreign_past) && members.every((m) => !m.missing && m.fresh && m.state === 'ABORTED')) verdict = 'ABORTED';
   else verdict = 'PENDING';
   const unaccounted = members.filter((m) => m.missing || !m.fresh).map((m) => `${m.producer}: ${m.missing ? 'no report' : `silent (${m.state || '?'})`}`);
   const notLive = !liveChain && verdict !== 'SPLIT' ? unaccounted : liveChain ? members.filter((m) => !liveChain.members.includes(m.producer)).map((m) => `${m.producer}: ${m.missing ? 'no report' : m.conflict ? 'identity conflict' : !m.fresh ? `silent (${m.state || '?'})` : m.state}`) : [];

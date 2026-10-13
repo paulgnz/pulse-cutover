@@ -113,6 +113,10 @@ refuses (exit 3) unless the resume guard passes now (nobody past chain creation,
 quorum unreachable without this node, or a signed coordinator abort with every member accounted
 for). --force-stranded --i-understand records an operator's fleet-wide decision instead (journaled
 with the fleet view it overrides). If the fleet went LIVE, use `pulse-cutover join` instead.
+rc.29: the same guard runs for a coordinated producer killed mid-ceremony (FROZEN, SNAPSHOTTED or
+VERIFIED, e.g. `cutover.sh abort`) and for an ABORTED journal whose source was paused but never
+resumed. From FROZEN..VERIFIED it is two-pass (the node first withdraws its VERIFIED report); if it
+fails the node is STRANDED (sealed, writes stay frozen) and `rollback` exits 3.
 
 A rollback records its intent (`rollback_requested`) before doing anything. If it dies before
 reaching ABORTED, `run` refuses to continue (`status` shows `rollback_pending: yes`); re-run

@@ -566,8 +566,9 @@ impl ChainOps for MockOps {
             if self.coord_down.get() {
                 return Err("mission control unreachable".into());
             }
-            // The relay is up and serves no abort unless a test sets one.
-            return Ok(Some(self.coord_doc.borrow().clone().unwrap_or_else(|| serde_json::json!({}))));
+            // The relay is up and serves the signed event e1 (no abort) unless a test sets another document.
+            return Ok(Some(self.coord_doc.borrow().clone().unwrap_or_else(|| serde_json::json!({
+                "event": signed(serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1"}))}))));
         }
         if url.ends_with("/api/status") {
             if self.coord_down.get() {
@@ -1991,8 +1992,55 @@ fn abort_for_another_event_or_unsigned_is_ignored() {
     let ops = MockOps::new(dir.path(), 110);
     let mut forged = signed(serde_json::json!({"type": "abort", "network": "rehearsal", "event_id": "e1"}));
     forged["sig"] = serde_json::json!("00".repeat(64));
-    *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"abort": forged}));
+    *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"abort": forged,
+        "event": signed(serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1"}))}));
     assert_eq!(run_machine(&cfg, &ops), State::Live, "a forged abort must not stop the ceremony");
+}
+
+#[test]
+fn rc29_an_empty_relay_answer_is_not_a_positive_no_abort() {
+    // A relay that lost its store answers 200 `{}`: before chain creation that is "unknown", never "no abort".
+    for doc in [serde_json::json!({}),
+                serde_json::json!({"event": signed(serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e0"}))}),
+                serde_json::json!({"event": signed(serde_json::json!({"type": "event", "network": "other", "event_id": "e1"}))})] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = coord_config(dir.path(), 120, 0, 60);
+        let ops = MockOps::new(dir.path(), 110);
+        *ops.coord_doc.borrow_mut() = Some(doc.clone());
+        // Sealed: STRANDED here (the guard has no fleet view to prove nobody created the chain), never LIVE.
+        assert_eq!(run_machine(&cfg, &ops), State::Stranded, "{doc}");
+        let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+        assert!(text.contains("cannot confirm the event is not aborted"), "{doc}");
+        assert!(!text.contains("\"create_chain\"") && !text.contains("ignite_started"), "nothing irreversible: {doc}");
+    }
+}
+
+#[test]
+fn rc29_no_abort_needs_the_exact_accepted_event_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = coord_config(dir.path(), 120, 0, 60);
+    let _ = base;
+    let text = std::fs::read_to_string(dir.path().join("ceremony-coord.toml")).unwrap();
+    let ev = signed(serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "h": 120}));
+    let other = signed(serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "h": 121}));
+    let hash = pulse_cutover::coord::payload_hash(&ev).unwrap();
+    let path = dir.path().join("ceremony-hash.toml");
+    std::fs::write(&path, text.replace("event_id = \"e1\"\n", &format!("event_id = \"e1\"\nevent_hash = \"{hash}\"\n"))).unwrap();
+    let cfg = Config::load(&path).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"event": other}));
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded, "a re-signed event with another payload is not ours");
+    assert!(!std::fs::read_to_string(&cfg.journal_path).unwrap().contains("ignite_started"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let _ = coord_config(dir.path(), 120, 0, 60);
+    let text = std::fs::read_to_string(dir.path().join("ceremony-coord.toml")).unwrap();
+    let path = dir.path().join("ceremony-hash.toml");
+    std::fs::write(&path, text.replace("event_id = \"e1\"\n", &format!("event_id = \"e1\"\nevent_hash = \"{hash}\"\n"))).unwrap();
+    let cfg = Config::load(&path).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"event": ev}));
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
 }
 
 #[test]
@@ -2171,6 +2219,31 @@ fn resumed_frozen_run_keeps_waiting_for_the_scheduled_snapshot() {
     let snapped: serde_json::Value = text.lines().map(|l| serde_json::from_str(l).unwrap())
         .find(|v: &serde_json::Value| v["state"] == "SNAPSHOTTED" && v["kind"] == "transition").unwrap();
     assert_eq!(snapped["data"]["cut_height"], 120, "cut stays exactly H after a crash");
+}
+
+#[test]
+fn rc29_a_resumed_frozen_run_keeps_the_producer_paused_once_h_is_final() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = sched_config(dir.path());
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    ops.schedule_snapshot(120).unwrap();
+    let entries = [
+        serde_json::json!({"seq": 0, "ts_ms": 1, "ts": "t", "kind": "transition", "state": "ARMED",
+            "data": {"chain_id": hex::encode(CHAIN_ID), "resolved_h": 120}}),
+        serde_json::json!({"seq": 1, "ts_ms": 2, "ts": "t", "kind": "evidence", "state": "ARMED",
+            "data": {"snapshot_scheduled_at": 120}}),
+        serde_json::json!({"seq": 2, "ts_ms": 3, "ts": "t", "kind": "transition", "state": "FROZEN",
+            "data": {"chain_id": hex::encode(CHAIN_ID)}}),
+    ];
+    std::fs::write(&cfg.journal_path, entries.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+    // The crashed agent had paused the producer after H became final.
+    ops.head.set(125);
+    ops.paused.set(true);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("kept_paused_on_resume") && !text.contains("resumed_production_for_snapshot"), "{text}");
+    assert_eq!(ops.resumes.get(), 0, "no old-chain blocks re-produced after H");
 }
 
 #[test]
@@ -2578,7 +2651,7 @@ fn event_quorum_is_never_inherited_and_release_pin_needs_a_plugin() {
     std::fs::write(&src, "journal_path = \"/j\"\n[ceremony]\nrehearsal = true\nfreeze_height = 0\n[snapshot]\nstaged_path = \"/s\"\n[coordination]\nurl = \"https://mc\"\nnetwork = \"testnet\"\nfleet_quorum = 1\n").unwrap();
     let ev = serde_json::json!({"type": "event", "event_id": "e9", "h": 900, "roster": [{"producer": "bp1"}, {"producer": "bp2"}, {"producer": "bp3"}]});
     let out = dir.path().join("d.toml");
-    derived_config(&src, &ev, &out).unwrap();
+    derived_config(&src, &ev, None, &out).unwrap();
     let d: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
     assert_eq!(d["coordination"]["fleet_quorum"].as_integer(), Some(3), "no event quorum = all roster members, not the local 1");
 
@@ -5582,4 +5655,117 @@ fn rc24_a_short_of_quorum_fleet_view_is_waited_out_within_the_grace() {
     assert_eq!(run_machine(&cfg, &ops), State::Live);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
     assert!(text.contains("degraded_fleet_short") && !text.contains("HALTED"), "{text}");
+}
+
+/// rc.29: the journal of an agent killed at VERIFIED (e.g. by `cutover.sh abort`): a stranded run's journal cut
+/// before its first error record. The mock keeps the source paused, as the killed agent left it.
+fn rc29_killed_at_verified(d: &std::path::Path, cfg: &Config, ops: &MockOps) {
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp2", serde_json::json!({"state": "IGNITED", "ignition_started": true})),
+        ("bp3", serde_json::json!({"state": "VERIFIED"})), ("bp4", serde_json::json!({"state": "VERIFIED"})), ("bp5", serde_json::json!({"state": "VERIFIED"}))]));
+    assert_eq!(run_machine(cfg, ops), State::Stranded);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let kept: Vec<&str> = text.lines().take_while(|l| !l.contains("\"kind\":\"error\"")).collect();
+    assert!(kept.last().unwrap().contains("\"state\":\"VERIFIED\""), "{kept:?}");
+    std::fs::write(&cfg.journal_path, kept.join("\n") + "\n").unwrap();
+    let _ = d;
+    assert!(ops.paused.get());
+}
+
+#[test]
+fn rc29_operator_rollback_from_verified_runs_the_resume_guard() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    rc29_killed_at_verified(d.path(), &cfg, &ops);
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert_eq!(rec.state, Some(State::Verified));
+    // bp2 ignited: a plain rollback must not resume the old chain. The node is stranded instead (sealed).
+    let err = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).unwrap_err();
+    assert!(err.starts_with("refusing") && err.contains("bp2 was reported past chain creation") && err.contains("STRANDED"), "{err}");
+    assert_eq!(ops.resumes.get(), 0, "the old chain is NOT resumed");
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "writes stay frozen");
+    assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["state"], "STRANDED");
+    // --force-stranded remains the operator's journaled override.
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, true).unwrap();
+    assert_eq!((out.state, ops.resumes.get()), (State::Aborted, 1));
+}
+
+#[test]
+fn rc29_operator_rollback_from_verified_resumes_when_the_guard_passes() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    rc29_killed_at_verified(d.path(), &cfg, &ops);
+    // Every peer before chain creation and the quorum unreachable without this node.
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp1", serde_json::json!({"state": "VERIFIED", "aborting": true})),
+        ("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
+        ("bp4", serde_json::json!({"state": "VERIFIED"})), ("bp5", serde_json::json!({"state": "FROZEN"}))]));
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).unwrap();
+    assert_eq!((out.state, ops.resumes.get()), (State::Aborted, 1), "{:?}", out.notes);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("\"abort_intent\":true") && text.contains("own_report_withdrawn"), "two-pass guard: {text}");
+}
+
+#[test]
+fn rc29_auto_rollback_off_still_runs_the_guard_and_keeps_writes_frozen() {
+    let d = tempfile::tempdir().unwrap();
+    let base = rc23_fleet_config(d.path());
+    let _ = base;
+    let text = std::fs::read_to_string(d.path().join("fleet.toml")).unwrap();
+    let text = text.replacen("[target]\n", "[target]\nauto_rollback = false\n", 1);
+    let cfg = load_toml(d.path(), "fleet-noauto.toml", &text).unwrap();
+    assert!(!cfg.target.auto_rollback);
+    let ops = MockOps::new(d.path(), 110);
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp2", serde_json::json!({"state": "IGNITED", "ignition_started": true})),
+        ("bp3", serde_json::json!({"state": "VERIFIED"})), ("bp4", serde_json::json!({"state": "VERIFIED"})), ("bp5", serde_json::json!({"state": "VERIFIED"}))]));
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded, "auto_rollback = false no longer skips the guard");
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "on_abort did not reopen writes");
+    assert_eq!(ops.resumes.get(), 0);
+}
+
+#[test]
+fn rc29_an_agent_abort_records_its_intent_before_resuming() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    // Peers aborted: the agent's own abort (fleet gate short) passes the guard and resumes.
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
+        ("bp4", serde_json::json!({"state": "FROZEN"})), ("bp5", serde_json::json!({"state": "FROZEN"}))]));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let intent = text.find("\"by\":\"agent_abort\"").expect("intent journaled");
+    let resumed = text.find("\"rollback_step\":\"resume\"").expect("resume step journaled");
+    assert!(intent < resumed, "intent before the first rollback step");
+    // A crash right after the resume step: replay must refuse to carry on the ceremony.
+    let kept: Vec<&str> = text.lines().take_while(|l| !l.contains("\"rollback_step\":\"resume\"")).chain(
+        text.lines().filter(|l| l.contains("\"rollback_step\":\"resume\""))).collect();
+    std::fs::write(&cfg.journal_path, kept.join("\n") + "\n").unwrap();
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("refusing to run") && err.contains("rollback_requested"), "{err}");
+    // And `rollback` finishes it without re-running the guard (the source was already resumed).
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).unwrap();
+    assert_eq!(out.state, State::Aborted);
+}
+
+#[test]
+fn rc29_fork_backend_rehashes_the_staged_snapshot_before_ignition() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    // Crash at VERIFIED (before ignite_started), then another file lands at staged_path.
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let kept: Vec<&str> = text.lines().take_while(|l| !l.contains("ignite_started")).collect();
+    assert!(kept.iter().any(|l| l.contains("\"kind\":\"transition\"") && l.contains("\"state\":\"VERIFIED\"")));
+    std::fs::write(&cfg.journal_path, kept.join("\n") + "\n").unwrap();
+    std::fs::write(&cfg.snapshot.staged_path, b"another ceremony's snapshot").unwrap();
+    let ops = MockOps::new(dir.path(), 125);
+    ops.paused.set(true);
+    let st = run_machine(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("staged snapshot does not match the artifact this ceremony verified"), "{st:?} {text}");
+    assert!(!text.contains("ignite_started"), "never ignited");
 }

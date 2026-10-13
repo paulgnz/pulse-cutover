@@ -33,7 +33,8 @@ function setup(netExtra = {}) {
   return dir;
 }
 function start(dir) {
-  const proc = spawn(process.execPath, [join(HERE, '..', 'server.js')], { env: { ...process.env, PORT: '0', MC_OFFLINE: '1',
+  mkdirSync(join(dir, 'state'), { recursive: true }); writeFileSync(join(dir, 'state', 'admin.token'), ADMIN_TOKEN);
+  const proc = spawn(process.execPath, [join(HERE, '..', 'server.js')], { env: { ...process.env, ADMIN_TOKEN_FILE: join(dir, 'state', 'admin.token'), PORT: '0', MC_OFFLINE: '1',
     NETWORKS: join(dir, 'networks.json'), TOKENS: join(dir, 'tokens.json'), COORD_FILE: join(dir, 'state', 'coord.json') } });
   procs.push(proc);
   return new Promise((ok, ko) => {
@@ -72,6 +73,9 @@ test('a new instance for a token whose old instance went silent replaces it (no 
 
 // ---- fleet verdict --------------------------------------------------------------------------------------
 import { fleetVerdict, projectReport } from '../lib.mjs';
+// rc.29: admin endpoints need the admin token as well as loopback.
+const ADMIN_TOKEN = 'test-admin-token-0123456789';
+const ADMIN_H = { authorization: `Bearer ${ADMIN_TOKEN}` };
 const AFTER = 'a1'.repeat(32), OTHER = 'b2'.repeat(32), BID = 'TargetChainAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', BID2 = 'TargetChainBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
 const ce = (state, over = {}) => ({ state, since: null, seq: 1, transitions: [], evidence: {}, ...over });
 const tgt = (head, after = AFTER, bid = BID) => ({ blockchain_id: bid, subnet_id: null, chain_id: null, head, head_id: null, after_cut_id: after });
@@ -94,7 +98,12 @@ test('fleet verdict: LIVE needs a quorum of roster members LIVE on one chain wit
   assert.notEqual(v.verdict, 'LIVE');
   // pre-creation and symmetric abort
   assert.equal(fleetVerdict(ev(), fleetOf({ bpa: ce('VERIFIED'), bpb: ce('FROZEN') })).verdict, 'PENDING');
-  assert.equal(fleetVerdict(ev(), fleetOf({ bpa: ce('ABORTED', { rollback_complete: true }), bpb: ce('ABORTED', { rollback_complete: true }) })).verdict, 'ABORTED');
+  // rc.29: a fleet-wide ABORTED needs every roster member present and fresh (2 of 5 is PENDING, the rest unaccounted).
+  const ab = () => ce('ABORTED', { rollback_complete: true });
+  v = fleetVerdict(ev(), fleetOf({ bpa: ab(), bpb: ab() }));
+  assert.equal(v.verdict, 'PENDING');
+  assert.ok(v.not_live.includes('bpc: no report'), JSON.stringify(v.not_live));
+  assert.equal(fleetVerdict(ev(), fleetOf({ bpa: ab(), bpb: ab(), bpc: ab(), bpd: ab(), bpe: ab() })).verdict, 'ABORTED');
   // no roster: never LIVE
   assert.equal(fleetVerdict(ev({ roster: undefined, quorum: undefined }), fleetOf({ bpa: live(1005) })).verdict, 'DEGRADED');
 });
@@ -183,8 +192,8 @@ test('r4 with the resumer SILENT before it aborted: the old chain advancing past
   n = await net(base);
   assert.equal(n.fleet.verdict, 'SPLIT');
   assert.equal(n.fleet.latched, true);
-  assert.equal((await fetch(`${base}/api/admin/clear-split?net=testnet`, { method: 'POST', headers: { 'x-real-ip': '203.0.113.9' } })).status, 403);
-  assert.equal((await fetch(`${base}/api/admin/clear-split?net=testnet`, { method: 'POST' })).status, 200);
+  assert.equal((await fetch(`${base}/api/admin/clear-split?net=testnet`, { method: 'POST', headers: { ...ADMIN_H, 'x-real-ip': '203.0.113.9' } })).status, 403);
+  assert.equal((await fetch(`${base}/api/admin/clear-split?net=testnet`, { method: 'POST', headers: ADMIN_H })).status, 200);
   n = await net(base);
   assert.notEqual(n.fleet.verdict, 'SPLIT');
   // The high-water mark is published for the agents.

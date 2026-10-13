@@ -12,6 +12,9 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { safeRequest } from '../lib.mjs';
+// rc.29: admin endpoints need the admin token as well as loopback.
+const ADMIN_TOKEN = 'test-admin-token-0123456789';
+const ADMIN_H = { authorization: `Bearer ${ADMIN_TOKEN}` };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CHAIN = '71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd';
@@ -33,7 +36,8 @@ function setup({ roster = false, extraNets = [] } = {}) {
   return dir;
 }
 function start(dir) {
-  const proc = spawn(process.execPath, [join(HERE, '..', 'server.js')], { env: { ...process.env, PORT: '0', MC_OFFLINE: '1',
+  mkdirSync(join(dir, 'state'), { recursive: true }); writeFileSync(join(dir, 'state', 'admin.token'), ADMIN_TOKEN);
+  const proc = spawn(process.execPath, [join(HERE, '..', 'server.js')], { env: { ...process.env, ADMIN_TOKEN_FILE: join(dir, 'state', 'admin.token'), PORT: '0', MC_OFFLINE: '1',
     NETWORKS: join(dir, 'networks.json'), TOKENS: join(dir, 'tokens.json'), COORD_FILE: join(dir, 'state', 'coord.json') } });
   procs.push(proc);
   return new Promise((ok, ko) => {
@@ -142,7 +146,7 @@ test('#5 clearing one of three conflicting instances leaves the other two in con
   let p = await pnz(base);
   assert.equal(p.beacons.length, 3);
   const sid = p.beacons[0].sid;
-  const r = await fetch(`${base}/api/admin/clear-server?net=testnet&producer=protonnz&sid=${sid}`, { method: 'POST' });
+  const r = await fetch(`${base}/api/admin/clear-server?net=testnet&producer=protonnz&sid=${sid}`, { method: 'POST', headers: ADMIN_H });
   assert.equal(r.status, 200);
   p = await pnz(base);
   assert.equal(p.beacons.length, 2);

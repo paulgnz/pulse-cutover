@@ -11,7 +11,10 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
-import { fleetVerdict, movementArmed, nextEventMark, stateRank, PAUSED_RANK } from '../lib.mjs';
+import { fleetVerdict, movementArmed, nextEventMark, stateRank, PAUSED_RANK, silentAfterMs } from '../lib.mjs';
+// rc.29: admin endpoints need the admin token as well as loopback.
+const ADMIN_TOKEN = 'test-admin-token-0123456789';
+const ADMIN_H = { authorization: `Bearer ${ADMIN_TOKEN}` };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CHAIN = '71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd';
@@ -34,7 +37,8 @@ function setup() {
   return dir;
 }
 function start(dir, extraEnv = {}) {
-  const proc = spawn(process.execPath, [join(HERE, '..', 'server.js')], { env: { ...process.env, ...extraEnv, PORT: '0', MC_OFFLINE: '1',
+  mkdirSync(join(dir, 'state'), { recursive: true }); writeFileSync(join(dir, 'state', 'admin.token'), ADMIN_TOKEN);
+  const proc = spawn(process.execPath, [join(HERE, '..', 'server.js')], { env: { ...process.env, ADMIN_TOKEN_FILE: join(dir, 'state', 'admin.token'), ...extraEnv, PORT: '0', MC_OFFLINE: '1',
     NETWORKS: join(dir, 'networks.json'), TOKENS: join(dir, 'tokens.json'), COORD_FILE: join(dir, 'state', 'coord.json') } });
   procs.push(proc);
   return new Promise((ok, ko) => {
@@ -68,7 +72,7 @@ function reporter(base, startTs) {
   };
 }
 const evlog = async (base, p = 'bpa') => (await net(base)).producers.find((x) => x.name === p).creation_evidence;
-const retire = (base, q) => fetch(`${base}/api/admin/retire-evidence?net=testnet&producer=bpa&${q}`, { method: 'POST' });
+const retire = (base, q) => fetch(`${base}/api/admin/retire-evidence?net=testnet&producer=bpa&${q}`, { method: 'POST', headers: ADMIN_H });
 
 test('rc.28: evidence survives instance replacement, a fresh ABORTED and a restart; only a local operator retires it, by id', async () => {
   const dir = setup();
@@ -87,12 +91,17 @@ test('rc.28: evidence survives instance replacement, a fresh ABORTED and a resta
   ({ base, proc } = await start(dir));
   assert.equal((await evlog(base)).obs.length, 1, 'persisted');
   assert.equal((await retire(base, 'id=1').then((r) => r.status)), 200);
-  assert.equal((await fetch(`${base}/api/admin/retire-evidence?net=testnet&producer=bpa&id=1`, { method: 'POST', headers: { 'x-real-ip': '1.2.3.4' } })).status, 403);
+  assert.equal((await fetch(`${base}/api/admin/retire-evidence?net=testnet&producer=bpa&id=1`, { method: 'POST', headers: { ...ADMIN_H, 'x-real-ip': '1.2.3.4' } })).status, 403);
   assert.equal((await retire(base, 'h=999')).status, 400, 'by id only');
   assert.equal((await retire(base, 'id=1')).status, 404, 'already retired');
   n = await net(base);
   assert.equal(n.producers.find((p) => p.name === 'bpa').creation_evidence.obs.length, 0);
-  assert.equal(n.fleet.verdict, 'ABORTED');
+  // rc.29: ABORTED needs every member fresh: the reports above are a minute old by now, so refresh them.
+  const now = reporter(base, Date.now());
+  for (const p of BPS.slice(1)) assert.equal((await now(p, 'ev-1', { state: 'ABORTED', evidence: { h: CUT } }, 'c')).status, 200);
+  assert.equal((await now('bpa', 'ev-1', { state: 'ABORTED', evidence: { h: CUT } }, 'b')).status, 200);
+  n = await net(base);
+  assert.equal(n.fleet.verdict, 'ABORTED', JSON.stringify(n.fleet));
   await kill(proc);
 });
 
@@ -239,4 +248,42 @@ test('rc.28 verification: a coordination write that committed despite an error (
   const c = await (await fetch(`${base}/api/coord/testnet`)).json();
   assert.ok(JSON.stringify(c).includes('abort'), 'restart serves the abort');
   await kill(proc);
+});
+
+// ---- rc.29 ----------------------------------------------------------------------------------------------------
+test('rc.29: admin endpoints need the admin token, even from loopback', async () => {
+  const dir = setup();
+  const { base, proc } = await start(dir);
+  const url = `${base}/api/admin/retire-evidence?net=testnet&producer=bpa&id=1`;
+  assert.equal((await fetch(url, { method: 'POST' })).status, 403, 'no token');
+  assert.equal((await fetch(url, { method: 'POST', headers: { authorization: 'Bearer wrong-token-0123456789' } })).status, 403, 'wrong token');
+  assert.equal((await fetch(url, { method: 'POST', headers: ADMIN_H })).status, 404, 'token accepted (no such evidence)');
+  await kill(proc);
+  // No token file (or a short one): admin is disabled.
+  writeFileSync(join(dir, 'state', 'short.token'), 'short');
+  const s = await start(dir, { ADMIN_TOKEN_FILE: join(dir, 'state', 'short.token') });
+  const r = await fetch(`${s.base}/api/admin/retire-evidence?net=testnet&producer=bpa&id=1`, { method: 'POST', headers: { authorization: 'Bearer short' } });
+  assert.equal(r.status, 403);
+  assert.match((await r.json()).error, /admin endpoints disabled/);
+  await kill(s.proc);
+});
+
+test('rc.29: an observation with unknown H (h null, e.g. migrated) blocks a new event until retired', () => {
+  const rep = (state) => ({ coord: { event_id: 'ev-2' }, ceremony: { state, evidence: { h: CUT } }, interval_secs: 10 });
+  const by = Object.fromEntries(BPS.map((p) => [p, [{ report: rep('ABORTED'), silent: false, conflict: false }]]));
+  const ev = { event_id: 'ev-2', h: CUT, roster: BPS.map((producer) => ({ producer })), quorum: 4 };
+  assert.equal(fleetVerdict(ev, by, {}, {}).verdict, 'ABORTED');
+  const migrated = { seq: 1, overflow: false, obs: [{ id: 1, event_id: 'ev-old', h: null, state: 'LIVE', migrated: 'rc.27 past_create mark' }] };
+  const v = fleetVerdict(ev, by, {}, { bpa: migrated });
+  assert.notEqual(v.verdict, 'ABORTED', JSON.stringify(v));
+  assert.equal(v.members.find((m) => m.producer === 'bpa').past_create, true);
+  // A known, different H does not block (it is surfaced instead).
+  const other = { seq: 1, overflow: false, obs: [{ id: 1, event_id: 'ev-old', h: CUT - 5, state: 'LIVE' }] };
+  assert.equal(fleetVerdict(ev, by, {}, { bpa: other }).members.find((m) => m.producer === 'bpa').past_create, false);
+});
+
+test('rc.29: a beacon cannot stretch its own silence window past 10 minutes', () => {
+  assert.equal(silentAfterMs({ interval_secs: 3600 }), 600e3);
+  assert.equal(silentAfterMs({ interval_secs: 10 }), 45e3);
+  assert.equal(silentAfterMs({ interval_secs: 60 }), 180e3);
 });

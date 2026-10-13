@@ -12,6 +12,9 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { safeRequest, projectReport, endpointId, endpointRef, endpointFromRef, isAppRoute } from '../lib.mjs';
+// rc.29: admin endpoints need the admin token as well as loopback.
+const ADMIN_TOKEN = 'test-admin-token-0123456789';
+const ADMIN_H = { authorization: `Bearer ${ADMIN_TOKEN}` };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CHAIN = '71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd';
@@ -30,7 +33,8 @@ function setup() {
   return dir;
 }
 function start(dir, coordFile = join(dir, 'state', 'coord.json')) {
-  const proc = spawn(process.execPath, [join(HERE, '..', 'server.js')], { env: { ...process.env, PORT: '0', MC_OFFLINE: '1',
+  mkdirSync(join(dir, 'state'), { recursive: true }); writeFileSync(join(dir, 'state', 'admin.token'), ADMIN_TOKEN);
+  const proc = spawn(process.execPath, [join(HERE, '..', 'server.js')], { env: { ...process.env, ADMIN_TOKEN_FILE: join(dir, 'state', 'admin.token'), PORT: '0', MC_OFFLINE: '1',
     NETWORKS: join(dir, 'networks.json'), TOKENS: join(dir, 'tokens.json'), COORD_FILE: coordFile } });
   procs.push(proc);
   return new Promise((ok, ko) => {
@@ -154,7 +158,7 @@ test('one token on two machines: both kept and flagged; loopback-only operator c
   const sid = p.beacons[1].sid;
   assert.match(sid, /^[0-9a-f]{16}$/);
   assert.equal((await fetch(`${base}/api/node/testnet/protonnz/${sid}`)).status, 200);
-  const clear = (h = {}) => fetch(`${base}/api/admin/clear-server?net=testnet&producer=protonnz&sid=${sid}`, { method: 'POST', headers: h });
+  const clear = (h = {}) => fetch(`${base}/api/admin/clear-server?net=testnet&producer=protonnz&sid=${sid}`, { method: 'POST', headers: { ...ADMIN_H, ...h } });
   assert.equal((await clear({ 'x-real-ip': '203.0.113.9' })).status, 403, 'anything that came through the proxy is refused');
   assert.equal((await clear()).status, 200);
   p = (await (await fetch(`${base}/api/status`)).json()).networks[0].producers.find((x) => x.name === 'protonnz');

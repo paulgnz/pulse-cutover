@@ -13,7 +13,7 @@
 // MC_OFFLINE=1 disables all outbound polling (tests). PORT=0 picks a free port (printed on start).
 import http from 'node:http';
 import net from 'node:net';
-import { createHash, createPublicKey, verify as edVerify } from 'node:crypto';
+import { createHash, createPublicKey, verify as edVerify, timingSafeEqual } from 'node:crypto';
 import { readFileSync, existsSync, watchFile, renameSync, mkdirSync, openSync, writeSync, fsyncSync, closeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +29,9 @@ const COORD_FILE = process.env.COORD_FILE || '/var/lib/pulse-control/coord.json'
 const REPLAY_FILE = process.env.REPLAY_FILE || join(dirname(COORD_FILE), 'replay.json'); // rc.6 format, migrated on start
 const STATE_FILE = process.env.STATE_FILE || join(dirname(COORD_FILE), 'servers.json');
 const OFFLINE = process.env.MC_OFFLINE === '1';
+// rc.29: the admin endpoints (which can retire resume-blocking evidence) need a bearer token from this file on top of the
+// loopback rule, so a reverse proxy that forgets X-Real-IP, or another local process, cannot call them.
+const ADMIN_TOKEN_FILE = process.env.ADMIN_TOKEN_FILE || join(dirname(COORD_FILE), 'admin.token');
 const MAX_BODY = 256 * 1024;
 const TS_FUTURE_MS = 2 * 60e3, TS_PAST_MS = 5 * 60e3;
 
@@ -37,6 +40,17 @@ process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e?.
 process.on('uncaughtException', (e) => console.error('uncaughtException:', e?.stack || e));
 
 const sha = (s) => createHash('sha256').update(s).digest('hex');
+/** Local operator AND the admin token (read per call, so it can be rotated without a restart). null = allowed. */
+function adminRefusal(req) {
+  const sock = normIp(req.socket.remoteAddress);
+  if (!(sock === '127.0.0.1' || sock === '::1') || req.headers['x-real-ip'] || req.headers['x-forwarded-for']) return 'local operator only';
+  let want;
+  try { want = readFileSync(ADMIN_TOKEN_FILE, 'utf8').trim(); } catch { want = ''; }
+  if (want.length < 16) return `admin endpoints disabled: no admin token in ${ADMIN_TOKEN_FILE} (16+ characters)`;
+  const got = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  const a = Buffer.from(sha(got), 'hex'), b = Buffer.from(sha(want), 'hex');
+  return got && timingSafeEqual(a, b) ? null : 'admin token required (Authorization: Bearer <token>)';
+}
 const dict = () => Object.create(null);
 // Deep copy into null-prototype maps (keys like "constructor" or "__proto__" can never resolve to Object.prototype).
 const clone = (o) => JSON.parse(JSON.stringify(o), (k, v) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.assign(dict(), v) : v));
@@ -549,7 +563,10 @@ function serverSnapshot(override, lastOverride, emOverride, evOverride) {
   if (emOverride) (em[emOverride[0]] ||= {})[emOverride[1]] = emOverride[2]; // the producer's whole per-event map
   const evd = JSON.parse(JSON.stringify(evidence));
   if (evOverride) (evd[evOverride[0]] ||= {})[evOverride[1]] = evOverride[2]; // the producer's whole evidence log
-  const out = { v: 1, lastTs: { ...lastTs, ...(lastOverride || {}) }, nodes: {}, event_max: em, evidence: evd };
+  // rc.29: a watermark older than the freshness window can never matter (such reports are refused as too old): not kept.
+  const cutoff = Date.now() - TS_PAST_MS;
+  const ts = Object.fromEntries(Object.entries({ ...lastTs, ...(lastOverride || {}) }).filter(([, v]) => v >= cutoff));
+  const out = { v: 1, lastTs: ts, nodes: {}, event_max: em, evidence: evd };
   const put = (netId, prod, byKey) => { const o = ((out.nodes[netId] ||= {})[prod] = {});
     for (const [k, e] of Object.entries(byKey)) o[k] = { report: e.report, received: e.received, first_seen: e.first_seen, instance_id: e.instance_id ?? null, conflict: !!e.conflict }; };
   for (const [netId, prods] of Object.entries(nodes)) for (const [prod, byKey] of Object.entries(prods)) {
@@ -586,7 +603,7 @@ function compatMarks(marks, log, current) {
     // The current event gets the whole rc.28 blocking set (review): same-H observations of other events and
     // unattributed ones, which an rc.27 agent would otherwise not see under its event id.
     if (current?.event_id && o.event_id !== current.event_id
-      && (!o.event_id || (Number.isInteger(current.h) && o.h === current.h))) put(current.event_id, o);
+      && (!o.event_id || o.h === null || o.h === undefined || (Number.isInteger(current.h) && o.h === current.h))) put(current.event_id, o);
   }
   if (log.overflow) {
     if (current?.event_id) out[current.event_id] ||= { past_create: false, state: null, at: 0 };
@@ -957,8 +974,8 @@ async function handle(req, res) {
   }
   if (req.method === 'POST' && path === '/api/admin/clear-split') {
     // Operator-only (same rule as clear-server): clears a latched fleet SPLIT once it has been resolved.
-    const sock = normIp(req.socket.remoteAddress);
-    if (!(sock === '127.0.0.1' || sock === '::1') || req.headers['x-real-ip'] || req.headers['x-forwarded-for']) return send(res, 403, { error: 'local operator only' });
+    const refused = adminRefusal(req);
+    if (refused) return send(res, 403, { error: refused });
     const netId = url.searchParams.get('net');
     if (!RE.net.test(netId || '') || !own(coord, netId) || !coord[netId].split_latch) return send(res, 404, { error: 'no latched split for that network' });
     const next = clone(coord); delete next[netId].split_latch;
@@ -970,8 +987,8 @@ async function handle(req, res) {
   if (req.method === 'POST' && path === '/api/admin/retire-evidence') {
     // Operator-only (rc.28): retire ONE creation-evidence observation by its id (or the overflow flag with
     // overflow=1), AFTER checking that target is fenced (stopped / untracked). Every other observation keeps blocking.
-    const sock = normIp(req.socket.remoteAddress);
-    if (!(sock === '127.0.0.1' || sock === '::1') || req.headers['x-real-ip'] || req.headers['x-forwarded-for']) return send(res, 403, { error: 'local operator only' });
+    const refused = adminRefusal(req);
+    if (refused) return send(res, 403, { error: refused });
     const netId = url.searchParams.get('net'), prod = url.searchParams.get('producer'), idq = url.searchParams.get('id'), ov = url.searchParams.get('overflow') === '1';
     if (!RE.net.test(netId || '') || !RE.producer.test(prod || '') || !(ov || /^\d{1,12}$/.test(idq || ''))) return send(res, 400, { error: 'need ?net=&producer=&id=<observation id> (or &overflow=1)' });
     const log = evidence[netId]?.[prod];
@@ -1002,8 +1019,8 @@ async function handle(req, res) {
   if (req.method === 'POST' && path === '/api/admin/clear-server') {
     // Operator-only, from the box itself: the reverse proxy always sets X-Real-IP, so a request that arrives on
     // loopback WITHOUT it came from a local shell (curl on the mission-control host), never from the internet.
-    const sock = normIp(req.socket.remoteAddress);
-    if (!(sock === '127.0.0.1' || sock === '::1') || req.headers['x-real-ip'] || req.headers['x-forwarded-for']) return send(res, 403, { error: 'local operator only' });
+    const refused = adminRefusal(req);
+    if (refused) return send(res, 403, { error: refused });
     const netId = url.searchParams.get('net'), prod = url.searchParams.get('producer'), sid = url.searchParams.get('sid');
     if (!RE.net.test(netId || '') || !RE.producer.test(prod || '') || !RE.sid.test(sid || '')) return send(res, 400, { error: 'need ?net=&producer=&sid=' });
     const byKey = nodes[netId]?.[prod]; const hit = byKey && Object.keys(byKey).find((k) => sidOf(k) === sid);
@@ -1068,7 +1085,8 @@ async function handle(req, res) {
     const evFor = evNow && evNow.event_id === evId ? evNow : {};
     // A journal armed for another H is not this event's evidence (ceremonyFor): it never raises the event's mark.
     const ce = ceremonyFor(r, evFor);
-    if (evId && ce && (r.role || 'producer') === 'producer' && !reservedKey(evId) && signedEvent(r.network, evId)) {
+    // rc.29: marks and the evidence log take every role (the agent counts any role's report for a roster member).
+    if (evId && ce && !reservedKey(evId) && signedEvent(r.network, evId)) {
       const mine = eventMax[r.network]?.[r.producer] || {};
       const cur = mine[evId];
       const marks = dict();
@@ -1084,7 +1102,7 @@ async function handle(req, res) {
       }
     }
     // rc.28: every accepted past-creation report is an observation in the producer's creation-evidence log.
-    const evNext = (r.role || 'producer') === 'producer' ? nextEvidence(evidence[r.network]?.[r.producer], r, now) : null;
+    const evNext = nextEvidence(evidence[r.network]?.[r.producer], r, now);
     if (!commitServers([r.network, r.producer, byKey], { [key]: ts }, em ? [r.network, r.producer, em] : null, evNext ? [r.network, r.producer, evNext] : null)) return send(res, 503, { error: stateUncertain ? 'server state uncertain after a failed write: not accepted; mission control must be restarted' : 'could not persist the report; not accepted, retry' });
     if (evNext) {
       (evidence[r.network] ||= dict())[r.producer] = evNext;
@@ -1095,6 +1113,7 @@ async function handle(req, res) {
     (nodes[r.network] ||= dict())[r.producer] = byKey;
     if (em) (eventMax[r.network] ||= dict())[r.producer] = em;
     lastTs[key] = ts;
+    for (const [k, v] of Object.entries(lastTs)) if (v < now - TS_PAST_MS) delete lastTs[k];
     const label = servers(r.network, r.producer).find((s) => s.key === key)?.label || r.node;
     const who = Object.keys(byKey).length > 1 || r.node ? `${r.producer} · ${label}` : r.producer;
     if (replaced.length) pushEvent(r.network, who, `replaced ${replaced.length} silent instance${replaced.length > 1 ? 's' : ''} of this beacon token (new instance id; the old one stopped reporting)`);

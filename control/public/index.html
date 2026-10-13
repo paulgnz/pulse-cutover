@@ -51,6 +51,8 @@ header{position:sticky;top:0;z-index:20;backdrop-filter:saturate(140%) blur(14px
 .switch button:focus-visible{outline:2px solid var(--pvm);outline-offset:2px}
 .switch .pill{position:absolute;z-index:0;top:4px;bottom:4px;border-radius:999px;background:linear-gradient(135deg,rgba(245,165,36,.18),rgba(139,92,246,.28));box-shadow:inset 0 0 0 1px rgba(255,255,255,.09);transition:left .45s cubic-bezier(.2,.8,.2,1),width .45s cubic-bezier(.2,.8,.2,1)}
 .sd{width:8px;height:8px;border-radius:50%;background:var(--dim)}
+#stale{position:sticky;top:0;z-index:50;padding:10px 16px;background:var(--bad);color:#111;font-weight:600;text-align:center}
+body.is-stale main,body.is-stale .fleet{opacity:.45;filter:grayscale(1)}
 .sd.ok{background:var(--ok)}.sd.warn{background:var(--warn)}.sd.bad{background:var(--bad)}
 .count{font:600 11px var(--mono);color:var(--muted);padding:2px 7px;border-radius:99px;background:rgba(255,255,255,.05)}
 
@@ -1216,15 +1218,31 @@ async function renderPage() {
 }
 
 let lastHead = {};
+// rc.29: after a few failed polls (including the relay's 503 while its state is uncertain) the page says the view is
+// stale instead of quietly showing the last verdict as current.
+let fails = 0, lastOk = null;
+function staleBanner(msg) {
+  let b = document.getElementById('stale');
+  if (!msg) { if (b) b.remove(); document.body.classList.remove('is-stale'); return; }
+  if (!b) { b = document.createElement('div'); b.id = 'stale'; document.body.prepend(b); }
+  b.textContent = msg; document.body.classList.add('is-stale');
+}
 async function poll() {
   try {
-    data = await (await fetch('/api/status', { cache: 'no-store' })).json();
+    const r = await fetch('/api/status', { cache: 'no-store' });
+    if (!r.ok) { let e = ''; try { e = (await r.json()).error || ''; } catch {} throw new Error(`HTTP ${r.status}${e ? ': ' + e : ''}`); }
+    data = await r.json();
+    fails = 0; lastOk = Date.now(); staleBanner(null);
     const n = data.networks.find((x) => x.id === (active || data.networks[0].id));
     if (n?.chain?.head && lastHead[n.id] && n.chain.head > lastHead[n.id]) fireBlock(n.chain.head_producer);
     if (n?.chain?.head) lastHead[n.id] = n.chain.head;
     render(); renderPage();
     $('clock').textContent = new Date(data.generated_at).toISOString().slice(11, 19) + ' UTC';
-  } catch { $('clock').textContent = 'reconnecting'; }
+  } catch (e) {
+    $('clock').textContent = 'reconnecting';
+    if (++fails >= 3) staleBanner(`STALE: mission control is not answering (${e.message || 'network error'}). Nothing below is current`
+      + (lastOk ? ` — last good data ${new Date(lastOk).toISOString().slice(11, 19)} UTC.` : '.'));
+  }
 }
 poll(); setInterval(poll, 2000);
 </script>

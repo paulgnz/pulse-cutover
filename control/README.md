@@ -37,6 +37,10 @@ NETWORKS=control/networks.json TOKENS=/etc/pulse-control/tokens.json COORD_FILE=
   PORT=8787 node control/server.js
 # behind nginx/caddy with TLS; it binds 127.0.0.1 only. The proxy MUST overwrite X-Real-IP with the client address
 # (nginx: proxy_set_header X-Real-IP $remote_addr;) — /api/reach trusts that header only from loopback.
+# rc.29: the /api/admin/* endpoints also need a bearer token (16+ characters) from ADMIN_TOKEN_FILE (default:
+# admin.token next to COORD_FILE; mode 600). Without it they are disabled (403). Create it once:
+#   umask 077; openssl rand -hex 32 > /var/lib/pulse-control/admin.token
+# and call them as: curl -X POST -H "Authorization: Bearer $(cat /var/lib/pulse-control/admin.token)" 'http://127.0.0.1:8787/api/admin/…'
 node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random port, temp config)
 ```
 
@@ -83,8 +87,9 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   servers never count as prepared and their evidence never counts toward agreement (shown as `conflicted`).
 - **Operator clear** (identity conflicts): removes only the selected instance; the token's remaining instances stay
   flagged while more than one remains. On the mission-control host itself,
-  `curl -X POST 'http://127.0.0.1:8787/api/admin/clear-server?net=<net>&producer=<acct>&sid=<sid>'`. Accepted only on
-  loopback without `X-Real-IP`/`X-Forwarded-For`, i.e. never through the public proxy (which always sets X-Real-IP).
+  `curl -X POST -H "Authorization: Bearer $(cat /var/lib/pulse-control/admin.token)" 'http://127.0.0.1:8787/api/admin/clear-server?net=<net>&producer=<acct>&sid=<sid>'`.
+  Accepted only on loopback without `X-Real-IP`/`X-Forwarded-For`, i.e. never through the public proxy (which always sets
+  X-Real-IP), AND with the admin token (rc.29; every `/api/admin/*` call below needs the same header).
 - **Fleet verdict and the latched SPLIT** (rc.23): `/api/status` carries `fleet` per network for the current event
   (LIVE / STALLED / DEGRADED / SPLIT / STRANDED / ABORTED / PENDING, plus `warnings`, see `fleetVerdict` in `lib.mjs`) and, per producer, `event_max`: the
   highest stage each producer reported per event id (only raised, kept across restarts in `servers.json`; the agents'
@@ -105,12 +110,13 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   producer's log (`creation_evidence` in `/api/status`: `{seq, obs: [{id, event_id, h, state, instance_id, target_bid,
   after_cut_id, at}], overflow}`), whether or not its event is published, whatever its H. Persisted with the server
   state, never trimmed, never changed by later reports; 128 observations per producer, then `overflow` (blocks).
-  Agents block a resume on any observation for their event; the board warns on another-H observations or overflow.
+  Agents block a resume on any observation for their event (and, rc.29, on any observation whose H is unknown, e.g.
+  every mark migrated from rc.27: retire those by id before reusing the network); the board warns on another-H observations or overflow.
   Marks (`event_max`) are progress bookkeeping only, kept for coordinator-signed events. After confirming THAT target is
   fenced, retire exactly one observation on the mission-control host:
   `curl -X POST 'http://127.0.0.1:8787/api/admin/retire-evidence?net=<net>&producer=<bp>&id=<id>'` (`&overflow=1` for the
   flag; loopback only, like clear-split). What blocks an event: its own observations (any H), any event's observations
-  at the SAME H (an unfenced earlier target at this cut), and unattributed ones (no event id: quarantined, block every
+  at the SAME H (an unfenced earlier target at this cut) or at an unknown H (rc.29), and unattributed ones (no event id: quarantined, block every
   event). Logged = past state, or creation / ignition / a join started, also on an ABORTED report. Retiring the last
   observation of an event also clears that event's `past_create` mark (the log is authoritative). On the first rc.28
   start, rc.27 `foreign_past` records and ordinary `past_create` marks are migrated into the log; a malformed evidence

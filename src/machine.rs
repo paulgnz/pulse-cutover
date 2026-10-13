@@ -181,8 +181,11 @@ fn coordinator_abort_state<O: ChainOps>(cfg: &Config, ops: &O, last: &mut u64, f
             if crate::coord::aborted(&doc, &co.coordinator_keys, &co.network, id) {
                 crate::coord::record_tombstone(cfg, id, "aborted", "signed abort seen by the ceremony");
                 AbortPoll::Aborted
-            } else {
+            } else if crate::coord::carries_event(&doc, &co.coordinator_keys, &co.network, id, co.event_hash.as_deref()) {
                 AbortPoll::Clear
+            } else {
+                // rc.29: a 200 without our signed event (e.g. `{}` from a relay that lost its store) is not "no abort".
+                AbortPoll::Unknown
             }
         }
         _ => AbortPoll::Unknown,
@@ -315,9 +318,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // Defense in depth (main.rs checks too): a readiness-only config never drives anything.
         self.cfg.ensure_ceremony_profile()?;
         if self.rollback_pending {
-            return Err("refusing to run: an operator `pulse-cutover rollback` was started on this journal and \
-                 did not finish (it recorded `rollback_requested` but never reached ABORTED). The operator \
-                 asked to go back, not to carry on: re-run `pulse-cutover rollback` to finish it."
+            return Err("refusing to run: a rollback (`pulse-cutover rollback`, or this agent's own abort) was started \
+                 on this journal and did not finish (it recorded `rollback_requested` but never reached ABORTED). \
+                 The ceremony was going back, not carrying on: re-run `pulse-cutover rollback` to finish it."
                 .into());
         }
         // A previous agent that died mid-hook (or mid pipeline step) left that process group
@@ -933,7 +936,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// resumed) only if the resume guard passes now, or with
     /// `force_stranded` (an operator's record of a fleet-wide decision, journaled).
     pub fn operator_rollback_opts(&mut self, force: bool, force_stranded: bool) -> Result<RollbackOutcome, String> {
-        if self.state == State::Stranded {
+        let guarded = self.operator_rollback_needs_guard();
+        if guarded {
             if force_stranded {
                 // The fleet view being overridden is journaled with the override (review #10).
                 let co = self.cfg.coordination.clone();
@@ -951,11 +955,33 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.journal.evidence(self.state, json!({"resume_guard": "overridden by the operator (--force-stranded --i-understand)",
                     "overridden_fleet_view": view,
                     "by": std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "unknown".into())}))?;
-            } else if self.cfg.coordination.as_ref().is_some_and(|c| c.event_id.is_some()) {
+            } else if self.state == State::Stranded || self.state == State::Aborted {
                 if let Err(why) = self.resume_guard()? {
                     return Err(format!(
-                        "refusing to roll back a STRANDED ceremony: {why}. Nothing was changed. If the fleet went LIVE, \
-                         use `pulse-cutover join`; after a fleet-wide decision to resume the old chain, re-run with --force-stranded."));
+                        "refusing to roll back a {} ceremony: {why}. Nothing was changed. If the fleet went LIVE, \
+                         use `pulse-cutover join`; after a fleet-wide decision to resume the old chain, re-run with \
+                         --force-stranded --i-understand.", self.state));
+                }
+            } else {
+                // rc.29: FROZEN..VERIFIED (e.g. `cutover.sh abort` killed the agent mid-ceremony). Same two-pass guard
+                // as the agent's own abort: peers of this event may already have created or ignited the target.
+                // A failed guard strands the node (sealed, writes stay frozen), as the automatic path does.
+                let reason = "operator rollback (pulse-cutover rollback)";
+                let detail = json!({"by": "operator_rollback", "state_before": self.state.as_str()});
+                if let Err(why) = self.resume_guard()? {
+                    self.strand(reason, detail, &why)?;
+                    return Err(format!("refusing to resume the old chain: {why}. The node is now STRANDED (sealed, \
+                        writes stay frozen). If the fleet went LIVE, use `pulse-cutover join`; after a fleet-wide decision \
+                        to resume the old chain, re-run with --force-stranded --i-understand."));
+                }
+                self.journal.evidence(self.state, json!({"abort_intent": true, "reason": reason,
+                    "note": "withdrawing this node's VERIFIED report before resuming the old chain"}))?;
+                self.wait_own_report_withdrawn()?;
+                if let Err(why) = self.resume_guard()? {
+                    self.strand(reason, detail, &why)?;
+                    return Err(format!("refusing to resume the old chain: {why}. The node is now STRANDED (sealed, \
+                        writes stay frozen). If the fleet went LIVE, use `pulse-cutover join`; after a fleet-wide decision \
+                        to resume the old chain, re-run with --force-stranded --i-understand."));
                 }
             }
         }
@@ -1083,7 +1109,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // journaled (the beacon then stops presenting this node as VERIFIED), the agent waits until the
         // relay shows that (or until its last VERIFIED report is too old for any peer's gate to count),
         // and only a second pass of the guard lets it resume.
-        if perform && self.needs_resume_guard() {
+        // rc.29: the guard runs whatever `auto_rollback` says: without it, on_abort would still reopen writes
+        // and the ABORTED journal would invite an unguarded manual resume.
+        if self.needs_resume_guard() {
             if let Err(why) = self.resume_guard()? {
                 return self.strand(reason, detail, &why);
             }
@@ -1094,11 +1122,35 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return self.strand(reason, detail, &why);
             }
         }
+        if perform {
+            // rc.29: intent before the first step, as the operator path does: an agent that dies between resuming
+            // the source and the ABORTED transition must not replay as a ceremony still in progress.
+            self.journal.evidence(self.state, json!({"rollback_requested": true, "by": "agent_abort"}))?;
+            self.rollback_pending = true;
+        }
         let (failed, _notes) = self.rollback_steps(reason, detail, perform, false)?;
         if !failed.is_empty() {
             eprintln!("ABORTED, but the rollback is INCOMPLETE: {}", failed.join("; "));
         }
         Ok(())
+    }
+
+    /// rc.29: the operator's `rollback` re-checks the fleet before resuming the source of a coordinated producer
+    /// whenever the source may still be frozen for this event: STRANDED, FROZEN..VERIFIED (an agent killed
+    /// mid-ceremony, e.g. by `cutover.sh abort`), or ABORTED with the resume step not yet done (an abort
+    /// that ran with `auto_rollback = false`, or died before resuming). Past the point of no return the
+    /// forced path fences the target instead.
+    fn operator_rollback_needs_guard(&self) -> bool {
+        self.cfg.ceremony.mode == Mode::Producer
+            && self.cfg.coordination.as_ref().is_some_and(|c| c.event_id.is_some())
+            && !self.past_point_of_no_return()
+            && !self.step_done("resume")
+            && match self.state {
+                State::Stranded | State::Frozen | State::Snapshotted | State::Verified => true,
+                // Only an abort that paused the source for this event (a pause head is journaled).
+                State::Aborted => !self.aborted_rollback_complete && self.head_at_pause.is_some(),
+                _ => false,
+            }
     }
 
     /// The resume guard applies to a coordinated producer whose source this ceremony froze (FROZEN to
@@ -1805,11 +1857,20 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // chain cannot finalize a snapshot block — unpause first (writes are
         // still frozen by the hook, so re-produced blocks stay empty).
         if self.ops.producer_paused()? {
-            self.ops.resume()?;
-            self.journal.evidence(
-                State::Frozen,
-                json!({"resumed_production_for_snapshot": true}),
-            )?;
+            // rc.29: with a scheduled snapshot whose H is already final, the snapshot does not need this node's
+            // blocks: a crash after the pause keeps it paused (re-producing old-chain blocks after H would trip
+            // every peer's quiescence window and abort the whole event).
+            let final_already = self.scheduled && self.ops.source_info()?.last_irreversible_block_num >= self.h();
+            if final_already {
+                self.journal.evidence(State::Frozen, json!({"kept_paused_on_resume": true,
+                    "note": "H is already final: the scheduled snapshot needs no more blocks from this producer"}))?;
+            } else {
+                self.ops.resume()?;
+                self.journal.evidence(
+                    State::Frozen,
+                    json!({"resumed_production_for_snapshot": true}),
+                )?;
+            }
         }
         let started = self.ops.now_ms();
         let snap = if self.scheduled {
@@ -2896,6 +2957,23 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // the join checked the fleet itself.
         if !self.joining && !self.require_no_abort("ignition")? {
             return Ok(());
+        }
+        if !upstream_backend {
+            // rc.29: the fork backend's target imports whatever sits at staged_path when it ignites: re-hash it
+            // against the staged artifact this ceremony verified (a crash at VERIFIED, then a late copy or another
+            // ceremony's file, would otherwise be imported unchecked).
+            let path = self.cfg.snapshot.staged_path.clone();
+            let got = verify::sha256_file(&path).map(|(h, _)| h);
+            let ok = match (&got, self.staged_sha256.as_deref()) {
+                (Ok(g), Some(want)) => g.eq_ignore_ascii_case(want),
+                _ => false,
+            };
+            if !ok {
+                self.abort("staged snapshot does not match the artifact this ceremony verified",
+                    json!({"staged_path": path, "sha256": got.as_ref().ok(), "error": got.as_ref().err(),
+                           "expected": self.staged_sha256}))?;
+                return Ok(());
+            }
         }
         let started = self.ops.now_ms();
         // Point of no return (locally): journaled BEFORE the command runs. From here any failure
