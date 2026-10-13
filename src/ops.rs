@@ -51,7 +51,7 @@ pub trait ChainOps {
     /// r30 round 2: schedule a single-block snapshot at `height` and return the producer API's
     /// `snapshot_request_id` when it reports one, so the caller can later remove exactly that request.
     fn schedule_snapshot_request(&self, height: u64) -> Result<Option<u64>, String> {
-        self.schedule_snapshot(height).map(|_| None)
+        self.schedule_snapshot(height).map(|_| None) // ungated: trait default forwarding to the implementor's own schedule_snapshot; callers are gated or marked
     }
     /// Remove the pending snapshot request `id`, and only it, and only while it is still the single-block request at
     /// `height` it was recorded as (r30 round 3: a producer-local id proves nothing on its own). Ok(true) when it was
@@ -134,7 +134,7 @@ pub trait ChainOps {
     /// Long-running pipeline steps (upstream export/import over a mainnet snapshot take far
     /// longer than any hook timeout). Default: same as run_hook.
     fn run_long(&self, cmd: &str) -> Result<String, String> {
-        self.run_hook(cmd)
+        self.run_hook(cmd) // ungated: trait default: pipeline steps (export/import/compare), callers are the upstream pipeline and the drill guard
     }
     /// `run_long` that can be cut short: `cancel` is polled while the step runs (and once before
     /// it starts); when it returns true the step's process group is killed and Ok(None) is
@@ -910,7 +910,7 @@ impl ChainOps for HttpOps {
         if cmd.contains("{blockchain_id}") {
             return Err(format!("ignite command still has an unbound {{blockchain_id}}: `{cmd}`"));
         }
-        self.run_hook(&cmd)
+        self.run_hook(&cmd) // ungated: HttpOps::ignite runs the configured ignite command; ignite itself is marked at its single call site
     }
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {

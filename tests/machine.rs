@@ -7015,15 +7015,65 @@ fn r30r3_far_ahead_is_judged_on_the_highest_public_head() {
 /// (the gate itself and the paging-only on_halt), so a new call site cannot skip the shadow identity proof.
 #[test]
 fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
-    let src = include_str!("../src/machine.rs");
-    let raw: Vec<(usize, &str)> = src.lines().enumerate()
-        .filter(|(_, l)| (l.contains("self.ops.pause()") || l.contains("self.ops.resume()") || l.contains("self.ops.run_hook("))
-            && !l.contains("// ungated:"))
-        .map(|(i, l)| (i + 1, l.trim()))
-        .collect();
-    assert!(raw.is_empty(), "ungated source mutation(s) in src/machine.rs: {raw:?}");
-    let marked = src.lines().filter(|l| l.contains("// ungated:")).count();
-    assert_eq!(marked, 5, "exactly the three gate bodies and the two on_halt pages are ungated");
+    // Round-4 review (F3): scan EVERY src/*.rs (outside its #[cfg(test)] module) for EVERY mutating ChainOps call,
+    // through any receiver (`self.ops.x(`, `ops.x(`, `o.x(` after a rebinding, `ChainOps::x(`). Each one must carry an
+    // explicit `// ungated: <reason>` marker, or (src/drill.rs, owned by the drill's own guard) be listed exactly below.
+    let files: [(&str, &str); 22] = [
+        ("beacon.rs", include_str!("../src/beacon.rs")), ("config.rs", include_str!("../src/config.rs")),
+        ("coord.rs", include_str!("../src/coord.rs")), ("doctor.rs", include_str!("../src/doctor.rs")),
+        ("drill.rs", include_str!("../src/drill.rs")), ("fleet.rs", include_str!("../src/fleet.rs")),
+        ("journal.rs", include_str!("../src/journal.rs")), ("keys.rs", include_str!("../src/keys.rs")),
+        ("lib.rs", include_str!("../src/lib.rs")), ("live_watch.rs", include_str!("../src/live_watch.rs")),
+        ("looper.rs", include_str!("../src/looper.rs")), ("machine.rs", include_str!("../src/machine.rs")),
+        ("main.rs", include_str!("../src/main.rs")), ("ops.rs", include_str!("../src/ops.rs")),
+        ("report.rs", include_str!("../src/report.rs")), ("sanitize.rs", include_str!("../src/sanitize.rs")),
+        ("scan.rs", include_str!("../src/scan.rs")), ("secrets.rs", include_str!("../src/secrets.rs")),
+        ("shadow.rs", include_str!("../src/shadow.rs")), ("state.rs", include_str!("../src/state.rs")),
+        ("upstream.rs", include_str!("../src/upstream.rs")), ("verify.rs", include_str!("../src/verify.rs")),
+    ];
+    // The drill's own guarded calls (DrillGuard forwards only the request it scheduled; tests/drill.rs proves it).
+    let drill_allowed = [
+        "self.schedule_snapshot_request(height).map(|_| ())",
+        "let id = self.inner.schedule_snapshot_request(height)?;",
+        "self.inner.unschedule_snapshot_request(id, height)",
+        "let rec = match ops.unschedule_snapshot_request(id, h) {",
+        "let request_id = ops.schedule_snapshot_request(h).map_err(|e| format!(\"schedule_snapshot({h}) failed: {e}\"))?;",
+    ];
+    let mutating = |l: &str| ["pause", "resume", "run_hook", "ignite", "create_snapshot", "schedule_snapshot", "unschedule_snapshot"]
+        .iter().any(|m| l.contains(&format!(".{m}(")) || l.contains(&format!("::{m}("))
+            || l.contains(&format!(".{m}_")) && (m.ends_with("snapshot")));
+    let scan = |name: &str, text: &str| -> Vec<String> {
+        let mut bad = vec![];
+        for (i, line) in text.lines().enumerate() {
+            if line.contains("#[cfg(test)]") {
+                break;
+            }
+            let t = line.trim();
+            if t.starts_with("//") || !mutating(t) {
+                continue;
+            }
+            let marked = t.split("// ungated:").nth(1).is_some_and(|r| r.trim().len() >= 10);
+            if !marked && !(name == "drill.rs" && drill_allowed.contains(&t)) {
+                bad.push(format!("src/{name}:{}: {t}", i + 1));
+            }
+        }
+        bad
+    };
+    let bad: Vec<String> = files.iter().flat_map(|(n, t)| scan(n, t)).collect();
+    assert!(bad.is_empty(), "source mutation(s) without the shadow gate or an `// ungated: <reason>` marker:\n{}", bad.join("\n"));
+    // Every src file is in the list (a new module cannot escape the scan).
+    let on_disk = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).unwrap()
+        .filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.ends_with(".rs")).count();
+    assert_eq!(on_disk, files.len(), "add the new src/*.rs file to this scan");
+    // The scanner itself flags the shapes that used to escape it.
+    for sneaky in ["let o = self.ops; o.resume();", "ChainOps::pause(self.ops)?;", "self.ops.unschedule_snapshot_request(1, 2)?;",
+                   "ops.ignite()?;", "self.ops.run_hook(\"x\") // ungated: no"] {
+        assert_eq!(scan("looper.rs", sneaky).len(), 1, "the scan must flag `{sneaky}`");
+    }
+    // The gate bodies themselves are the only raw pause/resume/run_hook outside the on_halt pages.
+    let m = files.iter().find(|(n, _)| *n == "machine.rs").unwrap().1;
+    let raw = m.lines().filter(|l| (l.contains("self.ops.pause()") || l.contains("self.ops.resume()") || l.contains("self.ops.run_hook("))).count();
+    assert_eq!(raw, 5, "exactly the three gate bodies and the two on_halt pages call pause/resume/run_hook directly");
 }
 
 /// Round-4 review (Codex R4-1): a proxy can route `/v1/chain/*` to the shadow node and `/v1/producer/*` to a real

@@ -2000,7 +2000,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // writes it when H becomes irreversible. (Falls back to the
             // immediate create_snapshot path if the scheduler is missing.)
             self.check_mainnet_h()?;
-            match self.ops.schedule_snapshot(self.h()) {
+            match self.ops.schedule_snapshot(self.h()) { // ungated: source snapshot request (writes a file at H, no chain-state change); shadow identity proven at ARM and before the freeze
                 Ok(()) => {
                     self.scheduled = true;
                     self.journal.evidence(
@@ -2095,7 +2095,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // its snapshot to H with the scheduler — never "whatever head is when LIB passes H".
         if !self.cfg.ceremony.simulate_freeze && !self.scheduled {
             self.check_mainnet_h()?;
-            match self.ops.schedule_snapshot(self.h()) {
+            match self.ops.schedule_snapshot(self.h()) { // ungated: source snapshot request (writes a file at H, no chain-state change); shadow identity proven at ARM and before the freeze
                 Ok(()) => {
                     self.scheduled = true;
                     self.journal.evidence(State::Armed, json!({"snapshot_scheduled_at": self.h()}))?;
@@ -2183,7 +2183,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         } else {
             // simulate_freeze only (validated): a live chain, an inexact cut, journaled as such.
-            match self.ops.create_snapshot() {
+            match self.ops.create_snapshot() { // ungated: source snapshot file only (no chain-state change); shadow identity proven at ARM and before the freeze
                 Ok(s) => s,
                 Err(e) => {
                     self.abort("create_snapshot failed", json!({"error": e}))?;
@@ -2372,7 +2372,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 None => return Ok(()), // aborted inside, with evidence
             }
         } else {
-            match self.ops.create_snapshot() {
+            match self.ops.create_snapshot() { // ungated: source snapshot file only (no chain-state change); shadow identity proven at ARM and before the freeze
                 Ok(s) => s,
                 Err(e) => {
                     self.abort("create_snapshot failed", json!({"error": e}))?;
@@ -3524,7 +3524,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // source, because the target may already be running; recovery reads this record too.
         self.journal.evidence(State::Verified, json!({"side_effect": "ignite_started"}))?;
         self.reached_ignited = true;
-        let output = match self.ops.ignite() {
+        let output = match self.ops.ignite() { // ungated: TARGET side; on a shadow journal reachable only after step_verified set shadow_verified (fresh in-run proof)
             Ok(o) => o,
             Err(e) => {
                 self.abort("ignition command failed", json!({"error": e}))?;
