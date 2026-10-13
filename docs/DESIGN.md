@@ -133,6 +133,19 @@ stateDiagram-v2
   operator's journaled release (`rollback --force-stranded --i-understand`), after which R2 still applies. The read and
   the pause RPC are not atomic: a pause made between them is indistinguishable from ours (R2 still never reopens into
   a paused chain).
+  **Round 9 makes both precise.** *Pause episodes*: every pause (ours, journaled before the RPC, or someone else's,
+  adopted as evidence), every journaled resume and every operator release carries an episode number; R1 resumes only
+  when the LATEST open episode is ours, so a resume journaled earlier closes its episode and never authorizes resuming a
+  later pause (Codex R9-2). *Journal segments*: a `join` that re-enters an ABORTED or STRANDED ceremony journals
+  `segment_start` before its first side effect (the re-freeze, a pause, or its commit); rollback steps, `rollback_done`
+  and a strand intent belong to one segment, so an earlier completed rollback never covers what the join did and an
+  earlier strand intent never re-strands a valid join (R9-1, R9-3; a STRANDED transition also satisfies the intent it
+  completes). With the fleet LIVE, rolling back after such a segment goes through the resume guard like any frozen
+  ceremony (`--force-stranded` records the operator's decision). R2's fresh read is retried on ERRORS for up to 30 s
+  after a resume of ours succeeded in this rollback (failed reads journaled about once a second), and so are the reads
+  that decide ownership at the start of FROZEN and confirm our pause; a definite "paused" still seals at once. An
+  operator rollback that ends STRANDED is reported as INCOMPLETE (exit 4), never as "rolled back" (R9-4); its forced
+  release is journaled only after its `rollback_requested` intent (R9-6).
 - **ABORTED** is reachable only before `create_chain` (upstream) or `ignite_started` is journaled. It resumes the source
   producer (producer mode, if `target.auto_rollback`), restarts the source and reverts flips
   (API mode, if they ran), runs `on_abort`, and moves the staged snapshot aside. The rollback
@@ -314,7 +327,9 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 | Snapshot not at H | exact-H check | FROZEN | abort (rehearsal flags journal and continue) |
 | Pause does not take effect; `quiesce_cmd` fails | producer API; hook | FROZEN | abort |
 | Producer found paused after this ceremony froze writes, not by this journal (an operator, a hook, a scheduler) | pause ownership check (r30 round 7) | FROZEN | adopted for the cut (journaled `adopted: true`), never re-paused or resumed; the cut continues |
-| A performed rollback would reopen writes this journal froze, but a fresh read shows the producer paused (someone else's pause, or ours still paused) or unreadable | reopen invariant R2 (r30 round 8) | FROZEN–VERIFIED | STRANDED (`writes_kept_frozen`): no `on_abort`, someone else's pause never resumed, `on_halt` pages; `rollback --force-stranded --i-understand` releases an external pause (journaled), then R2 again |
+| A performed rollback would reopen writes this journal froze, but a fresh read shows the producer paused (someone else's pause, or ours still paused) or unreadable | reopen invariant R2 (r30 round 8) | FROZEN–VERIFIED | STRANDED (`writes_kept_frozen`): no `on_abort`, someone else's pause never resumed, `on_halt` pages; `rollback --force-stranded --i-understand` releases an external pause (journaled after its rollback intent), then R2 again; an operator rollback that ends here exits 4 (round 9). A read ERROR after our own resume is retried for up to 30 s first |
+| A `join` re-enters an ABORTED or STRANDED ceremony and dies (inside the re-freeze hook, after its own pause) | journal segment (r30 round 9) | ABORTED / STRANDED | `rollback` undoes what the join's segment did (reopens the re-frozen writes, resumes the join's own pause), never "already rolled back"; the resume guard applies (fleet LIVE: refused, or `--force-stranded`) |
+| The resumed agent cannot read the producer state at the start of FROZEN or right after its pause | bounded retry (r30 round 9) | FROZEN | retried for up to 30 s (journaled), then the run stops with the error (nothing changed) |
 | Head keeps moving after the pause | quiescence window | FROZEN | late blocks journaled; the window waits up to `quiescence_timeout_secs` (default 120), then ABORT (before ignition: `on_abort` reopens writes) |
 | Snapshot block id ≠ chain's block id at H (fork at the cut); chain_id changed | block lookup | FROZEN | abort |
 | Any transaction in H+1…pause, or an unreadable block, or an answer that is not that block with a `transactions` array | burn-off audit (fails closed) | FROZEN | abort |

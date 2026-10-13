@@ -148,6 +148,56 @@ pub struct Recovered {
     /// Round-2 review (D-10): the bindings a fresh XPR mainnet ARM authenticated (`mainnet_event_verified`), compared
     /// offline with the config on every later run, join, rollback and unhalt (coord::mainnet_binding_problem).
     pub mainnet_event_binding: Option<Value>,
+    /// r30 round 9 (Codex R9-2): every pause, resume and operator release, in journal order (pause EPISODES). A pause by
+    /// this ceremony (`side_effect: source_pause`, written before the RPC) or an adopted external one opens an episode;
+    /// a journaled resume (`rollback_step: resume`) closes the latest open one; an operator's `external_pause_release`
+    /// makes the latest open external episode ours. Never cleared: an old, completed resume can never authorize a later one.
+    pub pause_events: Vec<PauseEvent>,
+    /// r30 round 9 (Codex R9-3): writes this journal froze in its CURRENT segment (a `write_freeze` intent in it, or a
+    /// freeze carried over from the previous segment whose on_abort never reopened them).
+    pub writes_closed: bool,
+    /// r30 round 9 (Codex R9-1/R9-3): the journal segment (0 = the original ceremony). A `join` that re-enters an
+    /// ABORTED or STRANDED ceremony journals `segment_start` before its first side effect: undo bookkeeping
+    /// (rollback steps, rollback_done, strand intent) belongs to one segment only.
+    pub segment: u64,
+}
+
+/// r30 round 9: one entry of the pause-episode log (`Recovered::pause_events`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PauseEvent {
+    /// A pause: `ours` = this ceremony made it (intent before the RPC); false = someone else's, adopted as evidence.
+    Pause { ours: bool },
+    /// A journaled resume (a rollback's `resume` step): closes the latest open episode.
+    Resume,
+    /// The operator's journaled release of an external pause (`rollback --force-stranded --i-understand`).
+    Release,
+}
+
+/// r30 round 9: fold the pause-episode log. `legacy_paused`: an older agent's journal whose agent demonstrably paused
+/// (an open episode of ours before every journaled event). Returns (latest open episode is ours, latest open episode is
+/// someone else's, this journal ever paused the producer itself).
+pub fn pause_episodes(events: &[PauseEvent], legacy_paused: bool) -> (bool, bool, bool) {
+    // (ours, open)
+    let mut eps: Vec<(bool, bool)> = Vec::new();
+    if legacy_paused {
+        eps.push((true, true));
+    }
+    for e in events {
+        match e {
+            PauseEvent::Pause { ours } => eps.push((*ours, true)),
+            PauseEvent::Resume => {
+                if let Some(ep) = eps.iter_mut().rev().find(|(_, open)| *open) {
+                    ep.1 = false;
+                }
+            }
+            PauseEvent::Release => match eps.iter_mut().rev().find(|(_, open)| *open) {
+                Some(ep) => ep.0 = true,
+                None => eps.push((true, true)),
+            },
+        }
+    }
+    let latest_open = eps.iter().rev().find(|(_, open)| *open).map(|(ours, _)| *ours);
+    (latest_open == Some(true), latest_open == Some(false), eps.iter().any(|(ours, _)| *ours))
 }
 
 impl Journal {
@@ -456,10 +506,27 @@ impl Journal {
             {
                 out.shadow_refused = true;
             }
-            if entry.data.get("strand_intent").and_then(|v| v.as_bool()) == Some(true)
-                || entry.data.get("external_pause_held").and_then(|v| v.as_bool()) == Some(true)
+            // r30 round 9 (Codex R9-1): a strand intent is satisfied by the STRANDED transition it caused (the transition
+            // itself carries `external_pause_held` as a display field and is not an intent).
+            if entry.kind != "transition"
+                && (entry.data.get("strand_intent").and_then(|v| v.as_bool()) == Some(true)
+                    || entry.data.get("external_pause_held").and_then(|v| v.as_bool()) == Some(true))
             {
                 out.strand_intent = true;
+            }
+            if entry.kind == "transition" && entry.state == State::Stranded.as_str() {
+                out.strand_intent = false;
+            }
+            // r30 round 9 (Codex R9-3): a new segment (a join re-entering this ceremony) starts with no undo of its own
+            // done; writes the previous segment froze and never reopened stay ours to reopen.
+            if let Some(seg) = entry.data.get("segment_start").and_then(|v| v.as_u64()) {
+                let legacy_froze = out.undo_tracking == Some(false) && out.frozen_ts_ms.is_some();
+                let reopened = out.rollback_steps_done.iter().any(|x| x == "on_abort");
+                out.writes_closed = (out.writes_closed || legacy_froze) && !reopened;
+                out.rollback_steps_done.clear();
+                out.aborted_rollback_complete = false;
+                out.strand_intent = false;
+                out.segment = seg;
             }
             if let Some(b) = entry.data.get("mainnet_event_verified").filter(|b| b.is_object()) {
                 out.mainnet_event_binding = Some(b.clone());
@@ -468,6 +535,14 @@ impl Journal {
                 out.scheduled = true;
             }
             if let Some(se) = entry.data.get("side_effect").and_then(|v| v.as_str()) {
+                match se {
+                    "source_pause" => out.pause_events.push(PauseEvent::Pause {
+                        ours: entry.data.get("adopted").and_then(|v| v.as_bool()) != Some(true),
+                    }),
+                    "external_pause_release" => out.pause_events.push(PauseEvent::Release),
+                    "write_freeze" => out.writes_closed = true,
+                    _ => {}
+                }
                 // r30 round 7: a pause found after the freeze and ADOPTED for the cut (someone else paused the
                 // producer) is journaled as `side_effect: source_pause` with `adopted: true`; it is recovered as
                 // `source_pause_adopted`, never as this ceremony's own pause.
@@ -500,10 +575,13 @@ impl Journal {
                 out.rollback_steps_done.retain(|x| x != "on_abort");
             }
             if let Some(step) = entry.data.get("rollback_step").and_then(|v| v.as_str()) {
-                if entry.data.get("ok").and_then(|v| v.as_bool()) == Some(true)
-                    && !out.rollback_steps_done.iter().any(|x| x == step)
-                {
-                    out.rollback_steps_done.push(step.to_string());
+                if entry.data.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                    if step == "resume" {
+                        out.pause_events.push(PauseEvent::Resume);
+                    }
+                    if !out.rollback_steps_done.iter().any(|x| x == step) {
+                        out.rollback_steps_done.push(step.to_string());
+                    }
                 }
             }
             if entry.data.get("rollback_done").and_then(|v| v.as_bool()) == Some(true)

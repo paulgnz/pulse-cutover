@@ -62,6 +62,12 @@ struct MockOps {
     external_resume_at: Cell<u64>,
     /// r30 round 8: `producer_paused()` cannot be read (the producer API errors).
     paused_read_fails: Cell<bool>,
+    /// r30 round 9: the next N producer-paused reads fail (a transient error), then reads answer again.
+    paused_read_fail_count: Cell<u32>,
+    /// r30 round 9: a resume arms `paused_read_fail_count` with this many failing reads (transient errors right after).
+    fail_reads_after_resume: Cell<u32>,
+    /// r30 round 9: once the freeze hook ran, this many producer-paused reads fail (then reads answer again).
+    fail_reads_after_freeze: Cell<u32>,
     /// r30 round 8: `resume()` answers Ok but the producer stays paused (someone else's pause on top, a stuck node).
     resume_ignored: Cell<bool>,
     /// rc.29: the paused source gains one block once the snapshot was taken (after the quiescence audit).
@@ -251,6 +257,9 @@ impl MockOps {
             external_pause_at: Cell::new(0),
             external_resume_at: Cell::new(0),
             paused_read_fails: Cell::new(false),
+            paused_read_fail_count: Cell::new(0),
+            fail_reads_after_resume: Cell::new(0),
+            fail_reads_after_freeze: Cell::new(0),
             resume_ignored: Cell::new(false),
             flipped: Cell::new(false),
             stopped: Cell::new(false),
@@ -460,6 +469,14 @@ impl ChainOps for MockOps {
         if self.paused_read_fails.get() {
             return Err("http://mock/v1/producer/paused: connection refused".into());
         }
+        if self.freeze_head.get() > 0 && self.fail_reads_after_freeze.get() > 0 {
+            self.fail_reads_after_freeze.set(self.fail_reads_after_freeze.get() - 1);
+            return Err("http://mock/v1/producer/paused: timed out".into());
+        }
+        if self.paused_read_fail_count.get() > 0 {
+            self.paused_read_fail_count.set(self.paused_read_fail_count.get() - 1);
+            return Err("http://mock/v1/producer/paused: timed out".into());
+        }
         Ok(self.paused.get())
     }
 
@@ -479,6 +496,9 @@ impl ChainOps for MockOps {
         self.resumes.set(self.resumes.get() + 1);
         if !self.resume_ignored.get() {
             self.paused.set(false);
+        }
+        if self.fail_reads_after_resume.get() > 0 {
+            self.paused_read_fail_count.set(self.fail_reads_after_resume.get());
         }
         Ok(())
     }
@@ -5897,8 +5917,15 @@ fn rc23_join_refused_after_refreeze_says_writes_are_frozen_and_rollback_reopens_
         && err.contains("pulse-cutover rollback"), "{err}");
     assert_eq!(ops.hooks.borrow().last().map(String::as_str), Some("freeze-writes"));
     assert_eq!(pulse_cutover::beacon::journal_summary(&cfg.journal_path)["rollback_complete"], false, "mission control sees it");
+    // r30 round 9: the join started a new journal segment, so the earlier abort's completed rollback no longer covers
+    // it; with the fleet LIVE, reopening writes on the old chain is an operator's fleet-wide decision: a plain rollback
+    // refuses (nothing changed), --force-stranded reopens them.
     let (j, rec) = open_journal(&cfg.journal_path);
-    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback(false).unwrap();
+    let err = Machine::new(&cfg, &ops, j, rec).operator_rollback(false).err().unwrap_or_default();
+    assert!(err.contains("refusing to roll back") && err.contains("--force-stranded"), "{err}");
+    assert_eq!(ops.hooks.borrow().last().map(String::as_str), Some("freeze-writes"), "nothing changed");
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, true).unwrap();
     assert!(!out.already && out.failed.is_empty(), "{out:?}");
     assert_eq!(ops.hooks.borrow().last().map(String::as_str), Some("reopen-writes"), "on_abort reopened writes");
     assert!(pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap().aborted_rollback_complete);
@@ -8043,4 +8070,235 @@ fn r30r8_resume_ours_reopen_only_into_a_producing_chain() {
     let out = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, true).unwrap();
     assert!(out.failed.is_empty(), "{:?}", out.failed);
     assert!(ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "once it produces, writes reopen");
+}
+
+
+/// r30 round 9 (Codex R9-1): an R2 strand (the agent kept writes frozen because the source was not producing) journals a
+/// strand intent before its STRANDED transition. The transition satisfies it: a later, valid `join` reaches LIVE instead
+/// of being stranded again by the old intent (also for round 7's `external_pause_held` record).
+#[test]
+fn r30r9_a_join_after_an_r2_strand_reaches_live() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_upstream_fleet(d.path());
+    let ops = upstream_ops(d.path());
+    ops.coord_down.set(true);
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    // Make it an R2 strand: the strand intent (and round 7's record) precede the STRANDED transition.
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let at = lines.iter().rposition(|l| l.contains(r#""kind":"transition""#) && l.contains(r#""state":"STRANDED""#)).unwrap();
+    for rec in [serde_json::json!({"strand_intent": true, "writes_kept_frozen": "producer paused"}),
+                serde_json::json!({"external_pause_held": true})] {
+        let line = serde_json::json!({"seq": 0, "ts_ms": 0, "ts": "2026-10-13T00:00:00.000Z", "kind": "evidence",
+            "state": "VERIFIED", "data": rec}).to_string();
+        lines.insert(at, line);
+    }
+    std::fs::write(&cfg.journal_path, lines.join("\n") + "\n").unwrap();
+    assert!(!pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap().strand_intent,
+        "the STRANDED transition satisfied the intent");
+    ops.coord_down.set(false);
+    let ours = pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"].clone();
+    *ops.status_doc.borrow_mut() = Some(rc23_live_peers(&ours, &["bp2", "bp3", "bp4", "bp5"]));
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert_eq!(Machine::new(&cfg, &ops, j, rec).join("e1").unwrap(), State::Live, "the join is not re-stranded");
+}
+
+/// r30 round 9 (Codex R9-3): a join from ABORTED starts a new journal segment before its first side effect, so the
+/// earlier, completed rollback never covers what the join did. (a) Killed inside the re-freeze hook: `rollback` reopens
+/// writes (never "already rolled back"). (b) Killed after the join's own pause took effect but before its `join` side
+/// effect was journaled: `rollback` resumes that pause and reopens writes.
+#[test]
+fn r30r9_a_crashed_join_is_rolled_back_by_its_own_segment() {
+    let aborted = |d: &std::path::Path| {
+        let cfg = rc23_upstream_fleet(d);
+        let ops = upstream_ops(d);
+        *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
+            ("bp4", serde_json::json!({"state": "FROZEN"})), ("bp5", serde_json::json!({"state": "FROZEN"}))]));
+        assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+        assert!(pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap().aborted_rollback_complete);
+        (cfg, ops)
+    };
+    let all_aborted = || rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
+        ("bp4", serde_json::json!({"state": "ABORTED"})), ("bp5", serde_json::json!({"state": "ABORTED"}))]);
+
+    // (a)
+    let d = tempfile::tempdir().unwrap();
+    let (cfg, ops) = aborted(d.path());
+    *ops.panic_on_hook.borrow_mut() = Some("freeze-writes".into());
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Machine::new(&cfg, &ops, j, rec).join("e1")));
+    assert!(crashed.is_err(), "the join died inside the re-freeze hook");
+    *ops.panic_on_hook.borrow_mut() = None;
+    let rec = pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap();
+    assert!(!rec.aborted_rollback_complete && rec.segment == 1, "the join's segment is not covered by the old rollback");
+    *ops.status_doc.borrow_mut() = Some(all_aborted());
+    let resumes = ops.resumes.get();
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback(false).unwrap();
+    assert!(!out.already && out.failed.is_empty(), "{out:?}");
+    assert_eq!(ops.hooks.borrow().last().map(String::as_str), Some("reopen-writes"), "writes reopened");
+    assert_eq!(ops.resumes.get(), resumes, "nothing of ours to resume: the join never paused");
+
+    // (b): the records a join writes up to its pause, then the crash.
+    let d = tempfile::tempdir().unwrap();
+    let (cfg, ops) = aborted(d.path());
+    {
+        let (mut j, rec) = open_journal(&cfg.journal_path);
+        let st = rec.state.unwrap();
+        j.evidence(st, serde_json::json!({"segment_start": 1, "by": "join"})).unwrap();
+        j.evidence(st, serde_json::json!({"side_effect": "write_freeze"})).unwrap();
+        j.evidence(st, serde_json::json!({"join_refreeze": "ran: freeze-writes"})).unwrap();
+        j.evidence(st, serde_json::json!({"join": {"event_id": "e1", "source_paused": false}})).unwrap();
+        j.evidence(st, serde_json::json!({"side_effect": "source_pause", "episode": 2})).unwrap();
+    }
+    ops.paused.set(true); // the join's pause RPC took effect before the crash
+    *ops.status_doc.borrow_mut() = Some(all_aborted());
+    let resumes = ops.resumes.get();
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback(false).unwrap();
+    assert!(!out.already && out.failed.is_empty(), "{out:?}");
+    assert_eq!(ops.resumes.get(), resumes + 1, "the join's own pause is resumed");
+    assert_eq!(ops.hooks.borrow().last().map(String::as_str), Some("reopen-writes"), "and writes reopen");
+}
+
+/// r30 round 9 (Codex R9-2): this ceremony resumed its own pause, then on_abort failed, then someone else paused the
+/// producer. A completed resume never authorizes resuming a later pause: plain rollbacks never resume it.
+#[test]
+fn r30r9_a_resumed_then_externally_repaused_producer_is_not_resumed_by_a_plain_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r7_sched_config(dir.path(), "freeze-writes");
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    ops.burnoff_tx_per_block.set(1);
+    *ops.flaky_hook.borrow_mut() = Some(("reopen-writes".into(), 1));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    assert_eq!(ops.resumes.get(), 1, "our own pause was resumed");
+    assert!(!pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap().aborted_rollback_complete, "on_abort failed");
+    ops.paused.set(true); // someone else pauses it now
+    for _ in 0..2 {
+        let (j, rec) = open_journal(&cfg.journal_path);
+        let _ = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false);
+    }
+    assert_eq!(ops.resumes.get(), 1, "the later external pause is never resumed by a plain rollback");
+    assert_eq!(ops.hooks.borrow().iter().filter(|h| *h == "reopen-writes").count(), 1, "writes never reopened into a paused chain");
+}
+
+/// r30 round 9 (Codex R9-4): an operator rollback that cannot finish (the released pause's resume did not take effect,
+/// so writes stay frozen and the journal is STRANDED) reports a failure with the truth: never "rolled back".
+#[test]
+fn r30r9_a_stranded_operator_rollback_reports_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r7_sched_config(dir.path(), "freeze-writes");
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    ops.external_pause_at.set(117);
+    ops.peers_produce_to.set(126);
+    ops.burnoff_tx_per_block.set(1);
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    ops.resume_ignored.set(true);
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, true).unwrap();
+    assert_eq!(out.state, State::Stranded);
+    assert!(out.failed.iter().any(|f| f.contains("did NOT finish") && f.contains("writes stay FROZEN") && f.contains("STRANDED")),
+        "{:?}", out.failed);
+}
+
+/// r30 round 9 (Codex R9-5): an XPR mainnet ceremony that died inside its freeze hook (a write-freeze intent journaled,
+/// still ARMED) resumes past the freeze even when the config has no lock_dir: a warning, never a refusal.
+#[test]
+fn r30r9_a_frozen_armed_mainnet_journal_without_lock_dir_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_mainnet_coordinated_config(dir.path());
+    let ops = upstream_ops(dir.path());
+    ops.schedule_ok.set(true);
+    *ops.chain_id.borrow_mut() = MAINNET.into();
+    *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"event": mainnet_event(cfg.ceremony.freeze_height)}));
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp1", serde_json::json!({"state": "VERIFIED", "aborting": true})),
+        ("bp2", serde_json::json!({"state": "ABORTED"}))]));
+    let freeze = cfg.hooks.on_freeze.clone().unwrap();
+    *ops.panic_on_hook.borrow_mut() = Some(freeze.clone());
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_machine_result(&cfg, &ops)));
+    assert!(crashed.is_err(), "the agent died inside the freeze hook");
+    let rec = pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap();
+    assert_eq!(rec.state, Some(State::Armed));
+    assert!(rec.writes_closed, "the write-freeze intent is journaled");
+    *ops.panic_on_hook.borrow_mut() = None;
+    let text = std::fs::read_to_string(dir.path().join("mainnet-coord.toml")).unwrap();
+    let no_dir = text.lines().filter(|l| !l.starts_with("lock_dir")).collect::<Vec<_>>().join("\n");
+    let cfg2 = load_toml(dir.path(), "mainnet-coord-nodir.toml", &no_dir).unwrap();
+    assert!(cfg2.ceremony.lock_dir.is_none());
+    let _ = run_machine_result(&cfg2, &ops);
+    let e = journal_entries(&cfg2);
+    assert!(transition(&e, "FROZEN").is_some(), "the cut continued past the freeze");
+    assert!(e.iter().any(|v| v["data"]["mainnet_lock_dir_missing"].is_string()), "warned");
+    assert!(!e.iter().any(|v| v["kind"] == "error" && v.to_string().contains("must set [ceremony] lock_dir")),
+        "never refused for it");
+}
+
+/// r30 round 9 (Codex R9-6): a forced rollback that releases an external pause journals its rollback intent FIRST: a
+/// crash between the two records always recovers a pending rollback (run refuses, rollback finishes), never a released
+/// pause with nothing behind it.
+#[test]
+fn r30r9_the_forced_release_follows_the_rollback_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r7_sched_config(dir.path(), "freeze-writes");
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    ops.external_pause_at.set(117);
+    ops.peers_produce_to.set(126);
+    ops.burnoff_tx_per_block.set(1);
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    let before = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, true).unwrap();
+    assert!(out.failed.is_empty(), "{:?}", out.failed);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let added: Vec<&str> = text.lines().skip(before.lines().count()).collect();
+    let intent = added.iter().position(|l| l.contains(r#""rollback_requested":true"#)).expect("intent journaled");
+    let release = added.iter().position(|l| l.contains(r#""side_effect":"external_pause_release""#)).expect("release journaled");
+    assert!(intent < release, "the rollback intent precedes the release");
+    // The crash between them: the journal ends right after the intent.
+    let cut: Vec<&str> = before.lines().chain(added[..=intent].iter().copied()).collect();
+    std::fs::write(&cfg.journal_path, cut.join("\n") + "\n").unwrap();
+    let rec = pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap();
+    assert!(rec.rollback_pending, "a pending rollback is recovered");
+    ops.paused.set(true);
+    ops.hooks.borrow_mut().clear();
+    assert!(run_machine_result(&cfg, &ops).unwrap_err().contains("did not finish"), "run refuses to carry on");
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, true).unwrap();
+    assert!(out.failed.is_empty(), "{:?}", out.failed);
+    assert!(ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "the re-run finishes the rollback");
+}
+
+/// r30 round 9 (review R9-F1): right after this rollback resumed its own pause, a transient read error must not strand a
+/// healthy producer: the read is retried (bounded) and writes reopen once it answers "producing".
+#[test]
+fn r30r9_a_transient_read_after_our_resume_is_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r7_sched_config(dir.path(), "freeze-writes");
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    ops.burnoff_tx_per_block.set(1);
+    ops.fail_reads_after_resume.set(3);
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted, "not STRANDED: the read recovered");
+    assert_eq!(ops.resumes.get(), 1);
+    assert!(ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "writes reopened into the producing chain");
+    let e = journal_entries(&cfg);
+    assert!(e.iter().any(|v| v["data"]["producer_state_read_failed"].is_string()), "the failed reads are journaled");
+    assert!(e.iter().any(|v| v["data"]["producer_state_read_recovered"].is_string()));
+}
+
+/// r30 round 9 (review R9-F2): a transient read error while deciding who paused the producer (after the freeze) is
+/// retried instead of ending the run mid-FROZEN.
+#[test]
+fn r30r9_a_transient_read_during_adoption_is_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r7_sched_config(dir.path(), "freeze-writes");
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    ops.fail_reads_after_freeze.set(3);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    assert!(journal_entries(&cfg).iter().any(|v| v["data"]["producer_state_read_failed"].is_string()));
 }

@@ -289,3 +289,10 @@ whoever paused it): it ends STRANDED (`writes_kept_frozen`) and pages `on_halt`.
 it deliberately with `pulse-cutover rollback --config <file> --force-stranded --i-understand` (resumes the producer and
 reopens writes, journaled as `external_pause_release`), or follow a LIVE fleet with `pulse-cutover join`. A producer
 already paused by someone else **before** the freeze is refused at ARM, with nothing touched.
+
+`rollback` exit codes: **0** rolled back (or already rolled back); **3** refused, nothing changed; **4** INCOMPLETE: a
+step failed, or (round 9) the rollback could not reopen writes because the producer was paused or unreadable, so the
+journal is now STRANDED with writes still frozen. Exit 4 never means "rolled back": check the producer by hand (who
+paused it? is it producing?), then run `rollback` again. A forced release (`--force-stranded --i-understand`) is
+journaled only after the rollback's own intent, so a crash between them leaves a pending rollback that `run` refuses
+to continue and a re-run of `rollback` finishes.
