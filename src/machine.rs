@@ -461,6 +461,35 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Err(reason)
     }
 
+    /// Round 6 (Codex R6-5): after the freeze, a drill's surviving work under another journal directory (named by the
+    /// producer's work marker) is asked to stop and its recorded process group killed (evidence kept unless it is
+    /// proven gone); the cut never waits on it. Its export container can only be stopped by `drill --cancel` with
+    /// that drill's config (the ceremony never runs docker): journaled loudly.
+    fn stop_foreign_drill_work(&mut self, why: &str) -> Result<(), String> {
+        let crate::drill::MarkerWork::Live { journal_dir, h, .. } = crate::drill::marker_work(self.cfg) else {
+            eprintln!("WARNING: {why}. The cut continues.");
+            self.journal.evidence(self.state, json!({"readiness_drill_work_unknown": why,
+                "WARNING": "a drill work marker on this producer cannot be read after the freeze; the cut continues"}))?;
+            return Ok(());
+        };
+        let dir = journal_dir.join("drill").join(h.to_string());
+        let cancel = crate::ops::write_fresh_in(&journal_dir, &dir.join("cancel"), format!("{}\n", self.ops.now_ms()).as_bytes());
+        let killed = crate::ops::kill_recorded_hook_group_keep_evidence(
+            &crate::ops::hook_pgid_path(&dir.join("drill.jsonl")), std::time::Duration::from_secs(10));
+        let still = matches!(crate::drill::activity_at(&journal_dir), crate::drill::DrillActivity::Running { .. });
+        let detail = json!({"journal_dir": journal_dir, "h": h,
+            "cancel_file": cancel.as_ref().map(|_| "written".to_string()).unwrap_or_else(|e| e.to_string()),
+            "group_kill": match &killed { Ok(Some(d)) => d.clone(), Ok(None) => "no live pipeline group".into(), Err(e) => e.clone() }});
+        if still {
+            eprintln!("WARNING: {why}. It could not be verified stopped; stop it by hand. The cut continues.");
+            self.journal.evidence(self.state, json!({"readiness_drill_not_stopped": detail,
+                "WARNING": "another directory's drill work could not be verified stopped next to a cut in progress; the cut continues"}))?;
+        } else {
+            self.journal.evidence(self.state, json!({"readiness_drill_stopped_for_the_cut": detail}))?;
+        }
+        Ok(())
+    }
+
     /// Round-4 review (R4-7): a ceremony resumed AFTER its write freeze must not share the box with a readiness drill
     /// (the drill's conversion needs up to ~14 GB of RAM on mainnet, exactly what the cut needs), and must never be
     /// stranded for one. So: ask a live drill to stop (its cancel file), stop its recorded pipeline process group
@@ -829,15 +858,34 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // Round 5 (Codex R5-6): the producer's lock, shared by every config on this producer API whatever its journal
         // directory: a drill elsewhere on the same producer makes a fresh ARM (or one resumed while ARMED) refuse.
         if self.producer_lock.is_none() {
-            match Journal::lock(&crate::drill::producer_lock_base(&self.cfg)) {
+            // Round 6: only "held by another process" refuses (and only before the freeze, touching nothing: see
+            // rollback_steps). Any other failure (an unwritable or missing lock_dir) is journaled: this lock is drill
+            // hygiene; the fleet gate, not this lock, protects the cut.
+            match Journal::try_lock(&crate::drill::producer_lock_base(&self.cfg)) {
                 Ok(f) => self.producer_lock = Some(f),
-                Err(e) if pre_freeze => problems.push(format!(
-                    "another pulse-cutover process holds this producer's lock (a readiness drill on the same producer \
-                     API, possibly under another journal directory): {e}. Wait for it, or stop it with `pulse-cutover \
-                     drill --cancel` using that drill's config"
+                Err(crate::journal::LockError::Held(e)) if pre_freeze => problems.push(format!(
+                    "another pulse-cutover process holds this producer's lock (a readiness drill or loop on the same \
+                     producer, possibly under another journal directory): {e}. Wait for it, or stop it with \
+                     `pulse-cutover drill --cancel` using that drill's config"
                 )),
-                Err(_) => {} // past the freeze: reported by stop_drill_for_the_cut below
+                Err(crate::journal::LockError::Held(_)) => {} // past the freeze: reported by stop_drill_for_the_cut below
+                Err(crate::journal::LockError::Io(e)) => {
+                    eprintln!("WARNING: cannot take this producer's lock in {} ({e}); continuing without it",
+                              crate::drill::lock_dir(&self.cfg).display());
+                    self.journal.evidence(self.state, json!({"producer_lock_unavailable": e,
+                        "lock_dir": crate::drill::lock_dir(&self.cfg),
+                        "note": "the producer lock could not be taken for a reason other than another holder; the ceremony continues"}))?;
+                }
             }
+        }
+        // Round 6 (Codex R6-5): a drill under ANOTHER journal directory on this producer whose work survived its
+        // process (an export container or pipeline group not verified gone) is named by the producer's work marker.
+        if pre_freeze {
+            if let Some(why) = crate::drill::foreign_marker_blocker(&self.cfg) {
+                problems.push(why);
+            }
+        } else if let Some(why) = crate::drill::foreign_marker_blocker(&self.cfg) {
+            self.stop_foreign_drill_work(&why)?;
         }
         // A readiness drill running on this box would compete for CPU, RAM and disk in the cut window
         // (docs/DESIGN.md §7): before the freeze the ceremony refuses to ARM next to one; a stale record is only reported.

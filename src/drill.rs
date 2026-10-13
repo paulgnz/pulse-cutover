@@ -90,7 +90,16 @@ pub enum DrillActivity {
 /// The drill's recorded pipeline group, strictly: Some(pgid) when it is alive OR cannot be inspected (r30 round 4:
 /// "cannot tell" is never "stopped").
 fn group_not_proven_gone(cfg: &Config, h: u64) -> Option<u32> {
-    match crate::ops::recorded_group_status(&pgid_file(cfg, h)) {
+    group_not_proven_gone_at(&journal_dir_of(cfg), h)
+}
+
+fn journal_dir_of(cfg: &Config) -> PathBuf {
+    cfg.journal_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf()
+}
+
+fn group_not_proven_gone_at(journal_dir: &Path, h: u64) -> Option<u32> {
+    let pgid = crate::ops::hook_pgid_path(&journal_dir.join("drill").join(h.to_string()).join("drill.jsonl"));
+    match crate::ops::recorded_group_status(&pgid) {
         Some((g, crate::ops::GroupStatus::Live(_) | crate::ops::GroupStatus::Unknown(_))) => Some(g),
         _ => None,
     }
@@ -100,7 +109,13 @@ fn group_not_proven_gone(cfg: &Config, h: u64) -> Option<u32> {
 /// cannot be inspected, makes the drill RUNNING whatever the record says (r30 round 4: work that survived a failed
 /// or incomplete stop keeps blocking a ceremony).
 pub fn activity(cfg: &Config) -> DrillActivity {
-    let Ok(text) = std::fs::read_to_string(latest_path(cfg)) else { return DrillActivity::Idle };
+    activity_at(&journal_dir_of(cfg))
+}
+
+/// [`activity`] for the drill whose config keeps its journal in `journal_dir` (r30 round 6: a ceremony under
+/// another journal directory evaluates a drill named by the producer's work marker).
+pub fn activity_at(journal_dir: &Path) -> DrillActivity {
+    let Ok(text) = std::fs::read_to_string(journal_dir.join("drill").join("latest.json")) else { return DrillActivity::Idle };
     let Ok(v) = serde_json::from_str::<Value>(&text) else { return DrillActivity::Idle };
     if v["kind"].as_str() != Some(DRILL_KIND) {
         return DrillActivity::Idle;
@@ -110,7 +125,7 @@ pub fn activity(cfg: &Config) -> DrillActivity {
     // (killing the docker CLI does not stop a daemon-managed container): the drill counts as running.
     let container_live = container_not_verified_gone(&v);
     if v["state"].as_str() != Some("RUNNING") {
-        return match group_not_proven_gone(cfg, h) {
+        return match group_not_proven_gone_at(journal_dir, h) {
             Some(g) => DrillActivity::Running { h, pid: None, group: Some(g) },
             None if container_live => DrillActivity::Running { h, pid: None, group: None },
             None => DrillActivity::Idle,
@@ -122,7 +137,7 @@ pub fn activity(cfg: &Config) -> DrillActivity {
             _ => false,
         }
     });
-    let group = group_not_proven_gone(cfg, h);
+    let group = group_not_proven_gone_at(journal_dir, h);
     if pid.is_some() || group.is_some() || container_live {
         DrillActivity::Running { h, pid, group }
     } else {
@@ -596,19 +611,140 @@ fn canonical(p: &Path) -> PathBuf {
     }
 }
 
-/// r30 round 5 (Codex R5-6): the lock that keeps a drill and a ceremony apart ON THE SAME PRODUCER, whatever journal
-/// directory each config uses: keyed by the normalised producer API, in nodeos's snapshot directory. That directory
-/// is the one resource a drill and a ceremony on one producer necessarily share (a drill requires it; every
-/// production ceremony requires it for `schedule_at_h`), and every process computes the same path from it, root or
-/// not (a `/run` path would differ between privileged and unprivileged agents). A config without a snapshot
-/// directory falls back to its journal directory (same-directory exclusion only). Lock order everywhere: journal
+/// r30 round 6: the directory holding the per-producer lock and the drill work markers. Agent-owned and never
+/// nodeos's `snapshot.dir` (round 5 put the lock there: an agent without write access to nodeos's directory, a
+/// read-only mount, or an operator clearing old snapshots broke it, and an agent creating that directory as root
+/// could stop nodeos writing the cut). `[ceremony] lock_dir` when set; else `/var/lib/pulse-cutover/locks` when it
+/// is or can be made writable; else `locks/` beside the journal directory (its parent's `locks`). Every agent, drill and loop on one box must resolve
+/// the same directory (set `lock_dir` explicitly when they run as different users).
+pub fn lock_dir(cfg: &Config) -> PathBuf {
+    if let Some(d) = &cfg.ceremony.lock_dir {
+        return d.clone();
+    }
+    let default = PathBuf::from("/var/lib/pulse-cutover/locks");
+    if std::fs::create_dir_all(&default).is_ok() && dir_writable(&default) {
+        return default;
+    }
+    let journal_dir = canonical(&journal_dir_of(cfg));
+    journal_dir.parent().map(|p| p.join("locks")).unwrap_or_else(|| journal_dir.join("locks"))
+}
+
+fn dir_writable(d: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(d.as_os_str().as_bytes()) else { return false };
+    // SAFETY: a valid NUL-terminated path; access(2) only reads it.
+    unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
+/// The shared resource a ceremony, a drill and a loop on one producer have in common: nodeos's snapshot directory,
+/// canonicalised (so `localhost` / `127.0.0.1` / trailing-slash spellings of the producer API, or a symlinked path,
+/// collapse to one key). A config without a snapshot directory keys on its journal directory (same-directory
+/// exclusion only).
+pub fn producer_resource_key(cfg: &Config) -> String {
+    match &cfg.snapshot.dir {
+        Some(d) => format!("snapshot-dir:{}", canonical(d).display()),
+        None => format!("journal-dir:{}", canonical(cfg.journal_path.parent().unwrap_or(Path::new("."))).display()),
+    }
+}
+
+/// The per-producer lock (base path; the lock file is `<base>.lock`) in `lock_dir`. Lock order everywhere: journal
 /// lock, then drill-root lock, then this one.
 pub fn producer_lock_base(cfg: &Config) -> PathBuf {
     use sha2::{Digest, Sha256};
-    let key = hex::encode(Sha256::digest(normalized_endpoint(&cfg.source.producer_api_url).as_bytes()));
-    let dir = cfg.snapshot.dir.clone()
-        .unwrap_or_else(|| cfg.journal_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")));
-    dir.join(format!(".pulse-cutover-producer-{}", &key[..16]))
+    let key = hex::encode(Sha256::digest(producer_resource_key(cfg).as_bytes()));
+    lock_dir(cfg).join(format!("producer-{}", &key[..16]))
+}
+
+/// r30 round 6 (Codex R6-5): the drill work marker beside the producer lock (`<producer lock base>.work.json`).
+/// Written (fresh, never through a link) before a drill's work starts, naming its journal directory and H; removed
+/// only once that work is verified gone. The producer lock dies with the drill process, but a surviving export
+/// container or pipeline group does not: through the marker a ceremony under ANY journal directory still sees it.
+pub fn work_marker_path(cfg: &Config) -> PathBuf {
+    PathBuf::from(format!("{}.work.json", producer_lock_base(cfg).display()))
+}
+
+/// What the producer's work marker says, for a ceremony on that producer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkerWork {
+    /// No marker.
+    None,
+    /// A drill (under `journal_dir`) whose work is alive or cannot be shown stopped.
+    Live { journal_dir: PathBuf, h: u64, pid: Option<u32>, group: Option<u32> },
+    /// A marker that cannot be read or parsed: unknown is never "stopped".
+    Unknown(String),
+    /// The marker's drill is verified finished (its work is gone): a leftover marker.
+    Done { journal_dir: PathBuf },
+}
+
+pub fn marker_work(cfg: &Config) -> MarkerWork {
+    // No usable lock directory: no drill can have written a marker there (an unusable lock_dir is the agent's
+    // problem, journaled by the ceremony, never evidence of a drill).
+    if !lock_dir(cfg).is_dir() {
+        return MarkerWork::None;
+    }
+    let path = work_marker_path(cfg);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MarkerWork::None,
+        Err(e) => return MarkerWork::Unknown(format!("read {}: {e}", path.display())),
+    };
+    let v: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return MarkerWork::Unknown(format!("parse {}: {e}", path.display())),
+    };
+    let (Some(dir), Some(_)) = (v["journal_dir"].as_str(), v["h"].as_u64()) else {
+        return MarkerWork::Unknown(format!("{} names no journal_dir / h", path.display()));
+    };
+    let journal_dir = PathBuf::from(dir);
+    match activity_at(&journal_dir) {
+        DrillActivity::Running { h, pid, group } => MarkerWork::Live { journal_dir, h, pid, group },
+        _ => MarkerWork::Done { journal_dir },
+    }
+}
+
+fn write_work_marker(cfg: &Config, h: u64) -> Result<(), String> {
+    let me = std::process::id();
+    let body = json!({"kind": "readiness_drill_work", "journal_dir": canonical(&journal_dir_of(cfg)), "h": h,
+        "pid": me, "pid_start": crate::ops::process_start(me), "producer_resource": producer_resource_key(cfg)});
+    let path = work_marker_path(cfg);
+    // Replace a leftover marker of THIS producer only after checking it is done (the caller holds the producer lock).
+    match marker_work(cfg) {
+        MarkerWork::None | MarkerWork::Done { .. } => {}
+        MarkerWork::Live { journal_dir, h, .. } => return Err(format!(
+            "a readiness drill's work at H = {h} under {} is still running on this producer: stop it first \
+             (`pulse-cutover drill --cancel` with that config)", journal_dir.display())),
+        MarkerWork::Unknown(why) => return Err(format!("this producer's drill work marker is unreadable ({why}): \
+             check it by hand before another drill")),
+    }
+    crate::ops::write_fresh_in(&lock_dir(cfg), &path, body.to_string().as_bytes())
+        .map_err(|e| format!("cannot write the drill work marker {}: {e}", path.display()))
+}
+
+/// Remove this config's work marker once its drill's work is verified gone (never someone else's live one).
+pub fn clear_work_marker_if_done(cfg: &Config) {
+    let mine = canonical(&journal_dir_of(cfg));
+    if let MarkerWork::Done { journal_dir } = marker_work(cfg) {
+        if canonical(&journal_dir) == mine {
+            let _ = std::fs::remove_file(work_marker_path(cfg));
+        }
+    }
+}
+
+/// A ceremony's view: Some(why it must not ARM) while another directory's drill work on this producer is live or
+/// unknown. A marker naming the ceremony's own journal directory is left to the ceremony's own activity check.
+pub fn foreign_marker_blocker(cfg: &Config) -> Option<String> {
+    let mine = canonical(&journal_dir_of(cfg));
+    match marker_work(cfg) {
+        MarkerWork::Live { journal_dir, .. } if canonical(&journal_dir) == mine => None,
+        MarkerWork::Live { journal_dir, h, pid, group } => Some(format!(
+            "a readiness drill's work at H = {h} (under {}, pid {}, process group {}) is still running on this producer: \
+             wait for it, or stop it with `pulse-cutover drill --cancel` using that drill's config",
+            journal_dir.display(), pid.map_or("-".into(), |p| p.to_string()), group.map_or("-".into(), |g| g.to_string()))),
+        MarkerWork::Unknown(why) => Some(format!(
+            "this producer's drill work marker cannot be read ({why}): a drill's work may be running; check {} by hand",
+            work_marker_path(cfg).display())),
+        _ => None,
+    }
 }
 
 /// The drill root's own lock file (`<journal dir>/drill/drill.lock`): one drill per drill root, whatever journal
@@ -830,6 +966,7 @@ pub fn run<O: ChainOps>(cfg: &Config, ops: &O, opts: &DrillOptions) -> Result<Dr
 /// drill, even when the run itself returned Ok.
 pub fn run_with_guard<O: ChainOps>(cfg: &Config, guard: &DrillGuard<'_, O>, opts: &DrillOptions) -> Result<DrillOutcome, String> {
     let res = run_guarded(cfg, guard, opts);
+    clear_work_marker_if_done(cfg);
     let v = guard.violations.borrow().clone();
     if !v.is_empty() {
         // Defense in depth: the guard already refused each call; a drill that even tried is a bug to report.
@@ -871,6 +1008,8 @@ fn run_guarded<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillO
         ));
     }
     let h = opts.height;
+    // Round 6: the work marker, before any work starts (the producer lock is held).
+    write_work_marker(cfg, h)?;
     let info = ops.source_info()?;
     if let Some(pinned) = &cfg.ceremony.chain_id {
         if !pinned.eq_ignore_ascii_case(&info.chain_id) {
@@ -1329,6 +1468,14 @@ fn wait_until_not_running(cfg: &Config, wait: std::time::Duration) -> bool {
 ///    recorded, on the producer API it recorded, and only while that request is still the single-block request at
 ///    the recorded H (never by height alone), and mark it FAILED.
 pub fn cancel<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> Result<String, String> {
+    let r = cancel_inner(cfg, ops, wait);
+    if r.is_ok() {
+        clear_work_marker_if_done(cfg); // round 6: only once the drill's work is verified gone
+    }
+    r
+}
+
+fn cancel_inner<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> Result<String, String> {
     let (h, live_pid) = match activity(cfg) {
         DrillActivity::Idle => return Ok("no readiness drill is running on this box".into()),
         DrillActivity::Running { h, pid, .. } => (h, pid),

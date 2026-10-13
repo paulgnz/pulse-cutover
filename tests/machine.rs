@@ -7476,3 +7476,102 @@ fn r30r6_a_refused_arm_undoes_nothing_a_real_abort_still_undoes_what_it_did() {
     assert_eq!(ops.resumes.get(), 1, "the ceremony's own pause is undone");
     assert!(ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "the ceremony's own freeze is undone: {:?}", ops.hooks.borrow());
 }
+
+/// r30 round 6 (Codex R6-6/R6-7, reviewer R6-F1/F2): the producer lock lives in an agent-owned `lock_dir`, keyed on
+/// nodeos's canonical snapshot directory. Nothing is written into the snapshot directory (a read-only one still
+/// arms), spelling aliases of the producer API share one lock, and a lock_dir the agent cannot use is a journaled
+/// warning, never a refusal.
+#[test]
+fn r30r6_producer_lock_lives_in_lock_dir_keyed_on_the_snapshot_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let shared = tempfile::tempdir().unwrap();
+    let snapdir = shared.path().join("snapshots");
+    std::fs::create_dir_all(&snapdir).unwrap();
+    let locks = shared.path().join("locks");
+    let cfg_for = |dir: &std::path::Path, producer_api: &str, lock_dir: &std::path::Path| {
+        let _ = test_config(dir, 120);
+        let p = dir.join("ceremony.toml");
+        let t = std::fs::read_to_string(&p).unwrap()
+            .replacen("[snapshot]\n", &format!("[snapshot]\ndir = \"{}\"\n", snapdir.display()), 1)
+            .replacen("[ceremony]\n", &format!("[ceremony]\nlock_dir = \"{}\"\n", lock_dir.display()), 1)
+            .replace("producer_api_url = \"http://mock\"", &format!("producer_api_url = \"{producer_api}\""));
+        std::fs::write(&p, t).unwrap();
+        Config::load(&p).unwrap()
+    };
+    // Aliases of one producer API (and different journal directories) share one lock, in lock_dir.
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let ca = cfg_for(a.path(), "http://localhost:8888", &locks);
+    let cb = cfg_for(b.path(), "http://127.0.0.1:8888/", &locks);
+    assert_eq!(pulse_cutover::drill::producer_lock_base(&ca), pulse_cutover::drill::producer_lock_base(&cb));
+    assert!(pulse_cutover::drill::producer_lock_base(&ca).starts_with(&locks));
+
+    // A read-only snapshot directory still arms, and nothing is created in it.
+    std::fs::set_permissions(&snapdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let ops = MockOps::new(a.path(), 110);
+    let _ = run_machine_result(&ca, &ops);
+    std::fs::set_permissions(&snapdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let e = journal_entries(&ca);
+    assert!(transition(&e, "FROZEN").is_some(), "a read-only snapshot dir must not stop the ceremony arming");
+    assert!(!e.iter().any(|v| v.to_string().contains("producer's lock")));
+    let created: Vec<_> = std::fs::read_dir(&snapdir).unwrap().filter_map(|x| x.ok())
+        .map(|x| x.file_name().to_string_lossy().to_string()).filter(|n| n.starts_with(".pulse-cutover")).collect();
+    assert!(created.is_empty(), "the agent wrote into nodeos's snapshot dir: {created:?}");
+
+    // A lock_dir the agent cannot use (under a regular file): a journaled warning, the ceremony arms.
+    let blocker = shared.path().join("not-a-dir");
+    std::fs::write(&blocker, "x").unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let cc = cfg_for(c.path(), "http://mock", &blocker.join("locks"));
+    let ops = MockOps::new(c.path(), 110);
+    let _ = run_machine_result(&cc, &ops);
+    let e = journal_entries(&cc);
+    assert!(e.iter().any(|v| v["data"]["producer_lock_unavailable"].is_string()), "the unusable lock_dir is journaled");
+    assert!(transition(&e, "FROZEN").is_some(), "an unusable lock_dir must not refuse the cut");
+}
+
+/// r30 round 6 (Codex R6-5): a drill's work that survives its process (export container, pipeline group) is named by
+/// the producer's work marker, so a ceremony under ANOTHER journal directory still refuses to arm next to it, and
+/// arms once the work is verified gone.
+#[test]
+fn r30r6_orphan_drill_work_blocks_a_ceremony_in_another_directory() {
+    let shared = tempfile::tempdir().unwrap();
+    let snapdir = shared.path().join("snapshots");
+    std::fs::create_dir_all(&snapdir).unwrap();
+    let locks = shared.path().join("locks");
+    let cfg_for = |dir: &std::path::Path| {
+        let _ = test_config(dir, 120);
+        let p = dir.join("ceremony.toml");
+        let t = std::fs::read_to_string(&p).unwrap()
+            .replacen("[snapshot]\n", &format!("[snapshot]\ndir = \"{}\"\n", snapdir.display()), 1)
+            .replacen("[ceremony]\n", &format!("[ceremony]\nlock_dir = \"{}\"\n", locks.display()), 1);
+        std::fs::write(&p, t).unwrap();
+        Config::load(&p).unwrap()
+    };
+    let drill_dir = tempfile::tempdir().unwrap();
+    let ceremony_dir = tempfile::tempdir().unwrap();
+    let drill_cfg = cfg_for(drill_dir.path());
+    let cfg = cfg_for(ceremony_dir.path());
+    // The drill process is gone (no lock held), but its export container was never verified gone.
+    let root = pulse_cutover::drill::drill_root(&drill_cfg);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("latest.json"), serde_json::json!({"kind": "readiness_drill", "h": 99, "state": "FAILED",
+        "export_container": "pulse-drill-99-abc"}).to_string()).unwrap();
+    std::fs::create_dir_all(&locks).unwrap();
+    std::fs::write(pulse_cutover::drill::work_marker_path(&drill_cfg), serde_json::json!({"kind": "readiness_drill_work",
+        "journal_dir": drill_dir.path().canonicalize().unwrap(), "h": 99}).to_string()).unwrap();
+    let ops = MockOps::new(ceremony_dir.path(), 110);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("still running on this producer"), "{err}");
+    assert!(transition(&journal_entries(&cfg), "FROZEN").is_none(), "nothing froze");
+    assert_eq!((ops.pauses.get(), ops.resumes.get()), (0, 0));
+
+    // Once the container is verified gone, a fresh ceremony (new journal) arms.
+    std::fs::write(root.join("latest.json"), serde_json::json!({"kind": "readiness_drill", "h": 99, "state": "FAILED",
+        "export_container": "pulse-drill-99-abc", "export_container_gone": true}).to_string()).unwrap();
+    let ceremony_dir2 = tempfile::tempdir().unwrap();
+    let cfg2 = cfg_for(ceremony_dir2.path());
+    let ops = MockOps::new(ceremony_dir2.path(), 110);
+    let _ = run_machine_result(&cfg2, &ops);
+    assert!(transition(&journal_entries(&cfg2), "FROZEN").is_some());
+}

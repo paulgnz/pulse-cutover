@@ -42,6 +42,15 @@ pub struct Entry {
     pub data: Value,
 }
 
+/// Why a lock could not be taken (r30 round 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockError {
+    /// Another process holds it: a live competitor.
+    Held(String),
+    /// Anything else (directory missing or unwritable, read-only mount): not evidence of a competitor.
+    Io(String),
+}
+
 pub struct Journal {
     path: PathBuf,
     file: File,
@@ -142,9 +151,18 @@ impl Journal {
     /// drill for its whole run (r30), so a ceremony and a drill (or two of either) on one journal are mutually
     /// exclusive atomically. Creates the journal's directory if needed; never touches the journal itself.
     pub fn lock(path: &Path) -> Result<File, String> {
+        Self::try_lock(path).map_err(|e| match e {
+            LockError::Held(m) | LockError::Io(m) => m,
+        })
+    }
+
+    /// r30 round 6: like `lock`, but tells "another process holds it" (`Held`, the only answer that means a live
+    /// competitor) apart from every other failure (`Io`: an unwritable or missing directory, a read-only mount), so
+    /// a hygiene lock that cannot be taken is reported rather than mistaken for a competitor.
+    pub fn try_lock(path: &Path) -> Result<File, LockError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("create journal dir: {e}"))?;
+                std::fs::create_dir_all(parent).map_err(|e| LockError::Io(format!("create lock dir {}: {e}", parent.display())))?;
             }
         }
         let lock_path = PathBuf::from(format!("{}.lock", path.display()));
@@ -153,7 +171,7 @@ impl Journal {
             .truncate(false)
             .write(true)
             .open(&lock_path)
-            .map_err(|e| format!("open journal lock {}: {e}", lock_path.display()))?;
+            .map_err(|e| LockError::Io(format!("open lock {}: {e}", lock_path.display())))?;
         // A lock that is busy for a moment is not a second agent: a process that forked while this
         // lock's previous holder had it open shares the lock until it execs (the fd is close-on-exec).
         // Wait up to 2 s; a real concurrent agent holds the lock for the whole ceremony.
@@ -165,12 +183,12 @@ impl Journal {
         }
         match busy {
             Ok(()) => Ok(lock),
-            Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            Err(std::fs::TryLockError::WouldBlock) => Err(LockError::Held(format!(
                 "another pulse-cutover process holds {} — a ceremony (or a readiness drill) is already running on \
                  this journal. Refusing to start a second one.",
                 lock_path.display()
-            )),
-            Err(std::fs::TryLockError::Error(e)) => Err(format!("lock {}: {e}", lock_path.display())),
+            ))),
+            Err(std::fs::TryLockError::Error(e)) => Err(LockError::Io(format!("lock {}: {e}", lock_path.display()))),
         }
     }
 
