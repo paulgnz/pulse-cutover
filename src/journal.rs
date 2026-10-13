@@ -123,6 +123,11 @@ pub struct Recovered {
     /// The `shadow` value of the ARMED (arming) record: Null for a real ceremony, the shadow identity for a shadow
     /// (docs/DESIGN-shadow.md). None = no arming record yet. Journals from before shadow mode read as Null.
     pub armed_shadow: Option<Value>,
+    /// r30 round 6: the arming record's `undo_tracking` flag. Some(true) = this journal records every source pause
+    /// (`side_effect: source_pause`) and write freeze (`side_effect: write_freeze`) before doing it, so a rollback
+    /// undoes only those. Some(false) = an arming record from an older agent (rollback keeps its old behaviour).
+    /// None = no arming record yet (nothing was done).
+    pub undo_tracking: Option<bool>,
     /// Round-2 review: a shadow identity refusal was journaled (its first record). Sticky: from then on nothing may
     /// resume the source or run on_abort on this journal, whatever records follow (a crash between the refusal's
     /// records must not reopen a rollback that resumes a node which may be real).
@@ -405,6 +410,9 @@ impl Journal {
                 // The arming record (it carries "mode"; an unhalt returning to ARMED does not): bind the shadow identity.
                 if st == State::Armed && out.armed_shadow.is_none() && entry.data.get("mode").is_some() {
                     out.armed_shadow = Some(entry.data.get("shadow").cloned().unwrap_or(Value::Null));
+                }
+                if st == State::Armed && out.undo_tracking.is_none() && entry.data.get("mode").is_some() {
+                    out.undo_tracking = Some(entry.data.get("undo_tracking").and_then(|v| v.as_bool()) == Some(true));
                 }
                 if entry.state == State::Frozen.as_str() {
                     out.frozen_ts_ms = Some(entry.ts_ms);

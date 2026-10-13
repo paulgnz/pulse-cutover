@@ -101,6 +101,13 @@ pub struct Machine<'a, O: ChainOps> {
     /// producer API, in nodeos's snapshot dir), held like the drill-root lock, so a drill under ANOTHER journal
     /// directory on the same producer cannot run next to this ceremony. Lock order: journal, drill root, producer.
     producer_lock: Option<std::fs::File>,
+    /// r30 round 6 (Codex R6-1): undo only what this journal did. True once this journal recorded a source pause
+    /// (`side_effect: source_pause`, written before the pause) / a write freeze (`side_effect: write_freeze`, written
+    /// before on_freeze). A rollback resumes the producer and runs on_abort only for what this ceremony did; a
+    /// preflight refusal (a busy lock, a producer someone else paused) touches nothing. Journals from older agents
+    /// (`undo_tracking` absent on their arming record) keep the previous behaviour (both true).
+    paused_by_us: bool,
+    writes_closed_by_us: bool,
     /// The full shadow identity proof passed in THIS run, right before chain creation / ignition: the only thing that
     /// lets a shadow go past the XPR mainnet ignite refusal (never the config flag alone).
     shadow_verified: bool,
@@ -290,6 +297,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let rollback_steps_done = recovered.rollback_steps_done.clone();
         let rollback_pending = recovered.rollback_pending;
         let joining = recovered.side_effects.iter().any(|s| s == "join");
+        let legacy_undo = recovered.undo_tracking == Some(false);
+        let paused_by_us = legacy_undo || started("source_pause");
+        let writes_closed_by_us = legacy_undo || started("write_freeze");
         let create_chain_started = recovered.side_effects.iter().any(|s| s == "create_chain") || joining;
         Machine {
             cfg,
@@ -334,6 +344,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             armed_shadow: recovered.armed_shadow,
             drill_root_lock: None,
             producer_lock: None,
+            paused_by_us,
+            writes_closed_by_us,
             shadow_verified: false,
             shadow_refused: recovered.shadow_refused,
             shadow_proven: false,
@@ -516,7 +528,22 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     fn src_pause(&mut self) -> Result<(), String> {
         self.shadow_mutation_gate("pausing the source producer")?;
         self.shadow_producer_gate("pausing the source producer")?;
+        // r30 round 6: journaled BEFORE the pause, so a rollback (even after a crash) knows this ceremony paused it.
+        if !self.paused_by_us {
+            self.journal.evidence(self.state, json!({"side_effect": "source_pause"}))?;
+            self.paused_by_us = true;
+        }
         self.ops.pause() // ungated: this IS the gate
+    }
+
+    /// r30 round 6: the write freeze (on_freeze), journaled as a side effect BEFORE the hook runs, so a rollback
+    /// reopens writes (on_abort) only when this ceremony closed them.
+    fn freeze_writes(&mut self, hook: &str) -> Result<String, String> {
+        if !self.writes_closed_by_us {
+            self.journal.evidence(self.state, json!({"side_effect": "write_freeze"}))?;
+            self.writes_closed_by_us = true;
+        }
+        self.hook(hook)
     }
 
     fn src_resume(&mut self) -> Result<(), String> {
@@ -698,6 +725,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 State::Armed,
                 json!({
                     "mode": format!("{:?}", self.cfg.ceremony.mode),
+                    "undo_tracking": true,
                     "freeze_height": self.cfg.ceremony.freeze_height,
                     "resolved_h": resolved_h,
                     "simulate_freeze": self.cfg.ceremony.simulate_freeze,
@@ -1507,7 +1535,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// rollback moves any staged file; the agent's own abort only the one this ceremony staged.
     fn unstage(&mut self, any: bool, failed: &mut Vec<String>, notes: &mut Vec<String>) -> Result<(), String> {
         let staged = self.cfg.snapshot.staged_path.clone();
-        if !staged.exists() || !(any || self.staged_sha256.is_some()) {
+        // r30 round 6: undo only what this ceremony did. "Any" file at the staged path is moved aside only for a
+        // ceremony that got far enough to stage one (it froze writes); one refused at ARM never staged anything, and
+        // the file there may belong to another ceremony on this box.
+        if !staged.exists() || !(self.staged_sha256.is_some() || (any && self.writes_closed_by_us)) {
             return Ok(());
         }
         self.shadow_mutation_gate("moving the staged snapshot aside")?;
@@ -1913,7 +1944,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             match self.cfg.ceremony.mode {
                 // Producer mode: un-pausing nodeos IS the entire rollback.
                 Mode::Producer => {
-                    if !self.step_done("resume") {
+                    if !self.paused_by_us {
+                        // r30 round 6: undo only what this ceremony did. It never paused the producer (a preflight
+                        // refusal, a producer someone else paused): resuming it would undo another process's pause.
+                        rollback["source_producer_resumed"] = json!("not paused by this ceremony: nothing to resume");
+                    } else if !self.step_done("resume") {
                         match self.src_resume() {
                             Ok(()) => {
                                 rollback["source_producer_resumed"] = json!(true);
@@ -1988,11 +2023,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.journal.transition(State::Aborted, rollback)?;
         // rc.29: a producer's writes reopen only once its source produces again (auto_rollback = false, or a failed
         // resume, would otherwise send writes into a paused chain); the operator's `rollback` reopens them later.
-        let source_back = self.cfg.ceremony.mode != Mode::Producer || (perform && self.step_done("resume"));
+        let source_back = self.cfg.ceremony.mode != Mode::Producer || !self.paused_by_us || (perform && self.step_done("resume"));
+        // r30 round 6: writes are reopened only if this ceremony closed them (its on_freeze ran or started).
+        if self.cfg.hooks.on_abort.is_some() && !self.writes_closed_by_us && !self.step_done("on_abort") {
+            self.journal.evidence(State::Aborted, json!({"on_abort_skipped": "writes were not closed by this ceremony: nothing to reopen"}))?;
+        }
         if self.cfg.hooks.on_abort.is_some() && !source_back && !self.step_done("on_abort") {
             self.journal.evidence(State::Aborted, json!({"on_abort_deferred": "the source producer was not resumed: writes stay frozen until `pulse-cutover rollback`"}))?;
         }
-        if let Some(hook) = self.cfg.hooks.on_abort.clone().filter(|_| source_back) {
+        if let Some(hook) = self.cfg.hooks.on_abort.clone().filter(|_| source_back && self.writes_closed_by_us) {
             if !self.step_done("on_abort") {
                 let result = self.hook(&hook);
                 self.journal.evidence(State::Aborted, json!({"on_abort_hook": format!("{result:?}")}))?;
@@ -2003,8 +2042,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
         self.unstage(unstage_any, &mut failed, &mut notes)?;
+        // Nothing this ceremony did needs undoing (no pause, no freeze): the rollback is complete as it stands,
+        // whatever auto_rollback says, so a later `rollback` is a no-op instead of resuming someone else's producer.
+        let nothing_to_undo = !self.paused_by_us && !self.writes_closed_by_us;
+        if nothing_to_undo {
+            self.journal.evidence(State::Aborted, json!({"nothing_to_undo": true,
+                "note": "this ceremony neither paused the producer nor froze writes: nothing was resumed or reopened"}))?;
+        }
         if failed.is_empty() {
-            if perform {
+            if perform || nothing_to_undo {
                 self.journal.evidence(State::Aborted, json!({"rollback_done": true, "rollback_complete": true}))?;
                 self.aborted_rollback_complete = true;
             }
@@ -2084,8 +2130,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // The write freeze — the moment the write gap starts (R2: an
         // explicit reject at the API edge, never just a producer pause).
         self.check_mainnet_h()?;
-        let freeze_hook = if let Some(hook) = &self.cfg.hooks.on_freeze {
-            let result = self.hook(hook);
+        let freeze_hook = if let Some(hook) = self.cfg.hooks.on_freeze.clone() {
+            let result = self.freeze_writes(&hook);
             if let Err(e) = &result {
                 self.abort("write-freeze hook failed", json!({"error": e}))?;
                 return Ok(());
@@ -2161,9 +2207,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // cannot freeze the network's writes; that happened (or is simulated
         // to have happened) at the BP edge.
         self.check_mainnet_h()?;
-        let freeze_hook = if let Some(hook) = &self.cfg.hooks.on_freeze {
+        let freeze_hook = if let Some(hook) = self.cfg.hooks.on_freeze.clone() {
             // Required hook: a failed write-freeze must not be shrugged off (run-5 lesson).
-            match self.hook(hook) {
+            match self.freeze_writes(&hook) {
                 Ok(o) => o,
                 Err(e) => {
                     self.abort("write-freeze hook failed", json!({"error": e}))?;
@@ -2384,6 +2430,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             if final_already {
                 self.journal.evidence(State::Frozen, json!({"kept_paused_on_resume": true,
                     "note": "H is already final: the scheduled snapshot needs no more blocks from this producer"}))?;
+            } else if !self.paused_by_us {
+                // r30 round 6: this journal never paused the producer: someone else did. Never resume another
+                // process's pause; stop here (writes this ceremony froze are reopened by the abort).
+                self.abort("the source producer is paused, but not by this ceremony: refusing to resume it",
+                    json!({"fix": "find out who paused it (another agent, an operator) before re-running"}))?;
+                return Ok(());
             } else {
                 self.src_resume()?;
                 self.journal.evidence(
@@ -3254,7 +3306,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Err(forget(self, "join refused: this ceremony ABORTED (on_abort reopened writes) and has no hooks.on_freeze to close \
                             them again first. Nothing was changed on either chain.".into()));
             };
-            match self.hook(&hook) {
+            match self.freeze_writes(&hook) {
                 Ok(o) => self.journal.evidence(self.state, json!({"join_refreeze": o, "note": "writes frozen again before the join"}))?,
                 Err(e) => {
                     self.journal.evidence(self.state, json!({"join_refreeze_error": e}))?;

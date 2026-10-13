@@ -7415,3 +7415,64 @@ fn r30r5_a_fresh_ceremony_refuses_next_to_a_drill_on_the_same_producer_in_anothe
     drop(held);
 }
 
+
+/// r30 round 6 (Codex R6-1): undo only what this ceremony did. A preflight refusal (a producer someone else paused,
+/// a busy producer lock) must never resume that producer or reopen writes another process closed; a normal abort
+/// after this ceremony froze and paused still resumes and reopens (regression check).
+#[test]
+fn r30r6_a_refused_arm_undoes_nothing_a_real_abort_still_undoes_what_it_did() {
+    let with_on_abort = |dir: &std::path::Path, extra_snapshot: Option<&std::path::Path>| {
+        let _ = test_config(dir, 120);
+        let p = dir.join("ceremony.toml");
+        let mut t = std::fs::read_to_string(&p).unwrap().replacen("[hooks]\n", "[hooks]\non_abort = \"reopen-writes\"\n", 1);
+        if let Some(sd) = extra_snapshot {
+            t = t.replacen("[snapshot]\n", &format!("[snapshot]\ndir = \"{}\"\n", sd.display()), 1);
+        }
+        std::fs::write(&p, t).unwrap();
+        Config::load(&p).unwrap()
+    };
+    // (a) The producer is already paused by another process at ARM: refused, ABORTED, nothing resumed or reopened.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = with_on_abort(dir.path(), None);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.paused.set(true);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("producer already paused at arm time"), "{err}");
+    assert_eq!(ops.resumes.get(), 0, "another process's pause was undone");
+    assert!(ops.paused.get(), "the producer someone else paused stays paused");
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "writes another process closed were reopened: {:?}", ops.hooks.borrow());
+    let e = journal_entries(&cfg);
+    assert!(transition(&e, "ABORTED").is_some());
+    assert!(e.iter().any(|v| v["data"]["nothing_to_undo"] == serde_json::json!(true)));
+    // A later operator rollback is a no-op: the journal proves the rollback complete.
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback(false).unwrap();
+    assert!(out.already, "{:?}", out.notes);
+    assert_eq!(ops.resumes.get(), 0);
+
+    // (b) A busy producer lock at a fresh ARM: refused, nothing paused, resumed or reopened.
+    let shared = tempfile::tempdir().unwrap();
+    let snapdir = shared.path().join("snapshots");
+    std::fs::create_dir_all(&snapdir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = with_on_abort(dir.path(), Some(&snapdir));
+    let held = pulse_cutover::journal::Journal::lock(&pulse_cutover::drill::producer_lock_base(&cfg)).unwrap();
+    let ops = MockOps::new(dir.path(), 110);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("producer's lock"), "{err}");
+    assert_eq!((ops.pauses.get(), ops.resumes.get()), (0, 0));
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "reopen-writes" || h == "freeze-writes"), "{:?}", ops.hooks.borrow());
+    drop(held);
+
+    // (c) Regression: a real abort after this ceremony froze writes and paused the producer still resumes it and
+    //     reopens writes (a burn-off transaction after H aborts at SNAPSHOTTED).
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = with_on_abort(dir.path(), None);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.late_block.set(true);
+    ops.burnoff_tx_per_block.set(1);
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    assert!(ops.pauses.get() >= 1);
+    assert_eq!(ops.resumes.get(), 1, "the ceremony's own pause is undone");
+    assert!(ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "the ceremony's own freeze is undone: {:?}", ops.hooks.borrow());
+}
