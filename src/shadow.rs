@@ -347,6 +347,7 @@ pub fn public_mainnet_problems<O: ChainOps + ?Sized>(declared_keys: &[String], o
         Err(e) => return vec![format!("cannot read the source chain: {e} (shadow source unverified)")],
     };
     let (mut schedules_read, mut blocks_compared, mut unreachable) = (0usize, 0usize, vec![]);
+    let (mut max_head, mut behind): (Option<u64>, Vec<String>) = (None, vec![]);
     for base in PUBLIC_XPR_MAINNET_APIS {
         let info = match ops.public_chain_post(base, "/v1/chain/get_info", json!({})) {
             Ok(v) if v["chain_id"].as_str().is_some_and(crate::config::is_xpr_mainnet) => v,
@@ -387,23 +388,16 @@ pub fn public_mainnet_problems<O: ChainOps + ?Sized>(declared_keys: &[String], o
             }
             Err(e) => unreachable.push(format!("{base}: get_producer_schedule: {e}")),
         }
-        // Round-2 review (N2): a missing head is unreadable, never a comparison; and an endpoint merely BEHIND the
-        // source (lagging or syncing) proves nothing. Only a source final FAR past mainnet's own head (more than
-        // FAR_AHEAD_BLOCKS, one day of 0.5 s blocks: no healthy public endpoint lags by a day, and a restored
-        // snapshot never runs ahead of the network it came from by accident) counts as "not mainnet".
+        // Round-2 review (N2): a missing head is unreadable, never a comparison. Round-3 review (F2): an endpoint BEHIND
+        // the source is never judged on its own: the "far ahead" rule below applies to the HIGHEST head any answering
+        // mainnet endpoint reports, so one stuck endpoint cannot vouch for a source that a healthy one would expose.
         let Some(mainnet_head) = info["head_block_num"].as_u64() else {
             unreachable.push(format!("{base}: get_info without head_block_num (block not compared)"));
             continue;
         };
+        max_head = max_head.max(Some(mainnet_head));
         if mainnet_head < src_lib {
-            if src_lib - mainnet_head > FAR_AHEAD_BLOCKS {
-                blocks_compared += 1;
-            } else {
-                unreachable.push(format!(
-                    "{base}: mainnet head {mainnet_head} is behind the source's LIB {src_lib} by less than a day of blocks \
-                     (a lagging endpoint proves nothing; block not compared)"
-                ));
-            }
+            behind.push(format!("{base}: mainnet head {mainnet_head} is behind the source's LIB {src_lib}"));
             continue;
         }
         match ops.public_chain_post(base, "/v1/chain/get_block", json!({"block_num_or_id": src_lib})) {
@@ -420,6 +414,19 @@ pub fn public_mainnet_problems<O: ChainOps + ?Sized>(declared_keys: &[String], o
                 None => unreachable.push(format!("{base}: get_block {src_lib}: no id")),
             },
             Err(e) => unreachable.push(format!("{base}: get_block {src_lib}: {e}")),
+        }
+    }
+    // Only when EVERY answering endpoint (so the highest head among them) is more than FAR_AHEAD_BLOCKS (one day of 0.5 s
+    // blocks) behind the source's LIB does the gap itself count as "not mainnet": no healthy public endpoint lags by a
+    // day, and a restored snapshot never runs ahead of the network it came from by accident. Anything closer is
+    // unknown: a real get_block comparison is required.
+    if blocks_compared == 0 {
+        match max_head {
+            Some(h) if h < src_lib && src_lib - h > FAR_AHEAD_BLOCKS => blocks_compared = 1,
+            Some(_) => unreachable.extend(behind.into_iter().map(|b| format!(
+                "{b}; the highest public mainnet head is within a day of the source, so only a block comparison \
+                 counts (none possible: block not compared)"))),
+            None => {}
         }
     }
     if schedules_read == 0 || blocks_compared == 0 {

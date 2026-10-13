@@ -394,6 +394,49 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Ok(false)
     }
 
+    /// Round-3 review: THE gate for every source-side mutation (pause, resume, every hook but the paging-only on_halt,
+    /// unstage). On a SHADOW journal nothing may touch the source before the full identity proof (parts 1-3) has passed in
+    /// THIS run: a journal retargeted at a real producer (same label, network and keys, other URLs) is refused here,
+    /// whatever entry point got this far (run, rollback, join, unhalt, cancel-intent). A failed proof refuses through
+    /// `shadow_refuse` (touches nothing) and returns Err, so the caller's mutation never runs. Every mutating call in this
+    /// file goes through `src_pause` / `src_resume` / `hook` / `unstage` (a test enforces it).
+    fn shadow_mutation_gate(&mut self, what: &str) -> Result<(), String> {
+        if !self.is_shadow_journal() {
+            return Ok(());
+        }
+        if self.shadow_refused {
+            return Err(format!("SHADOW identity refused on this journal: {what} was not done (the source was not touched)"));
+        }
+        if self.shadow_proven {
+            return Ok(());
+        }
+        let problems = crate::shadow::identity_problems(self.cfg, self.ops);
+        if problems.is_empty() {
+            self.shadow_proven = true;
+            self.journal.evidence(self.state, json!({"shadow_identity": format!("proven in this run before {what}")}))?;
+            return Ok(());
+        }
+        let reason = format!("SHADOW identity not proven in this run, so {what} was refused (the source was not touched)");
+        self.shadow_refuse(&reason, json!({"identity_problems": problems}))?;
+        Err(reason)
+    }
+
+    fn src_pause(&mut self) -> Result<(), String> {
+        self.shadow_mutation_gate("pausing the source producer")?;
+        self.ops.pause() // ungated: this IS the gate
+    }
+
+    fn src_resume(&mut self) -> Result<(), String> {
+        self.shadow_mutation_gate("resuming the source producer")?;
+        self.ops.resume() // ungated: this IS the gate
+    }
+
+    /// Runs a hook through the shadow gate (every hook except the paging-only on_halt).
+    fn hook(&mut self, cmd: &str) -> Result<String, String> {
+        self.shadow_mutation_gate(&format!("hook `{cmd}`"))?;
+        self.ops.run_hook(cmd) // ungated: this IS the gate
+    }
+
     /// Round-2 review (D-10): an XPR MAINNET journal continues only with the event its fresh ARM authenticated.
     fn check_mainnet_binding(&self) -> Result<(), String> {
         let state = if self.resumed { Some(self.state) } else { None };
@@ -401,6 +444,29 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             Some(why) => Err(format!("{why}. Journal: {}", self.journal.path().display())),
             None => Ok(()),
         }
+    }
+
+    /// Round-3 review (D-10): the H this ceremony executes (`self.h()`, recovered from the ARMED record) must be the H the
+    /// signed event authorized. A crash right after ARMED followed by a resume with another config and a valid event for
+    /// another H would otherwise authenticate H2 and cut H1. Checked at run start, at authentication, before the snapshot
+    /// is scheduled and before the write freeze.
+    fn check_mainnet_h(&self) -> Result<(), String> {
+        let Some(h) = self.resolved_h else { return Ok(()) };
+        if !self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet) && self.mainnet_binding.is_none() {
+            return Ok(());
+        }
+        let config_h = self.cfg.ceremony.freeze_height;
+        if self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet) && config_h != 0 && config_h != h {
+            return Err(format!("XPR MAINNET: this journal executes H = {h} (its ARMED record) but the config's freeze_height \
+                is {config_h}: refused. Nothing was changed. Journal: {}", self.journal.path().display()));
+        }
+        if let Some(bh) = self.mainnet_binding.as_ref().and_then(|b| b.get("h")).and_then(|v| v.as_u64()) {
+            if bh != h {
+                return Err(format!("XPR MAINNET: the signed event authorized H = {bh} but this journal executes H = {h}: \
+                    refused. Nothing was changed. Journal: {}", self.journal.path().display()));
+            }
+        }
+        Ok(())
     }
 
     /// A config flipped to or from shadow (or a shadow's label, network or keys changed) since ARM: refused.
@@ -422,6 +488,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.cfg.ensure_ceremony_profile()?;
         self.check_shadow_binding()?;
         self.check_mainnet_binding()?;
+        self.check_mainnet_h()?;
         if self.shadow_refused {
             // Round-2 review: a journaled shadow refusal is final for this journal. Finish its records if a crash cut
             // them short, touch nothing, and stop.
@@ -677,7 +744,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 let co = self.cfg.coordination.as_ref().expect("checked above");
                 let url = format!("{}/api/coord/{}", co.url.trim_end_matches('/'), co.network);
                 let doc = self.ops.get_json(&url).ok().flatten();
-                let bound = crate::coord::mainnet_event_problems(doc.as_ref(), &self.cfg, &info.chain_id);
+                let mut bound = crate::coord::mainnet_event_problems(doc.as_ref(), &self.cfg, &info.chain_id);
+                // Round-3 review: the authenticated H must be the H this journal executes (recovered on a resume).
+                if let Some(h) = self.resolved_h.filter(|h| *h != self.cfg.ceremony.freeze_height) {
+                    bound.push(format!("the event and config authorize H = {} but this journal executes H = {h}",
+                        self.cfg.ceremony.freeze_height));
+                }
                 if bound.is_empty() {
                     // The bindings later runs compare offline (coord::mainnet_binding_problem), journaled before any freeze.
                     let binding = crate::coord::mainnet_binding(self.cfg, &info.chain_id);
@@ -1114,7 +1186,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             "clear_with": "pulse-cutover unhalt --config <file> --i-understand"}))?;
         eprintln!("HALTED at {from}: {reason}");
         if let Some(hook) = &self.cfg.hooks.on_halt {
-            let result = self.ops.run_hook(hook);
+            let result = self.ops.run_hook(hook); // ungated: on_halt only pages a human (shadow gate exempt)
             self.journal.evidence(State::Halted, json!({"on_halt_hook": format!("{result:?}")}))?;
         }
         Err(format!("HALTED at {from}: {reason}"))
@@ -1267,7 +1339,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // create two writable histories under one chain_id, by our own hand.
             let fence = self.cfg.target.fence_cmd();
             self.journal.evidence(self.state, json!({"side_effect": "target_fence", "cmd": fence}))?;
-            match self.ops.run_hook(&fence) {
+            match self.hook(&fence) {
                 Ok(out) => {
                     self.journal.evidence(self.state, json!({"target_fenced": true, "output": out}))?;
                     self.mark_step("target_fence")?;
@@ -1314,6 +1386,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if !staged.exists() || !(any || self.staged_sha256.is_some()) {
             return Ok(());
         }
+        self.shadow_mutation_gate("moving the staged snapshot aside")?;
         let mut to = staged.as_os_str().to_owned();
         to.push(format!(".rolled-back-{}", self.ops.now_ms()));
         let to = std::path::PathBuf::from(to);
@@ -1609,7 +1682,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             return Ok(true);
         }
-        let r = self.ops.pause().and_then(|_| self.ops.producer_paused());
+        let r = self.src_pause().and_then(|_| self.ops.producer_paused());
         let ok = matches!(r, Ok(true));
         self.journal.evidence(self.state, json!({"source_pause_enforced": ok, "result": format!("{r:?}")}))?;
         Ok(ok)
@@ -1686,7 +1759,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 (POST /v1/producer/pause); every `run`/`rollback` on this journal retries the pause.");
         }
         if let Some(hook) = &self.cfg.hooks.on_halt {
-            let result = self.ops.run_hook(hook);
+            let result = self.ops.run_hook(hook); // ungated: on_halt only pages a human (shadow gate exempt)
             self.journal.evidence(State::Stranded, json!({"on_halt_hook": format!("{result:?}")}))?;
         }
         Ok(())
@@ -1717,7 +1790,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 // Producer mode: un-pausing nodeos IS the entire rollback.
                 Mode::Producer => {
                     if !self.step_done("resume") {
-                        match self.ops.resume() {
+                        match self.src_resume() {
                             Ok(()) => {
                                 rollback["source_producer_resumed"] = json!(true);
                                 self.mark_step("resume")?;
@@ -1738,7 +1811,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 Mode::Api => {
                     if self.source_stopped && !self.step_done("source_restart") {
                         if let Some(cmd) = self.cfg.source.start_cmd.clone() {
-                            match self.ops.run_hook(&cmd) {
+                            match self.hook(&cmd) {
                                 Ok(o) => {
                                     rollback["source_restarted"] = json!(o);
                                     self.mark_step("source_restart")?;
@@ -1755,7 +1828,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     }
                     if self.hyperion_flip_ran && !self.step_done("hyperion_revert") {
                         if let Some(cmd) = self.cfg.hyperion.as_ref().and_then(|h| h.revert_cmd.clone()) {
-                            match self.ops.run_hook(&cmd) {
+                            match self.hook(&cmd) {
                                 Ok(o) => {
                                     rollback["hyperion_flip_reverted"] = json!(o);
                                     self.mark_step("hyperion_revert")?;
@@ -1769,7 +1842,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     }
                     if self.flip_ran && !self.step_done("flip_revert") {
                         if let Some(cmd) = self.cfg.flip.as_ref().and_then(|f| f.revert_cmd.clone()) {
-                            match self.ops.run_hook(&cmd) {
+                            match self.hook(&cmd) {
                                 Ok(o) => {
                                     rollback["flip_reverted"] = json!(o);
                                     self.mark_step("flip_revert")?;
@@ -1797,7 +1870,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         if let Some(hook) = self.cfg.hooks.on_abort.clone().filter(|_| source_back) {
             if !self.step_done("on_abort") {
-                let result = self.ops.run_hook(&hook);
+                let result = self.hook(&hook);
                 self.journal.evidence(State::Aborted, json!({"on_abort_hook": format!("{result:?}")}))?;
                 match result {
                     Ok(_) => self.mark_step("on_abort")?,
@@ -1829,6 +1902,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // Multi-BP mode: pin the snapshot to exactly H up front; nodeos
             // writes it when H becomes irreversible. (Falls back to the
             // immediate create_snapshot path if the scheduler is missing.)
+            self.check_mainnet_h()?;
             match self.ops.schedule_snapshot(self.h()) {
                 Ok(()) => {
                     self.scheduled = true;
@@ -1885,8 +1959,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         // The write freeze — the moment the write gap starts (R2: an
         // explicit reject at the API edge, never just a producer pause).
+        self.check_mainnet_h()?;
         let freeze_hook = if let Some(hook) = &self.cfg.hooks.on_freeze {
-            let result = self.ops.run_hook(hook);
+            let result = self.hook(hook);
             if let Err(e) = &result {
                 self.abort("write-freeze hook failed", json!({"error": e}))?;
                 return Ok(());
@@ -1922,6 +1997,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // Exact H: unless rehearsing against a live chain (simulate_freeze), the API node pins
         // its snapshot to H with the scheduler — never "whatever head is when LIB passes H".
         if !self.cfg.ceremony.simulate_freeze && !self.scheduled {
+            self.check_mainnet_h()?;
             match self.ops.schedule_snapshot(self.h()) {
                 Ok(()) => {
                     self.scheduled = true;
@@ -1960,9 +2036,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // writes with a clear "cutover in progress" error — R2). An API node
         // cannot freeze the network's writes; that happened (or is simulated
         // to have happened) at the BP edge.
+        self.check_mainnet_h()?;
         let freeze_hook = if let Some(hook) = &self.cfg.hooks.on_freeze {
             // Required hook: a failed write-freeze must not be shrugged off (run-5 lesson).
-            match self.ops.run_hook(hook) {
+            match self.hook(hook) {
                 Ok(o) => o,
                 Err(e) => {
                     self.abort("write-freeze hook failed", json!({"error": e}))?;
@@ -2184,7 +2261,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.journal.evidence(State::Frozen, json!({"kept_paused_on_resume": true,
                     "note": "H is already final: the scheduled snapshot needs no more blocks from this producer"}))?;
             } else {
-                self.ops.resume()?;
+                self.src_resume()?;
                 self.journal.evidence(
                     State::Frozen,
                     json!({"resumed_production_for_snapshot": true}),
@@ -2213,7 +2290,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
 
         // Stop production and require quiescence (R4: catches producers that
         // ignored the pause and late blocks arriving over p2p).
-        self.ops.pause()?;
+        self.src_pause()?;
         if !self.ops.producer_paused()? {
             self.abort("pause did not take effect", json!({}))?;
             return Ok(());
@@ -2221,7 +2298,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // Stand-in rehearsals: emulate "every producer paused" (e.g. sever
         // p2p on a live-syncing replica) so the quiescence window can pass.
         if let Some(cmd) = &self.cfg.source.quiesce_cmd {
-            match self.ops.run_hook(cmd) {
+            match self.hook(cmd) {
                 Ok(o) => self
                     .journal
                     .evidence(State::Frozen, json!({"quiesce_cmd": o}))?,
@@ -2887,7 +2964,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.journal.evidence(State::Verified, json!({"side_effect": "create_chain", "cmd": cmd,
                 "point_of_no_return": "chain creation may activate a target; any outcome from here halts instead of resuming the source"}))?;
             self.create_chain_started = true;
-            let out = match self.ops.run_hook(&cmd) {
+            let out = match self.hook(&cmd) {
                 Ok(o) => o,
                 Err(e) => {
                     self.abort("create_chain_cmd failed after it started", json!({"error": e,
@@ -3053,7 +3130,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Err(forget(self, "join refused: this ceremony ABORTED (on_abort reopened writes) and has no hooks.on_freeze to close \
                             them again first. Nothing was changed on either chain.".into()));
             };
-            match self.ops.run_hook(&hook) {
+            match self.hook(&hook) {
                 Ok(o) => self.journal.evidence(self.state, json!({"join_refreeze": o, "note": "writes frozen again before the join"}))?,
                 Err(e) => {
                     self.journal.evidence(self.state, json!({"join_refreeze_error": e}))?;
@@ -3079,7 +3156,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             "live_members": members, "source_head": info.head_block_num, "head_at_pause": paused_head,
             "burnoff_transactions": 0, "source_paused": paused, "evidence": ours}}))?;
         if !paused {
-            self.ops.pause()?;
+            self.src_pause()?;
             self.journal.evidence(self.state, json!({"join_paused_source": true}))?;
         }
         self.journal.evidence(self.state, json!({"side_effect": "join",
@@ -3567,7 +3644,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     fn run_required_hook(&mut self, site: &str, hook: &str) -> Result<Option<String>, String> {
         let mut attempt = 0u32;
         loop {
-            match self.ops.run_hook(hook) {
+            match self.hook(hook) {
                 Ok(o) => {
                     if attempt > 0 {
                         self.journal.evidence(self.state, json!({"hook_retry_succeeded": site, "attempts": attempt + 1}))?;
@@ -3773,7 +3850,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let flip_cmd = self.cfg.flip.as_ref().expect("validated").cmd.clone();
         self.journal.evidence(State::Ignited, json!({"side_effect": "flip_cmd"}))?;
         self.flip_ran = true; // even a failing cmd may have half-applied
-        let flip_out = match self.ops.run_hook(&flip_cmd) {
+        let flip_out = match self.hook(&flip_cmd) {
             Ok(o) => o,
             Err(e) => {
                 self.abort("flip command failed", json!({"error": e}))?;
@@ -3786,7 +3863,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if let Some(hyp) = self.cfg.hyperion.clone() {
             self.journal.evidence(State::Ignited, json!({"side_effect": "hyperion_flip_cmd"}))?;
             self.hyperion_flip_ran = true;
-            match self.ops.run_hook(&hyp.flip_cmd) {
+            match self.hook(&hyp.flip_cmd) {
                 Ok(o) => v2_flip_out = json!(o),
                 Err(e) => {
                     self.abort("hyperion /v2 flip command failed", json!({"error": e}))?;
@@ -3874,7 +3951,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let cmd = cmd
                 .replace("{first_post_cut_block}", &(cut + 1).to_string())
                 .replace("{cut_height}", &cut.to_string());
-            match self.ops.run_hook(&cmd) {
+            match self.hook(&cmd) {
                 Ok(o) => self
                     .journal
                     .evidence(State::Ignited, json!({"hyperion_start": o, "cmd": cmd}))?,
@@ -3961,7 +4038,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let started = self.ops.now_ms();
         self.journal.evidence(State::Flipped, json!({"side_effect": "source_stop_cmd"}))?;
         self.source_stopped = true; // even a failing stop may have half-applied
-        let stop_out = match self.ops.run_hook(&stop_cmd) {
+        let stop_out = match self.hook(&stop_cmd) {
             Ok(o) => o,
             Err(e) => {
                 self.abort("source stop command failed", json!({"error": e}))?;

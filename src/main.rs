@@ -75,7 +75,12 @@ refused to continue or roll back on its own. After the coordinator has made the
 fleet-wide decision, this clears the seal: it journals who/when and returns the
 journal to the state it halted from, so the next `run` resumes from there (a
 resumed run with ignition started halts again unless the cause is fixed).
-It never resumes the source chain or reverts routing itself.";
+It never resumes the source chain or reverts routing itself.
+
+SHADOW journals: a shadow halted because its identity proof failed (shadow_refused) stays
+refused after unhalt: `run`, `rollback` and `join` touch nothing on it. Check by hand which
+chain the source belongs to (docs/DESIGN-shadow.md, manual recovery); a new shadow starts on a
+fresh journal.";
 
 const HELP_ROLLBACK: &str = "\
 pulse-cutover rollback --config ceremony.toml [--wait SECS] [--force-after-ignite] [--force-stranded --i-understand] [--no-journal-i-know]

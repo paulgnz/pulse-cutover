@@ -103,8 +103,11 @@ mainnet's from the first block it produces. `[shadow] producer_keys` declares th
     not configurable, T6): every endpoint that answers as XPR mainnet (by its `get_info` chain_id) is asked; the
     proof fails if **any** of them lists a declared shadow key in mainnet's active, pending or proposed producer
     schedule, or serves **the source's own block id** at the source's LIB. An endpoint without a head, or merely
-    behind the source's LIB, compares nothing (a lagging or syncing endpoint proves nothing); only a source final
-    more than a day of blocks (`FAR_AHEAD_BLOCKS` = 172,800) past mainnet's own head counts as "not mainnet". If no
+    behind the source's LIB, compares nothing (a lagging or syncing endpoint proves nothing). The "far ahead" rule is
+    judged on the **highest** head any answering mainnet endpoint reports (round 3): only when even that is more than
+    a day of blocks (`FAR_AHEAD_BLOCKS` = 172,800) behind the source's LIB does the gap count as "not mainnet", so one
+    stuck endpoint cannot vouch for a source a healthy endpoint would expose; anything closer needs a real `get_block`
+    comparison. If no
     endpoint can answer either question, the proof fails: **a shadow run needs outbound HTTPS to at least one of those
     endpoints**.
 
@@ -125,6 +128,13 @@ The refusal is **authoritative from its first durable record** (a `shadow_refuse
 anything else): journal replay recovers it, so a crash before the ABORTED or `rollback_done` record cannot reopen a
 rollback; `run` and `rollback` finish the refusal's records without touching anything, and `join` refuses. It is final
 for that journal: a new shadow starts on a fresh journal.
+
+**Nothing touches the source of an unproven shadow (round 3).** Every source-side mutation in the state machine
+(pausing or resuming the producer, every hook except the paging-only `on_halt`, moving the staged snapshot aside)
+goes through one gate: on a shadow journal it first requires the full identity proof (parts 9–11) **in this run**,
+whatever the entry point (`run` retrying a STRANDED pause, `rollback` and `strand`, `join` re-running `on_freeze`,
+`unhalt` followed by `run`). A failed proof refuses through the path below; a test fails the build if a raw
+pause, resume or hook call appears outside the gate.
 
 **No abort resumes an unproven shadow.** Every abort and operator rollback of a shadow journal that would resume the
 source first re-proves the identity (parts 9–11) in the same run, unless this run already proved it; otherwise it

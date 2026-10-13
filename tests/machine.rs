@@ -55,6 +55,8 @@ struct MockOps {
     /// rc.29: the paused source gains one block once the snapshot was taken (after the quiescence audit).
     move_after_snapshot: Cell<bool>,
     resumes: Cell<u32>,
+    /// Round-3 review: every pause() call (the shadow gate must keep a retargeted source untouched).
+    pauses: Cell<u32>,
     ignited: Cell<bool>,
     target_polls: Cell<u64>,
     /// Head of the (mock) imported chain: the cut height, set by
@@ -216,6 +218,7 @@ impl MockOps {
             pause_ignored: Cell::new(false),
             move_after_snapshot: Cell::new(false),
             resumes: Cell::new(0),
+            pauses: Cell::new(0),
             ignited: Cell::new(false),
             target_polls: Cell::new(0),
             target_head: Cell::new(0),
@@ -325,6 +328,11 @@ impl ChainOps for MockOps {
         let pm = self.public_mainnet.borrow().clone().ok_or_else(|| format!("{base}: unreachable (mock)"))?;
         match path {
             // round-2 N2: "head": null = an endpoint whose get_info carries no head_block_num.
+            // round-3 F2: "heads": {base: head} gives each pinned endpoint its own head (null = no head_block_num).
+            "/v1/chain/get_info" if pm.get("heads").is_some() => Ok(match pm["heads"].get(base) {
+                Some(serde_json::Value::Null) | None => serde_json::json!({"chain_id": MAINNET}),
+                Some(h) => serde_json::json!({"chain_id": MAINNET, "head_block_num": h.as_u64().unwrap()}),
+            }),
             "/v1/chain/get_info" => Ok(match pm.get("head") {
                 Some(serde_json::Value::Null) => serde_json::json!({"chain_id": MAINNET}),
                 _ => serde_json::json!({"chain_id": MAINNET, "head_block_num": pm["head"].as_u64().unwrap_or(1u64 << 40)}),
@@ -408,6 +416,7 @@ impl ChainOps for MockOps {
     }
 
     fn pause(&self) -> Result<(), String> {
+        self.pauses.set(self.pauses.get() + 1);
         if !self.pause_ignored.get() {
             self.paused.set(true);
         }
@@ -6819,4 +6828,161 @@ fn r30r2_mainnet_event_binding_survives_crashes_and_config_edits() {
     *ops5.chain_id.borrow_mut() = MAINNET.into();
     let r = run_machine_result(&cfg, &ops5);
     assert!(!r.as_ref().err().is_some_and(|e| e.contains("authenticated") || e.contains("mainnet_event_verified")), "{r:?}");
+}
+
+/// A valid STRANDED shadow journal (VERIFIED, then stranded by its resume guard), for the round-3 recovery tests.
+fn shadow_journal_stranded(dir: &std::path::Path) -> Config {
+    let cfg = shadow_journal_at_verified(dir);
+    let (mut j, _) = open_journal(&cfg.journal_path);
+    j.transition(State::Stranded, serde_json::json!({"reason": "test: resume guard refused", "source_paused": true})).unwrap();
+    cfg
+}
+
+/// Codex round 3, HIGH 1: a valid STRANDED shadow journal whose source URLs now point at a REAL producer (label, network
+/// and keys unchanged) must not be touched by `run` (its pause retry), `rollback` (strand's pause / the resume) or `join`
+/// (on_freeze, the pause): every source mutation waits for a fresh identity proof in this run.
+#[test]
+fn r30r3_shadow_recovery_never_touches_a_retargeted_source_before_the_proof() {
+    type Entry = Box<dyn Fn(&Config, &MockOps)>;
+    let entries: Vec<(&str, Entry)> = vec![
+        ("run", Box::new(|cfg, ops| { let _ = run_machine_result(cfg, ops); })),
+        ("rollback", Box::new(|cfg, ops| { let (j, rec) = open_journal(&cfg.journal_path); let _ = Machine::new(cfg, ops, j, rec).operator_rollback(false); })),
+        ("rollback --force-stranded", Box::new(|cfg, ops| { let (j, rec) = open_journal(&cfg.journal_path); let _ = Machine::new(cfg, ops, j, rec).operator_rollback(true); })),
+        ("join from ABORTED", Box::new(|cfg, ops| { let (j, rec) = open_journal(&cfg.journal_path); let _ = Machine::new(cfg, ops, j, rec).join_with("e1", false); })),
+    ];
+    for (name, entry) in entries {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = shadow_journal_stranded(dir.path());
+        if name.starts_with("join") {
+            // join's first mutation is re-running on_freeze, which happens from ABORTED (on_abort reopened writes).
+            let (mut j, _) = open_journal(&cfg.journal_path);
+            j.transition(State::Aborted, serde_json::json!({"reason": "test: aborted after the guard passed"})).unwrap();
+            j.evidence(State::Aborted, serde_json::json!({"rollback_done": true})).unwrap();
+        }
+        // Both URLs retargeted to a real producer: it signs with a real key and is running (not paused).
+        let ops = shadow_ops(dir.path(), &["PUB_K1_realproducerkey"], Some(4242));
+        ops.paused.set(false);
+        entry(&cfg, &ops);
+        assert_eq!(ops.pauses.get(), 0, "{name}: the real producer was paused");
+        assert_eq!(ops.resumes.get(), 0, "{name}: the real producer was resumed");
+        assert!(ops.hooks.borrow().is_empty(), "{name}: a hook ran on an unproven shadow: {:?}", ops.hooks.borrow());
+        let rec = Journal::replay(&cfg.journal_path).unwrap();
+        assert!(rec.shadow_refused, "{name}: refused through shadow_refuse");
+    }
+    // A STRANDED join with the retargeted source: refused somewhere, but never after touching the source.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = shadow_journal_stranded(dir.path());
+    let ops = shadow_ops(dir.path(), &["PUB_K1_realproducerkey"], Some(4242));
+    ops.paused.set(false);
+    let (j, rec) = open_journal(&cfg.journal_path);
+    assert!(Machine::new(&cfg, &ops, j, rec).join_with("e1", false).is_err());
+    assert_eq!((ops.pauses.get(), ops.resumes.get()), (0, 0));
+    assert!(ops.hooks.borrow().is_empty(), "{:?}", ops.hooks.borrow());
+    // Identity intact: `run` on the STRANDED shadow proves it, then retries the pause as before.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = shadow_journal_stranded(dir.path());
+    let ops = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("STRANDED"), "{err}");
+    assert!(ops.pauses.get() >= 1, "a proven shadow retries the pause");
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("proven in this run before pausing the source producer"), "{text}");
+    assert!(!Journal::replay(&cfg.journal_path).unwrap().shadow_refused);
+}
+
+/// Codex round 3, HIGH 2: a crash right after ARMED (before the D-10 authentication), then a resume with a config AND a
+/// valid signed event for another H: the journal executes the ARMED record's H, so the authorization for the other H
+/// must refuse before anything is scheduled or frozen.
+#[test]
+fn r30r3_mainnet_resume_cannot_authorize_another_h_than_the_journal_executes() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_mainnet_coordinated_config(dir.path());
+    let h1 = cfg.ceremony.freeze_height;
+    let ops = upstream_ops(dir.path());
+    ops.schedule_ok.set(true);
+    *ops.chain_id.borrow_mut() = MAINNET.into();
+    *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"event": mainnet_event(h1)}));
+    *ops.status_doc.borrow_mut() = Some(rc23_status(&[("bp1", serde_json::json!({"state": "VERIFIED", "aborting": true})),
+        ("bp2", serde_json::json!({"state": "ABORTED"}))]));
+    let _ = run_machine_result(&cfg, &ops);
+    truncate_journal_after(&cfg, |v| v["kind"] == "transition" && v["state"] == "ARMED");
+    assert_eq!(Journal::replay(&cfg.journal_path).unwrap().resolved_h, Some(h1));
+    // A second config (H2) with its own valid signed event.
+    let h2 = h1 + 50;
+    let hash1 = pulse_cutover::coord::payload_hash(&mainnet_event(h1)).unwrap();
+    let hash2 = pulse_cutover::coord::payload_hash(&mainnet_event(h2)).unwrap();
+    let text = std::fs::read_to_string(dir.path().join("mainnet-coord.toml")).unwrap()
+        .replace(&format!("freeze_height = {h1}"), &format!("freeze_height = {h2}"))
+        .replace(&hash1, &hash2);
+    let other = load_toml(dir.path(), "mainnet-coord-h2.toml", &text).unwrap();
+    assert_eq!(other.ceremony.freeze_height, h2);
+    let ops2 = upstream_ops(dir.path());
+    ops2.schedule_ok.set(true);
+    *ops2.chain_id.borrow_mut() = MAINNET.into();
+    *ops2.coord_doc.borrow_mut() = Some(serde_json::json!({"event": mainnet_event(h2)}));
+    let err = run_machine_result(&other, &ops2).unwrap_err();
+    assert!(err.contains("executes H = ") , "{err}");
+    let e = journal_entries(&cfg);
+    assert!(transition(&e, "FROZEN").is_none(), "nothing froze");
+    assert!(!e.iter().any(|v| v["data"]["mainnet_event_verified"].is_object()), "no binding for H2 was journaled");
+    assert!(!e.iter().any(|v| v["data"]["snapshot_scheduled_at"].is_number() || v.to_string().contains("snapshot_scheduled")),
+        "nothing was scheduled");
+    assert_eq!(ops2.pauses.get(), 0);
+}
+
+/// Reviewer round 3, F2: the "far ahead" rule is judged on the HIGHEST head among the answering public endpoints. One
+/// stuck endpoint (a day behind) next to a healthy one within a day of the source proves nothing; only when every
+/// answering endpoint is more than a day behind does the gap count.
+#[test]
+fn r30r3_far_ahead_is_judged_on_the_highest_public_head() {
+    let apis = pulse_cutover::shadow::PUBLIC_XPR_MAINNET_APIS;
+    let far = pulse_cutover::shadow::FAR_AHEAD_BLOCKS;
+    let probe = |heads: serde_json::Value| {
+        let dir = tempfile::tempdir().unwrap();
+        stage_fake_upstream_tools(dir.path(), 0);
+        let ops = shadow_ops(dir.path(), &[SHADOW_KEY], Some(4242));
+        ops.head.set(10_000_000);
+        *ops.public_mainnet.borrow_mut() = Some(serde_json::json!({"keys": ["PUB_K1_realproducerkey"], "same_blocks": false,
+            "heads": heads}));
+        pulse_cutover::shadow::public_mainnet_problems(&[SHADOW_KEY.to_string()], &ops)
+    };
+    let src_lib = 10_000_000u64 - 1;
+    // One stuck endpoint more than a day behind, the rest within a day: refused (nothing really compared).
+    let mut heads = serde_json::Map::new();
+    heads.insert(apis[0].into(), serde_json::json!(src_lib - far - 10));
+    for a in &apis[1..] {
+        heads.insert((*a).into(), serde_json::json!(src_lib - 100));
+    }
+    let probs = probe(serde_json::Value::Object(heads));
+    assert!(probs.iter().any(|p| p.contains("could not be consulted")), "{probs:?}");
+    // Every answering endpoint more than a day behind: the gap itself counts, the proof passes.
+    let mut heads = serde_json::Map::new();
+    for a in apis {
+        heads.insert((*a).into(), serde_json::json!(src_lib - far - 10));
+    }
+    let probs = probe(serde_json::Value::Object(heads));
+    assert!(probs.is_empty(), "{probs:?}");
+    // One endpoint at or past the source with its own block, one stuck: the real comparison counts.
+    let mut heads = serde_json::Map::new();
+    heads.insert(apis[0].into(), serde_json::json!(src_lib - far - 10));
+    heads.insert(apis[1].into(), serde_json::json!(src_lib + 5));
+    let probs = probe(serde_json::Value::Object(heads));
+    assert!(probs.is_empty(), "{probs:?}");
+}
+
+/// Round-3 review: every source-side mutation in the state machine goes through the shadow gate (`src_pause`,
+/// `src_resume`, `hook`). A raw `self.ops.pause()` / `resume()` / `run_hook(` is allowed only on a line marked `ungated`
+/// (the gate itself and the paging-only on_halt), so a new call site cannot skip the shadow identity proof.
+#[test]
+fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
+    let src = include_str!("../src/machine.rs");
+    let raw: Vec<(usize, &str)> = src.lines().enumerate()
+        .filter(|(_, l)| (l.contains("self.ops.pause()") || l.contains("self.ops.resume()") || l.contains("self.ops.run_hook("))
+            && !l.contains("// ungated:"))
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    assert!(raw.is_empty(), "ungated source mutation(s) in src/machine.rs: {raw:?}");
+    let marked = src.lines().filter(|l| l.contains("// ungated:")).count();
+    assert_eq!(marked, 5, "exactly the three gate bodies and the two on_halt pages are ungated");
 }
