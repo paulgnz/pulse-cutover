@@ -17,20 +17,30 @@ service; see below.)
 
 ## 1. Run one command on your node
 
-Log in to the server that runs your **producer** nodeos, then run:
+Log in to the server that runs your **producer** nodeos. Download the installer from a **release tag** (not
+`main`: the tag is what was reviewed and released, and the pulse-cutover version it installs is pinned inside it),
+read it, then run it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh | sudo bash
+V=v0.5.0-rc.28
+curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
+less beacon-install.sh          # you are about to run this as root: read it
+sudo bash beacon-install.sh
 ```
 
 It works out everything itself: mainnet or testnet (from your chain), your producer account (from
-`producer-name` in your nodeos `config.ini`), and your nodeos API address.
+`producer-name` in your nodeos `config.ini`), and your nodeos API address. What you trust by running it: GitHub
+serving that tag, the pulse-cutover release the script pins (it verifies the binary against the release's
+`sha256sums.txt`), and mission control only as the place reports go.
 
-> Want to look before you install? Add `-s -- --dry-run` to the end. It shows what it found and your readiness
-> checklist, and changes nothing:
-> ```bash
-> curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh | sudo bash -s -- --dry-run
-> ```
+> Want to look before you install? `sudo bash beacon-install.sh --dry-run` shows what it found and your readiness
+> checklist, and changes nothing.
+>
+> Checking the download: from v0.5.0-rc.29 each release attaches the scripts and lists them in its
+> `sha256sums.txt` (`curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/download/$V/sha256sums.txt &&
+> sha256sum -c sha256sums.txt --ignore-missing`). For any tag, `git clone --branch $V --depth 1
+> https://github.com/paulgnz/pulse-cutover` gives you the same file, verified by git against the tag, at
+> `tools/beacon-install.sh`.
 
 ## 2. Send one line
 
@@ -52,20 +62,27 @@ again unless you change the producer or network.
 Once you're approved, your node appears on the dashboard with its readiness checks:
 `https://control-rehearsal.protonnz.com/testnet/youraccount`
 
+Until then (or without sending anything at all) you can see the same report locally:
+`sudo pulse-cutover beacon --config /etc/pulse-cutover/beacon.toml --once` prints one report instead of sending it,
+and `sudo systemctl status pulse-beacon` shows the service.
+
 A few red items are expected today (for example "validator not running" until the Metal node is set up).
 That list is a **preparation** checklist. A fully green list does not authorize a cutover: release, validator
 admission, funding and routing are checked separately.
 
 ## 4. Set up your Metal node
 
-One more command installs metalgo and prints your NodeID, BLS key and proof of possession:
-[METAL-QUICKSTART.md](METAL-QUICKSTART.md).
+One more script installs metalgo and prints your NodeID, BLS key and proof of possession:
+[METAL-QUICKSTART.md](METAL-QUICKSTART.md). The metalgo version and checksums it installs are pinned inside the
+script at the release tag; mission control's manifest only tells it which network and, once one exists, which
+PulseVM chain to track.
 
 ## 5. API and Hyperion operators: serve /v1 through the edge
 
 If your node serves a public `/v1` (install mode `api`) or `/v1` + `/v2` history (mode `hyperion`), set
 `"gateway": {"mode": "edge"}` in the ceremony manifest with PulseVM v1.0.0+ (the coordinator pins
-`artifacts.edge`). After the cut your `/v1` URL keeps answering the Leap 5 endpoints dapps call: the node's own
+`artifacts.edge`; [`examples/ceremony.json`](../examples/ceremony.json) is the documented manifest with the public
+values filled in). After the cut your `/v1` URL keeps answering the Leap 5 endpoints dapps call: the node's own
 API where it has one, translations for the rest, and a clear 501 where PulseVM cannot answer yet. In `hyperion`
 mode `/v1/history` and `/v2` go through the federator, which reads balances and permissions from the new chain
 and uses the old and new Hyperion indexes only to find accounts. What each endpoint does:
@@ -90,13 +107,14 @@ from the event's signed roster and the beacons' reports (`fleet` in `GET /api/st
 | `LIVE` | at least `quorum` roster members are LIVE on **one** target chain, with the same first block after H | if your box is HALTED or STRANDED on that chain, recover onto it (`unhalt` + `run`, or `join`; see below) |
 | `DEGRADED` | a target chain may be running, but no quorum is LIVE on one chain yet | do not reopen writes by hand; wait for LIVE or for the coordinator |
 | `SPLIT` (red) | a roster member resumed the old chain after others started chain creation or ignition, the old chain's head moved after every member had paused and someone had started chain creation, or members report different target chains / different blocks after H / different blocks at one height | stop: do not reopen writes anywhere until the coordinator resolves it; the alarm names the BPs |
-Upgrading to rc.27 is fleet-wide: every BP of an event must run it (an older agent's report has no protocol
-schedule hash and never counts at an rc.27 gate). A STRANDED/ABORTED journal from an older agent joins with
-`join --reverify`.
-
 | `STALLED` (rc.27, red) | a quorum is LIVE on one chain, but a quorum of those BPs' beacons report the post-LIVE watch failing (no new block beyond `post_live_max_idle_secs` and the workload probe failing) | the new chain is not taking transactions: check validators and the `target_live` detail; it clears by itself when blocks resume |
 | `STRANDED` (rc.26) | every reporting member stopped before chain creation and is sealed (STRANDED or ABORTED), at least one STRANDED | the coordinator decides: `pulse-cutover rollback` on each STRANDED box (it re-runs the resume guard), or `join` once a quorum is LIVE |
-| `ABORTED` | every reporting member aborted before chain creation | the old chain continues; wait for a new event |
+| `ABORTED` | every roster member is present with a fresh report and every one aborted before chain creation (rc.29; a missing or stale member keeps the verdict at PENDING/STRANDED) | the old chain continues; wait for a new event |
+
+**One release per fleet.** Every BP of an event must run the same pulse-cutover release, the one mission control
+announces for the event (`upgrade every agent to vX before arming`). An older agent's reports lack fields the newer
+gates compare (since rc.27 the protocol schedule hash, for example) and never count toward the quorum. A
+STRANDED/ABORTED journal left by an older agent joins a LIVE fleet with `join --reverify`.
 
 A `SPLIT` stays red (latched) for that event even if the reports that showed it change later. Only the
 mission-control operator clears it, once the split is resolved, from a shell on the mission-control host:
@@ -145,7 +163,12 @@ What your agent does with the same view (rc.23, coordinated events only):
   rehearsal that verified under the compare allowlist, every LIVE member and mission control must run rc.26 or later);
   otherwise `pulse-cutover rollback --config …` re-runs the guard and resumes the old chain only if it passes
   (`--force-stranded --i-understand` records a fleet-wide decision instead, journaled with the fleet view it
-  overrides).
+  overrides). Since rc.29 the same guard runs when you abort a coordinated producer by hand
+  (`./cutover.sh abort` on a journal in FROZEN, SNAPSHOTTED or VERIFIED) and when a rollback is re-run on an
+  ABORTED journal whose paused source was never resumed: the rollback exits 3 and the node is STRANDED if the guard
+  fails. Also since rc.29 the agent treats the relay's answer as "no abort" before chain creation and ignition
+  only when it carries this event's signed payload (the `event_hash` `await` wrote); an empty answer is unknown
+  and the step is refused.
 - **After ignition.** A local symptom (a block gap in the sustained-LIVE window, a slow first block, a failing
   `post_ignite` / `on_live` hook) no longer halts at once while a quorum of the roster reports the same target chain
   with a common block after H and a moving head: the ceremony shows **degraded**, retries hooks with backoff (they
@@ -157,7 +180,7 @@ What your agent does with the same view (rc.23, coordinated events only):
 
 There is no alphabetical 12-block rotation after the cut. Snowman / ProposerVM give validators stake-weighted
 proposal windows and blocks are built on demand; a block's `producer` field is the producer name configured on the
-node that built it (PulseVM v1.0.0 `controller.rs` lines 2210–2236), and in rehearsals every validator shares one
+node that built it (PulseVM v1.0.0 `controller.rs`, block building), and in rehearsals every validator shares one
 name and key (MetalBlockchain/pulsevm#107), so all blocks show the same producer. Missed-block trackers,
 `unpaid_blocks`-based pay and tools that assume a rotation will report nonsense. Details: [EXCHANGES.md §5](EXCHANGES.md#5-block-producers-after-the-cut-no-12-block-rotation).
 
@@ -167,16 +190,16 @@ name and key (MetalBlockchain/pulsevm#107), so all blocks show the same producer
 
 | You see | Do this |
 |---|---|
-| `could not find producer-name` | This box isn't your producer, or nodeos uses a custom config path. Add your account: `… \| sudo bash -s -- --producer youraccount` |
-| `could not reach nodeos chain API` | Your nodeos listens somewhere else. Add it: `… \| sudo bash -s -- --api http://127.0.0.1:8888` |
+| `could not find producer-name` | This box isn't your producer, or nodeos uses a custom config path. Add your account: `sudo bash beacon-install.sh --producer youraccount` |
+| `could not reach nodeos chain API` | Your nodeos listens somewhere else. Add it: `sudo bash beacon-install.sh --api http://127.0.0.1:8888` |
 | `unknown chain` | Not XPR mainnet or testnet. Add `--network <name>` |
 | `checksum mismatch` | Stop. Don't install. Tell the operator. |
 | Anything else | Run with `--dry-run` and send the output to the operator. |
 
-**Remove it any time:**
+**Remove it any time** (same script, same tag):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh | sudo bash -s -- --uninstall
+sudo bash beacon-install.sh --uninstall
 ```
 
 ---
@@ -184,8 +207,9 @@ curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/be
 <details>
 <summary>What exactly does it install?</summary>
 
-- `/usr/local/bin/pulse-cutover`: the prebuilt binary from the
-  [GitHub release](https://github.com/paulgnz/pulse-cutover/releases), checked against its sha256.
+- `/usr/local/bin/pulse-cutover`: the prebuilt binary of the release the script pins (`VERSION_DEFAULT`, bumped with
+  every release; `--version vX.Y.Z` to choose another) from the
+  [GitHub releases](https://github.com/paulgnz/pulse-cutover/releases), checked against that release's sha256sums.
 - `/etc/pulse-cutover/beacon.toml`: a readiness config for reporting only. **Never run `pulse-cutover run` with it.**
   From v0.5.0-rc.5 it is marked `profile = "readiness"` and the ceremony commands (`run`, `loop`, `await`)
   refuse it. Configs written by rc.4 and earlier lacked that guard; re-run the installer to upgrade.

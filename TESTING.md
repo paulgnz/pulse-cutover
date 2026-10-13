@@ -15,8 +15,11 @@ in the README, end to end:
    with a synced testnet nodeos;
 2. `pulse-cutover doctor` — the read-only survey (safe to run anywhere,
    including production; that alone is a useful data point for us);
-3. `./install.sh` with a rehearsal manifest — ask in the Telegram group for
-   the current rehearsal bundle, or adapt `examples/ceremony-api.toml`;
+3. `./install.sh` with a rehearsal manifest — start from `examples/ceremony.json`
+   (every field documented, the public values filled in) and take the
+   coordinator's values (the target chain ids, the pinned plugin and metalgo
+   binaries, the shared rehearsal producer identity) from the current rehearsal
+   bundle in the Telegram group;
 4. `./cutover.sh` — run the ceremony and watch it go LIVE (or ABORT — an
    abort with a journal is just as valuable);
 5. `pulse-cutover report` — one command, one sanitized bundle to share.
@@ -78,7 +81,7 @@ as useful as hand-driven ones; mention it was agent-driven in the issue.
 > a spare Ubuntu 20.04/22.04/24.04 box with a testnet nodeos, ~40 minutes, and the
 > walkthrough at https://github.com/paulgnz/pulse-cutover#start-here--the-operator-walkthrough
 > 1. `pulse-cutover doctor` — read-only survey, tells you if your box is READY
-> 2. `./install.sh --mode api --manifest ceremony.json` — stages everything (ask here for the rehearsal bundle)
+> 2. `./install.sh --mode api --manifest ceremony.json` — stages everything (start from examples/ceremony.json; ask here for the rehearsal bundle's values)
 > 3. `./cutover.sh` — run the ceremony to LIVE (aborts are safe AND useful)
 > 4. `pulse-cutover report` — post the sanitized bundle here (keys auto-redacted)
 > Every bundle — LIVE, aborted, or "UNSUPPORTED setup" — makes the real event
