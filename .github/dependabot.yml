@@ -1,0 +1,22 @@
+# Keeps the SHA-pinned GitHub Actions and the Cargo dependencies current.
+# Every action in .github/workflows/* is pinned to a commit SHA with a `# vX` comment;
+# Dependabot updates both the SHA and the comment.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    ignore:
+      # The PulseVM crates are pinned to an exact git revision on purpose (Cargo.toml explains:
+      # the rev predates PulseVM's licence change). Never auto-bump them.
+      - dependency-name: "pulsevm_*"

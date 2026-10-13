@@ -92,8 +92,10 @@ if [ -f "$MANIFEST" ]; then
     [ "$FM" -gt 0 ] 2>/dev/null || problems+=("neither freeze_height nor freeze_margin declared")
   fi
   if [ "$MODE" = "api" ]; then
+    # install.sh derives stop_cmd from the detected unit/container when the manifest has none, and writes it
+    # into the staged config: either place satisfies the check.
     STOP=$(jq -r '.source.stop_cmd // empty' "$MANIFEST")
-    [ -n "$STOP" ] || problems+=("api mode without source.stop_cmd")
+    [ -n "$STOP" ] || [ -n "$(tomlget stop_cmd)" ] || problems+=("api mode without source.stop_cmd (neither in $MANIFEST nor in $CONFIG — re-run install.sh)")
     [ -x /opt/pulse-cutover/flip-to-pulsevm.sh ] || problems+=("flip script missing — re-run install.sh")
   fi
 else

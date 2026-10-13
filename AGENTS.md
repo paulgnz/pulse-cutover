@@ -152,12 +152,12 @@ Always, LIVE or ABORTED:
 | `gateway/` | the /v1 edge (`gateway.mode = "edge"`): native `/v1/chain` pass-through + Leap 5 polyfills + `/v1/history` via the federator; coverage table in `docs/V1-COVERAGE.md` |
 | `federator/` | /v2 history federation router (pre-cut = legacy Hyperion, post-cut = local); state endpoints read values from the chain, indexes only for discovery |
 | `tools/capture-static.mjs` | captures the source chain's activated protocol features + consensus parameters for the edge (run before the source nodeos stops) |
-| `examples/` | commented manifests per mode + the reference loop deployment + the containerized haproxy test rig (`haproxy-test/`) |
+| `examples/` | `ceremony.json` (the documented install.sh manifest), `ceremony.toml` (every config field) and commented configs per mode + the reference loop deployment + the containerized haproxy test rig (`haproxy-test/`) |
 | `tools/state-diff.mjs` | byte-exact state comparison of two `/v1/chain` endpoints (atomicity A3) |
 | `tools/replay-canary.mjs` | exactly-once test across a same-chain_id cutover (atomicity A4) |
 | `docs/PROCESS.md` | the process, step by step, with diagrams |
 | `docs/V1-COVERAGE.md` | every Leap 5 `/v1` endpoint after the cut: native, polyfill, federator or 501, plus the upstream asks |
-| `docs/DESIGN.md` | the design as of rc.11: review findings R1–R12, state machine, config format, failure/rollback table, v2 sketch |
+| `docs/DESIGN.md` | the design as of rc.28: review findings R1–R12, state machine, config format, failure/rollback table, v2 sketch |
 | `docs/EVIDENCE.md` | every recorded rehearsal run, what it proves and does not, findings R13–R23 |
 | `docs/DESIGN-authority-boundary.md` | fleet-wide commit-or-abort design (not implemented) |
 | `src/beacon.rs` + `control/` | `pulse-cutover beacon` (readiness + evidence reporter) and Cutover Mission Control (multi-network status board) |

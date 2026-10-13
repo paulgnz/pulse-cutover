@@ -6,9 +6,11 @@ ceremony is shaped the way it is: the adversarial review that changed the design
 **R-numbers** that appear in log messages, config comments and the README), the state machine,
 the config format, the failure and rollback table, and a sketch of a faster v2.
 
-It describes the code as of **v0.5.0-rc.11**. The first version of this design was written
-in August 2026, before the multi-producer rehearsal and several review rounds; where that
-version differs from today's code, the code wins and the difference is marked *historical*.
+It describes the code as of **v0.5.0-rc.28** (§3 and §5 carry the rc.21–rc.28 changes; the
+review table in §2 was last re-checked at rc.11 and its "Today" column is dated that way). The
+first version of this design was written in August 2026, before the multi-producer rehearsal and
+several review rounds; where that version differs from today's code, the code wins and the
+difference is marked *historical*.
 
 Other documents cover the rest, and this one does not repeat them:
 
@@ -215,7 +217,7 @@ journal_path = "/var/lib/pulse-cutover/journal.jsonl"
 poll_ms = 250
 
 [ceremony]
-mode = "producer"                  # | "api"
+mode = "producer"                  # | "api" (hyperion mode = "api" + a [hyperion] section)
 freeze_height = 12345              # H; 0 only with derive_h_at_arm = true (rehearsals)
 chain_id = "…"                     # pinned source chain id
 import_cpu_scale = 143             # fork backend: chain identity, must equal the staged PulseVM chain config; upstream: ignored (warns)
@@ -254,8 +256,21 @@ on_live     = "…"   # flip the edge, reopen writes (producer mode)
 on_abort    = "…"   # reopen writes on the old chain
 on_halt     = "…"   # page a human; must not undo anything
 
-# [flip] / [hyperion]: api and hyperion modes. [coordination]: signed arming + fleet gate.
-# [upstream]: the #61 pipeline. [beacon]: mission control reporting. [loop]: loop harness.
+[beacon]                           # mission control reporting; a coordinated producer needs it
+url = "https://control.example/api/report"
+producer = "bp1"                   # must be in the event's roster
+network = "testnet"
+token_file = "/etc/pulse-cutover/beacon.token"
+
+[coordination]                     # signed arming (`await`) + the pre-ignite fleet gate
+url = "https://control.example"
+network = "testnet"
+coordinator_keys = ["<ed25519 hex>"]
+auto_arm = false                   # a signed ARM also needs confirm-<event_id> next to the journal
+fleet_quorum = 3                   # roster/quorum come from the signed event; await writes them,
+                                   # event_id and event_hash into the derived config
+# [flip] / [hyperion]: api and hyperion modes. [upstream]: the #61 pipeline. [loop]: loop harness.
+# Every field, with its default: examples/ceremony.toml.
 ```
 
 *Historical:* in the August design `post_ignite` failures were journaled and ignored, and

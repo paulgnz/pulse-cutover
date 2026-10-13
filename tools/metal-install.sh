@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # metal-install.sh — prepare a Metal (metalgo) node next to your XPR nodeos and print its identity.
 #
-#   curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/metal-install.sh | sudo bash
+#   Run it from a checkout of a RELEASE TAG, after reading it (docs/METAL-QUICKSTART.md):
+#     V=v0.5.0-rc.28
+#     git clone --branch "$V" --depth 1 https://github.com/paulgnz/pulse-cutover && cd pulse-cutover
+#     less tools/metal-install.sh
+#     sudo bash tools/metal-install.sh
 #
 # What it does:
-#   + reads the signed-off network manifest from mission control (which Metal network, pinned metalgo version
-#     + sha256, and the PulseVM subnet/chain IDs once they exist). No manifest, no install (fail closed).
+#   + the metalgo version, release-tarball checksums, Docker image digest and source commit are PINNED IN THIS
+#     SCRIPT (see PINS below): they arrive with the release tag you checked out, not from the network.
+#   + reads the network manifest from mission control for ONE purpose: which Metal network this XPR chain maps to
+#     and the PulseVM subnet/chain/VM ids once they exist. A manifest that names another metalgo version or
+#     checksum is refused: upgrade to a newer release tag, or take responsibility with --metalgo-version +
+#     --metalgo-sha256 (the sha256 of the official release tarball, typed on the command line).
 #   + checks the box (RAM, disk, ports, glibc, an existing metalgo it did not install) and picks a method:
 #       official binary (glibc >= 2.34) · Ubuntu 20.04 build of the same tag (glibc 2.31-2.33)
 #       · official Docker image pinned by digest · build from source (--build, pinned commit + Go checksum)
@@ -24,7 +32,11 @@
 #   --open-port            also add the 9651 rule to this server's own firewall (ufw / firewalld / iptables)
 #   --metal tahoe|mainnet  which Metal network (default: from this box's XPR chain id)
 #   --manifest-url URL     manifest to use (default: mission control)
-#   --allow-unpinned       manifest unreachable: fall back to the pins built into this script (testnet only)
+#   --no-manifest          manifest unreachable: install from this script's pins without the PulseVM subnet ids
+#                          (the node syncs the Metal primary network only; testnet only). --allow-unpinned = same
+#   --metalgo-version TAG  with --metalgo-sha256 HEX: install THIS metalgo release instead of the script's pin, with
+#                          the sha256 of its official linux-<arch> release tarball (method binary only; the
+#                          manifest's version is then ignored). Journaled in identity.json as pin_source=override
 #   --method binary|compat|docker|build   force an install method;  --build = --method build
 #   --adopt                take over a metalgo service this script did not install (only /var/lib/metalgo layout)
 #   --dry-run              show what would happen; installs and changes nothing (the manifest is fetched to validate it)
@@ -38,6 +50,39 @@ MARKER=$ETC/.installed-by-pulse-cutover
 MAINNET_CHAIN=384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0
 TESTNET_CHAIN=71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd
 
+# ---- PINS: the trust root of this script ----------------------------------------------------------------
+# Changed only by a reviewed commit that ships in a release tag. Each value is checked where it is used:
+#   *_SHA_AMD64/ARM64  sha256 of the official MetalBlockchain/metalgo release tarballs
+#                      (metalgo-linux-<arch>-<version>.tar.gz), recomputed from GitHub when pinned
+#   *_COMPAT_*         the Ubuntu 20.04 (glibc 2.31) build of the same tag, published under this repo's releases
+#                      (reproducible with tools/build-metalgo-glibc231.sh)
+#   *_IMAGE_DIGEST     the multi-arch index digest of the official Docker image for that tag
+#   *_COMMIT           the commit the release tag pointed at when pinned (--build refuses a moved tag)
+#   *_PROTOCOL         the rpcchainvm plugin protocol the binary must report (the PulseVM plugin must match)
+PIN_TAHOE_VERSION="v1.14.2-tahoe"
+PIN_TAHOE_COMMIT="da8f92f70a7c8c749a18b594c0e16b42b81d52d0"
+PIN_TAHOE_PROTOCOL=45
+PIN_TAHOE_SHA_AMD64="7732b814168d6c34bca209a4429ae73b3fb22629dd7e2f286e3d85ca35c90b2a"
+PIN_TAHOE_SHA_ARM64="99ff38889599e401c3fbcc8226e3fa92db20da27f959317ad1dfee83a99ed45b"
+PIN_TAHOE_COMPAT_URL="https://github.com/paulgnz/pulse-cutover/releases/download/metalgo-glibc2.31-1/metalgo-linux-amd64-v1.14.2-tahoe-glibc2.31.tar.gz"
+PIN_TAHOE_COMPAT_SHA="59777f62ae12e79a90bbec7effe2a38db59992d98683f8add37e9f68b063fdb2"
+PIN_TAHOE_IMAGE="metalblockchain/metalgo"
+PIN_TAHOE_IMAGE_DIGEST="sha256:c18e691b56a5106ffe7f3cd36acc23daf66d98accb14d8abe7ea48a7545b46a5"
+# Metal MAINNET: nothing is pinned yet (no mainnet cutover is scheduled). A mainnet install needs a newer release
+# tag that pins it, or --metalgo-version + --metalgo-sha256 from the coordinator's announcement.
+PIN_MAINNET_VERSION=""; PIN_MAINNET_COMMIT=""; PIN_MAINNET_PROTOCOL=""; PIN_MAINNET_SHA_AMD64=""; PIN_MAINNET_SHA_ARM64=""
+PIN_MAINNET_COMPAT_URL=""; PIN_MAINNET_COMPAT_SHA=""; PIN_MAINNET_IMAGE="metalblockchain/metalgo"; PIN_MAINNET_IMAGE_DIGEST=""
+
+# pins_load tahoe|mainnet → PIN_VERSION, PIN_COMMIT, PIN_PROTOCOL, PIN_SHA_AMD, PIN_SHA_ARM, PIN_COMPAT_URL,
+# PIN_COMPAT_SHA, PIN_IMAGE, PIN_IMAGE_DIGEST for that network ('' = not pinned).
+pins_load() {
+  local p
+  case "$1" in tahoe) p=PIN_TAHOE;; mainnet) p=PIN_MAINNET;; *) die "pins_load: unknown Metal network '$1'";; esac
+  eval "PIN_VERSION=\$${p}_VERSION; PIN_COMMIT=\$${p}_COMMIT; PIN_PROTOCOL=\$${p}_PROTOCOL; PIN_SHA_AMD=\$${p}_SHA_AMD64
+        PIN_SHA_ARM=\$${p}_SHA_ARM64; PIN_COMPAT_URL=\$${p}_COMPAT_URL; PIN_COMPAT_SHA=\$${p}_COMPAT_SHA
+        PIN_IMAGE=\$${p}_IMAGE; PIN_IMAGE_DIGEST=\$${p}_IMAGE_DIGEST"
+}
+
 G='\033[32m'; Y='\033[33m'; B='\033[1m'; N='\033[0m'
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[!]\033[0m %s\n' "$*"; }
@@ -45,13 +90,15 @@ die() { printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---- arguments ---------------------------------------------------------------------------------------
 parse_args() {
-  METAL=""; MANIFEST_URL=""; METHOD=""; CHECK=0; OPEN_PORT=0; DRY=0; UNINSTALL=0; ADOPT=0; ALLOW_UNPINNED=0; BACKED_UP=0
+  METAL=""; MANIFEST_URL=""; METHOD=""; CHECK=0; OPEN_PORT=0; DRY=0; UNINSTALL=0; ADOPT=0; NO_MANIFEST=0; BACKED_UP=0
+  OVR_VERSION=""; OVR_SHA=""
   while [ $# -gt 0 ]; do case "$1" in
     --metal) METAL=${2:-}; shift 2;; --manifest-url) MANIFEST_URL=${2:-}; shift 2;;
     --build) [ -z "$METHOD" ] || [ "$METHOD" = build ] || die "conflicting flags: --build and --method $METHOD"; METHOD=build; shift;;
     --method) [ -z "$METHOD" ] || [ "$METHOD" = "${2:-}" ] || die "conflicting flags: --method given twice"; METHOD=${2:-}; shift 2;;
     --dry-run) DRY=1; shift;; --check) CHECK=1; shift;; --open-port) OPEN_PORT=1; shift;; --uninstall) UNINSTALL=1; shift;;
-    --adopt) ADOPT=1; shift;; --allow-unpinned) ALLOW_UNPINNED=1; shift;; --i-have-backed-up) BACKED_UP=1; shift;;
+    --adopt) ADOPT=1; shift;; --no-manifest|--allow-unpinned) NO_MANIFEST=1; shift;; --i-have-backed-up) BACKED_UP=1; shift;;
+    --metalgo-version) OVR_VERSION=${2:-}; shift 2;; --metalgo-sha256) OVR_SHA=${2:-}; shift 2;;
     *) die "unknown option $1";; esac; done
   check_flags
 }
@@ -60,9 +107,17 @@ check_flags() {
   case "$METHOD" in ""|binary|compat|docker|build) ;; *) die "--method must be binary, compat, docker or build (got '$METHOD')";; esac
   if [ "$CHECK" = 1 ] && [ "$DRY" = 1 ] && [ "$OPEN_PORT" = 1 ]; then die "conflicting flags: --check --open-port --dry-run (--open-port changes the firewall; --dry-run promises no changes)"; fi
   if [ "$DRY" = 1 ] && [ "$OPEN_PORT" = 1 ]; then die "conflicting flags: --open-port changes the firewall; --dry-run promises no changes"; fi
-  if [ "$UNINSTALL" = 1 ] && { [ "$CHECK" = 1 ] || [ "$DRY" = 1 ] || [ "$OPEN_PORT" = 1 ] || [ -n "$METHOD" ]; }; then die "conflicting flags: --uninstall takes no other options"; fi
-  if [ "$CHECK" = 1 ] && { [ -n "$METHOD" ] || [ "$ADOPT" = 1 ] || [ "$ALLOW_UNPINNED" = 1 ]; }; then die "conflicting flags: --check only re-tests; it does not install"; fi
-  if [ "$ALLOW_UNPINNED" = 1 ] && [ "$METAL" = mainnet ]; then die "--allow-unpinned is refused on mainnet: mainnet installs only from the published manifest"; fi
+  if [ "$UNINSTALL" = 1 ] && { [ "$CHECK" = 1 ] || [ "$DRY" = 1 ] || [ "$OPEN_PORT" = 1 ] || [ -n "$METHOD" ] || [ -n "$OVR_VERSION$OVR_SHA" ]; }; then die "conflicting flags: --uninstall takes no other options"; fi
+  if [ "$CHECK" = 1 ] && { [ -n "$METHOD" ] || [ "$ADOPT" = 1 ] || [ "$NO_MANIFEST" = 1 ] || [ -n "$OVR_VERSION$OVR_SHA" ]; }; then die "conflicting flags: --check only re-tests; it does not install"; fi
+  if [ "$NO_MANIFEST" = 1 ] && [ "$METAL" = mainnet ]; then die "--no-manifest is refused on mainnet: a mainnet node must track the published PulseVM subnet"; fi
+  # The pin override: both halves, well-formed, and only for the plain release binary (the compat build, the
+  # Docker image and a source build each need their own pinned artifact, which an override does not carry).
+  if [ -n "$OVR_VERSION" ] || [ -n "$OVR_SHA" ]; then
+    [ -n "$OVR_VERSION" ] && [ -n "$OVR_SHA" ] || die "--metalgo-version and --metalgo-sha256 must be given together (the sha256 of the official metalgo-linux-<arch>-<version>.tar.gz)"
+    printf '%s' "$OVR_VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$' || die "--metalgo-version must be a metalgo release tag like v1.14.2-tahoe (got '$OVR_VERSION')"
+    printf '%s' "$OVR_SHA" | grep -qE '^[0-9a-f]{64}$' || die "--metalgo-sha256 must be 64 lowercase hex characters"
+    case "$METHOD" in ""|binary) ;; *) die "--metalgo-version/--metalgo-sha256 pin only the official release binary: --method $METHOD is not available with an override";; esac
+  fi
   return 0
 }
 
@@ -81,7 +136,8 @@ info_rpc() { curl -fsS -m4 -X POST -H 'content-type:application/json' -d "{\"jso
 
 # manifest_validate FILE XPR_NET EXPECTED_CHAIN_ID METAL
 # Structural validation of the manifest. On success prints `KEY=value` lines (shell-quoted) for eval; on any
-# problem prints the reason to stderr and returns 1.
+# problem prints the reason to stderr and returns 1. The version/checksum fields are OPTIONAL here (they are
+# only compared with this script's pins by pins_resolve); the network fields and the ids are what is used.
 manifest_validate() {
   python3 - "$@" <<'PY'
 import json, re, shlex, sys
@@ -108,8 +164,8 @@ if net not in NET: bad(f"manifest network {net!r} is not an installable Metal ne
 if metal and net != metal: bad(f"manifest is for Metal {net!r} but --metal {metal!r} was requested")
 nid = m.get("network_id")
 if nid != NET[net]: bad(f"manifest network_id {nid!r} does not match Metal {net!r} (expected {NET[net]})")
-ver = s("metalgo_version")
-if not re.match(r"^v\d+\.\d+\.\d+(-[a-z0-9.]+)?$", ver): bad(f"manifest metalgo_version {ver!r} is not a release tag")
+ver = s("metalgo_version", False)
+if ver and not re.match(r"^v\d+\.\d+\.\d+(-[a-z0-9.]+)?$", ver): bad(f"manifest metalgo_version {ver!r} is not a release tag")
 out = {"MF_NETWORK": net, "MF_NETID": str(nid), "MF_VERSION": ver, "MF_CHAIN_ID": mcid}
 for k, env in [("sha256_linux_amd64", "MF_SHA_AMD"), ("sha256_linux_arm64", "MF_SHA_ARM"), ("compat_glibc231_sha256", "MF_COMPAT_SHA")]:
     v = s(k, False)
@@ -239,17 +295,46 @@ for k in ("staking-tls-key-file-content", "staking-tls-cert-file-content", "stak
 PY2
 }
 
-# Pins built into this script, used only with --allow-unpinned on testnet when the manifest is unreachable.
-# They are still checksum-pinned; they just may be older than the published manifest.
+# The manifest used with --no-manifest on testnet when mission control is unreachable: the network mapping and
+# this script's own pins, no PulseVM ids (the node syncs the Tahoe primary network only until re-run).
 builtin_manifest() {
   cat <<J
 {"xpr_network":"testnet","xpr_chain_id":"$TESTNET_CHAIN","network":"tahoe","network_id":5,
- "metalgo_version":"v1.14.2-tahoe","rpcchainvm_protocol":45,
- "sha256_linux_amd64":"7732b814168d6c34bca209a4429ae73b3fb22629dd7e2f286e3d85ca35c90b2a",
- "sha256_linux_arm64":"99ff38889599e401c3fbcc8226e3fa92db20da27f959317ad1dfee83a99ed45b",
- "compat_glibc231_url":"https://github.com/paulgnz/pulse-cutover/releases/download/metalgo-glibc2.31-1/metalgo-linux-amd64-v1.14.2-tahoe-glibc2.31.tar.gz",
- "compat_glibc231_sha256":"59777f62ae12e79a90bbec7effe2a38db59992d98683f8add37e9f68b063fdb2"}
+ "metalgo_version":"$PIN_TAHOE_VERSION","rpcchainvm_protocol":$PIN_TAHOE_PROTOCOL,"metalgo_commit":"$PIN_TAHOE_COMMIT",
+ "sha256_linux_amd64":"$PIN_TAHOE_SHA_AMD64","sha256_linux_arm64":"$PIN_TAHOE_SHA_ARM64",
+ "compat_glibc231_url":"$PIN_TAHOE_COMPAT_URL","compat_glibc231_sha256":"$PIN_TAHOE_COMPAT_SHA",
+ "docker_image":"$PIN_TAHOE_IMAGE:$PIN_TAHOE_VERSION","docker_image_digest":"$PIN_TAHOE_IMAGE_DIGEST"}
 J
+}
+
+# pins_resolve: decide which metalgo this run installs and from which checksums. Reads PIN_* (this script,
+# loaded for MF_NETWORK), MF_* (the manifest; version/checksum fields may be absent) and OVR_* (command line),
+# and REWRITES MF_VERSION / MF_COMMIT / MF_PROTOCOL / MF_SHA_* / MF_COMPAT_* / MF_IMAGE* with the effective
+# values. The manifest never supplies a checksum: it can only agree with the script or be refused.
+#   PIN_SOURCE=script    the script's pins (the manifest agreed, or said nothing about versions)
+#   PIN_SOURCE=override  --metalgo-version + --metalgo-sha256 (method binary only; nothing else pinned)
+pins_resolve() {
+  if [ -n "$OVR_VERSION" ]; then
+    warn "PIN OVERRIDE: installing metalgo $OVR_VERSION with the sha256 you typed; this script's pins and the manifest's version are NOT used"
+    MF_VERSION=$OVR_VERSION; MF_COMMIT=""; MF_PROTOCOL=""; MF_COMPAT_URL=""; MF_COMPAT_SHA=""; MF_IMAGE_DIGEST=""
+    if [ "$A" = amd64 ]; then MF_SHA_AMD=$OVR_SHA; MF_SHA_ARM=""; else MF_SHA_ARM=$OVR_SHA; MF_SHA_AMD=""; fi
+    PIN_SOURCE=override; return 0
+  fi
+  [ -n "$PIN_VERSION" ] || die "this script pins no metalgo release for Metal $MF_NETWORK yet: use a newer release tag of pulse-cutover that pins it, or pass --metalgo-version <tag> --metalgo-sha256 <sha256 of metalgo-linux-$A-<tag>.tar.gz> from the coordinator's announcement"
+  local mism="" f want got
+  for f in VERSION:metalgo_version COMMIT:metalgo_commit PROTOCOL:rpcchainvm_protocol SHA_AMD:sha256_linux_amd64 SHA_ARM:sha256_linux_arm64 \
+           COMPAT_URL:compat_glibc231_url COMPAT_SHA:compat_glibc231_sha256 IMAGE_DIGEST:docker_image_digest; do
+    eval "want=\$PIN_${f%%:*}; got=\$MF_${f%%:*}"
+    [ -z "$got" ] || [ "$got" = "$want" ] || mism="$mism
+  ${f#*:}: manifest says '$got', this script pins '${want:-nothing}'"
+  done
+  [ -z "$mism" ] || die "the network manifest disagrees with the pins in this script:$mism
+  The manifest is unsigned and is never a source of checksums. Either the network moved to a newer metalgo (check out
+  the pulse-cutover release tag that pins it and re-run), or the manifest is wrong or tampered with (tell the operator).
+  To install the manifest's version anyway: --metalgo-version <tag> --metalgo-sha256 <sha256 of its official tarball>."
+  MF_VERSION=$PIN_VERSION; MF_COMMIT=$PIN_COMMIT; MF_PROTOCOL=$PIN_PROTOCOL; MF_SHA_AMD=$PIN_SHA_AMD; MF_SHA_ARM=$PIN_SHA_ARM
+  MF_COMPAT_URL=$PIN_COMPAT_URL; MF_COMPAT_SHA=$PIN_COMPAT_SHA; MF_IMAGE=$PIN_IMAGE; MF_IMAGE_DIGEST=$PIN_IMAGE_DIGEST
+  PIN_SOURCE=script
 }
 
 # glibc_version → "2.39" (or 0). No pipe into head: under pipefail, ldd dying of SIGPIPE when head closes early
@@ -358,8 +443,8 @@ print_port() {
     echo "       Likely cause:  $CAUSE"
     echo "       Fix:           $FIX"
     [ -n "$FIX2" ] && echo "                      $FIX2"
-    echo "       Then re-check (changes nothing):"
-    echo "         curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/metal-install.sh | sudo bash -s -- --check"
+    echo "       Then re-check (changes nothing), from the same checkout:"
+    echo "         sudo bash tools/metal-install.sh --check"
   else printf "  ${Y}?${N} 1. Could not test port 9651 (mission control unreachable). Make sure inbound TCP 9651 is open.\n"; fi
 }
 
@@ -640,7 +725,7 @@ write_records() {
 NodeID:              $NODEID
 BLS public key:      $BLSPUB
 Proof of possession: $BLSPOP
-Metal network:       $MF_NETWORK (network-id $MF_NETID) · metalgo $MF_VERSION ($METHOD)
+Metal network:       $MF_NETWORK (network-id $MF_NETID) · metalgo $MF_VERSION ($METHOD; pins: $PIN_SOURCE)
 Recorded:            $(date -u +%Y-%m-%dT%H:%M:%SZ) (use --check for the live values)
 Key backup (PRIVATE KEYS): $BK (sha256 $BKSHA)${BK_USER:+
 Copy for $SUDO_USER (PRIVATE KEYS): $BK_USER}
@@ -650,7 +735,7 @@ T
 import json
 print(json.dumps({"schema": "metal-identity-v1", "xpr_network": "$XPR", "producer": "$PRODUCER",
   "metal_network": "$MF_NETWORK", "network_id": $MF_NETID, "metalgo_version": "$MF_VERSION",
-  "runtime_version": "$RUN_VERSION", "install_method": "$METHOD", "node_id": "$NODEID",
+  "runtime_version": "$RUN_VERSION", "install_method": "$METHOD", "pin_source": "$PIN_SOURCE", "node_id": "$NODEID",
   "bls_public_key": "$BLSPUB", "bls_proof_of_possession": "$BLSPOP", "staking_address": "${PUBIP:-}",
   "staking_port_reachable": {"true": True, "false": False}.get("${REACH:-}"),
   "key_backup": "$BK", "key_backup_sha256": "$BKSHA", "key_backup_restore_tested": True, "custody": "unconfirmed", "state": "metal-node-prepared"}, indent=1))
@@ -718,7 +803,7 @@ print_summary() {
   if [ -n "$MF_CHAIN" ]; then echo "  Subnet tracking configured for $MF_SUBNET (chain $MF_CHAIN). The PulseVM plugin and chain config are a separate step."
   else echo "  No PulseVM chain is published for XPR $XPR yet: this node syncs the Metal $MF_NETWORK primary network for now."; fi
   [ -n "$MF_NOTE" ] && echo "  $MF_NOTE"
-  echo "  Upgrade: re-run this same command (keys are kept; failed upgrades roll back) · Health: curl -s 127.0.0.1:9650/ext/health | head -c 300"
+  echo "  Upgrade: check out the newer release tag and re-run this script (keys are kept; failed upgrades roll back) · Health: curl -s 127.0.0.1:9650/ext/health | head -c 300"
   echo "  Previous binary kept as $BIN.prev.keep · previous config as $ETC/config.json.prev"
   custody_ack
 }
@@ -741,19 +826,22 @@ main() {
   esac
   check_flags
 
-  # ---- manifest: fetched, structurally validated, bound to this chain. Fail closed. -------------------
+  # ---- manifest: fetched, structurally validated, bound to this chain. Used for the network mapping and the
+  #      PulseVM ids only; versions and checksums come from this script's pins (pins_resolve). Fail closed. ----
   TMP=$(mktemp -d); trap on_exit EXIT
   [ -n "$MANIFEST_URL" ] || MANIFEST_URL="$CONTROL/api/manifest/$XPR"
-  if curl -fsS -m10 -o "$TMP/manifest.json" "$MANIFEST_URL" 2>/dev/null; then say "manifest: $MANIFEST_URL"
-  elif [ "$ALLOW_UNPINNED" = 1 ] && [ "$XPR" = testnet ]; then warn "manifest unreachable: using the checksum pins built into this script (--allow-unpinned)"; builtin_manifest > "$TMP/manifest.json"
-  else die "could not fetch the network manifest from $MANIFEST_URL: refusing to install without it (testnet only: --allow-unpinned uses this script's built-in pins)"; fi
+  if curl -fsS -m10 -o "$TMP/manifest.json" "$MANIFEST_URL" 2>/dev/null; then say "manifest: $MANIFEST_URL (network mapping + PulseVM ids; checksums come from this script)"
+  elif [ "$NO_MANIFEST" = 1 ] && [ "$XPR" = testnet ]; then warn "manifest unreachable: installing from this script's pins without the PulseVM subnet ids (--no-manifest)"; builtin_manifest > "$TMP/manifest.json"
+  else die "could not fetch the network manifest from $MANIFEST_URL: refusing to install without it (testnet only: --no-manifest installs this script's pinned metalgo without the PulseVM subnet ids)"; fi
   local mv; mv=$(manifest_validate "$TMP/manifest.json" "$XPR" "$cid" "$METAL") || die "manifest rejected (see above): nothing was changed"
   eval "$mv"
-  say "XPR $XPR → Metal $MF_NETWORK (network-id $MF_NETID) · metalgo $MF_VERSION${MF_PROTOCOL:+ · plugin protocol $MF_PROTOCOL}"
 
   # ---- preflight (read-only) ---------------------------------------------------------------------------
   local ram free glibc probe
   ARCH=$(uname -m); case "$ARCH" in x86_64) A=amd64;; aarch64|arm64) A=arm64;; *) die "unsupported arch $ARCH";; esac
+  pins_load "$MF_NETWORK"
+  pins_resolve
+  say "XPR $XPR → Metal $MF_NETWORK (network-id $MF_NETID) · metalgo $MF_VERSION${MF_PROTOCOL:+ · plugin protocol $MF_PROTOCOL} · pins: $PIN_SOURCE"
   ram=$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo)
   probe=$DATA; [ -d "$probe" ] || probe=$(dirname "$DATA")
   free=$(df -Pk "$probe" | awk 'NR==2{printf "%d", $4/1024/1024}')
@@ -811,7 +899,7 @@ main() {
   fi
   swap_in
   verify_runtime
-  printf 'installed-by=pulse-cutover metal-install.sh\nversion=%s\nmethod=%s\nnetwork=%s\n' "$MF_VERSION" "$METHOD" "$MF_NETWORK" > "$MARKER"
+  printf 'installed-by=pulse-cutover metal-install.sh\nversion=%s\nmethod=%s\nnetwork=%s\npin_source=%s\n' "$MF_VERSION" "$METHOD" "$MF_NETWORK" "$PIN_SOURCE" > "$MARKER"
   backup_identity
 
   # ---- port, records, summary -------------------------------------------------------------------------

@@ -18,18 +18,26 @@ existing node; a fleet-wide rollback guarantee is **not yet implemented** (see
 the status box below).
 
 > [!IMPORTANT]
-> **Status (2026-09-29)**
-> - **Proven in rehearsal** (5 BPs on a private Metal network, fork plugin): same cut block, snapshot hash and
+> **Status (2026-10-13, v0.5.0-rc.28)**
+> - **Proven in rehearsal** (September, 5 BPs on a private Metal network, fork plugin): same cut block, snapshot hash and
 >   fingerprints on every BP; zero transactions after H; a symmetric abort where every BP resumed the old chain.
 > - **Demonstrated on a sample**: state equality on 19 accounts / 5 contracts / 32 table scopes; a replay canary
 >   (10 held + 10 pre-cut transfers).
-> - **Not done yet**: fleet-wide all-or-nothing (no authority boundary; a partial abort can split the network), exact H
->   in API mode and on restart, per-validator producer keys, crash recovery, validator registration/funding, and any
->   run on upstream PulseVM v1.0.0 (protocol 45) on Tahoe. Details: [ATOMICITY.md](ATOMICITY.md#known-limits-independent-review-2026-09-29).
+> - **Run on upstream PulseVM v1.0.0** (2026-10-06, 5 BPs, metalgo 1.14.2, protocol 45, a private Metal network, both
+>   rehearsal overrides on): identical state at H on all 5 and against a reference nodeos in every run, but every healthy
+>   run ended with LIVE *and* HALTED BPs on one target chain, and in one run a BP resumed the old chain after its peers
+>   had ignited (33 writes landed after H). rc.23–rc.28 make the agents fleet-aware (STRANDED, `join`, degraded waits,
+>   a fleet verdict and creation-evidence log on mission control); they do not make the cut fleet-decided.
+> - **Not done yet**: fleet-wide all-or-nothing (no authority boundary; a partial abort can still split the network),
+>   exact H in API mode and on restart under a real freeze, per-validator producer keys, crash recovery on a fleet,
+>   validator registration/funding, and any run on Tahoe itself (the public Metal testnet) rather than a private
+>   network. Details: [ATOMICITY.md](ATOMICITY.md#known-limits-independent-review-2026-09-29).
 
 > **Block producer? Connect your node in 2 minutes → [docs/OPERATOR-QUICKSTART.md](docs/OPERATOR-QUICKSTART.md) · set up your Metal validator and get your NodeID → [docs/METAL-QUICKSTART.md](docs/METAL-QUICKSTART.md)**
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh | sudo bash
+> V=v0.5.0-rc.28   # a release tag: the script's pins arrive with it (never main, never "latest")
+> curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
+> less beacon-install.sh && sudo bash beacon-install.sh
 > ```
 > The running beacon only observes; installing it writes a binary, a readiness-only config, a token and a systemd
 > service (it never touches nodeos). It detects your network and account and prints one line to send us.
@@ -115,13 +123,22 @@ use is defined in the [Glossary](#glossary).
 
 **Just want your node on Cutover Mission Control?** One command installs the prebuilt,
 checksum-verified binary and a readiness beacon that only observes (it never touches nodeos, its config or
-production; installing it writes the binary, a readiness-only config, a token and a systemd service). Try it with `--dry-run` first; it changes nothing:
+production; installing it writes the binary, a readiness-only config, a token and a systemd service). Download it
+from a **release tag** (never `main`: the tag is what was reviewed and released, and the script's pinned versions
+arrive with it), read it, try it with `--dry-run` first; it changes nothing:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh -o beacon-install.sh
+V=v0.5.0-rc.28
+curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
+less beacon-install.sh                  # you are about to run it as root: read it
 sudo bash beacon-install.sh --dry-run   # shows what it detected; changes nothing
 sudo bash beacon-install.sh             # detects network + producer from your node
 ```
+
+From v0.5.0-rc.29 every release also attaches the operator scripts and lists them in its `sha256sums.txt`, so the
+download can be checked before it runs (`curl -fsSLO …/releases/download/$V/sha256sums.txt && sha256sum -c
+sha256sums.txt --ignore-missing`); for older tags, `git clone --branch $V --depth 1` gives you the same files
+verified by git against the tag.
 
 It ends by printing `token_sha256=…`: send that line to the mission-control operator to be listed. Only the
 hash is enrolled and stored by mission control; the token itself is sent (over HTTPS) with every report, which is how
@@ -132,16 +149,18 @@ mission control authenticates it. See [control/README.md](control/README.md).
 producing node**: compiling takes minutes of full CPU.
 
 ```sh
-V=v0.5.0-rc.1   # or: latest
+V=v0.5.0-rc.28   # an exact release tag. Never "latest": GitHub's alias skips pre-releases and resolves to an old build
 curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/download/$V/pulse-cutover-x86_64-unknown-linux-musl
 curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/download/$V/sha256sums.txt
 sha256sum -c sha256sums.txt --ignore-missing
 sudo install -m 0755 pulse-cutover-x86_64-unknown-linux-musl /usr/local/bin/pulse-cutover
-git clone https://github.com/paulgnz/pulse-cutover   # for install.sh / cutover.sh and the examples
+git clone --branch $V --depth 1 https://github.com/paulgnz/pulse-cutover   # install.sh / cutover.sh / examples of the same tag
 ```
 
-`install.sh` does the same automatically (release binary, sha256-verified) whenever the ceremony manifest
-pins no agent artifact; a manifest-pinned binary still wins, fail-closed, in a real event.
+`install.sh` does the same automatically (release binary, sha256-verified against that release's sums) whenever the
+ceremony manifest pins no agent artifact: it fetches the manifest's `artifacts.agent_release_tag`, else the tag pinned
+in the script itself (`AGENT_RELEASE_DEFAULT`, bumped with every release together with `beacon-install.sh`), and
+refuses `latest`. A manifest-pinned binary (`artifacts.agent`) still wins, fail-closed, in a real event.
 
 **Building from source** (developers, on a non-producing box): `cargo build --release --locked`. The PulseVM
 import crates are fetched from a pinned git revision automatically; no second checkout is needed.
@@ -212,21 +231,42 @@ One command installs and configures every piece the ceremony needs. It does
 **not** touch your running nodeos and does **not** change any public traffic.
 
 It needs a *manifest* — a `ceremony.json` file saying which chain, which
-target, and which pinned binaries (its shape is shown in
-[the manifest section](#the-ceremonyjson-manifest) below). Where it comes
-from:
+target, and which pinned binaries. Start from
+[`examples/ceremony.json`](examples/ceremony.json): every field is documented
+in it, the public values are filled in (the XPR testnet chain id, the Tahoe
+network, the agent release tag, the `/v1` edge and federator files of that tag
+with their sha256), and the values only a ceremony coordinator can supply are
+marked `REPLACE-ME` (`install.sh` refuses a manifest that still has one and
+lists the paths). Where those come from:
 
-- **Testing with us**: ask in the
-  [Telegram group](https://t.me/+N1mAvoUDbtVmNTBh) for the current rehearsal
-  bundle — the manifest plus the prebuilt, sha256-pinned binaries it refers
-  to. (Every underlying knob is documented, field by field, in
-  `examples/ceremony-api.toml` and friends.)
+- **Testing with us**: the
+  [Telegram group](https://t.me/+N1mAvoUDbtVmNTBh) publishes the current
+  rehearsal bundle: the target chain's subnet/blockchain/VM ids, the pinned
+  PulseVM plugin and metalgo binaries with their sha256, and the shared
+  rehearsal producer identity. (There is no PulseVM chain for XPR testnet
+  itself yet; rehearsals run on a private Metal network.)
 - **A real event**: the ceremony coordinator publishes one manifest and
   every operator uses the same file.
 
 ```sh
+cp examples/ceremony.json ceremony.json && chmod 600 ceremony.json   # it will hold the producer key
+$EDITOR ceremony.json                                               # fill in every REPLACE-ME
 sudo ./install.sh --mode api --manifest ceremony.json
 ```
+
+What ends up where on the box (the beacon installer and the ceremony installer share one layout):
+
+| File | Written by | What it is |
+|---|---|---|
+| `/usr/local/bin/pulse-cutover` | both installers | the agent (release binary, sha256-verified) |
+| `/etc/pulse-cutover/beacon.toml` | `beacon-install.sh` | readiness-only config for the beacon (`profile = "readiness"`; `run` refuses it) |
+| `/etc/pulse-cutover/beacon.token`, `beacon.instance` | `beacon-install.sh` | the beacon's token (mode 600) and stable instance id |
+| `/etc/pulse-cutover/ceremony.toml` | `install.sh` | **the ceremony config** `cutover.sh` runs, generated from the manifest + the doctor survey |
+| `/etc/pulse-cutover/ceremony.json` | `install.sh` | a copy of the manifest it was generated from |
+| `/opt/pulse-cutover/flip-*.sh`, `source-*.sh` | `install.sh` | the templated flip/revert and (script-managed nodeos) stop/start scripts |
+| `<paths.work_dir>/` (`/var/lib/pulse-cutover` in the example) | `install.sh`, the agent | `doctor.json`, `journal.jsonl`, the staged snapshot (absent until VERIFIED), captured fingerprints |
+| `/opt/pulsevm/plugins/<vm_id>`, `/opt/metalgo/metalgo`, `/etc/metalgo/chains/<id>/config.json` | `install.sh` | the pinned PulseVM plugin, metalgo, and the target chain config (unit `metalgo-pulse`) |
+| `/var/lib/metalgo/` | `tools/metal-install.sh` | a standalone Metal validator (unit `metalgo`) with its identity in `staking/` |
 
 It re-runs `doctor` first and refuses, with reasons, if the box isn't ready.
 Discovery supports specific layouts (see Step 2 and the support matrix), and some
@@ -282,7 +322,7 @@ of a recorded rehearsal against the live XPR testnet:
 
 ```
 ceremony starting — journal: /root/api-cutover/journal.jsonl
-(the source chain stays authoritative until the last step; ^C + './cutover.sh abort' is always safe before FLIPPED)
+(^C + './cutover.sh abort' rolls back safely before IGNITED; after IGNITED a failure SEALS — nothing is resumed without a human)
 [ARMED]       watching the source chain; preflight passed.
   [2026-08-21T03:16:19.995Z]    ARMED {"blocks_to_h_final":240,"head":401579134,"lib":401578805}
   [2026-08-21T03:17:50.298Z]    ARMED {"blocks_to_h_final":72,"head":401579302,"lib":401578973}
@@ -296,11 +336,11 @@ ceremony starting — journal: /root/api-cutover/journal.jsonl
 LIVE. Evidence journal: /root/api-cutover/journal.jsonl
 ```
 
-That output is from a single API-provider box on an older build. Its banner "abort is always safe before
-FLIPPED" is outdated: in every mode ignition precedes FLIPPED, and from rc.7 an abort is only performed
-**before ignition starts**; after that `./cutover.sh abort` refuses (exit 3) and a failure HALTS instead. It
-was never a fleet guarantee either: once other producers may have ignited, a local abort that resumes the
-old chain can split the network (ATOMICITY Known limits #1).
+The state lines and timestamps are from a recorded single-box run (August 2026); the banner is what `cutover.sh`
+prints today. An abort is only performed **before ignition starts**; after that `./cutover.sh abort` refuses
+(exit 3) and a failure HALTS instead. It is not a fleet guarantee either: once other producers may have ignited,
+a local abort that resumes the old chain can split the network, which is why a coordinated producer's rollback
+runs the fleet resume guard first (ATOMICITY Known limits #1 and #14).
 
 How long each part takes (recorded, testnet-sized state; a bigger chain
 mostly stretches the snapshot and verify phases):
@@ -712,17 +752,32 @@ been exercised against real chain services or a fleet yet (ATOMICITY Known limit
 
 ### Commands
 
+Read-only, safe anywhere (including production):
+
 ```sh
-pulse-cutover run    --config ceremony.toml
-pulse-cutover loop   --config ceremony.toml --runs N
-pulse-cutover status --config ceremony.toml
-pulse-cutover verify --snapshot snap.bin [--cpu-scale 143] [--golden g.txt | --capture g.txt]
-pulse-cutover doctor [--json]                       # read-only environment survey + verdicts
+pulse-cutover doctor [--json]                       # environment survey + per-mode verdicts
+pulse-cutover status --config ceremony.toml         # how far the ceremony got, from the journal
 pulse-cutover scan-contracts snap.bin [--json]      # stubbed-intrinsic exposure (advisory)
 pulse-cutover report [--paranoid] [--out f.tar.gz]  # sanitized feedback bundle
+pulse-cutover beacon --config ceremony.toml [--once]   # readiness + evidence to mission control ([beacon])
+pulse-cutover await  --config ceremony.toml         # arm from the coordinator's SIGNED event ([coordination])
+pulse-cutover verify --snapshot snap.bin [--cpu-scale 143] [--golden g.txt | --capture g.txt]   # CPU/RAM heavy
 ```
 
-`pulse-cutover <command> --help` prints examples for each.
+Mutating (normally driven by `install.sh` / `cutover.sh`):
+
+```sh
+pulse-cutover run      --config ceremony.toml       # run the ceremony to LIVE (0), ABORTED or HALTED (1)
+pulse-cutover loop     --config ceremony.toml --runs N
+pulse-cutover rollback --config ceremony.toml [--wait S] [--force-after-ignite] [--force-stranded --i-understand]
+                                                    # what cutover.sh abort runs (exit 3 = refused, 4 = incomplete)
+pulse-cutover unhalt   --config ceremony.toml --i-understand   # clear a HALTED (sealed) journal after a fleet decision
+pulse-cutover join     --config ceremony-<event>.toml --event <id> [--reverify]   # a STRANDED/ABORTED producer joins
+                                                    # the chain a quorum of the event already runs LIVE
+```
+
+`pulse-cutover <command> --help` prints examples for each; `--cpu-scale` must equal the ceremony's
+`import_cpu_scale` for `verify` fingerprints to be comparable.
 
 ### API-provider mode (`mode = "api"`)
 
@@ -748,12 +803,13 @@ reverts the swap after fencing this box's target.
 - Snapshot via the node's **own** `producer_api` `create_snapshot` (works
   read-only on non-producers; keep it localhost-bound — R10).
 - `simulate_freeze = true` rehearses against a live chain that will *not*
-  stop: when LIB ≥ H the agent proceeds as if frozen; the journal records the
-  actual cut block. api mode today snapshots once LIB ≥ H and accepts its own
-  height, so its cut can be later than H: a producer write-freeze does not stop
-  empty source blocks at H. Exact-H for API providers is open (ATOMICITY Known
-  limits #2); until then an API provider must obtain and verify the exact-H
-  artifact rather than rely on its own snapshot.
+  stop: when LIB ≥ H the agent proceeds as if frozen, accepts its own cut
+  height (it can be later than H) and journals the actual cut block. Without
+  it, api mode schedules the snapshot at exactly H through its own nodeos
+  (`snapshot.dir`, picked up as `snapshot-<id of H>.bin`), like a producer.
+  That exact-H path has not been rehearsed under a real freeze in API mode
+  (ATOMICITY Known limits #2); an API provider should still verify its
+  artifact against the published goldens rather than trust its own snapshot.
 
 ### hyperion mode (`mode = "api"` + `[hyperion]`)
 
@@ -980,8 +1036,9 @@ nodeos stops). Without the capture those two endpoints answer 501.
 
 Beyond that it installs the agent, PulseVM plugin, metalgo, and (api mode)
 the /v1 REST gateway from the manifest's artifacts, each **sha256-verified,
-failing closed on a mismatch** (other install paths, such as `tools/metal-install.sh`
-and Docker images, have their own, weaker pinning; see docs/METAL-QUICKSTART.md);
+failing closed on a mismatch** (`tools/metal-install.sh` carries its metalgo
+checksums inside the script and reads mission control's manifest only for the
+network ids; see docs/METAL-QUICKSTART.md);
 extracts any tarball safely (`--no-same-owner`, staging dir); stages the
 metalgo/chain configs with the manifest's values; enforces R12 (no stale
 staged snapshot); and ends with an ARMED-READY print of exactly what will
@@ -999,30 +1056,41 @@ state of nodeos, metalgo and the edge before assuming the source is authoritativ
 
 ### The ceremony.json manifest
 
+The complete, documented example is [`examples/ceremony.json`](examples/ceremony.json)
+(JSON has no comments, so its `_`-prefixed keys carry the documentation and
+are ignored). The shape, abridged:
+
 ```json
 {
   "mode": "api",
-  "ceremony": { "chain_id": "…", "freeze_height": 0, "freeze_margin": 240,
+  "ceremony": { "rehearsal": true, "chain_id": "…", "freeze_height": 0, "freeze_margin": 240,
                 "simulate_freeze": true, "import_cpu_scale": 143 },
   "source":   { "rpc_url": "http://127.0.0.1:8888",
                 "producer_api_url": "http://127.0.0.1:8888",
-                "stop_cmd": "systemctl stop nodeos",
+                "stop_cmd": "systemctl stop nodeos",          // optional: derived from the doctor survey
                 "start_cmd": "systemctl start nodeos" },
+  "snapshot": { "dir": "…", "golden_roots": "…", "expected_sha256": "…", "prescan_path": "…" },   // all optional
   "target":   { "network_id": "tahoe", "subnet_id": "…", "blockchain_id": "…",
-                "vm_id": "…", "producer_name": "eosio", "producer_key": "PVT_K1_…",
-                "staking_dir": "/root/api-cutover/staking" },
-  "flip":     { "public_host": "<public-ip-or-domain>",
-                "edge": "auto" },
-  "artifacts": { "agent":   {"url": "…", "sha256": "…"},
-                 "plugin":  {"url": "…", "sha256": "…"},
-                 "metalgo": {"url": "…", "sha256": "…"},
-                 "gateway": {"url": "…", "sha256": "…"},
-                 "edge":    {"url": "…", "sha256": "…"} },
-  "gateway": { "mode": "edge" },
-  "paths": { "work_dir": "/root/api-cutover" }
+                "vm_id": "…", "producer_name": "…", "producer_key": "PVT_K1_…",
+                "staking_dir": "/var/lib/metalgo/staking", "post_live_probe_cmd": "…" },
+  "flip":     { "public_host": "<public-ip-or-domain>", "edge": "auto" },
+  "gateway":  { "mode": "edge" },
+  "artifacts": { "agent_release_tag": "v0.5.0-rc.28",      // or "agent": {"url", "sha256"}, which wins
+                 "plugin":    {"url": "…", "sha256": "…"},
+                 "metalgo":   {"url": "…", "sha256": "…"},
+                 "edge":      {"url": "…", "sha256": "…"},    // gateway.mode = edge
+                 "gateway":   {"url": "…", "sha256": "…"},    // gateway.mode = legacy
+                 "hyperion":  {"url": "…", "sha256": "…"},    // hyperion mode
+                 "federator": {"url": "…", "sha256": "…"} },  // hyperion mode
+  "hyperion": { "legacy_url": "…", "es_heap": "2g", "es_image": "…", "ship_ws": "ws://127.0.0.1:9090" },
+  "hooks":    { "on_freeze": "…", "post_ignite": "…", "on_live": "…", "on_abort": "…", "on_halt": "…" },
+  "paths":    { "work_dir": "/var/lib/pulse-cutover" }
 }
 ```
 
+`install.sh` reads exactly these keys (the mode-specific ones only in their
+mode) and turns them into `/etc/pulse-cutover/ceremony.toml`; every TOML field
+that results is documented in [`examples/ceremony.toml`](examples/ceremony.toml).
 `flip.edge` picks which web edge the ceremony flips when the box runs more
 than one: `"nginx"`, `"haproxy"`, or `"auto"` (default — auto-picks the one
 edge that routes /v1 to your nodeos, and refuses to guess if both do).
@@ -1095,17 +1163,20 @@ series) is in `examples/loop/`.
 
 ### Build
 
-Sibling checkout convention: this repo and `pulsevm-arena-import` (branch
-`feat/arena-snapshot-import` of paulgnz/pulsevm) live side by side; the
-fingerprint stack is consumed as path dependencies.
-
 ```sh
-cargo build --release && cargo test
+cargo build --release --locked && cargo test --locked
 ```
+
+The PulseVM import crates (`pulsevm_snapshot`, `pulsevm_snapshot_import`,
+`pulsevm_chaindb`) are git dependencies pinned to an exact commit in
+`Cargo.toml` (a commit that predates PulseVM's licence change, so this MIT
+crate links MIT code); cargo fetches them, no second checkout is needed.
+`Cargo.lock` is committed and CI/release builds use `--locked`. Release
+binaries are static musl builds made by `.github/workflows/release.yml`.
 
 ### Design docs & trust model
 
-- [docs/DESIGN.md](docs/DESIGN.md): the reviewed design as of rc.11 — review
+- [docs/DESIGN.md](docs/DESIGN.md): the reviewed design as of rc.28 — review
   findings R1–R12, state machine, config format, trust model, failure/rollback
   table, and the v2 shadow-mirror sketch.
 - [docs/EVIDENCE.md](docs/EVIDENCE.md): every recorded rehearsal run (single
@@ -1116,7 +1187,10 @@ cargo build --release && cargo test
 - [docs/PROCESS.md](docs/PROCESS.md) and [ATOMICITY.md](ATOMICITY.md): the
   process step by step, and what "atomic" means and how far the evidence goes.
 
-`examples/ceremony.toml` documents the full agent config format.
+`examples/ceremony.toml` documents the full agent config format: every field
+of every section in `src/config.rs`, with its default (`tools/test/run.sh`
+fails when one is missing). `examples/ceremony-bp.toml` is the coordinated
+producer shape with `[coordination]` and `[beacon]` filled in.
 
 ---
 
@@ -1288,21 +1362,22 @@ what testers get out of it.
 
 ## Status & caveats
 
-- Operator tooling v0.5.0-rc.9 (beacon, installers, mission control) — rehearsal-grade; the beacon installer
-  pins the latest *released* tag.
-  The recorded ceremonies are real but ran the fork plugin (`v0.0.0-arena-mempoolfix.1`
-  lineage, metalgo 1.13.5, plugin protocol 43), not upstream PulseVM v1.0.0 (protocol
-  45, needs metalgo 1.14.x); no *mainnet* event has run. See the status box at the top.
+- Operator tooling v0.5.0-rc.28 (beacon, installers, mission control) — rehearsal-grade; both installers and
+  `install.sh` pin an exact released tag (bumped by each release; `latest` is refused).
+  The September ceremonies ran the fork plugin (`v0.0.0-arena-mempoolfix.1`
+  lineage, metalgo 1.13.5, plugin protocol 43); the 2026-10-06 fleet runs ran upstream
+  PulseVM v1.0.0 (protocol 45, metalgo 1.14.2) on a private Metal network. Nothing has run on
+  Tahoe itself and no *mainnet* event has run. See the status box at the top.
 - Ubuntu 20.04/22.04/24.04 + systemd only; nginx and haproxy traffic flips
   (apache/caddy detected and refused with reasons). `report` bundles are how
   new setups get added.
 - Default import backend is still the fork path (`paulgnz/pulsevm`,
   `feat/arena-snapshot-import`), an interim bridge: the official migration
   path (MetalBlockchain/pulsevm#61) is merged, and `import_backend = "upstream"`
-  drives it through VERIFIED and can ignite from the checkpoint on PulseVM v1.0.0
-  (unit/integration-tested; a full ceremony on real services has not run yet). On
-  v1.0.0 that needs both rehearsal-only overrides, and it is refused for mainnet
-  (see "Import backends").
+  drives it through VERIFIED and ignites from the checkpoint on PulseVM v1.0.0
+  (rehearsed in the 2026-10-06 fleet runs: identical state at H everywhere, mixed
+  LIVE/HALTED outcomes per node). On v1.0.0 that needs both rehearsal-only
+  overrides, and it is refused for mainnet (see "Import backends").
 - Multi-producer: proven LIVE across 5 BPs with a **shared** target producer
   identity (field note 6). Per-BP producer keys on the migrated chain need an
   upstream change.

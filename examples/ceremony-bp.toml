@@ -37,9 +37,9 @@ poll_ms = 250                                     # poll interval, ms          [
 rehearsal = true             # REHEARSAL config: relaxes the production profile (see README "Production profile");
                              # a real cut drops this line and must load without it. Refused for XPR mainnet.
 mode = "producer"            # you are a BP                                    [LEAVE]
-freeze_height = 0            # real event: the coordinator's published H       [CHANGE per event]
-freeze_margin = 420          # rehearsal H = last-final + 420 (see note above) [LEAVE for rehearsals]
-derive_h_at_arm = true       # rehearsal only: H derived at arm; a real event takes H from the signed event
+freeze_height = 0            # real event: H comes from the signed event (`await`) or is typed here  [CHANGE per event]
+freeze_margin = 420          # rehearsal H = last-final + 420 (see note above) [LEAVE for rehearsals;
+derive_h_at_arm = true       # rehearsal only: H derived at arm                 DELETE both for `await`]
 
 # "schedule_at_h" = tell nodeos IN ADVANCE to write the snapshot the moment
 # block H becomes final — the multi-BP discipline (everyone cuts the exact
@@ -103,3 +103,51 @@ auto_rollback = true                  # on abort: resume the source producer aut
 on_freeze = "echo bp-write-freeze-marker"
 # on_abort: undo anything on_freeze/quiesce did (here: restore the replica's p2p).
 on_abort = "/root/bp-cutover/unquiesce.sh"
+# A real event also needs post_ignite (first transactions: PulseVM builds blocks
+# on demand) and on_live (flip your API edge); the production profile requires
+# all four. on_halt pages a human when the ceremony seals; timeout_secs (300)
+# bounds every hook.
+
+# -----------------------------------------------------------------------------
+# [beacon] — reports readiness + evidence to Cutover Mission Control. Needed
+# by every COORDINATED producer: the fleet gate and the resume guard only count
+# nodes whose reports the relay can see, and `producer` must be in the event's
+# roster (the config warns when it is not). The url/token/instance come from
+# tools/beacon-install.sh; put the same producer here.            [CHANGE producer/network]
+# -----------------------------------------------------------------------------
+[beacon]
+url = "https://control-rehearsal.protonnz.com/api/report"   # https only (plain http only to localhost)
+producer = "youraccount"            # your account as in the producer schedule AND the event roster
+network = "testnet"                 # mission control's network id (networks.json)
+node = "producer"                   # this server's label on the board (default: hostname); one per server
+role = "producer"                   # producer | api | history | seed
+token_file = "/etc/pulse-cutover/beacon.token"   # one line, mode 600; never the token itself here
+interval_secs = 5
+
+# -----------------------------------------------------------------------------
+# [coordination] — `pulse-cutover await`: arm from the coordinator's SIGNED
+# event instead of a typed H (every producer gets the same H, roster and
+# quorum), and gate ignition on the fleet. With this section, freeze_height
+# stays 0 and freeze_margin/derive_h_at_arm are removed: H comes from the event.
+# `await` writes a DERIVED config with H, event_id, event_hash and the event's
+# roster/quorum; `run` uses that one. Every field: examples/ceremony.toml.
+# -----------------------------------------------------------------------------
+[coordination]
+url = "https://control-rehearsal.protonnz.com"   # relay base URL (signed messages + beacon reports)
+network = "testnet"
+coordinator_keys = ["REPLACE-WITH-THE-COORDINATOR-ED25519-PUBLIC-KEY-HEX"]   # empty = trust nobody  [CHANGE]
+auto_arm = false                    # a signed ARM also needs `touch <journal dir>/confirm-<event_id>`
+min_lead_blocks = 120               # refuse an event whose H is closer than this to head
+fleet_quorum = 0                    # the signed event's roster + quorum override this at `await`; a typed-in
+                                    # roster (below) needs an explicit 1..=roster size
+fleet_timeout_secs = 300
+report_max_age_secs = 60
+degraded_patience_secs = 900        # after ignition: a local symptom is waited out this long while a quorum
+degraded_retry_secs = 10            # reports the same target chain (hooks retried with backoff)
+fleet_stall_secs = 300
+# Normally written by `await` from the signed event, not by hand:
+# event_id = "..."
+# event_hash = "..."               # rc.29: the relay's "no abort" must carry this signed event
+# [[coordination.roster]]
+# producer = "bp1"
+# instance_id = "<32-hex beacon.instance>"   # optional: pin the member to one beacon instance

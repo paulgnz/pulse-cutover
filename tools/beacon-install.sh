@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # beacon-install.sh — connect one server to Cutover Mission Control (readiness beacon).
 #
-#   curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh | sudo bash
+#   Download it from a RELEASE TAG (the pulse-cutover version it installs is pinned below), read it, run it:
+#     V=v0.5.0-rc.28
+#     curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
+#     less beacon-install.sh && sudo bash beacon-install.sh
 #
 # Network (mainnet/testnet) is detected from the node's chain_id and the producer account from
 # `producer-name` in nodeos' config.ini; pass --network / --producer to override.
@@ -487,7 +490,7 @@ for c in r.get("checks",[]): print("   ", "ok " if c.get("ok") else "-- ", c.get
   echo "      network=$NETWORK producer=$PRODUCER token_sha256=$HASH"
   echo
   echo "  Then watch your server here: ${URL%/}/$NETWORK/$PRODUCER/$NODE"
-  echo "  To remove it later:  curl -fsSL https://raw.githubusercontent.com/paulgnz/pulse-cutover/main/tools/beacon-install.sh | sudo bash -s -- --uninstall"
+  echo "  To remove it later:  sudo bash beacon-install.sh --uninstall   (this same script)"
 }
 
 [ "${BEACON_INSTALL_SOURCED:-0}" = 1 ] || main "$@"

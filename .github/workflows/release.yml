@@ -14,6 +14,13 @@
 # committed. If a future dependency ever breaks musl, the documented
 # fallback is a rust:1-bullseye (glibc 2.31) build — oldest supported
 # glibc — with a note in the release body; keep the asset names stable.
+#
+# Supply chain: every action is pinned to a full commit SHA (tag in the
+# comment) and the builder images by digest; `cargo build --locked` refuses
+# a Cargo.lock that does not match Cargo.toml. The release also carries the
+# operator scripts (install.sh, cutover.sh, tools/*.sh) and lists them in
+# sha256sums.txt, so a script downloaded from the release tag can be
+# verified before it is run as root (docs/METAL-QUICKSTART.md).
 name: release
 
 on:
@@ -30,22 +37,24 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            image: messense/rust-musl-cross:x86_64-musl
+            # messense/rust-musl-cross:x86_64-musl, resolved 2026-10-12
+            image: messense/rust-musl-cross@sha256:fb7229c2a7dd84957e3a46f8bec7d01c4ec7c295ad159606623093a0a9286253
           # aarch64 is nearly free with the same cross image (ARM boxes are
           # appearing among BPs; the installer picks the asset by uname -m).
           - target: aarch64-unknown-linux-musl
-            image: messense/rust-musl-cross:aarch64-musl
+            # messense/rust-musl-cross:aarch64-musl, resolved 2026-10-12
+            image: messense/rust-musl-cross@sha256:c9403b20663fca32f703b4201672120d8a634d5ebcaf95d013f0140382432a17
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build static ${{ matrix.target }}
         run: |
           docker run --rm -v "$PWD":/home/rust/src ${{ matrix.image }} \
-            sh -c "cargo build --release --target ${{ matrix.target }} && \
+            sh -c "cargo build --release --locked --target ${{ matrix.target }} && \
                    musl-strip target/${{ matrix.target }}/release/pulse-cutover"
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/pulse-cutover" \
              "dist/pulse-cutover-${{ matrix.target }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pulse-cutover-${{ matrix.target }}
           path: dist/pulse-cutover-${{ matrix.target }}
@@ -55,25 +64,35 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
-      - name: sha256sums
+      - name: Operator scripts + sha256sums
         run: |
+          # The scripts ship with the release so operators can verify what they run as root
+          # against this release's sums (the published names keep their repo paths' basenames).
+          cp install.sh cutover.sh tools/beacon-install.sh tools/metal-install.sh dist/
           cd dist
-          sha256sum pulse-cutover-* > sha256sums.txt
+          sha256sum pulse-cutover-* install.sh cutover.sh beacon-install.sh metal-install.sh > sha256sums.txt
           cat sha256sums.txt
       - name: Create release with assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/pulse-cutover-*
+            dist/install.sh
+            dist/cutover.sh
+            dist/beacon-install.sh
+            dist/metal-install.sh
             dist/sha256sums.txt
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
-            Static musl binaries — run on Ubuntu 20.04/22.04/24.04 (any glibc).
-            Verify: `sha256sum -c sha256sums.txt --ignore-missing`.
-            `install.sh` fetches + verifies these automatically when the
-            ceremony manifest pins no agent artifact.
+            Static musl binaries — run on Ubuntu 20.04/22.04/24.04 (any glibc) — plus the
+            operator scripts of this tag. Verify everything you downloaded:
+            `sha256sum -c sha256sums.txt --ignore-missing`.
+            `install.sh` fetches + verifies the binary of its pinned release tag
+            (or the manifest's `artifacts.agent_release_tag`) when the ceremony
+            manifest pins no agent artifact.
