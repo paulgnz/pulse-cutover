@@ -8,13 +8,16 @@ on:
 permissions:
   contents: read
 
+# Every action is pinned to a full commit SHA (the tag it corresponds to is in the comment); Dependabot
+# (.github/dependabot.yml) proposes bumps. A mutable tag could be moved to run other code with this
+# workflow's token.
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable (2026-10)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (2.9.2)
       - name: Build
         run: cargo build --locked
       - name: Tests (state machine, doctor, verify, scan, upstream mode)
@@ -23,8 +26,8 @@ jobs:
   scripts:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 18
       - name: Shell syntax
@@ -34,6 +37,8 @@ jobs:
           for f in $(git ls-files '*.sh'); do bash -n "$f"; done
       - name: Node syntax (edge, federator, tools, conformance harness)
         run: for f in $(git ls-files 'gateway/*.js' 'federator/*.js' 'examples/*.mjs' 'tools/*.mjs' 'tools/conformance/*.mjs' 'tools/conformance/clients/*.mjs'); do node --check "$f"; done
+      - name: Example manifest is valid JSON
+        run: jq -e . examples/ceremony.json >/dev/null
       - name: Edge + federator + mission control + conformance tests (node:test, mock upstreams, no network)
         run: node --test control/test/*.test.mjs gateway/test/*.test.mjs federator/test/*.test.mjs tools/conformance/test/*.test.mjs
       - name: Installer unit tests
