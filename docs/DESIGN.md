@@ -424,3 +424,53 @@ and snapshot creation grows with state size. v2 would take both off the critical
   metalgo), which would also cut the ignite step (8.3–14.4 s in the single-node runs).
 
 None of this is scheduled.
+
+## 7. Readiness drill (r30, risk register D-7)
+
+**Purpose.** Rung 4 of the mainnet test ladder ([HOW-IT-WORKS.md](HOW-IT-WORKS.md#7-how-it-gets-proven-before-mainnet)):
+every producer proves, on the live chain and with no effect on it, that its own infrastructure cuts exactly H and
+converts it to the same state as everyone else, and measures how long that takes. Nothing else can show this
+before a real event: rehearsals use rehearsal nodes, a drill uses each producer's real nodeos and hardware.
+
+**Shape.** A separate command, `pulse-cutover drill --config <ceremony.toml> --height H`, in its own module
+(`src/drill.rs`). It does not go through the state machine and never opens the ceremony journal for writing.
+
+1. Refuse unless the config uses the upstream backend with `compare_bin` and `snapshot.dir`; refuse while the
+   ceremony journal is in progress, sealed, unfinished or LIVE (only no journal, an empty one or a finished ABORTED
+   may run next to a drill); refuse H < head + 20 and an H already drilled on this box.
+2. `schedule_snapshot(H)` (the same producer-API call ARM makes). No freeze, no pause, no burn-off gate: the chain
+   keeps producing, and the blocks after H are recorded as information only.
+3. Wait for LIB ≥ H, pin H's block id, pick up `snapshot-<id of H>.bin`, hash it.
+4. Run `upstream::run_pipeline` unchanged (export → import → compare → fingerprint) in
+   `<journal dir>/drill/<H>/work`, with the rehearsal compare allowlist and any pinned `golden_state_root` cleared:
+   the drill reports the TRUE compare result. When the compare fails, the drill still fingerprints the checkpoint
+   (same tool and arguments as the pipeline), because comparing producers' state is half of what it measures.
+5. Journal every step in `<journal dir>/drill/<H>/drill.jsonl` (`kind = "readiness_drill"` on every line), publish
+   `<journal dir>/drill/latest.json`, keep the compare report and checkpoint manifest, delete the multi-GB work
+   files unless `--keep-work`.
+
+**Why it cannot change anything.** The drill never holds the raw `ChainOps`: every call goes through `DrillGuard`,
+which passes read-only calls, `schedule_snapshot` and the pipeline's commands, and refuses (and records) pause,
+resume, `create_snapshot`, ignite, hooks, orphan-hook kills, target reads and target binding. A drill that even
+tried one fails. It runs no hook, so no write freeze, flip, stop or chain creation can happen; it never reads or
+writes `snapshot.staged_path`; its pipeline uses its own work dir and its own process-group file, so a ceremony's
+orphan-hook cleanup and a drill cannot kill each other's processes.
+
+**Mainnet.** A drill is allowed on XPR mainnet without any override; the config is loaded with the normal rules, so
+rehearsal overrides stay refused for mainnet. A readiness-profile config (the one `beacon-install.sh` writes) can run
+a drill once it has `[upstream]` and `snapshot.dir`.
+
+**Reporting.** The beacon publishes `latest.json` as a top-level `drill` field (never inside `ceremony`). Its
+`fingerprints_digest` is computed exactly as a real VERIFIED record's (`{"upstream_state_root": root}`), so drills
+and ceremonies compare directly. Mission control validates the field (`projectDrill`), compares producers per drill
+height (`drillComparison`: same block at H, snapshot, state root, compare result, timings) and shows a separate
+READINESS DRILL panel. Drill data never feeds the fleet verdict, the agreement table, the creation-evidence log or
+any agent decision. `status` prints the latest drill on its own line, labelled as not a ceremony, and `report`
+bundles `drill-latest.json`.
+
+**Exit codes.** 0 = evidence complete and the compare matched; 5 = evidence complete, the compare did not match;
+1 = the drill failed.
+
+**Not covered.** The finality wait it measures is the live chain's, not a frozen fleet's; the snapshot write is
+timed as "LIB ≥ H → file present". Peak memory is not measured by the agent (use the host's own monitoring). H is
+typed by each operator; a signed coordinator drill event is a possible follow-up.

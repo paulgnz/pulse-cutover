@@ -869,6 +869,8 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         "checks": checks,
         "source": {"head": head, "lib": lib, "chain_id": chain_id},
         "ceremony": journal,
+        // A readiness drill's latest result (never the ceremony: a drill touches no ceremony journal).
+        "drill": crate::drill::beacon_view(cfg),
         "coord": coord_public(cfg),
         "metal": metal,
     })

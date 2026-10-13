@@ -1,0 +1,383 @@
+//! Readiness drill (risk D-7): it measures and reports on the LIVE chain and never changes it.
+
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+
+use pulse_cutover::config::Config;
+use pulse_cutover::drill::{self, DrillGuard, DrillOptions};
+use pulse_cutover::ops::{ChainInfo, ChainOps, SnapshotResult};
+use serde_json::Value;
+
+const MAINNET: &str = "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0";
+
+fn block_id(h: u64) -> String {
+    format!("{h:08x}{}", "ab".repeat(28))
+}
+
+/// A live chain that never stops: head +1 per read, LIB 3 behind. A scheduled snapshot lands once LIB ≥ H, as
+/// nodeos does. Every call is recorded by name.
+struct LiveChain {
+    dir: PathBuf,
+    snap_dir: PathBuf,
+    chain_id: String,
+    head: RefCell<u64>,
+    scheduled: RefCell<Option<u64>>,
+    calls: RefCell<Vec<String>>,
+    clock: RefCell<u64>,
+}
+
+impl LiveChain {
+    fn new(dir: &Path, chain_id: &str, head: u64) -> Self {
+        let snap_dir = dir.join("snapshots");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        LiveChain {
+            dir: dir.to_path_buf(),
+            snap_dir,
+            chain_id: chain_id.into(),
+            head: RefCell::new(head),
+            scheduled: RefCell::new(None),
+            calls: RefCell::new(vec![]),
+            clock: RefCell::new(1_000_000),
+        }
+    }
+    fn call(&self, n: &str) {
+        self.calls.borrow_mut().push(n.into());
+    }
+    fn called(&self, n: &str) -> bool {
+        self.calls.borrow().iter().any(|c| c == n)
+    }
+}
+
+impl ChainOps for LiveChain {
+    fn source_info(&self) -> Result<ChainInfo, String> {
+        self.call("source_info");
+        let head = {
+            let mut h = self.head.borrow_mut();
+            *h += 1;
+            *h
+        };
+        let lib = head.saturating_sub(3);
+        if let Some(h) = *self.scheduled.borrow() {
+            let f = self.snap_dir.join(format!("snapshot-{}.bin", block_id(h)));
+            if lib >= h && !f.exists() {
+                std::fs::write(&f, format!("snapshot at {h}")).unwrap();
+                std::fs::write(
+                    self.dir.join("cut-facts.env"),
+                    format!("CHAIN_ID={}\nCUT_BLOCK_ID={}\nCUT_HEIGHT={h}\n", self.chain_id, block_id(h)),
+                )
+                .unwrap();
+            }
+        }
+        Ok(ChainInfo {
+            chain_id: self.chain_id.clone(),
+            head_block_num: head,
+            head_block_id: block_id(head),
+            head_block_time: "2026-10-13T00:00:00.000".into(),
+            last_irreversible_block_num: lib,
+        })
+    }
+    fn source_block_id(&self, n: u64) -> Result<(String, String), String> {
+        self.call("source_block_id");
+        Ok((block_id(n), "2026-10-13T00:00:00.000".into()))
+    }
+    fn source_block_tx_count(&self, _n: u64) -> Result<u64, String> {
+        self.call("source_block_tx_count");
+        Ok(7)
+    }
+    fn producer_paused(&self) -> Result<bool, String> {
+        self.call("producer_paused");
+        Ok(false)
+    }
+    fn pause(&self) -> Result<(), String> {
+        self.call("pause");
+        Ok(())
+    }
+    fn resume(&self) -> Result<(), String> {
+        self.call("resume");
+        Ok(())
+    }
+    fn create_snapshot(&self) -> Result<SnapshotResult, String> {
+        self.call("create_snapshot");
+        Err("not in a drill".into())
+    }
+    fn schedule_snapshot(&self, h: u64) -> Result<(), String> {
+        self.call("schedule_snapshot");
+        *self.scheduled.borrow_mut() = Some(h);
+        Ok(())
+    }
+    fn target_info(&self) -> Result<Option<ChainInfo>, String> {
+        self.call("target_info");
+        Ok(None)
+    }
+    fn public_info(&self, _u: &str) -> Result<Option<ChainInfo>, String> {
+        self.call("public_info");
+        Ok(None)
+    }
+    fn ignite(&self) -> Result<String, String> {
+        self.call("ignite");
+        Ok(String::new())
+    }
+    fn run_hook(&self, _cmd: &str) -> Result<String, String> {
+        self.call("run_hook");
+        Ok(String::new())
+    }
+    fn run_long(&self, cmd: &str) -> Result<String, String> {
+        self.call("run_long");
+        pulse_cutover::ops::run_shell(cmd)
+    }
+    fn run_long_cancellable(&self, cmd: &str, _c: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
+        self.call("run_long");
+        pulse_cutover::ops::run_shell(cmd).map(Some)
+    }
+    fn get_json(&self, _url: &str) -> Result<Option<Value>, String> {
+        self.call("get_json");
+        Ok(None)
+    }
+    fn now_ms(&self) -> u64 {
+        let mut c = self.clock.borrow_mut();
+        *c += 100;
+        *c
+    }
+    fn sleep_ms(&self, _ms: u64) {}
+}
+
+fn script(path: &Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Fake upstream tools with the official argument shapes. `compare_ok = false` makes the compare fail on the two
+/// tables v1.0.0 reports for every XPR snapshot (issue #109).
+fn stage_tools(dir: &Path, compare_ok: bool) {
+    let d = dir.display();
+    let sidecar = r#"{"version":2,"source_chain_id":"%s","source_block_id":"%s","account_metadata":[{"name":1,"recv_sequence":3,"auth_sequence":1,"code_sequence":0,"abi_sequence":0},{"name":2,"recv_sequence":2,"auth_sequence":0,"code_sequence":0,"abi_sequence":0}],"global_action_sequence":5,"input_transactions":[]}"#;
+    script(
+        &dir.join("export.sh"),
+        &format!(
+            "#!/bin/sh\nset -e\nsnap=\"$1\"; out=\"$2\"\n\
+             sha() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi | awk '{{print $1}}'; }}\n\
+             . {d}/cut-facts.env\nmkdir -p \"$out/work/state-history\"\n\
+             printf SHIPLOG > \"$out/work/state-history/chain_state_history.log\"\n\
+             printf '{sidecar}' \"$CHAIN_ID\" \"$CUT_BLOCK_ID\" > \"$out/work/deferred-transactions.json\"\n\
+             echo \"INPUT_SNAPSHOT_SHA256=$(sha \"$snap\")\" > \"$out/work/manifest.env\"\necho exported\n"
+        ),
+    );
+    script(
+        &dir.join("import.sh"),
+        &format!(
+            "#!/bin/sh\nset -e\n. {d}/cut-facts.env\nprintf CKPT > \"$3\"\n\
+             printf '{{\"checkpoint_sha256\":\"cc\",\"checkpoint_revision\":%s,\"source_block_id\":\"%s\"}}' \"$CUT_HEIGHT\" \"$CUT_BLOCK_ID\" > \"$3.manifest.json\"\n\
+             echo imported\n"
+        ),
+    );
+    let tables = pulse_cutover::upstream::REQUIRED_COMPARE_TABLES.join(" ");
+    let compare = if compare_ok {
+        format!("#!/bin/sh\nfor t in {tables}; do echo \"table $t: rows=1 sha256=aa\"; done\nexit 0\n")
+    } else {
+        "#!/bin/sh\necho 'table contract_index_double: nodeos=Some(TableReport { rows: 104 }) arena=None' >&2\n\
+         echo 'table global_property: first differing row index 0' >&2\necho '21-table nodeos/Arena comparison FAILED' >&2\nexit 1\n"
+            .to_string()
+    };
+    script(&dir.join("compare.sh"), &compare);
+    script(&dir.join("fingerprint.sh"), "#!/bin/sh\necho 'revision 1'\necho 'state_root 42b0a70fa12998bdfeedfacecafebeef'\n");
+}
+
+fn drill_config(dir: &Path, chain_id: &str, extra_upstream: &str) -> Result<Config, String> {
+    let d = dir.display();
+    let text = format!(
+        r#"
+journal_path = "{d}/journal.jsonl"
+poll_ms = 1
+
+[ceremony]
+profile = "readiness"
+chain_id = "{chain_id}"
+import_backend = "upstream"
+
+[source]
+rpc_url = "http://mock"
+producer_api_url = "http://mock"
+
+[snapshot]
+staged_path = "{d}/staged.bin"
+dir = "{d}/snapshots"
+
+[target]
+metalgo_unit = "mock.service"
+rpc_url = "http://mock"
+
+[upstream]
+work_dir = "{d}/ceremony-work"
+export_cmd = "sh {d}/export.sh {{snapshot}} {{export_dir}}"
+import_bin = "{d}/import.sh"
+fingerprint_bin = "{d}/fingerprint.sh"
+compare_bin = "{d}/compare.sh"
+{extra_upstream}
+"#
+    );
+    let p = dir.join("drill.toml");
+    std::fs::write(&p, text).unwrap();
+    Config::load(&p)
+}
+
+const FORBIDDEN: &[&str] = &["pause", "resume", "create_snapshot", "ignite", "run_hook", "target_info", "public_info"];
+
+#[test]
+fn drill_on_mainnet_measures_and_reports_without_touching_the_chain_or_the_ceremony() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let cfg = drill_config(dir.path(), MAINNET, "").expect("a mainnet drill config loads without any override");
+    let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+    let out = drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).unwrap();
+
+    for f in FORBIDDEN {
+        assert!(!chain.called(f), "a drill called {f}");
+    }
+    assert!(chain.called("schedule_snapshot"));
+    assert!(out.evidence_complete && out.compare_match);
+    let v = &out.view;
+    assert_eq!(v["kind"], "readiness_drill");
+    assert_eq!(v["state"], "DONE");
+    assert_eq!(v["compare"], "MATCH");
+    assert_eq!(v["block_id_at_h"], block_id(1_050));
+    assert_eq!(v["state_root"], "42b0a70fa12998bdfeedfacecafebeef");
+    // The same digest a real ceremony's VERIFIED record carries, so drills and ceremonies compare directly.
+    let expect = pulse_cutover::beacon::fingerprints_digest(&serde_json::json!({"upstream_state_root": "42b0a70fa12998bdfeedfacecafebeef"}));
+    assert_eq!(v["fingerprints_digest"], expect);
+    for k in ["export", "import", "compare", "conversion_total", "h_final_to_evidence", "snapshot_sha256", "total"] {
+        assert!(v["timings_ms"][k].is_u64(), "timing {k} missing: {}", v["timings_ms"]);
+    }
+    // The chain kept running past H (informational only).
+    assert!(v["post_h_blocks_informational"].as_u64().unwrap() > 0);
+
+    // Nothing of the ceremony was touched: no journal, no staged snapshot, not its work dir.
+    assert!(!cfg.journal_path.exists());
+    assert!(!dir.path().join("staged.bin").exists());
+    assert!(!dir.path().join("ceremony-work").exists());
+    // Evidence kept, multi-GB work files removed.
+    let root = drill::drill_root(&cfg);
+    assert!(root.join("1050/drill.jsonl").exists());
+    assert!(root.join("1050/checkpoint-1050.bin.manifest.json").exists());
+    assert!(!root.join("1050/work").exists());
+    let log = std::fs::read_to_string(root.join("1050/drill.jsonl")).unwrap();
+    assert!(log.lines().all(|l| serde_json::from_str::<Value>(l).unwrap()["kind"] == "readiness_drill"));
+
+    // The beacon reports it as `drill`, never as the ceremony.
+    let view = drill::beacon_view(&cfg).unwrap();
+    assert_eq!(view["state"], "DONE");
+    assert_eq!(view["fingerprints_digest"], expect);
+    let report = pulse_cutover::beacon::build_report(&cfg, "bp1", "mainnet");
+    assert_eq!(report["drill"]["h"], 1_050);
+    assert!(report["ceremony"]["state"].is_null() || report["ceremony"]["state"] == "");
+
+    // Every drill height is used once.
+    let again = drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false });
+    assert!(again.unwrap_err().contains("already ran"));
+}
+
+#[test]
+fn drill_reports_the_true_compare_failure_and_still_fingerprints() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), false);
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 500);
+    let out = drill::run(&cfg, &chain, &DrillOptions { height: 540, keep_work: false }).unwrap();
+    assert!(out.evidence_complete);
+    assert!(!out.compare_match);
+    assert_eq!(out.view["compare"], "MISMATCH");
+    let failing: Vec<&str> = out.view["compare_failing_tables"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(failing.contains(&"contract_index_double") && failing.contains(&"global_property"), "{failing:?}");
+    assert_eq!(out.view["state_root"], "42b0a70fa12998bdfeedfacecafebeef");
+    assert!(out.view["timings_ms"]["fingerprint"].is_u64());
+    for f in FORBIDDEN {
+        assert!(!chain.called(f), "a drill called {f}");
+    }
+}
+
+#[test]
+fn a_rehearsal_allowlist_never_reaches_a_drill_and_stays_refused_on_mainnet() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), false);
+    // On mainnet the override is refused at load, drill or not.
+    let err = drill_config(dir.path(), MAINNET, r#"rehearsal_allow_compare_mismatch = ["contract_index_double", "global_property"]"#)
+        .unwrap_err();
+    assert!(err.contains("refused for XPR MAINNET"), "{err}");
+    // On another chain the config loads, but the drill ignores the allowlist: it reports the true mismatch.
+    let testnet = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd";
+    let cfg = drill_config(dir.path(), testnet, r#"rehearsal_allow_compare_mismatch = ["contract_index_double", "global_property"]"#)
+        .unwrap();
+    let chain = LiveChain::new(dir.path(), testnet, 100);
+    let out = drill::run(&cfg, &chain, &DrillOptions { height: 140, keep_work: false }).unwrap();
+    assert_eq!(out.view["compare"], "MISMATCH");
+}
+
+#[test]
+fn the_guard_refuses_and_records_every_mutating_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 1);
+    let g = DrillGuard::new(&chain);
+    assert!(g.pause().is_err());
+    assert!(g.resume().is_err());
+    assert!(g.create_snapshot().is_err());
+    assert!(g.ignite().is_err());
+    assert!(g.run_hook("echo flip").is_err());
+    assert!(g.kill_orphan_hooks().is_err());
+    assert!(g.target_info().is_err());
+    assert!(g.public_info("https://x").is_err());
+    g.bind_target(&[("a".into(), "b".into())]);
+    assert_eq!(g.violations.borrow().len(), 9);
+    for f in FORBIDDEN {
+        assert!(!chain.called(f), "the guard passed {f} through");
+    }
+    // Read-only calls and the snapshot schedule pass.
+    assert!(g.source_info().is_ok());
+    assert!(g.schedule_snapshot(10).is_ok());
+}
+
+#[test]
+fn drill_refuses_next_to_a_ceremony_in_progress_and_too_close_heights() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+    let near = drill::run(&cfg, &chain, &DrillOptions { height: 1_005, keep_work: false }).unwrap_err();
+    assert!(near.contains("too close"), "{near}");
+    assert!(!chain.called("schedule_snapshot"));
+
+    // A ceremony journal in FROZEN: refused before anything is scheduled.
+    {
+        let (mut j, _) = pulse_cutover::journal::Journal::open(&cfg.journal_path).unwrap();
+        j.transition(pulse_cutover::state::State::Armed, serde_json::json!({})).unwrap();
+        j.transition(pulse_cutover::state::State::Frozen, serde_json::json!({})).unwrap();
+    }
+    let busy = drill::run(&cfg, &chain, &DrillOptions { height: 2_000, keep_work: false }).unwrap_err();
+    assert!(busy.contains("in progress") && busy.contains("FROZEN"), "{busy}");
+    assert!(!chain.called("schedule_snapshot"));
+}
+
+#[test]
+fn drill_needs_the_upstream_pipeline_with_a_compare() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display();
+    let text = format!(
+        r#"
+journal_path = "{d}/journal.jsonl"
+[ceremony]
+profile = "readiness"
+[source]
+rpc_url = "http://mock"
+producer_api_url = "http://mock"
+[snapshot]
+staged_path = "{d}/staged.bin"
+[target]
+metalgo_unit = "mock.service"
+rpc_url = "http://mock"
+"#
+    );
+    let p = dir.path().join("c.toml");
+    std::fs::write(&p, text).unwrap();
+    let cfg = Config::load(&p).unwrap();
+    let problems = drill::config_problems(&cfg);
+    assert_eq!(problems.len(), 3, "{problems:?}");
+}

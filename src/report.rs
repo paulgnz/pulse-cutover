@@ -160,6 +160,8 @@ pub fn run(opts: &ReportOptions) -> Result<(), String> {
             ("scan-contracts.txt", "scan-contracts.txt"),
             ("captured-roots.txt", "captured-roots.txt"),
             ("loop-metrics.jsonl", "loop-metrics.jsonl"),
+            // A readiness drill's latest result: its own file, never part of the ceremony journal.
+            ("drill-latest.json", "drill/latest.json"),
         ] {
             let p = work.join(file);
             if p.exists() {
