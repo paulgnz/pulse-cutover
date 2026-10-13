@@ -47,8 +47,8 @@ freeze_height = 12345
                              # markers (keyed on the canonical snapshot.dir). Absolute. Every agent, drill and loop on one
                              # box must share it. Default: /var/lib/pulse-cutover/locks when writable, else locks/ beside
                              # the journal directory. Nothing is ever written into nodeos's snapshot.dir. REQUIRED for
-                             # XPR mainnet (refused at load for a configured mainnet chain_id, at ARM for a discovered
-                             # one); elsewhere the default is journaled as producer_lock_dir_default and shown by status.
+                             # XPR mainnet where something new starts (await, loop, a drill, a fresh ARM); other commands
+                             # warn. install.sh writes it. Elsewhere the default is journaled as producer_lock_dir_default.
 # shadow = false             # SHADOW CUTOVER (docs/DESIGN-shadow.md): the full ceremony on a PRIVATE network from a
                              # re-keyed copy of mainnet state, mainnet chain_id kept. Needs the [shadow] section below
                              # and a private target.metal_network_id; checked at load, at ARM and before the freeze.

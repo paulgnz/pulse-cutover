@@ -107,10 +107,14 @@ pub struct Machine<'a, O: ChainOps> {
     /// preflight refusal (a busy lock, a producer someone else paused) touches nothing. Journals from older agents
     /// (`undo_tracking` absent on their arming record) keep the previous behaviour (both true).
     paused_by_us: bool,
-    /// r30 round 7: the producer was found paused AFTER this ceremony froze writes, and not by this journal (an
-    /// operator pausing by hand near H, a hook, a scheduler): the pause was adopted for the cut. It is never resumed by
-    /// an abort and writes are never reopened into it; only an operator's forced rollback releases it.
+    /// r30 round 7/8: the producer was found paused by someone else after this ceremony froze writes (an operator
+    /// pausing by hand near H, a hook, a scheduler) and the pause was adopted for the cut. Round 8: evidence and display
+    /// only; the abort decisions rest on two invariants checked at the action point (`paused_by_us` for a resume, a
+    /// fresh "producing" read for reopening writes), never on this flag.
     pause_adopted: bool,
+    /// r30 round 8 (Codex R8-6): an abort journaled that it keeps writes frozen and seals; a run that finds it (after a
+    /// crash before the STRANDED transition) completes the strand and touches nothing else.
+    strand_intent: bool,
     /// r30 round 7: the operator released an adopted pause (`rollback --force-stranded --i-understand`).
     adopted_released: bool,
     writes_closed_by_us: bool,
@@ -310,11 +314,23 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let rollback_pending = recovered.rollback_pending;
         let joining = recovered.side_effects.iter().any(|s| s == "join");
         let legacy_undo = recovered.undo_tracking == Some(false);
+        // r30 round 8 (Codex R8-3): an older agent's journal never fabricates ownership. Its pause is ours only when
+        // that agent demonstrably reached its pause step (a journaled pause head, a state past FROZEN, or a strand,
+        // which pauses); its freeze only when it reached FROZEN.
+        let legacy_paused = legacy_undo
+            && (recovered.head_at_pause.is_some()
+                || matches!(state, State::Snapshotted | State::Verified | State::Ignited | State::Flipped | State::Live
+                    | State::Halted | State::Stranded));
+        let legacy_froze = legacy_undo
+            && (recovered.frozen_ts_ms.is_some()
+                || matches!(state, State::Frozen | State::Snapshotted | State::Verified | State::Ignited | State::Flipped
+                    | State::Live | State::Halted | State::Stranded));
         // r30 round 7: an operator's forced release of an adopted external pause makes that pause ours to resume.
         let adopted_released = started("external_pause_release");
         let pause_adopted = started("source_pause_adopted");
-        let paused_by_us = legacy_undo || started("source_pause") || adopted_released;
-        let writes_closed_by_us = legacy_undo || started("write_freeze");
+        let paused_by_us = legacy_paused || started("source_pause") || adopted_released;
+        let writes_closed_by_us = legacy_froze || started("write_freeze");
+        let strand_intent = recovered.strand_intent;
         let create_chain_started = recovered.side_effects.iter().any(|s| s == "create_chain") || joining;
         Machine {
             cfg,
@@ -361,6 +377,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             producer_lock: None,
             paused_by_us,
             pause_adopted,
+            strand_intent,
             adopted_released,
             writes_closed_by_us,
             shadow_verified: false,
@@ -571,21 +588,51 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         Ok(())
     }
 
-    /// r30 round 7: an adopted external pause this ceremony must neither resume nor reopen writes into (producer mode,
-    /// not released by the operator).
-    fn held_external_pause(&self) -> bool {
-        self.cfg.ceremony.mode == Mode::Producer && self.pause_adopted && !self.adopted_released
+    /// r30 round 8: the producer is already paused by someone else (a fresh read), so this ceremony must neither
+    /// pause it again (that would record it as ours) nor ever resume it: adopt it (evidence only) and carry on.
+    /// Returns true when it adopted. The read and the pause RPC are not atomic: a pause made by someone else between
+    /// them becomes indistinguishable from ours (the RPC is idempotent); nothing short of an atomic producer API closes
+    /// that window, and the reopen invariant (`writes_may_reopen`) still never sends writes into a paused chain.
+    fn adopt_external_pause(&mut self) -> Result<bool, String> {
+        if self.cfg.ceremony.mode != Mode::Producer || self.paused_by_us || !self.ops.producer_paused()? {
+            return Ok(false);
+        }
+        if !self.pause_adopted {
+            self.journal.evidence(self.state, json!({"side_effect": "source_pause", "adopted": true, "by": "external",
+                "note": "the producer was paused by someone else after this ceremony froze writes: adopted for the cut; \
+                         this ceremony never resumes it, and writes reopen only into a producing chain"}))?;
+            self.pause_adopted = true;
+        }
+        Ok(true)
     }
 
     fn src_pause(&mut self) -> Result<(), String> {
         self.shadow_mutation_gate("pausing the source producer")?;
         self.shadow_producer_gate("pausing the source producer")?;
-        // r30 round 6: journaled BEFORE the pause, so a rollback (even after a crash) knows this ceremony paused it.
         if !self.paused_by_us {
+            // r30 round 8 (Codex R8-1): a pause someone else made (also one made during the snapshot wait) is never
+            // recorded as ours: decided by a fresh read right here, at the action point.
+            if self.adopt_external_pause()? {
+                return Ok(());
+            }
+            // r30 round 6: journaled BEFORE the pause, so a rollback (even after a crash) knows this ceremony paused it.
             self.journal.evidence(self.state, json!({"side_effect": "source_pause"}))?;
             self.paused_by_us = true;
         }
         self.ops.pause() // ungated: this IS the gate
+    }
+
+    /// r30 round 8, the reopen invariant: writes reopen (on_abort) only when this journal froze them AND a fresh read
+    /// shows the source producing. Ok(None) = may reopen; Ok(Some(why)) = must keep writes frozen.
+    fn writes_may_reopen(&self) -> Option<String> {
+        if self.cfg.ceremony.mode != Mode::Producer {
+            return None;
+        }
+        match self.ops.producer_paused() {
+            Ok(false) => None,
+            Ok(true) => Some("producer paused".into()),
+            Err(e) => Some(format!("producer state unknown ({e})")),
+        }
     }
 
     /// r30 round 6: the write freeze (on_freeze), journaled as a side effect BEFORE the hook runs, so a rollback
@@ -670,6 +717,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 continued on it (the source was not touched). Check by hand which chain the source belongs to \
                 (docs/DESIGN-shadow.md, manual recovery); a new shadow starts on a fresh journal. Journal: {}",
                 self.journal.path().display()));
+        }
+        if self.strand_intent && !matches!(self.state, State::Stranded | State::Aborted | State::Halted | State::Live) {
+            // r30 round 8 (Codex R8-6): an abort journaled that it keeps writes frozen and seals, then died before the
+            // STRANDED transition. Complete the strand: nothing is resumed or reopened.
+            self.strand("an abort decided to keep writes frozen and seal (journaled) before the agent stopped", json!({}),
+                "writes stay frozen: the source was not producing when they would have reopened")?;
+            return Err(self.stranded_message());
         }
         if self.rollback_pending {
             return Err("refusing to run: a rollback (`pulse-cutover rollback`, or this agent's own abort) was started \
@@ -1003,7 +1057,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // api mode: this node does not produce; we only need producer_api
             // reachable for create_snapshot — its paused flag is irrelevant.
             Ok(paused) => {
-                if !resumed && paused && self.cfg.ceremony.mode == Mode::Producer {
+                // r30 round 8 (Codex R8-4): a run resumed while still ARMED that never froze writes is a fresh ARM for
+                // this purpose: a producer someone else paused is refused before anything freezes.
+                let fresh_arm = !resumed || (self.state == State::Armed && !self.writes_closed_by_us && !self.paused_by_us);
+                if fresh_arm && paused && self.cfg.ceremony.mode == Mode::Producer {
                     problems.push("producer already paused at arm time".into());
                 }
             }
@@ -1483,8 +1540,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         a real node). Resume it by hand only after checking which chain it belongs to (docs/DESIGN-shadow.md)".into());
             return Ok(RollbackOutcome { state: self.state, failed: vec![], notes, already: true });
         }
-        // r30 round 7: an adopted external pause is released only by an explicit operator decision.
-        if self.held_external_pause() {
+        // r30 round 7/8: a pause someone else made (a fresh read; not this journal's) is released only by an explicit
+        // operator decision, and only matters when this rollback would reopen writes this journal froze.
+        if self.cfg.ceremony.mode == Mode::Producer && !self.paused_by_us && self.writes_closed_by_us
+            && !self.step_done("on_abort") && matches!(self.ops.producer_paused(), Ok(true))
+        {
             if !force_stranded {
                 return Err(format!("refusing to roll back: {EXTERNAL_PAUSE_HELD}. Nothing was changed."));
             }
@@ -1669,13 +1729,6 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         if !self.shadow_reprove_before_resume("an abort", &json!({"reason": reason, "detail": detail}))? {
             return Ok(());
-        }
-        // r30 round 7: the producer was paused by someone else and adopted for the cut. Never resume another
-        // process's pause, and never reopen writes into a paused chain: seal (STRANDED, on_halt pages) instead. An
-        // operator releases it with `rollback --force-stranded --i-understand`.
-        if self.held_external_pause() {
-            self.journal.evidence(self.state, json!({"external_pause_held": true, "reason": reason}))?;
-            return self.strand(reason, detail, EXTERNAL_PAUSE_HELD);
         }
         let perform = self.cfg.target.auto_rollback;
         // rc.23 (fleet run r4): a coordinated producer that froze writes resumes the OLD chain only when the
@@ -1998,7 +2051,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// `on_halt` pages a human.
     fn strand(&mut self, reason: &str, detail: serde_json::Value, why: &str) -> Result<(), String> {
         let from = self.state;
-        let external = self.held_external_pause();
+        let external = self.cfg.ceremony.mode == Mode::Producer && !self.paused_by_us
+            && matches!(self.ops.producer_paused(), Ok(true));
         self.journal.error(self.state, reason, detail.clone())?;
         // rc.29: sealed means not producing old-chain blocks either (a strand before the pause, e.g. an operator
         // rollback from FROZEN, would otherwise keep producing past H and trip every peer's quiescence window).
@@ -2058,13 +2112,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             match self.cfg.ceremony.mode {
                 // Producer mode: un-pausing nodeos IS the entire rollback.
                 Mode::Producer => {
-                    if self.held_external_pause() {
-                        // r30 round 7: adopted external pause: never resumed by this ceremony.
-                        rollback["source_producer_resumed"] = json!("paused by someone else (adopted for the cut): not resumed");
-                        rollback["external_pause_held"] = json!(true);
-                    } else if !self.paused_by_us {
-                        // r30 round 6: undo only what this ceremony did. It never paused the producer (a preflight
-                        // refusal, a producer someone else paused): resuming it would undo another process's pause.
+                    // r30 round 8, the resume invariant (R1): resume only a pause this journal durably recorded as its
+                    // own (`side_effect: source_pause` written before the RPC, or an operator's journaled release).
+                    if !self.paused_by_us {
+                        // It never paused the producer (a preflight refusal, a pause someone else made or adopted):
+                        // resuming it would undo another process's pause.
                         rollback["source_producer_resumed"] = json!("not paused by this ceremony: nothing to resume");
                     } else if !self.step_done("resume") {
                         match self.src_resume() {
@@ -2135,25 +2187,36 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 }
             }
         }
+        // r30 round 8, the reopen invariant (R2): writes this journal froze reopen only into a producing chain, read
+        // fresh right here (after the resume above). If the producer is paused (someone else's pause, or ours left
+        // paused) or unreadable, a performed rollback keeps writes frozen and seals: STRANDED, on_halt pages. The
+        // intent is journaled first, so a crash before the transition completes the strand on the next run.
+        let reopen_pending = self.cfg.hooks.on_abort.is_some() && self.writes_closed_by_us && !self.step_done("on_abort");
+        let resume_failed = rollback.get("source_producer_resume_error").is_some();
+        let keep_frozen = if reopen_pending { self.writes_may_reopen() } else { None };
+        if let (true, Some(why)) = (perform && !resume_failed, keep_frozen.as_ref()) {
+            self.journal.evidence(self.state, json!({"strand_intent": true, "writes_kept_frozen": why, "reason": reason,
+                "note": "writes are not reopened into a chain that is not producing; sealing instead"}))?;
+            self.strand_intent = true;
+            let msg = format!("writes were not reopened because the source is not producing ({why}); the producer is \
+                left as it is. If someone else paused it, resolve that by hand, then `pulse-cutover rollback --force-stranded \
+                --i-understand` resumes it and reopens writes (journaled)");
+            self.strand(reason, detail, &msg)?;
+            return Ok((vec![], notes));
+        }
         // The reverts' result only: completion of the WHOLE rollback is `rollback_done`, below.
         rollback["reverts_ok"] = json!(perform && failed.is_empty());
         self.state = State::Aborted;
         self.journal.transition(State::Aborted, rollback)?;
-        // rc.29: a producer's writes reopen only once its source produces again (auto_rollback = false, or a failed
-        // resume, would otherwise send writes into a paused chain); the operator's `rollback` reopens them later.
-        let source_back = !self.held_external_pause()
-            && (self.cfg.ceremony.mode != Mode::Producer || !self.paused_by_us || (perform && self.step_done("resume")));
+        // rc.29 / r30 round 8: a producer's writes reopen only into a producing chain (R2, a fresh read; auto_rollback =
+        // false or a failed resume leave it paused); the operator's `rollback` reopens them later.
+        let source_back = keep_frozen.is_none() && (self.cfg.ceremony.mode != Mode::Producer || !resume_failed);
         // r30 round 6: writes are reopened only if this ceremony closed them (its on_freeze ran or started).
         if self.cfg.hooks.on_abort.is_some() && !self.writes_closed_by_us && !self.step_done("on_abort") {
             self.journal.evidence(State::Aborted, json!({"on_abort_skipped": "writes were not closed by this ceremony: nothing to reopen"}))?;
         }
         if self.cfg.hooks.on_abort.is_some() && !source_back && !self.step_done("on_abort") {
             self.journal.evidence(State::Aborted, json!({"on_abort_deferred": "the source producer was not resumed: writes stay frozen until `pulse-cutover rollback`"}))?;
-        }
-        if self.held_external_pause() {
-            // Not complete: the adopted pause and the write freeze stay until the operator releases them.
-            failed.push("the source producer was paused by someone else (adopted for the cut): it was NOT resumed and \
-                         writes stay frozen; `pulse-cutover rollback --force-stranded --i-understand` releases it".into());
         }
         if let Some(hook) = self.cfg.hooks.on_abort.clone().filter(|_| source_back && self.writes_closed_by_us) {
             if !self.step_done("on_abort") {
@@ -2547,23 +2610,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // chain cannot finalize a snapshot block — unpause first (writes are
         // still frozen by the hook, so re-produced blocks stay empty).
         if self.ops.producer_paused()? {
-            // r30 round 7: ownership is decided FIRST, whether or not H is already final. A pause this journal did not
-            // make, found after this ceremony froze writes (an operator pausing by hand near H, a hook, a scheduler),
-            // is ADOPTED for the cut: journaled, never resumed by this ceremony, never re-paused (which would turn it
-            // into ours), and the cut carries on. An abort later seals instead of resuming it (`held_external_pause`).
-            if !self.paused_by_us && !self.pause_adopted {
-                self.journal.evidence(State::Frozen, json!({"side_effect": "source_pause", "adopted": true, "by": "external",
-                    "note": "the producer was paused by someone else after this ceremony froze writes: adopted for the cut; \
-                             it is never resumed by this ceremony and writes are never reopened into it"}))?;
-                self.pause_adopted = true;
-            }
+            // r30 round 7/8: ownership is decided FIRST, whether or not H is already final. A pause this journal did
+            // not record as its own, found after this ceremony froze writes (an operator pausing by hand near H, a
+            // hook, a scheduler), is ADOPTED for the cut: journaled as evidence, never re-paused (which would turn it
+            // into ours), never resumed by this ceremony, and the cut carries on.
             // rc.29: with a scheduled snapshot whose H is already final, the snapshot does not need this node's
             // blocks: a crash after the pause keeps it paused (re-producing old-chain blocks after H would trip
             // every peer's quiescence window and abort the whole event).
-            let final_already = self.scheduled && self.ops.source_info()?.last_irreversible_block_num >= self.h();
-            if self.pause_adopted && !self.paused_by_us {
+            if self.adopt_external_pause()? {
                 // Adopted: stays paused (the scheduled snapshot finalizes on the other producers' blocks).
-            } else if final_already {
+            } else if self.scheduled && self.ops.source_info()?.last_irreversible_block_num >= self.h() {
                 self.journal.evidence(State::Frozen, json!({"kept_paused_on_resume": true,
                     "note": "H is already final: the scheduled snapshot needs no more blocks from this producer"}))?;
             } else {
@@ -2596,10 +2652,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
 
         // Stop production and require quiescence (R4: catches producers that
         // ignored the pause and late blocks arriving over p2p).
-        // r30 round 7: an adopted pause that still holds is not paused again (that would record it as ours).
-        if !(self.pause_adopted && !self.paused_by_us && self.ops.producer_paused()?) {
-            self.src_pause()?;
-        }
+        // r30 round 8 (Codex R8-1): src_pause decides by a fresh read: a pause someone else made (also during the
+        // snapshot wait above) is adopted, never paused again or recorded as ours.
+        self.src_pause()?;
         if !self.ops.producer_paused()? {
             self.abort("pause did not take effect", json!({}))?;
             return Ok(());

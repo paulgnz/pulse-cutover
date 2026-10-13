@@ -46,6 +46,8 @@ struct LiveChain {
     cancel_export: RefCell<bool>,
     /// r30 round 7: the docker daemon cannot be reached (every docker call fails, not "no such object").
     docker_down: RefCell<bool>,
+    /// r30 round 8: the next N `source_info` calls fail (the source does not answer).
+    source_info_fails: RefCell<u32>,
 }
 
 impl LiveChain {
@@ -69,6 +71,7 @@ impl LiveChain {
             containers: RefCell::new(Default::default()),
             container_sticky: RefCell::new(false),
             docker_down: RefCell::new(false),
+            source_info_fails: RefCell::new(0),
             cancel_export: RefCell::new(false),
         }
     }
@@ -88,6 +91,13 @@ impl LiveChain {
 impl ChainOps for LiveChain {
     fn source_info(&self) -> Result<ChainInfo, String> {
         self.call("source_info");
+        {
+            let mut f = self.source_info_fails.borrow_mut();
+            if *f > 0 {
+                *f -= 1;
+                return Err("http://mock/v1/chain/get_info: timed out".into());
+            }
+        }
         let head = {
             let mut h = self.head.borrow_mut();
             *h += 1;
@@ -358,6 +368,22 @@ fn r7_a_mainnet_drill_needs_an_explicit_lock_dir() {
     let markers = std::fs::read_dir(drill::lock_dir(&cfg)).map(|d| d.filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".work.json")).count()).unwrap_or(0);
     assert_eq!(markers, 0, "no work marker was left behind");
+}
+
+/// r30 round 8 (Codex R8-7): the discovered-mainnet lock_dir check needs a SUCCESSFUL discovery: a source that does
+/// not answer is refused (never read as "not mainnet"), and the drill reuses that one checked answer.
+#[test]
+fn r8_a_drill_refuses_when_the_source_chain_cannot_be_discovered() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| t.replace(&format!("chain_id = \"{MAINNET}\"\n"), "")).unwrap();
+    assert!(cfg.ceremony.lock_dir.is_none() && cfg.ceremony.chain_id.is_none());
+    let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+    *chain.source_info_fails.borrow_mut() = 1; // the first read times out, a second would say mainnet
+    let err = drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).unwrap_err();
+    assert!(err.contains("cannot read the source chain"), "{err}");
+    assert!(!drill::drill_dir(&cfg, 1_050).exists(), "nothing ran");
+    assert_eq!(chain.calls.borrow().iter().filter(|c| *c == "source_info").count(), 1, "no second read decided it");
 }
 
 fn drill_config(dir: &Path, chain_id: &str, extra_upstream: &str) -> Result<Config, String> {

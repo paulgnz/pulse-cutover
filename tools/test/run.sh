@@ -399,6 +399,9 @@ json.dump(fill(json.load(sys.stdin)), open(sys.argv[1],"w"))' "$T/filled.json"
     jq -e "$k" "$ROOT/examples/ceremony.json" >/dev/null 2>&1 || bad "example manifest: install.sh requires $k (mget) but the example lacks it"
   done
   ok "example manifest: cross-checked against install.sh's required reads"
+  # r30 round 8: XPR mainnet refuses to start anything without an explicit [ceremony] lock_dir, so generated configs carry one.
+  grep -q 'echo "lock_dir = ' "$ROOT/install.sh" && ok "install.sh: generated ceremony configs set an explicit lock_dir" \
+    || bad "install.sh: generated ceremony configs lack [ceremony] lock_dir"
 fi
 
 echo "examples/ceremony.toml (the full config format)"

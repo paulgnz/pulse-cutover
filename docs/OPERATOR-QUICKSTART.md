@@ -272,9 +272,11 @@ snapshot directory. If the agent, a drill or a loop on one box run as different 
 anything changes); a `lock_dir` the agent cannot use is a journaled warning. A ceremony refused at ARM undoes
 nothing: it never resumes a producer it did not pause or reopens writes it did not close.
 
-**XPR mainnet requires an explicit `lock_dir`** (rc.30 round 7): the default depends on which user runs, so a root
-ceremony and a non-root drill could lock different directories. A mainnet config without one is refused at load (or at
-ARM when the chain is discovered); elsewhere the default is journaled (`producer_lock_dir_default`) and shown by
+**XPR mainnet requires an explicit `lock_dir`** (rc.30 rounds 7–8): the default depends on which user runs, so a root
+ceremony and a non-root drill could lock different directories. `install.sh` writes `lock_dir =
+"/var/lib/pulse-cutover/locks"` into generated configs. A mainnet config without one is refused only where something
+new would start (`await`, `loop`, a drill, and a fresh ARM); the beacon, `status`, `report`, `rollback`, `unhalt` and a
+resumed cut load it with a warning. Elsewhere the default is journaled (`producer_lock_dir_default`) and shown by
 `pulse-cutover status` and the beacon.
 
 ### Pausing the producer by hand during a cut (rc.30 round 7)
@@ -282,7 +284,8 @@ ARM when the chain is discovered); elsewhere the default is journaled (`producer
 If you (or a hook, or a scheduler) pause the producer **after** the ceremony froze writes, the agent adopts that pause
 for the cut: it journals it (`side_effect: source_pause` with `adopted: true`), never pauses it again and never
 resumes it, and the cut carries on. If the ceremony then has to stop, it does **not** resume your pause and does
-**not** reopen writes into a paused chain: it ends STRANDED (`external_pause_held: true`) and pages `on_halt`. Release
+**not** reopen writes into a paused chain (round 8: writes reopen only when a fresh read shows the producer producing,
+whoever paused it): it ends STRANDED (`writes_kept_frozen`) and pages `on_halt`. Release
 it deliberately with `pulse-cutover rollback --config <file> --force-stranded --i-understand` (resumes the producer and
 reopens writes, journaled as `external_pause_release`), or follow a LIVE fleet with `pulse-cutover join`. A producer
 already paused by someone else **before** the freeze is refused at ARM, with nothing touched.

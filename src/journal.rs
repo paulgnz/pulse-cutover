@@ -141,6 +141,10 @@ pub struct Recovered {
     /// resume the source or run on_abort on this journal, whatever records follow (a crash between the refusal's
     /// records must not reopen a rollback that resumes a node which may be real).
     pub shadow_refused: bool,
+    /// r30 round 8 (Codex R8-6): an abort decided to keep writes frozen and seal (STRANDED) because the producer was
+    /// paused (or unreadable) when writes would have reopened (`strand_intent`, or round 7's `external_pause_held`). A
+    /// crash before the STRANDED transition must not let a later run carry on: the next run completes the strand.
+    pub strand_intent: bool,
     /// Round-2 review (D-10): the bindings a fresh XPR mainnet ARM authenticated (`mainnet_event_verified`), compared
     /// offline with the config on every later run, join, rollback and unhalt (coord::mainnet_binding_problem).
     pub mainnet_event_binding: Option<Value>,
@@ -451,6 +455,11 @@ impl Journal {
                 || entry.data.get("detail").and_then(|d| d.get("shadow_refused")).and_then(|v| v.as_bool()) == Some(true)
             {
                 out.shadow_refused = true;
+            }
+            if entry.data.get("strand_intent").and_then(|v| v.as_bool()) == Some(true)
+                || entry.data.get("external_pause_held").and_then(|v| v.as_bool()) == Some(true)
+            {
+                out.strand_intent = true;
             }
             if let Some(b) = entry.data.get("mainnet_event_verified").filter(|b| b.is_object()) {
                 out.mainnet_event_binding = Some(b.clone());

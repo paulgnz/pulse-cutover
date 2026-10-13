@@ -122,10 +122,17 @@ stateDiagram-v2
   `{subnet_id}` / … into the target RPC, ignite command and hooks, install the chain config,
   and only then `ignite_started`. Rehearsal-only overrides (compare allowlist, target chain_id
   change) are refused for mainnet and journaled wherever they act.
-- **Undo only what this journal did** (r30 rounds 6–7). The source pause and the write freeze are journaled before they
-  happen; a rollback resumes only a pause this journal made and reopens only writes it closed. A pause someone else
-  made after the freeze is adopted for the cut and, on any abort, held: the ceremony strands instead of resuming it or
-  reopening writes into it, until an operator releases it (`rollback --force-stranded --i-understand`).
+- **Undo only what this journal did** (r30 rounds 6–8). Round 8 reduces it to two invariants, each checked at its
+  action point: **R1** a rollback resumes the producer only if this journal durably recorded that pause as its own
+  (`side_effect: source_pause`, written before the RPC; an old agent's journal only if it demonstrably reached its
+  pause step); **R2** writes this journal froze reopen (`on_abort`) only if a fresh read right before shows the
+  producer **producing**. Paused or unreadable: a performed rollback keeps writes frozen and seals (STRANDED,
+  `writes_kept_frozen`, `on_halt` pages; the intent is journaled first and completed by the next run after a crash).
+  A pause someone else made (found by a fresh read before this ceremony pauses, including during the snapshot wait)
+  is adopted for the cut as evidence only; it is never paused again, recorded as ours or resumed, except by an
+  operator's journaled release (`rollback --force-stranded --i-understand`), after which R2 still applies. The read and
+  the pause RPC are not atomic: a pause made between them is indistinguishable from ours (R2 still never reopens into
+  a paused chain).
 - **ABORTED** is reachable only before `create_chain` (upstream) or `ignite_started` is journaled. It resumes the source
   producer (producer mode, if `target.auto_rollback`), restarts the source and reverts flips
   (API mode, if they ran), runs `on_abort`, and moves the staged snapshot aside. The rollback
@@ -307,7 +314,7 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 | Snapshot not at H | exact-H check | FROZEN | abort (rehearsal flags journal and continue) |
 | Pause does not take effect; `quiesce_cmd` fails | producer API; hook | FROZEN | abort |
 | Producer found paused after this ceremony froze writes, not by this journal (an operator, a hook, a scheduler) | pause ownership check (r30 round 7) | FROZEN | adopted for the cut (journaled `adopted: true`), never re-paused or resumed; the cut continues |
-| Any abort while an adopted external pause holds | `held_external_pause` | FROZEN–VERIFIED | STRANDED (`external_pause_held`): no resume, no `on_abort`, `on_halt` pages; `rollback --force-stranded --i-understand` releases it (resume + reopen, journaled) |
+| A performed rollback would reopen writes this journal froze, but a fresh read shows the producer paused (someone else's pause, or ours still paused) or unreadable | reopen invariant R2 (r30 round 8) | FROZEN–VERIFIED | STRANDED (`writes_kept_frozen`): no `on_abort`, someone else's pause never resumed, `on_halt` pages; `rollback --force-stranded --i-understand` releases an external pause (journaled), then R2 again |
 | Head keeps moving after the pause | quiescence window | FROZEN | late blocks journaled; the window waits up to `quiescence_timeout_secs` (default 120), then ABORT (before ignition: `on_abort` reopens writes) |
 | Snapshot block id ≠ chain's block id at H (fork at the cut); chain_id changed | block lookup | FROZEN | abort |
 | Any transaction in H+1…pause, or an unreadable block, or an answer that is not that block with a `transactions` array | burn-off audit (fails closed) | FROZEN | abort |

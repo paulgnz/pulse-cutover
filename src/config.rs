@@ -1088,12 +1088,21 @@ impl Config {
         // r30 round 7 (review F2): the default lock_dir depends on which user runs (a root ceremony and a non-root
         // drill or loop would lock different directories and stop excluding each other). XPR mainnet configs (the
         // ceremony, its drills and loops all load a ceremony-profile config) must name it.
-        if config.ceremony.profile == Profile::Ceremony && config.ceremony.lock_dir.is_none()
-            && config.ceremony.chain_id.as_deref().is_some_and(is_xpr_mainnet)
-        {
-            return Err(MAINNET_LOCK_DIR_REQUIRED.into());
+        // r30 round 8 (review R8-F1): enforced only where something new would start (`await`, `loop`, a drill, and a
+        // fresh ARM in the state machine), never at load: the beacon, `status`, `report`, `rollback`, `unhalt` and a
+        // resumed cut must keep working on existing installer-generated configs. Here it is a warning.
+        if let Some(why) = config.mainnet_lock_dir_problem() {
+            eprintln!("WARNING: {why}");
         }
         Ok(config)
+    }
+
+    /// r30 round 7/8: Some(why) when this is an XPR mainnet ceremony-profile config without an explicit
+    /// `[ceremony] lock_dir`. Refused by the entry points that start something new; a warning everywhere else.
+    pub fn mainnet_lock_dir_problem(&self) -> Option<&'static str> {
+        (self.ceremony.profile == Profile::Ceremony && self.ceremony.lock_dir.is_none()
+            && self.ceremony.chain_id.as_deref().is_some_and(is_xpr_mainnet))
+            .then_some(MAINNET_LOCK_DIR_REQUIRED)
     }
 
     /// Settings that are accepted but do nothing in this configuration, one line each (printed at

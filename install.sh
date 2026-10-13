@@ -1182,6 +1182,8 @@ PRESCAN=$(mget_opt '.snapshot.prescan_path')
   [ -n "$FM" ] && { echo "freeze_margin = $FM"; echo "derive_h_at_arm = true   # rehearsal: H derived at arm"; }
   [ "$SIM" = "true" ] && echo 'simulate_freeze = true'
   echo "chain_id = \"$CHAIN_ID\""
+  # r30: one lock directory for every agent, drill and loop on this box (XPR mainnet requires it to be explicit).
+  echo "lock_dir = \"$(mget_opt '.ceremony.lock_dir' | grep . || echo /var/lib/pulse-cutover/locks)\""
   echo "import_cpu_scale = $CPU_SCALE"
   # Producer mode: where to write the history boundary for a federating router (manifest .ceremony.boundary_path).
   BPATH=$(mget_opt '.ceremony.boundary_path'); [ -n "$BPATH" ] && echo "boundary_path = \"$BPATH\""

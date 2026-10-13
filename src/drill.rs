@@ -1105,27 +1105,27 @@ fn run_guarded<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillO
     // Round 7 (F2): XPR mainnet needs an explicit `[ceremony] lock_dir`, also when the config leaves the chain to
     // discovery: a default that depends on who runs the drill could split it from the ceremony's lock. Checked before
     // the work marker exists, so a refusal leaves nothing behind.
-    if cfg.ceremony.lock_dir.is_none() {
-        let discovered = ops.source_info().map(|i| i.chain_id).unwrap_or_default();
-        if crate::config::is_xpr_mainnet(&discovered) {
-            return Err("the source is XPR MAINNET: set an explicit [ceremony] lock_dir (the same one the ceremony uses) \
-                        before running a drill".into());
-        }
+    // r30 round 8 (Codex R8-7): the discovery must succeed (an unreadable source is refused, never read as "not
+    // mainnet"), and the drill reuses this checked answer instead of asking again.
+    let info = ops.source_info()
+        .map_err(|e| format!("cannot read the source chain before the drill ({e}): refused, nothing started"))?;
+    if cfg.ceremony.lock_dir.is_none() && crate::config::is_xpr_mainnet(&info.chain_id) {
+        return Err("the source is XPR MAINNET: set an explicit [ceremony] lock_dir (the same one the ceremony uses) \
+                    before running a drill".into());
     }
     // Round 6: the work marker, before any work starts (the producer lock is held). Round 7: bound to this drill.
     let drill_id = new_drill_id();
     let container = format!("pulse-drill-{h}-{}", container_suffix(h, ops.now_ms()));
     write_work_marker(cfg, h, &drill_id, &container)?;
-    let res = run_marked(cfg, ops, opts, &drill_id, &container);
+    let res = run_marked(cfg, ops, opts, &drill_id, &container, info);
     // Still under the journal, drill-root and producer locks (they drop when this function returns).
     clear_work_marker_if_done(cfg, &drill_id);
     res
 }
 
-fn run_marked<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillOptions, drill_id: &str, container: &str)
-    -> Result<DrillOutcome, String> {
+fn run_marked<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillOptions, drill_id: &str, container: &str,
+                           info: crate::ops::ChainInfo) -> Result<DrillOutcome, String> {
     let h = opts.height;
-    let info = ops.source_info()?;
     if let Some(pinned) = &cfg.ceremony.chain_id {
         if !pinned.eq_ignore_ascii_case(&info.chain_id) {
             return Err(format!("source chain_id {} != configured ceremony.chain_id {pinned}", info.chain_id));

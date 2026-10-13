@@ -572,6 +572,9 @@ fn cmd_join(args: &[String]) -> Result<(), String> {
 fn cmd_loop(args: &[String]) -> Result<(), String> {
     let cfg = load_config(args)?;
     cfg.ensure_ceremony_profile()?;
+    if let Some(why) = cfg.mainnet_lock_dir_problem() {
+        return Err(why.into());
+    }
     cfg.ensure_h_known()?;
     let runs: u32 = arg(args, "--runs")
         .ok_or("missing --runs")?
@@ -606,6 +609,10 @@ fn cmd_await(args: &[String]) -> Result<(), String> {
     let path = PathBuf::from(arg(args, "--config").ok_or("--config <ceremony.toml> is required")?);
     let cfg = Config::load(&path)?;
     cfg.ensure_ceremony_profile()?;
+    // r30 round 8: a new mainnet event is never armed without an explicit lock_dir (checked again at ARM).
+    if let Some(why) = cfg.mainnet_lock_dir_problem() {
+        return Err(why.into());
+    }
     let code = pulse_cutover::coord::run_await(&cfg, &path)?;
     std::process::exit(code);
 }
