@@ -95,7 +95,7 @@ mainnet's from the first block it produces. `[shadow] producer_keys` declares th
    at load and, at ARM, a signed event, a roster and `fleet_quorum` ≥ 2 (the D-10 rule). Only an API-mode shadow
    may run alone.
 
-**The identity proof** (`shadow::identity_problems`), three independent parts, every one fail-closed:
+**The identity proof** (`shadow::identity_problems`), four independent parts, every one fail-closed:
 
 9. **Target**: the metalgo behind `target.rpc_url` reports `info.getNetworkID` equal to the configured private id.
 10. **Source**: its active producer schedule signs only with the declared `producer_keys`.
@@ -114,6 +114,12 @@ mainnet's from the first block it produces. `[shadow] producer_keys` declares th
 A real mainnet node can pass 10 only by declaring the real keys, which 11 refuses; it can never pass the block-id half
 of 11, whatever is declared.
 
+12. **Producer binding** (round 4, T6): the head block id the **producer API itself** reports
+    (`/v1/producer/get_integrity_hash`) must be the block the chain API serves at that height (one node behind both
+    paths), and must not be public mainnet's block at that height (judged as in 11). This closes a proxy that serves
+    the chain API from the shadow and forwards the producer API to a real producer. It runs with the proof and
+    **again right before every pause and resume**; an unreadable answer is a failure.
+
 The proof runs **at ARM, right before the write freeze, right before chain creation / ignition** (also on every
 resume or `join` that reaches that step) and, for the target half, **again after ignition** before IGNITED. Only
 the positive result of the check right before creation **in the same run** (`shadow_verified`) lets the shadow past
@@ -131,13 +137,13 @@ for that journal: a new shadow starts on a fresh journal.
 
 **Nothing touches the source of an unproven shadow (round 3).** Every source-side mutation in the state machine
 (pausing or resuming the producer, every hook except the paging-only `on_halt`, moving the staged snapshot aside)
-goes through one gate: on a shadow journal it first requires the full identity proof (parts 9–11) **in this run**,
+goes through one gate: on a shadow journal it first requires the full identity proof (parts 9–12) **in this run**,
 whatever the entry point (`run` retrying a STRANDED pause, `rollback` and `strand`, `join` re-running `on_freeze`,
 `unhalt` followed by `run`). A failed proof refuses through the path below; a test fails the build if a raw
 pause, resume or hook call appears outside the gate.
 
 **No abort resumes an unproven shadow.** Every abort and operator rollback of a shadow journal that would resume the
-source first re-proves the identity (parts 9–11) in the same run, unless this run already proved it; otherwise it
+source first re-proves the identity (parts 9–12) in the same run, unless this run already proved it; otherwise it
 goes through the refusal above. (A resumed run at VERIFIED, for example, can fail an ordinary preflight check before
 the step that re-proves the identity; that failure no longer reaches a resume.)
 

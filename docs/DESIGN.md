@@ -552,3 +552,9 @@ bundles `drill-latest.json`.
 **Not covered.** The finality wait it measures is the live chain's, not a frozen fleet's; the snapshot write is
 timed as "LIB ≥ H → file present". Peak memory is not measured by the agent (use the host's own monitoring). H is
 typed by each operator; a signed coordinator drill event is a possible follow-up.
+
+**A ceremony and a drill on one box** (rc.30 round 4). A fresh ceremony, or one resumed while still ARMED, refuses to
+arm while a drill holds the drill lock or is running. A ceremony resumed **after its freeze** is never refused: it
+stops the drill (cancel file, then a kill of the drill's recorded process group that keeps the record unless the group
+is proven gone), re-takes the lock and journals `readiness_drill_stopped_for_the_cut`, or a loud
+`readiness_drill_not_stopped` if it cannot confirm the drill stopped. A cut in progress is never stranded by a drill.
