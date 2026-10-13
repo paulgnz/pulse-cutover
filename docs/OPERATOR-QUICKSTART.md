@@ -118,8 +118,8 @@ STRANDED/ABORTED journal left by an older agent joins a LIVE fleet with `join --
 
 A `SPLIT` stays red (latched) for that event even if the reports that showed it change later. Only the
 mission-control operator clears it, once the split is resolved, from a shell on the mission-control host:
-`curl -X POST 'http://127.0.0.1:8787/api/admin/clear-split?net=testnet'` (its own port; accepted on loopback only,
-never through the public proxy). If the condition still holds, it latches again. Details: `control/README.md`.
+`curl -X POST -H "Authorization: Bearer $(cat /var/lib/pulse-control/admin.token)" 'http://127.0.0.1:8787/api/admin/clear-split?net=testnet'`
+(its own port; accepted on loopback only, never through the public proxy, and from rc.29 only with the admin token). If the condition still holds, it latches again. Details: `control/README.md`.
 
 How it is computed: for each roster member (its pinned instance, if the event names one) the freshest report for this
 event; LIVE members are grouped by target chain (Metal blockchain id, else chain id) and by the id of the first block
