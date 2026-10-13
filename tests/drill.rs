@@ -28,6 +28,8 @@ struct LiveChain {
     /// Requests someone else (a ceremony) holds: (id, height). Never the drill's to remove.
     foreign: RefCell<Vec<(u64, u64)>>,
     calls: RefCell<Vec<String>>,
+    /// Every argument vector the drill ran (r30 round 4: no shell ever).
+    argvs: RefCell<Vec<Vec<String>>>,
     clock: RefCell<u64>,
     /// LIB never reaches this height (a chain whose finality is slow): the drill waits.
     lib_cap: RefCell<Option<u64>>,
@@ -49,6 +51,7 @@ impl LiveChain {
             next_id: RefCell::new(7),
             foreign: RefCell::new(vec![]),
             calls: RefCell::new(vec![]),
+            argvs: RefCell::new(vec![]),
             clock: RefCell::new(1_000_000),
             lib_cap: RefCell::new(None),
             real_sleep_ms: 0,
@@ -180,6 +183,31 @@ impl ChainOps for LiveChain {
         self.call("run_long");
         pulse_cutover::ops::run_shell(cmd).map(Some)
     }
+    /// The test stand-in for running by argument vector: `docker run … <image> /xce/export.sh …` runs the staged
+    /// export emulation with the mounted host paths; a fake native tool `<bin>` runs its emulation `<bin>.run`.
+    /// Neither goes through a configured command string.
+    fn run_argv_cancellable(&self, argv: &[String], c: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
+        self.call("run_argv");
+        self.argvs.borrow_mut().push(argv.to_vec());
+        if c() {
+            return Ok(None);
+        }
+        let q = |a: &str| format!("'{a}'");
+        if argv[0] == "docker" {
+            let mount = |dst: &str| argv.iter().find_map(|a| {
+                let mut it = a.splitn(3, ':');
+                let (src, d) = (it.next()?, it.next()?);
+                (d == dst).then(|| src.to_string())
+            });
+            let out = mount("/out").ok_or("no /out mount")?;
+            let snap = mount("/in/cut.bin").ok_or("no snapshot mount")?;
+            let tools = mount("/xce").ok_or("no /xce mount")?;
+            return pulse_cutover::ops::run_shell(&format!("sh {} {} {}", q(&format!("{tools}/export.sh")), q(&snap), q(&out)))
+                .map(Some);
+        }
+        let rest: Vec<String> = argv[1..].iter().map(|a| q(a)).collect();
+        pulse_cutover::ops::run_shell(&format!("sh {} {}", q(&format!("{}.run", argv[0])), rest.join(" "))).map(Some)
+    }
     fn get_json(&self, _url: &str) -> Result<Option<Value>, String> {
         self.call("get_json");
         Ok(None)
@@ -202,29 +230,38 @@ fn script(path: &Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// Fake upstream tools with the official argument shapes. `compare_ok = false` makes the compare fail on the two
-/// tables v1.0.0 reports for every XPR snapshot (issue #109).
+/// A fake native executable: an ELF header, mode 0755, one name. The mock runs `<path>.run` in its place.
+fn native(path: &Path) {
+    let mut bytes = b"\x7fELF".to_vec();
+    bytes.extend_from_slice(&[0u8; 60]);
+    std::fs::write(path, bytes).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Fake upstream tools with the official argument shapes: `xce/export.sh` (mounted as the export tools dir) and the
+/// three tools as fake native executables under `bin/` with their emulations beside them. `compare_ok = false`
+/// makes the compare fail on the two tables v1.0.0 reports for every XPR snapshot (issue #109).
 fn stage_tools(dir: &Path, compare_ok: bool) {
     let d = dir.display();
+    std::fs::create_dir_all(dir.join("xce")).unwrap();
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
     let sidecar = r#"{"version":2,"source_chain_id":"%s","source_block_id":"%s","account_metadata":[{"name":1,"recv_sequence":3,"auth_sequence":1,"code_sequence":0,"abi_sequence":0},{"name":2,"recv_sequence":2,"auth_sequence":0,"code_sequence":0,"abi_sequence":0}],"global_action_sequence":5,"input_transactions":[]}"#;
-    script(
-        &dir.join("export.sh"),
-        &format!(
-            "#!/bin/sh\nset -e\nsnap=\"$1\"; out=\"$2\"\n\
-             sha() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi | awk '{{print $1}}'; }}\n\
-             . {d}/cut-facts.env\nmkdir -p \"$out/work/state-history\"\n\
-             printf SHIPLOG > \"$out/work/state-history/chain_state_history.log\"\n\
-             printf '{sidecar}' \"$CHAIN_ID\" \"$CUT_BLOCK_ID\" > \"$out/work/deferred-transactions.json\"\n\
-             echo \"INPUT_SNAPSHOT_SHA256=$(sha \"$snap\")\" > \"$out/work/manifest.env\"\necho exported\n"
-        ),
+    let export = format!(
+        "#!/bin/sh\nset -e\nsnap=\"$1\"; out=\"$2\"\n\
+         sha() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi | awk '{{print $1}}'; }}\n\
+         . {d}/cut-facts.env\nmkdir -p \"$out/work/state-history\"\n\
+         printf SHIPLOG > \"$out/work/state-history/chain_state_history.log\"\n\
+         printf '{sidecar}' \"$CHAIN_ID\" \"$CUT_BLOCK_ID\" > \"$out/work/deferred-transactions.json\"\n\
+         echo \"INPUT_SNAPSHOT_SHA256=$(sha \"$snap\")\" > \"$out/work/manifest.env\"\necho exported\n"
     );
-    script(
-        &dir.join("import.sh"),
-        &format!(
-            "#!/bin/sh\nset -e\n. {d}/cut-facts.env\nprintf CKPT > \"$3\"\n\
-             printf '{{\"checkpoint_sha256\":\"cc\",\"checkpoint_revision\":%s,\"source_block_id\":\"%s\"}}' \"$CUT_HEIGHT\" \"$CUT_BLOCK_ID\" > \"$3.manifest.json\"\n\
-             echo imported\n"
-        ),
+    std::fs::write(dir.join("xce/export.sh"), &export).unwrap();
+    // The ceremony's shell form (export_cmd) keeps a copy outside the tools dir.
+    script(&dir.join("export.sh"), &export);
+    let import = format!(
+        "#!/bin/sh\nset -e\n. {d}/cut-facts.env\nprintf CKPT > \"$3\"\n\
+         printf '{{\"checkpoint_sha256\":\"cc\",\"checkpoint_revision\":%s,\"source_block_id\":\"%s\"}}' \"$CUT_HEIGHT\" \"$CUT_BLOCK_ID\" > \"$3.manifest.json\"\n\
+         echo imported\n"
     );
     let tables = pulse_cutover::upstream::REQUIRED_COMPARE_TABLES.join(" ");
     let compare = if compare_ok {
@@ -234,8 +271,14 @@ fn stage_tools(dir: &Path, compare_ok: bool) {
          echo 'table global_property: first differing row index 0' >&2\necho '21-table nodeos/Arena comparison FAILED' >&2\nexit 1\n"
             .to_string()
     };
-    script(&dir.join("compare.sh"), &compare);
-    script(&dir.join("fingerprint.sh"), "#!/bin/sh\necho 'revision 1'\necho 'state_root 42b0a70fa12998bdfeedfacecafebeef'\n");
+    let fingerprint = "#!/bin/sh\necho 'revision 1'\necho 'state_root 42b0a70fa12998bdfeedfacecafebeef'\n".to_string();
+    for (name, body) in [("import", import), ("compare", compare), ("fingerprint", fingerprint)] {
+        let bin = dir.join("bin").join(name);
+        if !bin.exists() {
+            native(&bin);
+        }
+        script(&dir.join("bin").join(format!("{name}.run")), &body);
+    }
 }
 
 fn drill_config(dir: &Path, chain_id: &str, extra_upstream: &str) -> Result<Config, String> {
@@ -269,9 +312,12 @@ rpc_url = "http://mock"
 [upstream]
 work_dir = "{d}/ceremony-work"
 export_cmd = "sh {d}/export.sh {{snapshot}} {{export_dir}}"
-import_bin = "{d}/import.sh"
-fingerprint_bin = "{d}/fingerprint.sh"
-compare_bin = "{d}/compare.sh"
+export_image = "leap-sidecar:5.0.3"
+export_tools_dir = "{d}/xce"
+chain_state_db_size_mb = 12288
+import_bin = "{d}/bin/import"
+fingerprint_bin = "{d}/bin/fingerprint"
+compare_bin = "{d}/bin/compare"
 {extra_upstream}
 "#
     );
@@ -598,35 +644,6 @@ fn the_drill_pgid_file_is_its_own_never_the_ceremonys() {
     assert!(!ceremony.exists());
 }
 
-#[test]
-fn a_drill_refuses_conversion_commands_that_reach_a_side_effect_command() {
-    let dir = tempfile::tempdir().unwrap();
-    stage_tools(dir.path(), true);
-    let d = dir.path().display().to_string();
-    let hook = format!("{d}/hooks/on-freeze.sh");
-    std::fs::create_dir_all(dir.path().join("hooks")).unwrap();
-    script(&dir.path().join("hooks/on-freeze.sh"), "#!/bin/sh\necho freeze\n");
-    // 1. export_cmd calls the freeze hook directly.
-    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| {
-        t.replace("export_cmd = \"sh ", &format!("export_cmd = \"{hook} r1 && sh "))
-            + &format!("\n[hooks]\non_freeze = \"{hook} r1\"\n")
-    }).unwrap();
-    let p = drill::config_problems(&cfg).join("; ");
-    assert!(p.contains("upstream.export_cmd references hooks.on_freeze"), "{p}");
-    let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
-    let err = drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).unwrap_err();
-    assert!(err.contains("hooks.on_freeze"), "{err}");
-    assert!(!chain.called("schedule_snapshot"));
-    // 2. A wrapper script the pipeline names calls a stop command.
-    script(&dir.path().join("import.sh"), &format!("#!/bin/sh\nsystemctl stop nodeos-xpr\nprintf CKPT > \"$3\"\n"));
-    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| t.replace("[source]\n", "[source]\nstop_cmd = \"systemctl stop nodeos-xpr\"\n")).unwrap();
-    let p = drill::config_problems(&cfg).join("; ");
-    assert!(p.contains("upstream.import_bin (script") && p.contains("source.stop_cmd"), "{p}");
-    // 3. The published commands with unrelated hooks configured: accepted.
-    stage_tools(dir.path(), true);
-    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| t + "\n[hooks]\non_freeze = \"/opt/edge/freeze.sh\"\non_live = \"/opt/edge/flip.sh\"\n").unwrap();
-    assert!(drill::config_problems(&cfg).is_empty(), "{:?}", drill::config_problems(&cfg));
-}
 
 #[test]
 fn a_drill_refuses_paths_that_overlap_the_ceremony_even_through_a_symlink() {
@@ -658,54 +675,7 @@ fn a_drill_refuses_paths_that_overlap_the_ceremony_even_through_a_symlink() {
 
 // ------------------------------------------------------------------------------- r30 round 2 review ----
 
-#[test]
-fn r2_wrapper_scripts_are_found_through_shell_punctuation_and_unreadable_commands_refuse() {
-    let dir = tempfile::tempdir().unwrap();
-    stage_tools(dir.path(), true);
-    let d = dir.path().display().to_string();
-    std::fs::create_dir_all(dir.path().join("hooks")).unwrap();
-    script(&dir.path().join("hooks/on-freeze.sh"), "#!/bin/sh\necho freeze\n");
-    script(&dir.path().join("wrap.sh"), &format!("#!/bin/sh\n{d}/hooks/on-freeze.sh r1\n"));
-    let hooks = format!("\n[hooks]\non_freeze = \"{d}/hooks/on-freeze.sh r1\"\n");
-    // `sh <wrapper>; …`: the old whitespace split looked for the file "<wrapper>;" and missed it.
-    for glue in [";", "&&", "|", ")"] {
-        let cmd = if glue == ")" { format!("(sh {d}/wrap.sh) ; sh {d}/export.sh {{snapshot}} {{export_dir}}") }
-                  else { format!("sh {d}/wrap.sh{glue} sh {d}/export.sh {{snapshot}} {{export_dir}}") };
-        let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| {
-            let start = t.find("export_cmd = ").unwrap();
-            let end = start + t[start..].find('\n').unwrap();
-            format!("{}export_cmd = {}{}{}", &t[..start], toml_str(&cmd), &t[end..], hooks)
-        }).unwrap();
-        let p = drill::config_problems(&cfg).join("; ");
-        assert!(p.contains("(script ") && p.contains("wrap.sh") && p.contains("hooks.on_freeze"), "{glue}: {p}");
-    }
-    // Inside a quoted `bash -c '…'` script too (the published export_cmd shape).
-    let cmd = format!("bash -c 'mkdir -p /tmp/x && sh {d}/wrap.sh && sh {d}/export.sh {{snapshot}} {{export_dir}}'");
-    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| {
-        let start = t.find("export_cmd = ").unwrap();
-        let end = start + t[start..].find('\n').unwrap();
-        format!("{}export_cmd = {}{}{}", &t[..start], toml_str(&cmd), &t[end..], hooks)
-    }).unwrap();
-    assert!(drill::config_problems(&cfg).join("; ").contains("hooks.on_freeze"));
-    // Commands that cannot be read unambiguously refuse: unterminated quote, command substitution, variable path.
-    for bad in [format!("sh '{d}/export.sh"), format!("sh $(echo {d}/export.sh)"), format!("sh `echo {d}`/export.sh"),
-                "sh $HOME/export.sh".to_string()] {
-        let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| {
-            let start = t.find("export_cmd = ").unwrap();
-            let end = start + t[start..].find('\n').unwrap();
-            format!("{}export_cmd = {}{}", &t[..start], toml_str(&bad), &t[end..])
-        }).unwrap();
-        let p = drill::config_problems(&cfg).join("; ");
-        assert!(p.contains("cannot be read unambiguously") || p.contains("depends on a variable"), "{bad}: {p}");
-    }
-    // The tokenizer itself.
-    assert_eq!(drill::shell_words("a 'b c'\"d\\\"e\";f|g&&h (i) <j >k").unwrap(),
-               vec!["a", "b cd\"e", "f", "g", "h", "i", "j", "k"]);
-}
 
-fn toml_str(s: &str) -> String {
-    serde_json::to_string(s).unwrap() // a JSON string is a valid TOML basic string
-}
 
 #[test]
 fn r2_every_drill_output_path_is_protected_including_shared_telemetry_and_locks() {
@@ -841,11 +811,6 @@ fn r2_a_failed_kill_of_the_pipeline_group_is_an_incomplete_cancel_never_success(
 
 // ------------------------------------------------------------------------------- r30 round 3 review ----
 
-fn set_export_cmd(t: &str, cmd: &str, tail: &str) -> String {
-    let start = t.find("export_cmd = ").unwrap();
-    let end = start + t[start..].find('\n').unwrap();
-    format!("{}export_cmd = {}{}{}", &t[..start], toml_str(cmd), &t[end..], tail)
-}
 
 #[test]
 fn r3_a_drill_never_writes_through_a_symlink_or_hard_link_beneath_its_root() {
@@ -966,37 +931,151 @@ fn r3_a_failed_cancel_keeps_the_group_record_so_the_drill_keeps_blocking() {
     assert_eq!(latest(&cfg)["state"], "RUNNING");
 }
 
+// ------------------------------------------------------------------------------- r30 round 4 review ----
+
+fn set_toml(t: &str, key: &str, value: &str) -> String {
+    let start = t.find(&format!("{key} = ")).unwrap();
+    let end = start + t[start..].find('\n').unwrap();
+    format!("{}{key} = {}{}", &t[..start], serde_json::to_string(value).unwrap(), &t[end..])
+}
+
+/// R4-4 / R4-5 and every scanner bypass before them: a drill runs no configured text, so an export_cmd (or a relative
+/// wrapper, or a `..` path through a symlink) that would run a hook is simply never run. Before round 4 the scanner
+/// accepted these and the drill ran export_cmd, firing the hook.
 #[test]
-fn r3_hook_references_are_found_after_quotes_dots_cd_and_symlinks() {
+fn r4_a_drill_never_runs_export_cmd_or_any_shell_whatever_it_says() {
     let dir = tempfile::tempdir().unwrap();
     stage_tools(dir.path(), true);
     let d = dir.path().display().to_string();
-    std::fs::create_dir_all(dir.path().join("hooks")).unwrap();
-    script(&dir.path().join("hooks/on-freeze.sh"), "#!/bin/sh\necho freeze\n");
-    std::os::unix::fs::symlink(dir.path().join("hooks/on-freeze.sh"), dir.path().join("innocent.sh")).unwrap();
-    let hooks = format!("\n[hooks]\non_freeze = \"{d}/hooks/on-freeze.sh r1\"\n");
-    let export = format!("sh {d}/export.sh {{snapshot}} {{export_dir}}");
-    let cases = [
-        (format!("sh {d}/hooks/on-'freeze'.sh && {export}"), "hooks.on_freeze"),
-        (format!("sh {d}/hooks/./on-freeze.sh && {export}"), "hooks.on_freeze"),
-        (format!("sh {d}/hooks/../hooks/on-freeze.sh && {export}"), "hooks.on_freeze"),
-        (format!("cd {d}/hooks && ./on-freeze.sh && {export}"), "hooks.on_freeze"),
-        (format!("cd {d}/hooks && sh on-freeze.sh && {export}"), "hooks.on_freeze"),
-        (format!("sh {d}/innocent.sh && {export}"), "hooks.on_freeze"),
-        (format!("sh ~/hooks/on-freeze.sh && {export}"), "home directory"),
-        (format!("cd hooks && sh on-freeze.sh && {export}"), "absolute path"),
-    ];
-    for (cmd, want) in cases {
-        let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| set_export_cmd(&t, &cmd, &hooks)).unwrap();
-        let p = drill::config_problems(&cfg).join("; ");
-        assert!(p.contains(want), "{cmd}: {p}");
+    let marker = dir.path().join("HOOK-RAN");
+    std::fs::create_dir_all(dir.path().join("hooks/sub")).unwrap();
+    std::fs::create_dir_all(dir.path().join("conv")).unwrap();
+    script(&dir.path().join("hooks/on-freeze.sh"), &format!("#!/bin/sh\ntouch {}\n", marker.display()));
+    script(&dir.path().join("conv/wrapper.sh"), &format!("#!/bin/sh\n{d}/hooks/on-freeze.sh\nsh {d}/export.sh \"$1\" \"$2\"\n"));
+    std::os::unix::fs::symlink(dir.path().join("hooks/sub"), dir.path().join("link")).unwrap();
+    let hooks = format!("\n[hooks]\non_freeze = \"{d}/hooks/on-freeze.sh\"\n");
+    for (i, cmd) in [
+        format!("cd {d}/conv && sh wrapper.sh {{snapshot}} {{export_dir}}"),
+        format!("sh {d}/link/../on-freeze.sh && sh {d}/export.sh {{snapshot}} {{export_dir}}"),
+        format!("H={d}/hooks; \"$H/on-freeze.sh\"; sh {d}/export.sh {{snapshot}} {{export_dir}}"),
+    ].iter().enumerate() {
+        let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| set_toml(&t, "export_cmd", cmd) + &hooks).unwrap();
+        assert!(drill::config_problems(&cfg).is_empty(), "{cmd}: {:?}", drill::config_problems(&cfg));
+        let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+        let h = 1_050 + 100 * i as u64;
+        let out = drill::run(&cfg, &chain, &DrillOptions { height: h, keep_work: false }).unwrap();
+        assert_eq!(out.view["state"], "DONE");
+        assert!(!marker.exists(), "{cmd}: the hook ran");
+        assert!(!chain.called("run_long"), "{cmd}: a shell command reached the chain ops");
+        // The export is the fixed vector, built only from the explicit fields.
+        let argvs = chain.argvs.borrow();
+        let ex = argvs.iter().find(|a| a[0] == "docker").expect("the export ran by argument vector");
+        assert_eq!(&ex[..5], ["docker", "run", "--rm", "--network", "none"]);
+        assert!(ex.contains(&"leap-sidecar:5.0.3".to_string()) && ex.contains(&format!("{d}/xce:/xce:ro")));
+        assert!(ex.contains(&"--chain-state-db-size-mb".to_string()) && ex.contains(&"12288".to_string()));
+        assert!(ex.iter().all(|a| !a.contains("on-freeze") && !a.contains("wrapper")), "{ex:?}");
+        for tool in ["import", "compare", "fingerprint"] {
+            assert!(argvs.iter().any(|a| a[0] == format!("{d}/bin/{tool}")), "{tool} not run by vector");
+        }
     }
-    // A wrapper script that cds and calls the hook relatively is caught too.
-    script(&dir.path().join("wrap.sh"), &format!("#!/bin/sh\n# a comment with ~ in it\ncd {d}/hooks\n./on-freeze.sh r1\n"));
-    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| set_export_cmd(&t, &format!("sh {d}/wrap.sh && {export}"), &hooks)).unwrap();
-    let p = drill::config_problems(&cfg).join("; ");
-    assert!(p.contains("(script ") && p.contains("hooks.on_freeze"), "{p}");
-    // The published command shape with unrelated hooks stays accepted.
-    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| set_export_cmd(&t, &export, &hooks)).unwrap();
-    assert!(drill::config_problems(&cfg).is_empty(), "{:?}", drill::config_problems(&cfg));
 }
+
+#[test]
+fn r4_the_guard_refuses_shell_and_every_program_but_the_validated_four() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 1);
+    let g = DrillGuard::new(&chain);
+    assert!(g.run_long("echo hi").is_err());
+    assert!(g.run_long_cancellable("echo hi", &mut || false).is_err());
+    g.allow_programs(vec!["docker".into(), "/opt/bin/import".into()]);
+    assert!(g.run_argv_cancellable(&["/bin/sh".into(), "-c".into(), "touch x".into()], &mut || false).is_err());
+    assert!(g.run_argv_cancellable(&["systemctl".into(), "stop".into(), "nodeos".into()], &mut || false).is_err());
+    assert_eq!(g.violations.borrow().len(), 4);
+    assert!(!chain.called("run_long") && !chain.called("run_argv"));
+}
+
+#[test]
+fn r4_drill_tools_must_be_plain_native_executables_and_the_export_fields_explicit() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), true);
+    let d = dir.path().display().to_string();
+    let base = drill_config(dir.path(), MAINNET, "").unwrap();
+    assert!(drill::config_problems(&base).is_empty(), "{:?}", drill::config_problems(&base));
+    // A script, a symlink, a hard link, a relative path, a group-writable file: each refused.
+    script(&dir.path().join("bin/script-tool"), "#!/bin/sh\necho hi\n");
+    std::os::unix::fs::symlink(dir.path().join("bin/import"), dir.path().join("bin/import-link")).unwrap();
+    native(&dir.path().join("bin/hard"));
+    std::fs::hard_link(dir.path().join("bin/hard"), dir.path().join("bin/hard2")).unwrap();
+    native(&dir.path().join("bin/gw"));
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.path().join("bin/gw"), std::fs::Permissions::from_mode(0o775)).unwrap();
+    for (tool, want) in [("bin/script-tool", "a script"), ("bin/import-link", "symlink"), ("bin/hard", "hard link"),
+                         ("bin/gw", "writable")] {
+        let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| set_toml(&t, "import_bin", &format!("{d}/{tool}"))).unwrap();
+        let p = drill::config_problems(&cfg).join("; ");
+        assert!(p.contains("upstream.import_bin") && p.contains(want), "{tool}: {p}");
+    }
+    let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| set_toml(&t, "compare_bin", "bin/compare")).unwrap();
+    assert!(drill::config_problems(&cfg).join("; ").contains("not an absolute path"));
+    // Missing or invalid export fields.
+    for (edit, want) in [
+        (Box::new(|t: String| t.replace("export_image = \"leap-sidecar:5.0.3\"\n", "")) as Box<dyn Fn(String) -> String>, "export_image"),
+        (Box::new(|t: String| t.replace("leap-sidecar:5.0.3", "img; rm -rf /")), "plain image reference"),
+        (Box::new(|t: String| t.replace("leap-sidecar:5.0.3", "--privileged")), "plain image reference"),
+        (Box::new(|t: String| t.replace("chain_state_db_size_mb = 12288\n", "")), "chain_state_db_size_mb"),
+        (Box::new(move |t: String| t.replace(&format!("{d}/xce"), "/nonexistent-xce")), "export_tools_dir"),
+    ] {
+        let cfg = drill_config_edit(dir.path(), MAINNET, "", edit).unwrap();
+        let p = drill::config_problems(&cfg).join("; ");
+        assert!(p.contains(want), "{want}: {p}");
+        let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+        assert!(drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).is_err());
+        assert!(!chain.called("schedule_snapshot"));
+    }
+}
+
+/// R4-6: an endpoint with a query, fragment or credentials is refused for a drill and for its cancel.
+#[test]
+fn r4_a_drill_refuses_an_ambiguous_producer_api_and_cancel_writes_nothing() {
+    for url in ["http://proxy/api?node=shadow", "http://proxy/api#x", "http://user:pw@proxy/api"] {
+        let dir = tempfile::tempdir().unwrap();
+        stage_tools(dir.path(), true);
+        let cfg = drill_config_edit(dir.path(), MAINNET, "", |t| t.replacen("producer_api_url = \"http://mock\"",
+            &format!("producer_api_url = \"{url}\""), 1)).unwrap();
+        let p = drill::config_problems(&cfg).join("; ");
+        assert!(p.contains("source.producer_api_url"), "{url}: {p}");
+        let chain = LiveChain::new(dir.path(), MAINNET, 1_000);
+        assert!(drill::run(&cfg, &chain, &DrillOptions { height: 1_050, keep_work: false }).is_err());
+        assert!(!chain.called("schedule_snapshot"));
+        // A stale record: cancel refuses before writing anything.
+        std::fs::create_dir_all(drill::drill_dir(&cfg, 777)).unwrap();
+        std::fs::write(drill::latest_path(&cfg), serde_json::json!({"kind": "readiness_drill", "h": 777, "state": "RUNNING",
+            "pid": std::process::id(), "pid_start": "x", "snapshot_request_id": 8, "snapshot_request_h": 777,
+            "snapshot_request_endpoint": drill::normalized_endpoint(url)}).to_string()).unwrap();
+        let err = drill::cancel(&cfg, &chain, std::time::Duration::from_millis(20)).unwrap_err();
+        assert!(err.contains("nothing changed") && err.contains("producer_api_url"), "{url}: {err}");
+        assert!(!drill::drill_dir(&cfg, 777).join("drill.jsonl").exists());
+        assert!(!chain.called("unschedule_snapshot"));
+    }
+}
+
+/// R4-8 (drill side): a finished record does not end the drill while its recorded process group is still alive.
+#[test]
+fn r4_a_recorded_live_group_keeps_a_finished_drill_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    std::fs::create_dir_all(drill::drill_dir(&cfg, 9)).unwrap();
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new("sh").arg("-c").arg("sleep 30").process_group(0).spawn().unwrap();
+    std::fs::write(drill::pgid_file(&cfg, 9), format!("{}\n", child.id())).unwrap();
+    std::fs::write(drill::latest_path(&cfg), serde_json::json!({"kind": "readiness_drill", "h": 9, "state": "FAILED"}).to_string()).unwrap();
+    let a = drill::activity(&cfg);
+    let blocker = drill::ceremony_blocker(&cfg);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(matches!(a, drill::DrillActivity::Running { h: 9, .. }), "{a:?}");
+    assert!(blocker.is_some());
+    // Once the group is gone the finished record is idle again.
+    assert_eq!(drill::activity(&cfg), drill::DrillActivity::Idle);
+}
+

@@ -87,21 +87,38 @@ pub enum DrillActivity {
     Stale { h: u64 },
 }
 
-/// Read `latest.json` and tell a live drill from a stale record.
+/// The drill's recorded pipeline group, strictly: Some(pgid) when it is alive OR cannot be inspected (r30 round 4:
+/// "cannot tell" is never "stopped").
+fn group_not_proven_gone(cfg: &Config, h: u64) -> Option<u32> {
+    match crate::ops::recorded_group_status(&pgid_file(cfg, h)) {
+        Some((g, crate::ops::GroupStatus::Live(_) | crate::ops::GroupStatus::Unknown(_))) => Some(g),
+        _ => None,
+    }
+}
+
+/// Read `latest.json` and tell a live drill from a stale record. A recorded pipeline group that is alive, or that
+/// cannot be inspected, makes the drill RUNNING whatever the record says (r30 round 4: work that survived a failed
+/// or incomplete stop keeps blocking a ceremony).
 pub fn activity(cfg: &Config) -> DrillActivity {
     let Ok(text) = std::fs::read_to_string(latest_path(cfg)) else { return DrillActivity::Idle };
     let Ok(v) = serde_json::from_str::<Value>(&text) else { return DrillActivity::Idle };
-    if v["kind"].as_str() != Some(DRILL_KIND) || v["state"].as_str() != Some("RUNNING") {
+    if v["kind"].as_str() != Some(DRILL_KIND) {
         return DrillActivity::Idle;
     }
     let Some(h) = v["h"].as_u64() else { return DrillActivity::Idle };
+    if v["state"].as_str() != Some("RUNNING") {
+        return match group_not_proven_gone(cfg, h) {
+            Some(g) => DrillActivity::Running { h, pid: None, group: Some(g) },
+            None => DrillActivity::Idle,
+        };
+    }
     let pid = v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()).filter(|p| *p > 1).filter(|p| {
         match (crate::ops::process_start(*p), v["pid_start"].as_str()) {
             (Some(now), Some(want)) => now == want,
             _ => false,
         }
     });
-    let group = crate::ops::live_recorded_group(&pgid_file(cfg, h));
+    let group = group_not_proven_gone(cfg, h);
     if pid.is_some() || group.is_some() {
         DrillActivity::Running { h, pid, group }
     } else {
@@ -143,11 +160,19 @@ pub struct DrillGuard<'a, O: ChainOps> {
     /// `--cancel` of a dead drill, the recorded request it was allowed to clean up). The guard only ever removes a
     /// request by this id, never by height (r30 round 2: a ceremony may hold a request at the same height).
     scheduled: RefCell<Option<(u64, Option<u64>)>>,
+    /// r30 round 4: the only programs a drill may run (by argument vector): `docker` for the export and the three
+    /// validated tool paths. Anything else, and any shell command, is refused.
+    programs: RefCell<Vec<String>>,
 }
 
 impl<'a, O: ChainOps> DrillGuard<'a, O> {
     pub fn new(inner: &'a O) -> Self {
-        DrillGuard { inner, violations: RefCell::new(vec![]), scheduled: RefCell::new(None) }
+        DrillGuard { inner, violations: RefCell::new(vec![]), scheduled: RefCell::new(None), programs: RefCell::new(vec![]) }
+    }
+
+    /// Allow exactly these programs (`argv[0]`) for [`ChainOps::run_argv_cancellable`].
+    pub fn allow_programs(&self, programs: Vec<String>) {
+        *self.programs.borrow_mut() = programs;
     }
 
     /// `--cancel` of a drill whose process died: allow removing exactly the request that drill recorded.
@@ -241,11 +266,18 @@ impl<O: ChainOps> ChainOps for DrillGuard<'_, O> {
     fn kill_orphan_hooks(&self) -> Result<Option<String>, String> {
         self.refuse("kill_orphan_hooks")
     }
-    fn run_long(&self, cmd: &str) -> Result<String, String> {
-        self.inner.run_long(cmd)
+    fn run_long(&self, _cmd: &str) -> Result<String, String> {
+        self.refuse("run_long (a drill never runs a shell command)")
     }
-    fn run_long_cancellable(&self, cmd: &str, cancel: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
-        self.inner.run_long_cancellable(cmd, cancel)
+    fn run_long_cancellable(&self, _cmd: &str, _cancel: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
+        self.refuse("run_long_cancellable (a drill never runs a shell command)")
+    }
+    fn run_argv_cancellable(&self, argv: &[String], cancel: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
+        let prog = argv.first().cloned().unwrap_or_default();
+        if !self.programs.borrow().iter().any(|p| *p == prog) {
+            return self.refuse(&format!("running {prog:?} (not one of the drill's validated programs)"));
+        }
+        self.inner.run_argv_cancellable(argv, cancel)
     }
     fn get_json(&self, url: &str) -> Result<Option<Value>, String> {
         self.inner.get_json(url)
@@ -267,7 +299,7 @@ pub fn config_problems(cfg: &Config) -> Vec<String> {
         p.push("a drill runs the official upstream pipeline: set [ceremony] import_backend = \"upstream\"".into());
     }
     match &cfg.upstream {
-        None => p.push("a drill needs an [upstream] section (export_cmd, import_bin, compare_bin, fingerprint_bin)".into()),
+        None => p.push("a drill needs an [upstream] section (export_image, export_tools_dir, chain_state_db_size_mb, import_bin, compare_bin, fingerprint_bin)".into()),
         Some(u) if u.compare_bin.is_none() => {
             p.push("a drill needs [upstream] compare_bin: the table comparison is half of what it measures".into())
         }
@@ -276,325 +308,158 @@ pub fn config_problems(cfg: &Config) -> Vec<String> {
     if cfg.snapshot.dir.is_none() {
         p.push("a drill picks up nodeos's scheduled snapshot: set [snapshot] dir".into());
     }
-    p.extend(pipeline_side_effect_problems(cfg));
+    p.extend(exec_problems(cfg));
+    if let Some(why) = producer_api_problem(&cfg.source.producer_api_url) {
+        p.push(why);
+    }
     p
 }
 
-/// Every configured command that changes something (freeze/flip/stop/start/create/ignite/quiesce/probe), with its
-/// config key. A drill must never run one of them, directly or through its conversion commands.
-fn side_effect_commands(cfg: &Config) -> Vec<(&'static str, String)> {
-    let mut out: Vec<(&'static str, Option<String>)> = vec![
-        ("hooks.on_freeze", cfg.hooks.on_freeze.clone()),
-        ("hooks.post_ignite", cfg.hooks.post_ignite.clone()),
-        ("hooks.on_live", cfg.hooks.on_live.clone()),
-        ("hooks.on_abort", cfg.hooks.on_abort.clone()),
-        ("hooks.on_halt", cfg.hooks.on_halt.clone()),
-        ("source.stop_cmd", cfg.source.stop_cmd.clone()),
-        ("source.start_cmd", cfg.source.start_cmd.clone()),
-        ("source.quiesce_cmd", cfg.source.quiesce_cmd.clone()),
-        ("target.create_chain_cmd", cfg.target.create_chain_cmd.clone()),
-        ("target.ignite_cmd", cfg.target.ignite_cmd.clone()),
-        ("target.stop_cmd", cfg.target.stop_cmd.clone()),
-        ("target.post_live_probe_cmd", cfg.target.post_live_probe_cmd.clone()),
-    ];
-    if let Some(f) = &cfg.flip {
-        out.push(("flip.cmd", Some(f.cmd.clone())));
-        out.push(("flip.revert_cmd", f.revert_cmd.clone()));
+/// r30 round 4: a drill never runs free-form shell. Rounds 1–3 tried to scan the configured conversion commands and
+/// any wrapper scripts for references to a hook or a stop/create/ignite command; every round found another way past
+/// the scan (quotes, `cd`, `..` through a symlink, hard links, variables, PATH). So a drill does not run configured
+/// text at all: the export is a fixed `docker run` argument vector built from explicit, validated fields, and the
+/// three tools must be native executables run by argument vector. Nothing a config says can add a command.
+fn exec_problems(cfg: &Config) -> Vec<String> {
+    let mut p = vec![];
+    let Some(up) = &cfg.upstream else { return p };
+    match &up.export_image {
+        None => p.push(
+            "a drill runs the export as a fixed `docker run` (never `export_cmd`, which is shell): set [upstream] \
+             export_image (the Leap 5.0.3 sidecar image, ideally pinned by digest)"
+                .into(),
+        ),
+        Some(img) if !valid_image(img) => p.push(format!(
+            "upstream.export_image {img:?} is not a plain image reference (letters, digits, `._/:@-`, not starting \
+             with `-`, at most 255 characters)"
+        )),
+        _ => {}
     }
-    if let Some(h) = &cfg.hyperion {
-        out.push(("hyperion.start_cmd", h.start_cmd.clone()));
-        out.push(("hyperion.flip_cmd", Some(h.flip_cmd.clone())));
-        out.push(("hyperion.revert_cmd", h.revert_cmd.clone()));
+    match &up.export_tools_dir {
+        None => p.push(
+            "a drill mounts the export tools read-only: set [upstream] export_tools_dir (the absolute directory holding \
+             export.sh)"
+                .into(),
+        ),
+        Some(d) => p.extend(tools_dir_problems(d)),
     }
-    out.into_iter().filter_map(|(k, v)| v.map(|v| (k, v.trim().to_string()))).filter(|(_, v)| !v.is_empty()).collect()
-}
-
-/// The words of a shell command as the shell would split them: on whitespace and the control operators
-/// `; & | ( ) < >` and newlines, with single and double quotes and backslashes resolved (r30 round 2: a plain
-/// whitespace split read `sh /opt/export.sh; …` as the file `/opt/export.sh;` and missed the wrapper). Err when the
-/// command cannot be read unambiguously: an unterminated quote, a trailing backslash, or command substitution
-/// (`$(…)`, backticks), whose result no static check can know.
-pub fn shell_words(cmd: &str) -> Result<Vec<String>, String> {
-    let mut words = vec![];
-    let mut cur = String::new();
-    let mut in_word = false;
-    let mut it = cmd.chars().peekable();
-    while let Some(c) = it.next() {
-        match c {
-            c if c.is_whitespace() || ";&|()<>".contains(c) => {
-                if in_word {
-                    words.push(std::mem::take(&mut cur));
-                    in_word = false;
-                }
-            }
-            '\'' => {
-                in_word = true;
-                loop {
-                    match it.next() {
-                        Some('\'') => break,
-                        Some(ch) => cur.push(ch),
-                        None => return Err(format!("unterminated single quote in `{cmd}`")),
-                    }
-                }
-            }
-            '"' => {
-                in_word = true;
-                loop {
-                    match it.next() {
-                        Some('"') => break,
-                        Some('\\') => match it.next() {
-                            Some(ch) if "$`\"\\\n".contains(ch) => cur.push(ch),
-                            Some(ch) => {
-                                cur.push('\\');
-                                cur.push(ch);
-                            }
-                            None => return Err(format!("unterminated double quote in `{cmd}`")),
-                        },
-                        Some('`') => return Err(format!("command substitution (backticks) in `{cmd}`")),
-                        Some('$') if it.peek() == Some(&'(') => return Err(format!("command substitution `$(…)` in `{cmd}`")),
-                        Some(ch) => cur.push(ch),
-                        None => return Err(format!("unterminated double quote in `{cmd}`")),
-                    }
-                }
-            }
-            '\\' => match it.next() {
-                Some(ch) => {
-                    in_word = true;
-                    cur.push(ch);
-                }
-                None => return Err(format!("trailing backslash in `{cmd}`")),
-            },
-            '`' => return Err(format!("command substitution (backticks) in `{cmd}`")),
-            '$' if it.peek() == Some(&'(') => return Err(format!("command substitution `$(…)` in `{cmd}`")),
-            ch => {
-                in_word = true;
-                cur.push(ch);
-            }
+    match up.chain_state_db_size_mb {
+        None => p.push("a drill passes the chain-state size to export.sh: set [upstream] chain_state_db_size_mb".into()),
+        Some(n) if !(1..=1_048_576).contains(&n) => {
+            p.push(format!("upstream.chain_state_db_size_mb = {n} is out of range (1..=1048576)"))
         }
+        _ => {}
     }
-    if in_word {
-        words.push(cur);
-    }
-    Ok(words)
-}
-
-/// `shell_words`, also splitting every word that is itself a script (`bash -c '… && /x/y.sh …'`), to a fixed
-/// depth. Err as `shell_words`.
-fn all_shell_words(cmd: &str) -> Result<Vec<String>, String> {
-    fn go(cmd: &str, depth: u8, out: &mut Vec<String>) -> Result<(), String> {
-        for w in shell_words(cmd)? {
-            if depth < 3 && w.chars().any(|c| c.is_whitespace() || ";&|".contains(c)) {
-                go(&w, depth + 1, out)?;
-            }
-            out.push(w);
-        }
-        Ok(())
-    }
-    let mut out = vec![];
-    go(cmd, 0, &mut out)?;
-    Ok(out)
-}
-
-/// What to look for in the conversion commands: the whole command, and every path-like word of it that is not a
-/// generic interpreter or wrapper (a script `/root/hooks/on-freeze.sh` is specific; `/bin/sh` is not).
-fn command_needles(cmd: &str) -> Vec<String> {
-    const GENERIC: &[&str] = &["sh", "bash", "dash", "zsh", "env", "sudo", "nohup", "setsid", "timeout", "docker",
-        "python", "python3", "node", "perl", "exec", "systemd-run"];
-    let mut n = vec![cmd.to_string()];
-    let words = all_shell_words(cmd).unwrap_or_else(|_| cmd.split_whitespace().map(str::to_string).collect());
-    for w in words {
-        let base = w.rsplit('/').next().unwrap_or(&w);
-        if w.contains('/') && w.len() >= 4 && !w.contains('{') && !w.chars().any(char::is_whitespace) && !GENERIC.contains(&base) {
-            n.push(w.clone());
-        }
-    }
-    n
-}
-
-/// The conversion commands a drill runs, as text: the configured strings, plus the contents of any small text
-/// script they name (a wrapper like `import.sh` that itself calls a hook is caught too), and the scripts those
-/// name in turn. Commands are split as the shell splits them; a command that cannot be read unambiguously, or a
-/// script path that depends on a variable, is a problem (the drill refuses rather than guess).
-fn pipeline_texts(cfg: &Config) -> (Vec<(String, String)>, Vec<String>) {
-    let mut problems = vec![];
-    let Some(up) = &cfg.upstream else { return (vec![], problems) };
-    let mut cmds: Vec<(String, String)> = vec![
-        ("upstream.export_cmd".into(), up.export_cmd.clone()),
-        ("upstream.import_bin".into(), up.import_bin.display().to_string()),
-        ("upstream.fingerprint_bin".into(), up.fingerprint_bin.display().to_string()),
-    ];
+    p.extend(native_executable_problems("upstream.import_bin", &up.import_bin));
+    p.extend(native_executable_problems("upstream.fingerprint_bin", &up.fingerprint_bin));
     if let Some(c) = &up.compare_bin {
-        cmds.push(("upstream.compare_bin".into(), c.display().to_string()));
+        p.extend(native_executable_problems("upstream.compare_bin", c));
     }
-    let mut out = cmds.clone();
-    // (where, text, is_configured_command): configured commands must tokenize; script bodies are read loosely.
-    let mut queue: Vec<(String, String, bool, u8)> = cmds.iter().map(|(k, c)| (k.clone(), c.clone(), true, 0)).collect();
-    let mut seen = std::collections::BTreeSet::new();
-    while let Some((k, text, configured, depth)) = queue.pop() {
-        let words = match all_shell_words(&text) {
-            Ok(w) => w,
-            Err(e) if configured => {
-                problems.push(format!("{k} cannot be read unambiguously ({e}): a drill only runs conversion commands it can check"));
-                continue;
-            }
-            // A script body may use shell syntax the static reader does not follow: scan its whitespace words.
-            Err(_) => text.split_whitespace().map(|w| w.trim_matches(|c| "'\";&|()<>".contains(c)).to_string()).collect(),
-        };
-        for w in words {
-            if !w.starts_with('/') && !w.starts_with('.') && !w.starts_with('$') {
-                continue;
-            }
-            if w.contains('$') && w.contains('/') && configured {
-                problems.push(format!("{k} names `{w}`, a path that depends on a variable: a drill cannot check it"));
-                continue;
-            }
-            let path = Path::new(&w);
-            let Ok(meta) = std::fs::metadata(path) else { continue };
-            if !meta.is_file() || meta.len() > 256 * 1024 || !seen.insert(canonical(path)) {
-                continue;
-            }
-            if let Ok(body) = std::fs::read_to_string(path) {
-                out.push((format!("{k} (script {w})"), body.clone()));
-                if depth < 2 {
-                    queue.push((format!("{k} (script {w})"), body, false, depth + 1));
-                }
-            }
-        }
-    }
-    (out, problems)
-}
-
-/// r30 review (a): the guard cannot sandbox shell. A drill runs the configured conversion commands as they are;
-/// it refuses when any of them (or a small script it names) references a configured side-effect command.
-///
-/// Round 3: a raw-text search was bypassed by quoting (`/opt/hooks/on-'freeze'.sh`), `.` components, `cd` plus a
-/// relative path, `~`, and symlinks. So the words of every conversion text are also RESOLVED the way the shell
-/// would see them (quotes removed, relative to the last `cd`, `.`/`..` folded, symlinks followed) and compared with
-/// the resolved paths of every side-effect command. A `cd` to anything but an absolute path, and a `~` path, are
-/// refused: the drill cannot know where they lead.
-fn pipeline_side_effect_problems(cfg: &Config) -> Vec<String> {
-    let effects = side_effect_commands(cfg);
-    let effect_paths: Vec<(&'static str, PathBuf)> = effects
-        .iter()
-        .flat_map(|(key, cmd)| {
-            text_words(cmd)
-                .into_iter()
-                .filter(|w| is_pathlike(w))
-                .map(move |w| (*key, canonical(&lexical(Path::new(&w), None))))
-        })
-        .collect();
-    let (texts, mut p) = pipeline_texts(cfg);
-    for (where_, text) in texts {
-        for (key, cmd) in &effects {
-            if let Some(n) = command_needles(cmd).into_iter().find(|n| text.contains(n.as_str())) {
-                p.push(side_effect_message(&where_, key, &n));
-            }
-        }
-        let words = text_words(&text);
-        let mut cwd: Option<PathBuf> = None;
-        let mut i = 0;
-        while i < words.len() {
-            let w = &words[i];
-            if w == "cd" || w == "pushd" {
-                match words.get(i + 1) {
-                    Some(t) if t.starts_with('/') && !t.contains('$') => cwd = Some(lexical(Path::new(t), None)),
-                    other => p.push(format!(
-                        "{where_} changes directory to `{}`: a drill only follows `cd` to an absolute path (it must \
-                         know what every relative path names); use absolute paths",
-                        other.map_or("", |s| s.as_str())
-                    )),
-                }
-                i += 2;
-                continue;
-            }
-            if w.starts_with('~') {
-                p.push(format!(
-                    "{where_} names `{w}`, a path relative to a home directory: a drill cannot know where it leads; use \
-                     an absolute path"
-                ));
-            } else if let Some(resolved) = resolve_word(w, cwd.as_deref()) {
-                for (key, ep) in &effect_paths {
-                    if &resolved == ep {
-                        p.push(side_effect_message(&where_, key, &format!("{w} → {}", resolved.display())));
-                    }
-                }
-            }
-            i += 1;
-        }
-    }
-    p.sort();
-    p.dedup();
     p
 }
 
-fn side_effect_message(where_: &str, key: &str, what: &str) -> String {
-    format!(
-        "{where_} references {key} (`{what}`): a drill runs the conversion commands as configured and must never \
-         reach a freeze, flip, stop, chain-creation or ignition command; use the published conversion commands"
-    )
+/// A plain container image reference: no shell syntax, no option-looking first character.
+pub fn valid_image(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 255
+        && !s.starts_with('-')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '@' | '-'))
 }
 
-/// The words of a command or a script body, quotes removed. A body that does not tokenize as a whole is read line
-/// by line (comment lines skipped), falling back to whitespace for a line that does not tokenize either.
-fn text_words(text: &str) -> Vec<String> {
-    if let Ok(w) = all_shell_words(text) {
-        return w;
-    }
-    let mut out = vec![];
-    for line in text.lines() {
-        let t = line.trim_start();
-        if t.starts_with('#') {
-            continue;
-        }
-        match all_shell_words(t) {
-            Ok(w) => out.extend(w),
-            Err(_) => out.extend(t.split_whitespace().map(|w| w.trim_matches(|c| "'\";&|()<>".contains(c)).to_string())),
-        }
-    }
-    out
-}
-
-/// A word that names a file: it contains `/` and is not a generic interpreter/wrapper.
-fn is_pathlike(w: &str) -> bool {
-    const GENERIC: &[&str] = &["sh", "bash", "dash", "zsh", "env", "sudo", "nohup", "setsid", "timeout", "docker",
-        "python", "python3", "node", "perl", "exec", "systemd-run"];
-    let base = w.rsplit('/').next().unwrap_or(w);
-    w.contains('/') && !w.contains('$') && !w.contains('{') && !w.chars().any(char::is_whitespace) && !GENERIC.contains(&base)
-}
-
-/// `p` made absolute (relative to `cwd`, else the process's directory) with `.` and `..` folded lexically.
-fn lexical(p: &Path, cwd: Option<&Path>) -> PathBuf {
-    use std::path::Component;
-    let abs = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        cwd.map(Path::to_path_buf).unwrap_or_else(|| std::env::current_dir().unwrap_or_default()).join(p)
+/// `name` = a single-named regular file (not a symlink, not hard-linked), not writable by group or others.
+fn plain_file_problem(key: &str, path: &Path) -> Option<String> {
+    let m = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => return Some(format!("{key} {}: {e}", path.display())),
     };
-    let mut out = PathBuf::new();
-    for c in abs.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
+    if m.file_type().is_symlink() {
+        return Some(format!("{key} {} is a symlink: a drill only runs a file by its own name", path.display()));
+    }
+    if !m.is_file() {
+        return Some(format!("{key} {} is not a regular file", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if m.nlink() != 1 {
+            return Some(format!("{key} {} has {} names (a hard link): refused", path.display(), m.nlink()));
+        }
+        if m.mode() & 0o022 != 0 {
+            return Some(format!("{key} {} is writable by group or others: refused", path.display()));
         }
     }
-    out
+    None
 }
 
-/// What a word names on disk, if it can name a file: a path-like word (relative ones against the last `cd`), or a
-/// bare word that exists in the `cd` directory (`cd /opt/hooks && sh on-freeze.sh`).
-fn resolve_word(w: &str, cwd: Option<&Path>) -> Option<PathBuf> {
-    if w.is_empty() || w.contains('$') {
-        return None;
+/// A drill tool must be an absolute path to a native executable (ELF, or Mach-O on macOS), never a script.
+fn native_executable_problems(key: &str, path: &Path) -> Vec<String> {
+    if !path.is_absolute() {
+        return vec![format!("{key} {} is not an absolute path: a drill runs its tools by absolute path only", path.display())];
     }
-    if w.contains('/') {
-        return Some(canonical(&lexical(Path::new(w), cwd)));
+    if let Some(why) = plain_file_problem(key, path) {
+        return vec![why];
     }
-    let c = cwd?;
-    let p = c.join(w);
-    p.exists().then(|| canonical(&p))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(path).map(|m| m.permissions().mode() & 0o111 == 0).unwrap_or(true) {
+            return vec![format!("{key} {} is not executable", path.display())];
+        }
+    }
+    let mut magic = [0u8; 4];
+    let read = std::fs::File::open(path).and_then(|mut f| {
+        use std::io::Read;
+        f.read_exact(&mut magic)
+    });
+    if read.is_err() {
+        return vec![format!("{key} {}: cannot read its header", path.display())];
+    }
+    if !is_native_executable_magic(&magic) {
+        let what = if magic.starts_with(b"#!") { "a script" } else { "not a native executable" };
+        return vec![format!(
+            "{key} {} is {what}: a drill runs only native executables (ELF or Mach-O) by argument vector, never a \
+             script or shell",
+            path.display()
+        )];
+    }
+    vec![]
+}
+
+/// ELF, or Mach-O (32/64-bit, either byte order, universal).
+pub fn is_native_executable_magic(m: &[u8; 4]) -> bool {
+    m == b"\x7fELF"
+        || matches!(u32::from_be_bytes(*m), 0xfeed_face | 0xfeed_facf | 0xcefa_edfe | 0xcffa_edfe | 0xcafe_babe)
+}
+
+/// The export tools directory: absolute, a real directory (not a symlink), holding `export.sh` as a plain file.
+fn tools_dir_problems(d: &Path) -> Vec<String> {
+    if !d.is_absolute() {
+        return vec![format!("upstream.export_tools_dir {} is not an absolute path", d.display())];
+    }
+    match std::fs::symlink_metadata(d) {
+        Err(e) => return vec![format!("upstream.export_tools_dir {}: {e}", d.display())],
+        Ok(m) if m.file_type().is_symlink() => {
+            return vec![format!("upstream.export_tools_dir {} is a symlink: refused", d.display())]
+        }
+        Ok(m) if !m.is_dir() => return vec![format!("upstream.export_tools_dir {} is not a directory", d.display())],
+        _ => {}
+    }
+    plain_file_problem("export.sh in upstream.export_tools_dir", &d.join("export.sh")).into_iter().collect()
+}
+
+/// r30 round 4: the producer API a snapshot request is bound to must be ONE unambiguous endpoint: a query,
+/// fragment or userinfo could route the same normalised base to different nodes behind a proxy.
+fn producer_api_problem(url: &str) -> Option<String> {
+    match url::Url::parse(url.trim()) {
+        Err(e) => Some(format!("source.producer_api_url {url:?} is not a URL: {e}")),
+        Ok(u) if u.query().is_some() || u.fragment().is_some() || !u.username().is_empty() || u.password().is_some() => {
+            Some(format!(
+                "source.producer_api_url {url:?} carries a query, fragment or credentials: a drill binds its snapshot \
+                 request to scheme, host, port and path only, so the endpoint must be exactly that"
+            ))
+        }
+        Ok(_) => None,
+    }
 }
 
 /// `p` made absolute with symlinks resolved, also when it (or its tail) does not exist yet: the longest existing
@@ -935,6 +800,16 @@ fn run_guarded<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillO
             let _ = log.record(now, "failed", json!({"error": e}));
             unschedule_if_pending(ops, h, &mut log);
             let now = ops.now_ms();
+            // r30 round 4: a pipeline tool whose process group could not be verified gone (its record is kept)
+            // leaves the drill RUNNING (stage `stop_incomplete`), so a ceremony's ARM keeps refusing until the work is
+            // stopped (`pulse-cutover drill --cancel`). Its work files stay too (something may still write them).
+            if let Some(g) = group_not_proven_gone(cfg, h) {
+                let _ = log.publish(json!({"state": "RUNNING", "stage": "stop_incomplete",
+                    "error": crate::beacon::sanitize_short(&format!("FAILED-INCOMPLETE: process group {g} not proven gone: {e}")),
+                    "finished_ts_ms": now}));
+                return Err(format!("FAILED-INCOMPLETE: {e} (pipeline process group {g} is not proven gone; the drill stays \
+                    RUNNING until `pulse-cutover drill --cancel` stops it)"));
+            }
             let _ = log.publish(json!({"state": "FAILED", "error": crate::beacon::sanitize_short(&e), "finished_ts_ms": now}));
             if !opts.keep_work {
                 let _ = std::fs::remove_dir_all(&work);
@@ -1053,11 +928,23 @@ fn drive<O: ChainOps>(
     up.work_dir = work.to_path_buf();
     up.rehearsal_allow_compare_mismatch.clear();
     up.golden_state_root = None;
+    // r30 round 4: no shell anywhere. The export is a fixed `docker run` vector from the validated explicit fields;
+    // the tools run by argument vector; the guard allows exactly these four programs.
+    let export = upstream::DrillExport {
+        image: up.export_image.clone().ok_or("upstream.export_image is required for a drill")?,
+        tools_dir: up.export_tools_dir.clone().ok_or("upstream.export_tools_dir is required for a drill")?,
+        chain_state_db_size_mb: up.chain_state_db_size_mb.ok_or("upstream.chain_state_db_size_mb is required for a drill")?,
+    };
+    let mut programs = vec!["docker".to_string(), up.import_bin.display().to_string(), up.fingerprint_bin.display().to_string()];
+    if let Some(c) = &up.compare_bin {
+        programs.push(c.display().to_string());
+    }
+    ops.allow_programs(programs);
     let chain_id = ops.source_info()?.chain_id;
     let mut blobs: Vec<Value> = vec![];
     let conv_started = ops.now_ms();
-    let res = upstream::run_pipeline(&up, ops, &snapshot, &sha256, h, &id_h, &chain_id,
-        |v| blobs.push(v), |_| cancel.exists());
+    let res = upstream::run_pipeline_exec(&up, ops, &upstream::PipelineExec::Argv(export), &snapshot, &sha256, h,
+        &id_h, &chain_id, |v| blobs.push(v), |_| cancel.exists());
     for b in &blobs {
         log.record(ops.now_ms(), "pipeline", b.clone())?;
     }
@@ -1094,9 +981,12 @@ fn drive<O: ChainOps>(
             let arena = work.join(format!("arena-fingerprint-{h}"));
             let _ = std::fs::remove_dir_all(&arena);
             std::fs::create_dir_all(&arena).map_err(|e| format!("create {}: {e}", arena.display()))?;
-            let cmd = format!("'{}' '{}' '{}'", up.fingerprint_bin.display(), checkpoint.display(), arena.display());
+            let argv = vec![up.fingerprint_bin.display().to_string(), checkpoint.display().to_string(),
+                arena.display().to_string()];
             let t = ops.now_ms();
-            let out = ops.run_long(&cmd).map_err(|e| format!("xpr_state_fingerprint failed: {e}"))?;
+            let out = ops.run_argv_cancellable(&argv, &mut || cancel.exists())
+                .map_err(|e| format!("xpr_state_fingerprint failed: {e}"))?
+                .ok_or_else(|| CANCELLED.to_string())?;
             timings.insert("fingerprint".into(), json!(ops.now_ms().saturating_sub(t)));
             let (root, _tables) = crate::verify::parse_upstream_report(&out);
             (root, false)
@@ -1192,6 +1082,9 @@ pub fn cancel<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> 
     if !overlap.is_empty() {
         return Err(format!("cancel refused, nothing changed: {}", overlap.join("; ")));
     }
+    if let Some(why) = producer_api_problem(&cfg.source.producer_api_url) {
+        return Err(format!("cancel refused, nothing changed: {why}"));
+    }
     let read_view = || {
         std::fs::read_to_string(latest_path(cfg)).ok()
             .and_then(|t| serde_json::from_str::<Value>(&t).ok())
@@ -1238,7 +1131,7 @@ pub fn cancel<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> 
     // Success only when the pipeline group is verified gone. A failed kill, or a group still alive, is an
     // incomplete cancel: the record stays RUNNING (a ceremony's ARM keeps refusing), the group record is kept, and
     // the command fails.
-    let group_left = crate::ops::live_recorded_group(&pgid_file(cfg, h));
+    let group_left = group_not_proven_gone(cfg, h);
     if killed.is_err() || group_left.is_some() {
         log.record(ops.now_ms(), "cancel_incomplete", json!({"result": killed_s, "live_group": group_left}))?;
         return Err(format!(

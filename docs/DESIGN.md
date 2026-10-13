@@ -435,13 +435,12 @@ before a real event: rehearsals use rehearsal nodes, a drill uses each producer'
 **Shape.** A separate command, `pulse-cutover drill --config <ceremony.toml> --height H`, in its own module
 (`src/drill.rs`). It does not go through the state machine and never opens the ceremony journal for writing.
 
-1. Refuse unless the config uses the upstream backend with `compare_bin` and `snapshot.dir`, and none of its
-   conversion commands (or a small script they name) references a configured side-effect command (`hooks.*`,
-   `source.stop_cmd` / `start_cmd` / `quiesce_cmd`, `target.create_chain_cmd` / `ignite_cmd` / `stop_cmd` /
-   `post_live_probe_cmd`, flip and hyperion commands). Commands are split as the shell splits them (quotes,
-   backslashes, `; & | ( ) < >`, nested `bash -c '…'` scripts), and the scripts they name are read in turn (two
-   levels); a configured command that cannot be read unambiguously (an unterminated quote, `$(…)` or backticks, a
-   script path behind a variable) is refused. Before creating anything, refuse when any path the drill writes
+1. Refuse unless the config uses the upstream backend with `compare_bin` and `snapshot.dir`, and (round 4) the
+   drill's own structural requirements hold: `[upstream] export_image` (a plain image reference),
+   `export_tools_dir` (an absolute real directory whose `export.sh` is a plain single-named file) and
+   `chain_state_db_size_mb` are set; `import_bin`, `compare_bin` and `fingerprint_bin` are absolute paths to
+   single-named regular files that are native executables (ELF, or Mach-O on macOS), not scripts, not links, not
+   writable by group or others; and `source.producer_api_url` has no query, fragment or credentials. Before creating anything, refuse when any path the drill writes
    overlaps (after resolving symlinks) `snapshot.staged_path`, the journal, `upstream.work_dir` or `snapshot.dir`:
    the whole drill root (each drill's work files, `latest.json` and its temp file, the cancel and lock files) and
    the journal's lock file; and (round 3) refuse when any of those paths already exists as a symlink or a file with
@@ -459,10 +458,17 @@ before a real event: rehearsals use rehearsal nodes, a drill uses each producer'
    (normalised) and its height: a producer-local id means nothing on another node (round 3). No freeze, no pause, no burn-off gate: the chain
    keeps producing, and the blocks after H are recorded as information only.
 3. Wait for LIB ≥ H, pin H's block id, pick up `snapshot-<id of H>.bin`, hash it.
-4. Run `upstream::run_pipeline` unchanged (export → import → compare → fingerprint) in
-   `<journal dir>/drill/<H>/work`, with the rehearsal compare allowlist and any pinned `golden_state_root` cleared:
-   the drill reports the TRUE compare result. When the compare fails, the drill still fingerprints the checkpoint
-   (same tool and arguments as the pipeline), because comparing producers' state is half of what it measures.
+4. Run the upstream pipeline (export → import → compare → fingerprint) in `<journal dir>/drill/<H>/work` in its
+   ARGUMENT-VECTOR mode (`upstream::run_pipeline_exec` with `PipelineExec::Argv`; the ceremony's `run_pipeline` is
+   unchanged and still runs its shell strings): the export is the fixed vector `docker run --rm --network none
+   -v <export dir>:/out -v <snapshot>:/in/cut.bin:ro -v <export_tools_dir>:/xce:ro --entrypoint bash <export_image>
+   /xce/export.sh --nodeos /usr/local/bin/nodeos --xpr-core /src/leap --snapshot /in/cut.bin --work-dir /out/export
+   --chain-state-db-size-mb <n> --timeout-seconds 7200 --deferred-sidecar /out/deferred-transactions.json`
+   (`upstream::drill_export_argv`), and the three tools run by argument vector with the pipeline's arguments. No
+   shell runs anywhere, and `upstream.export_cmd` is never used by a drill. The rehearsal compare allowlist and any
+   pinned `golden_state_root` are cleared: the drill reports the TRUE compare result. When the compare fails, the
+   drill still fingerprints the checkpoint (same tool and arguments, by vector), because comparing producers' state
+   is half of what it measures.
 5. Journal every step in `<journal dir>/drill/<H>/drill.jsonl` (`kind = "readiness_drill"` on every line), publish
    `<journal dir>/drill/latest.json`, keep the compare report and checkpoint manifest, delete the multi-GB work
    files unless `--keep-work`.
@@ -475,13 +481,24 @@ ceremony may hold its own request at the same height): the guard refuses an unsc
 unschedule of any id but the drill's own. Without a recorded id nothing is removed (recorded; the operator removes
 it by hand).
 
-**What it cannot vouch for.** The guard covers every call the agent makes; it cannot sandbox shell. The
-conversion commands (`upstream.export_cmd`, `import_bin`, `compare_bin`, `fingerprint_bin`) run as configured, so
-the drill is only as harmless as those commands. The check above catches the obvious mistake (a conversion command
-or wrapper that calls a hook, a stop or a chain-creation command): by text, and (round 3) by RESOLVED path, so quoting
-(`on-'freeze'.sh`), `.`/`..` components, a `cd` followed by a relative path, and a symlink to a hook are caught too;
-a `cd` to anything but an absolute path, and a `~` path, are refused because the drill cannot know where they lead.
-It cannot prove what an arbitrary binary does. Operators must use the published conversion commands.
+**No shell, by construction (round 4).** Rounds 1–3 scanned the configured conversion commands and the wrapper
+scripts they named for references to hooks or stop/create/ignite commands; every review round found another way past
+the scan (quotes, `cd` and relative wrappers, `..` through a symlink, hard links, variables, `PATH`). The scanner is
+gone. A drill runs no configured text at all: the export is the fixed `docker run` vector above, built only from the
+validated `export_image`, `export_tools_dir` and `chain_state_db_size_mb`, and the three tools must be native
+executables run by argument vector. The guard refuses `run_long` / `run_long_cancellable` (shell) outright and lets
+`run_argv_cancellable` start only `docker` and the three validated tool paths. What remains trusted is what any
+operator trusts: the published sidecar image, the official `export.sh`, and the official tool binaries.
+
+**Process groups (round 4).** The drill's tools run in their own process group with a record written as a fresh
+inode (`O_CREAT | O_EXCL | O_NOFOLLOW`, exactly one name; an old name is unlinked first, never written through).
+A tool run ends only when `ps` positively shows its whole group gone: a group that survives the kill (self-cancel,
+timeout, or descendants still running after the tool exits), or whose state `ps` cannot report (missing, refused,
+non-zero, unparseable: "unknown" is never "stopped"), KEEPS its record and the run fails as INCOMPLETE. The drill
+then stays RUNNING (`stage = stop_incomplete`, work files kept) and `activity` reports it RUNNING whatever
+`latest.json` says while the recorded group is alive or unknown, so a ceremony's ARM keeps refusing until
+`pulse-cutover drill --cancel` has really stopped it. The ceremony's shell steps keep their behaviour, except that
+their process-group record is also written as a fresh inode (never through a symlink).
 
 **Both ways exclusive.** A fresh ceremony's ARM preflight refuses while `drill/latest.json` is RUNNING with a live
 drill process (same pid and start time) or a live pipeline process group; a RUNNING record with nothing alive is
@@ -510,7 +527,7 @@ everywhere: the journal lock, then the drill-root lock (drill, `drill --cancel`,
 every acquisition is a bounded try-lock.
 
 **Why it cannot change anything.** The drill never holds the raw `ChainOps`: every call goes through `DrillGuard`,
-which passes read-only calls, `schedule_snapshot` and the pipeline's commands, and refuses (and records) pause,
+which passes read-only calls, `schedule_snapshot` and the four validated programs by argument vector, and refuses (and records) every shell command and (and records) pause,
 resume, `create_snapshot`, ignite, hooks, orphan-hook kills, target reads and target binding. A drill that even
 tried one fails. It runs no hook, so no write freeze, flip, stop or chain creation can happen; it never reads or
 writes `snapshot.staged_path`; its pipeline uses its own work dir and its own process-group file, so a ceremony's
