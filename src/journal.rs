@@ -459,6 +459,14 @@ impl Journal {
                 out.scheduled = true;
             }
             if let Some(se) = entry.data.get("side_effect").and_then(|v| v.as_str()) {
+                // r30 round 7: a pause found after the freeze and ADOPTED for the cut (someone else paused the
+                // producer) is journaled as `side_effect: source_pause` with `adopted: true`; it is recovered as
+                // `source_pause_adopted`, never as this ceremony's own pause.
+                let se = if se == "source_pause" && entry.data.get("adopted").and_then(|v| v.as_bool()) == Some(true) {
+                    "source_pause_adopted"
+                } else {
+                    se
+                };
                 if !out.side_effects.iter().any(|x| x == se) {
                     out.side_effects.push(se.to_string());
                 }

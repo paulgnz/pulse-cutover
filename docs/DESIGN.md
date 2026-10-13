@@ -122,6 +122,10 @@ stateDiagram-v2
   `{subnet_id}` / … into the target RPC, ignite command and hooks, install the chain config,
   and only then `ignite_started`. Rehearsal-only overrides (compare allowlist, target chain_id
   change) are refused for mainnet and journaled wherever they act.
+- **Undo only what this journal did** (r30 rounds 6–7). The source pause and the write freeze are journaled before they
+  happen; a rollback resumes only a pause this journal made and reopens only writes it closed. A pause someone else
+  made after the freeze is adopted for the cut and, on any abort, held: the ceremony strands instead of resuming it or
+  reopening writes into it, until an operator releases it (`rollback --force-stranded --i-understand`).
 - **ABORTED** is reachable only before `create_chain` (upstream) or `ignite_started` is journaled. It resumes the source
   producer (producer mode, if `target.auto_rollback`), restarts the source and reverts flips
   (API mode, if they ran), runs `on_abort`, and moves the staged snapshot aside. The rollback
@@ -302,6 +306,8 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 | H does not finalize, or the scheduled file never appears | `snapshot_timeout_secs` | FROZEN | abort |
 | Snapshot not at H | exact-H check | FROZEN | abort (rehearsal flags journal and continue) |
 | Pause does not take effect; `quiesce_cmd` fails | producer API; hook | FROZEN | abort |
+| Producer found paused after this ceremony froze writes, not by this journal (an operator, a hook, a scheduler) | pause ownership check (r30 round 7) | FROZEN | adopted for the cut (journaled `adopted: true`), never re-paused or resumed; the cut continues |
+| Any abort while an adopted external pause holds | `held_external_pause` | FROZEN–VERIFIED | STRANDED (`external_pause_held`): no resume, no `on_abort`, `on_halt` pages; `rollback --force-stranded --i-understand` releases it (resume + reopen, journaled) |
 | Head keeps moving after the pause | quiescence window | FROZEN | late blocks journaled; the window waits up to `quiescence_timeout_secs` (default 120), then ABORT (before ignition: `on_abort` reopens writes) |
 | Snapshot block id ≠ chain's block id at H (fork at the cut); chain_id changed | block lookup | FROZEN | abort |
 | Any transaction in H+1…pause, or an unreadable block, or an answer that is not that block with a `transactions` array | burn-off audit (fails closed) | FROZEN | abort |

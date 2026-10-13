@@ -875,6 +875,8 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         "profile": format!("{:?}", cfg.ceremony.profile).to_lowercase(),
         // SHADOW cutover label (docs/DESIGN-shadow.md); null outside a shadow.
         "shadow": crate::shadow::label(cfg),
+        // r30 round 7: the lock directory this agent uses (every ceremony, drill and loop on the box must share it).
+        "lock_dir": {"path": crate::drill::lock_dir(cfg), "explicit": cfg.ceremony.lock_dir.is_some()},
         // Preparation telemetry only — see module docs.
         "ready": ready,
         "checks": checks,

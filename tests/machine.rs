@@ -52,6 +52,9 @@ struct MockOps {
     paused: Cell<bool>,
     /// rc.29: `pause()` answers Ok but the producer keeps producing.
     pause_ignored: Cell<bool>,
+    /// r30 round 7: while THIS producer is paused, the fleet's other producers keep producing up to this head (then
+    /// they pause too): H can finalize without this node.
+    peers_produce_to: Cell<u64>,
     /// rc.29: the paused source gains one block once the snapshot was taken (after the quiescence audit).
     move_after_snapshot: Cell<bool>,
     resumes: Cell<u32>,
@@ -221,6 +224,7 @@ impl MockOps {
             head: Cell::new(start_head),
             paused: Cell::new(false),
             pause_ignored: Cell::new(false),
+            peers_produce_to: Cell::new(0),
             move_after_snapshot: Cell::new(false),
             resumes: Cell::new(0),
             pauses: Cell::new(0),
@@ -381,6 +385,9 @@ impl ChainOps for MockOps {
             let polls = self.paused_polls.get() + 1;
             self.paused_polls.set(polls);
             if self.never_quiesce.get() {
+                self.head.set(self.head.get() + 1);
+            }
+            if self.head.get() < self.peers_produce_to.get() {
                 self.head.set(self.head.get() + 1);
             }
             if polls == 2 && self.late_block.replace(false) {
@@ -603,6 +610,11 @@ impl ChainOps for MockOps {
         }
         if cmd == "freeze-writes" {
             self.freeze_head.set(self.head.get());
+        }
+        // r30 round 7: the write freeze, after which an operator (or the hook itself) pauses the producer by hand.
+        if cmd == "freeze-writes-operator-pauses" {
+            self.freeze_head.set(self.head.get());
+            self.paused.set(true);
         }
         // Upstream-pipeline commands reference generated fake tools in the
         // test dir — execute them for real: the pipeline verifies their
@@ -2339,6 +2351,10 @@ fn rc29_a_resumed_frozen_run_keeps_the_producer_paused_once_h_is_final() {
             "data": {"snapshot_scheduled_at": 120}}),
         serde_json::json!({"seq": 2, "ts_ms": 3, "ts": "t", "kind": "transition", "state": "FROZEN",
             "data": {"chain_id": hex::encode(CHAIN_ID)}}),
+        // r30 round 7: the crashed agent's own pause is on its journal (written before the pause RPC); without it the
+        // pause would be someone else's and is adopted instead (r30r7_* tests).
+        serde_json::json!({"seq": 3, "ts_ms": 4, "ts": "t", "kind": "evidence", "state": "FROZEN",
+            "data": {"side_effect": "source_pause"}}),
     ];
     std::fs::write(&cfg.journal_path, entries.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
     // The crashed agent had paused the producer after H became final.
@@ -3945,6 +3961,7 @@ rehearsal = true
 freeze_height = 120
 quiescence_polls = 3
 import_backend = "upstream"
+lock_dir = "{d}/locks"
 {extra_ceremony}
 
 [source]
@@ -7623,4 +7640,174 @@ fn r30r6_loop_gate_fails_closed_and_takes_the_producer_lock() {
     assert!(err.contains("holds its lock"), "{err}");
     assert!(!dir.path().join("reset-ran").exists());
     drop(held);
+}
+
+/// r30 round 7: a schedule_at_h producer config with abort/halt hooks (writes reopened by `reopen-writes`).
+fn r7_sched_config(dir: &std::path::Path, on_freeze: &str) -> Config {
+    let toml_text = format!(
+        r#"
+journal_path = "{dir}/journal.jsonl"
+poll_ms = 1
+
+[ceremony]
+rehearsal = true
+freeze_height = 120
+freeze_strategy = "schedule_at_h"
+quiescence_polls = 3
+
+[source]
+rpc_url = "http://mock"
+producer_api_url = "http://mock"
+
+[snapshot]
+staged_path = "{dir}/staged.bin"
+capture_roots = "{dir}/captured-roots.txt"
+dir = "{dir}"
+
+[target]
+metalgo_unit = "mock.service"
+rpc_url = "http://mock"
+quorum_timeout_secs = 60
+
+[hooks]
+on_freeze = "{on_freeze}"
+post_ignite = "resume-traffic"
+on_live = "flip-gateway"
+on_abort = "reopen-writes"
+on_halt = "page-oncall"
+"#,
+        dir = dir.display(),
+    );
+    load_toml(dir, "r7.toml", &toml_text).unwrap()
+}
+
+fn r7_journal_has_adopted(cfg: &Config) -> bool {
+    journal_entries(cfg).iter().any(|v| v["data"]["side_effect"] == "source_pause" && v["data"]["adopted"] == true)
+}
+
+fn r7_journal_has_own_pause(cfg: &Config) -> bool {
+    journal_entries(cfg).iter().any(|v| v["data"]["side_effect"] == "source_pause" && v["data"]["adopted"] != true)
+}
+
+/// r30 round 7 (reviewer F1): an operator pausing the producer by hand right after the write freeze must not drop
+/// this producer out of the cut: the pause is adopted (journaled), never re-paused or resumed, and the cut goes LIVE.
+#[test]
+fn r30r7_an_operator_pause_after_the_freeze_is_adopted_and_the_cut_goes_live() {
+    // Fleet: the other producers finalize H while this one is paused (then pause too, at 125).
+    let dir = tempfile::tempdir().unwrap();
+    let cfg2 = r7_sched_config(dir.path(), "freeze-writes-operator-pauses");
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    ops.peers_produce_to.set(125);
+    assert_eq!(run_machine(&cfg2, &ops), State::Live);
+    assert!(r7_journal_has_adopted(&cfg2), "the external pause is journaled as adopted");
+    assert!(!r7_journal_has_own_pause(&cfg2), "never recorded as this ceremony's pause");
+    assert_eq!(ops.pauses.get(), 0, "an adopted pause is never paused again (that would make it ours)");
+    assert_eq!(ops.resumes.get(), 0, "never resumed");
+}
+
+/// r30 round 7 (Codex R7-1): the external pause is found after a crash with H already final. Ownership is decided
+/// BEFORE the H-final branch: adopted, never turned into this ceremony's pause, and the cut goes LIVE.
+#[test]
+fn r30r7_an_external_pause_with_h_already_final_is_adopted_not_converted() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r7_sched_config(dir.path(), "freeze-writes");
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    *ops.panic_on_hook.borrow_mut() = Some("freeze-writes".into());
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_machine_result(&cfg, &ops)));
+    assert!(crashed.is_err(), "agent died inside the freeze hook");
+    // Meanwhile the fleet finalized H and someone paused this producer by hand.
+    let ops2 = MockOps::new(dir.path(), 130);
+    ops2.schedule_ok.set(true);
+    ops2.paused.set(true);
+    assert_eq!(run_machine(&cfg, &ops2), State::Live);
+    assert!(r7_journal_has_adopted(&cfg));
+    assert!(!r7_journal_has_own_pause(&cfg), "the H-final path must not record the external pause as ours");
+    assert_eq!((ops2.pauses.get(), ops2.resumes.get()), (0, 0));
+}
+
+/// r30 round 7: an abort of a ceremony whose producer someone else paused seals (STRANDED, on_halt pages): no
+/// resume, no on_abort (writes are never reopened into a paused chain). A forced operator rollback then releases it:
+/// resume + reopen, journaled. Our own pause keeps round 6's behaviour (resume + reopen on abort).
+#[test]
+fn r30r7_an_abort_never_resumes_an_adopted_pause_until_the_operator_releases_it() {
+    // Operator pause, then an abort (transactions in the burn-off window).
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r7_sched_config(dir.path(), "freeze-writes");
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    *ops.panic_on_hook.borrow_mut() = Some("freeze-writes".into());
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_machine_result(&cfg, &ops)));
+    let ops2 = MockOps::new(dir.path(), 130);
+    ops2.schedule_ok.set(true);
+    ops2.paused.set(true);
+    ops2.burnoff_tx_per_block.set(1);
+    assert_eq!(run_machine(&cfg, &ops2), State::Stranded);
+    assert!(r7_journal_has_adopted(&cfg));
+    assert_eq!(ops2.resumes.get(), 0, "an adopted external pause is never resumed by an abort");
+    assert!(!ops2.hooks.borrow().iter().any(|h| h == "reopen-writes"), "writes never reopened into a paused chain");
+    assert!(ops2.hooks.borrow().iter().any(|h| h == "page-oncall"), "a human is paged");
+    let e = journal_entries(&cfg);
+    assert!(e.iter().any(|v| v["kind"] == "transition" && v["state"] == "STRANDED" && v["data"]["external_pause_held"] == true));
+
+    // A plain operator rollback refuses (nothing changed); the forced one releases it: resume + reopen, journaled.
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let err = Machine::new(&cfg, &ops2, j, rec).operator_rollback_opts(false, false).err().unwrap_or_default();
+    assert!(err.contains("paused by someone else"), "{err}");
+    assert_eq!(ops2.resumes.get(), 0);
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops2, j, rec).operator_rollback_opts(false, true).unwrap();
+    assert!(out.failed.is_empty(), "{:?}", out.failed);
+    assert_eq!(ops2.resumes.get(), 1, "the operator's forced rollback resumes the released pause");
+    assert!(ops2.hooks.borrow().iter().any(|h| h == "reopen-writes"), "and reopens writes");
+    assert!(journal_entries(&cfg).iter().any(|v| v["data"]["side_effect"] == "external_pause_release"));
+
+    // Regression (round 6): our own pause, then the same abort: resumed and writes reopened.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r7_sched_config(dir.path(), "freeze-writes");
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    ops.burnoff_tx_per_block.set(1);
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    assert!(r7_journal_has_own_pause(&cfg) && !r7_journal_has_adopted(&cfg));
+    assert_eq!(ops.resumes.get(), 1, "our own pause is resumed on abort");
+    assert!(ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "and writes reopen");
+}
+
+
+/// r30 round 7 (review F2): the default lock_dir depends on which user runs, so XPR mainnet configs must name it: a
+/// configured mainnet chain_id without one is refused at load, a discovered mainnet source refuses at ARM before anything
+/// freezes, and elsewhere the default is journaled loudly.
+#[test]
+fn r30r7_mainnet_requires_an_explicit_lock_dir_and_the_default_is_loud() {
+    // Load time: a configured mainnet chain_id.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let _ = upstream_mainnet_coordinated_config(dir.path());
+    let base = std::fs::read_to_string(dir.path().join("mainnet-coord.toml")).unwrap();
+    let with_chain = base.replacen("[ceremony]\n", &format!("[ceremony]\nchain_id = \"{MAINNET}\"\n"), 1);
+    assert!(load_toml(dir.path(), "m-ok.toml", &with_chain).is_ok(), "with lock_dir it loads");
+    let no_dir = with_chain.lines().filter(|l| !l.starts_with("lock_dir")).collect::<Vec<_>>().join("\n");
+    let err = load_toml(dir.path(), "m.toml", &no_dir).unwrap_err();
+    assert!(err.contains("must set [ceremony] lock_dir"), "{err}");
+
+    // ARM: a mainnet source discovered at runtime (chain_id not in the config).
+    let cfg = test_config(dir.path(), 120);
+    assert!(cfg.ceremony.lock_dir.is_none() && cfg.ceremony.chain_id.is_none());
+    let ops = MockOps::new(dir.path(), 110);
+    *ops.chain_id.borrow_mut() = MAINNET.into();
+    let _ = run_machine_result(&cfg, &ops);
+    let e = journal_entries(&cfg);
+    assert!(e.iter().any(|v| v.to_string().contains("must set [ceremony] lock_dir")), "refused at ARM");
+    assert!(transition(&e, "FROZEN").is_none(), "nothing froze");
+    assert_eq!((ops.pauses.get(), ops.resumes.get()), (0, 0));
+
+    // Any other chain: the default is used, journaled loudly with its path.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    assert!(journal_entries(&cfg).iter().any(|v| v["data"]["producer_lock_dir_default"].is_string()),
+        "the default lock_dir is journaled");
 }

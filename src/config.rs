@@ -13,6 +13,11 @@ use serde::Deserialize;
 /// again at ARM (when the chain_id is discovered rather than configured).
 pub const XPR_MAINNET_CHAIN_ID: &str = "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0";
 
+/// r30 round 7: why an XPR mainnet config without an explicit `[ceremony] lock_dir` is refused.
+pub const MAINNET_LOCK_DIR_REQUIRED: &str = "an XPR MAINNET config must set [ceremony] lock_dir explicitly (an absolute \
+    directory every pulse-cutover ceremony, drill and loop on this box shares, whatever user runs it): the default \
+    depends on which user runs, and two processes using different defaults would not exclude each other";
+
 /// True when `chain_id` is XPR mainnet (case-insensitive).
 pub fn is_xpr_mainnet(chain_id: &str) -> bool {
     chain_id.trim().eq_ignore_ascii_case(XPR_MAINNET_CHAIN_ID)
@@ -1079,6 +1084,14 @@ impl Config {
             return Err("freeze_strategy = \"schedule_at_h\" requires snapshot.dir (the host \
                         directory where the scheduled snapshot-<block_id>.bin lands)"
                 .into());
+        }
+        // r30 round 7 (review F2): the default lock_dir depends on which user runs (a root ceremony and a non-root
+        // drill or loop would lock different directories and stop excluding each other). XPR mainnet configs (the
+        // ceremony, its drills and loops all load a ceremony-profile config) must name it.
+        if config.ceremony.profile == Profile::Ceremony && config.ceremony.lock_dir.is_none()
+            && config.ceremony.chain_id.as_deref().is_some_and(is_xpr_mainnet)
+        {
+            return Err(MAINNET_LOCK_DIR_REQUIRED.into());
         }
         Ok(config)
     }

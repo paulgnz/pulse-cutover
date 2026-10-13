@@ -831,6 +831,9 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         println!("ceremony: production profile met");
     }
     print_drill_status(&cfg);
+    // r30 round 7: the effective lock directory (shared by every ceremony, drill and loop on this box).
+    println!("lock_dir: {} ({})", pulse_cutover::drill::lock_dir(&cfg).display(),
+        if cfg.ceremony.lock_dir.is_some() { "explicit" } else { "DEFAULT: set [ceremony] lock_dir so every user shares it" });
     if !cfg.journal_path.exists() {
         println!("no journal at {} — ceremony not started", cfg.journal_path.display());
         return Ok(());
