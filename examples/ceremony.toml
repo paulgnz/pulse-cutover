@@ -173,7 +173,13 @@ auto_rollback = true                 # on abort BEFORE ignition: resume the sour
 # [upstream]
 # work_dir = "/root/cutover-rehearsal/upstream"   # REQUIRED. export/import scratch root
 # export_cmd = "docker run --rm ... export.sh --snapshot {snapshot} --work-dir {export_dir}/work ..."   # REQUIRED
-# import_bin = "/root/pulsevm/target/release/examples/xpr_import_check"          # REQUIRED
+# export_image = "leap-sidecar@sha256:..."      # READINESS DRILL only: the Leap 5.0.3 sidecar image; a drill never
+                                                 # runs export_cmd (shell) but a fixed `docker run` argument vector
+# export_tools_dir = "/opt/xpr-chainbase-export" # READINESS DRILL only: absolute dir with the official export.sh
+                                                 # (a plain file), mounted read-only
+# chain_state_db_size_mb = 12288                 # READINESS DRILL only: export.sh --chain-state-db-size-mb
+# import_bin = "/root/pulsevm/target/release/examples/xpr_import_check"          # REQUIRED (a drill: an absolute
+                                                 # native executable, not a script or link; same for the two below)
 # fingerprint_bin = "/root/pulsevm/target/release/examples/xpr_state_fingerprint"   # REQUIRED
 # compare_bin = "/root/pulsevm/target/release/examples/xpr_19_table_compare"    # the verification gate
                                                  # (the production profile requires it)

@@ -216,6 +216,83 @@ fn step<O: ChainOps>(ops: &O, cmd: &str, during: &'static str, abort: &mut impl 
     }
 }
 
+/// How the pipeline runs its four external steps.
+///
+/// - [`PipelineExec::Shell`] (the ceremony, unchanged): `export_cmd` is the operator's shell template and the three
+///   tools run as quoted shell strings through `run_long_cancellable`.
+/// - [`PipelineExec::Argv`] (the readiness drill, r30 round 4): NOTHING runs through a shell. The export is a fixed
+///   `docker run` argument vector built from the explicit `[upstream] export_image` / `export_tools_dir` /
+///   `chain_state_db_size_mb` fields ([`drill_export_argv`]), and the tools run by argument vector
+///   (`run_argv_cancellable`), so no configured text can smuggle another command into a drill.
+#[derive(Debug, Clone)]
+pub enum PipelineExec {
+    Shell,
+    Argv(DrillExport),
+}
+
+/// The drill's export: the published Leap 5.0.3 sidecar image and the export tools directory, mounted read-only.
+#[derive(Debug, Clone)]
+pub struct DrillExport {
+    pub image: String,
+    pub tools_dir: PathBuf,
+    pub chain_state_db_size_mb: u64,
+}
+
+/// Inside the image: where the sidecar image keeps nodeos and the pinned Leap checkout (the published
+/// `leap-sidecar:5.0.3` layout export.sh's preflight checks).
+pub const DRILL_EXPORT_NODEOS: &str = "/usr/local/bin/nodeos";
+pub const DRILL_EXPORT_XPR_CORE: &str = "/src/leap";
+/// export.sh's own timeout for the export nodeos (seconds).
+pub const DRILL_EXPORT_TIMEOUT_SECS: u64 = 7200;
+
+/// The fixed `docker run` argument vector of a drill's export: no shell, no network, the snapshot and the tools
+/// mounted read-only, output only into the drill's fresh export directory. Err when a host path cannot be expressed
+/// in docker's `-v src:dst[:ro]` syntax unambiguously (a `:` or `,` in it, or a relative path).
+pub fn drill_export_argv(ex: &DrillExport, export_dir: &Path, snapshot: &Path) -> Result<Vec<String>, String> {
+    let mount = |p: &Path, what: &str| -> Result<String, String> {
+        let s = p.display().to_string();
+        if !p.is_absolute() || s.contains(':') || s.contains(',') || s.contains('\n') {
+            return Err(format!("{what} {s} cannot be mounted unambiguously (absolute, no ':' or ',')"));
+        }
+        Ok(s)
+    };
+    Ok(vec![
+        "docker".into(), "run".into(), "--rm".into(), "--network".into(), "none".into(),
+        "-v".into(), format!("{}:/out", mount(export_dir, "export dir")?),
+        "-v".into(), format!("{}:/in/cut.bin:ro", mount(snapshot, "snapshot")?),
+        "-v".into(), format!("{}:/xce:ro", mount(&ex.tools_dir, "export_tools_dir")?),
+        "--entrypoint".into(), "bash".into(),
+        ex.image.clone(),
+        "/xce/export.sh".into(),
+        "--nodeos".into(), DRILL_EXPORT_NODEOS.into(),
+        "--xpr-core".into(), DRILL_EXPORT_XPR_CORE.into(),
+        "--snapshot".into(), "/in/cut.bin".into(),
+        "--work-dir".into(), "/out/export".into(),
+        "--chain-state-db-size-mb".into(), ex.chain_state_db_size_mb.to_string(),
+        "--timeout-seconds".into(), DRILL_EXPORT_TIMEOUT_SECS.to_string(),
+        "--deferred-sidecar".into(), "/out/deferred-transactions.json".into(),
+    ])
+}
+
+/// The ceremony's quoted shell form of a tool's argument vector: byte-for-byte what the pipeline always ran
+/// (`'<bin>' '<arg>' …`).
+fn quoted(argv: &[String]) -> String {
+    argv.iter().map(|a| format!("'{a}'")).collect::<Vec<_>>().join(" ")
+}
+
+/// Run one tool step in the given mode.
+fn tool_step<O: ChainOps>(ops: &O, exec: &PipelineExec, argv: &[String], during: &'static str,
+                          abort: &mut impl FnMut(bool) -> bool) -> Result<Result<String, String>, PipelineError> {
+    match exec {
+        PipelineExec::Shell => step(ops, &quoted(argv), during, abort),
+        PipelineExec::Argv(_) => match ops.run_argv_cancellable(argv, &mut || abort(false)) {
+            Ok(Some(out)) => Ok(Ok(out)),
+            Ok(None) => Err(PipelineError::Aborted { during }),
+            Err(e) => Ok(Err(e)),
+        },
+    }
+}
+
 /// Drive the whole #61 pipeline over the cut snapshot. `progress` receives
 /// journal-ready evidence blobs between steps; `PipelineError::Failed` is a verification failure
 /// (the machine aborts with it). `abort(force)` is asked before every step (force = true) and
@@ -228,6 +305,24 @@ fn step<O: ChainOps>(ops: &O, cmd: &str, during: &'static str, abort: &mut impl 
 pub fn run_pipeline<O: ChainOps>(
     up: &Upstream,
     ops: &O,
+    snapshot: &Path,
+    snapshot_sha256: &str,
+    cut_height: u64,
+    cut_block_id: &str,
+    chain_id: &str,
+    progress: impl FnMut(Value),
+    abort: impl FnMut(bool) -> bool,
+) -> Result<UpstreamOutcome, PipelineError> {
+    run_pipeline_exec(up, ops, &PipelineExec::Shell, snapshot, snapshot_sha256, cut_height, cut_block_id, chain_id,
+        progress, abort)
+}
+
+/// [`run_pipeline`] with an explicit [`PipelineExec`]: `Shell` is the ceremony's path, `Argv` the drill's.
+#[allow(clippy::too_many_arguments)]
+pub fn run_pipeline_exec<O: ChainOps>(
+    up: &Upstream,
+    ops: &O,
+    exec: &PipelineExec,
     snapshot: &Path,
     snapshot_sha256: &str,
     cut_height: u64,
@@ -256,14 +351,26 @@ pub fn run_pipeline<O: ChainOps>(
         }
         None => {
             fresh_dir(&export_dir)?;
-            let cmd = up
-                .export_cmd
-                .replace("{snapshot}", &snapshot.display().to_string())
-                .replace("{export_dir}", &export_dir.display().to_string());
-            progress(json!({"upstream_export_cmd": cmd}));
-            let started = ops.now_ms();
-            let out = step(ops, &cmd, "export", &mut abort)?
-                .map_err(|e| format!("upstream export_cmd failed: {e}"))?;
+            let started;
+            let out = match exec {
+                PipelineExec::Shell => {
+                    let cmd = up
+                        .export_cmd
+                        .replace("{snapshot}", &snapshot.display().to_string())
+                        .replace("{export_dir}", &export_dir.display().to_string());
+                    progress(json!({"upstream_export_cmd": cmd}));
+                    started = ops.now_ms();
+                    step(ops, &cmd, "export", &mut abort)?
+                        .map_err(|e| format!("upstream export_cmd failed: {e}"))?
+                }
+                PipelineExec::Argv(ex) => {
+                    let argv = drill_export_argv(ex, &export_dir, snapshot)?;
+                    progress(json!({"upstream_export_argv": argv}));
+                    started = ops.now_ms();
+                    tool_step(ops, exec, &argv, "export", &mut abort)?
+                        .map_err(|e| format!("export (docker, fixed argument vector) failed: {e}"))?
+                }
+            };
             let log = find_file(&export_dir, "chain_state_history.log").ok_or(
                 "export_cmd succeeded but no chain_state_history.log found under the export dir",
             )?;
@@ -321,15 +428,15 @@ pub fn run_pipeline<O: ChainOps>(
     let _ = std::fs::remove_file(&checkpoint_path);
     let _ = std::fs::remove_file(manifest_json_path(&checkpoint_path));
     let started = ops.now_ms();
-    let import_cmd = format!(
-        "'{}' '{}' '{}' '{}' '{}'",
-        up.import_bin.display(),
-        ship_log.display(),
-        arena_import.display(),
-        checkpoint_path.display(),
-        sidecar.display()
-    );
-    let import_out = step(ops, &import_cmd, "import", &mut abort)?
+    let import_argv: Vec<String> = [
+        up.import_bin.display().to_string(),
+        ship_log.display().to_string(),
+        arena_import.display().to_string(),
+        checkpoint_path.display().to_string(),
+        sidecar.display().to_string(),
+    ]
+    .into();
+    let import_out = tool_step(ops, exec, &import_argv, "import", &mut abort)?
         .map_err(|e| format!("xpr_import_check failed: {e}"))?;
     let checkpoint_manifest: Value = serde_json::from_str(
         &std::fs::read_to_string(manifest_json_path(&checkpoint_path))
@@ -388,17 +495,17 @@ pub fn run_pipeline<O: ChainOps>(
             // A non-zero exit (any nodeos-vs-Arena table difference) is a
             // verification FAILURE, unless (rehearsal only) every failing table it names is on
             // the explicit allowlist.
-            let compare_cmd = format!(
-                "'{}' '{}' '{}' '{}' '{}' '{}' '{}'",
-                bin.display(),
-                ship_log.display(),
-                checkpoint_path.display(),
-                arena_cmp.display(),
-                chain_id,
-                sidecar.display(),
-                report.display()
-            );
-            let res = step(ops, &compare_cmd, "table compare", &mut abort)?;
+            let compare_argv: Vec<String> = [
+                bin.display().to_string(),
+                ship_log.display().to_string(),
+                checkpoint_path.display().to_string(),
+                arena_cmp.display().to_string(),
+                chain_id.to_string(),
+                sidecar.display().to_string(),
+                report.display().to_string(),
+            ]
+            .into();
+            let res = tool_step(ops, exec, &compare_argv, "table compare", &mut abort)?;
             let wall = ops.now_ms().saturating_sub(started);
             match res {
                 Ok(out) => {
@@ -506,13 +613,13 @@ pub fn run_pipeline<O: ChainOps>(
     // ---- 4. xpr_state_fingerprint: whole-state root (cross-node golden) ----
     let arena_fp = up.work_dir.join(format!("arena-fingerprint-{cut_height}"));
     fresh_dir(&arena_fp)?;
-    let fp_cmd = format!(
-        "'{}' '{}' '{}'",
-        up.fingerprint_bin.display(),
-        checkpoint_path.display(),
-        arena_fp.display()
-    );
-    let fp_out = step(ops, &fp_cmd, "state fingerprint", &mut abort)?
+    let fp_argv: Vec<String> = [
+        up.fingerprint_bin.display().to_string(),
+        checkpoint_path.display().to_string(),
+        arena_fp.display().to_string(),
+    ]
+    .into();
+    let fp_out = tool_step(ops, exec, &fp_argv, "state fingerprint", &mut abort)?
         .map_err(|e| format!("xpr_state_fingerprint failed: {e}"))?;
     let (state_root, fingerprint_tables) = verify::parse_upstream_report(&fp_out);
     progress(json!({

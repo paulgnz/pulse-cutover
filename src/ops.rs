@@ -151,6 +151,12 @@ pub trait ChainOps {
         }
         Ok(Some(out))
     }
+    /// Run a program by ARGUMENT VECTOR, never through a shell (the readiness drill's only way to run anything,
+    /// r30 round 4): `argv[0]` is the program, the rest its arguments, passed as they are. Same contract as
+    /// `run_long_cancellable` otherwise. Default: refused (an implementation must opt in).
+    fn run_argv_cancellable(&self, argv: &[String], _cancel: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
+        Err(format!("run_argv_cancellable is not supported here ({})", argv.first().map(String::as_str).unwrap_or("")))
+    }
     /// GET a JSON document (hyperion /v2/health, local or public).
     /// Ok(None) while unreachable / non-JSON — health gates treat that as a
     /// transient bounded by their own timeout.
@@ -220,24 +226,87 @@ fn kill_group(pid: u32) {
 #[cfg(not(unix))]
 fn kill_group(_pid: u32) {}
 
-/// Process ids currently in process group `pgid` (empty if none / cannot tell).
+/// Process ids currently in process group `pgid` (empty if none / cannot tell). The ceremony's historical view:
+/// an inspection that fails reads as "no members". Strict callers (the readiness drill) use [`group_status`].
 #[cfg(unix)]
 fn group_members(pgid: u32) -> Vec<u32> {
-    let out = match std::process::Command::new("ps").args(["-A", "-o", "pid=,pgid=,stat="]).output() {
+    match group_status(pgid) {
+        GroupStatus::Live(m) => m,
+        GroupStatus::Gone | GroupStatus::Unknown(_) => vec![],
+    }
+}
+
+/// What process inspection says about a process group (r30 round 4: "cannot tell" is not "gone").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupStatus {
+    /// `ps` listed the processes and none (except zombies) is in the group.
+    Gone,
+    /// Live members (pids).
+    Live(Vec<u32>),
+    /// `ps` is missing, refused, exited non-zero or printed nothing parseable: unknown, never "stopped".
+    Unknown(String),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: the program used as `ps` on this thread (to simulate a failing process inspection).
+    pub(crate) static PS_PROGRAM: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn ps_program() -> String {
+    #[cfg(test)]
+    if let Some(p) = PS_PROGRAM.with(|p| p.borrow().clone()) {
+        return p;
+    }
+    "ps".to_string()
+}
+
+/// [`GroupStatus`] of process group `pgid`.
+#[cfg(unix)]
+pub fn group_status(pgid: u32) -> GroupStatus {
+    let out = match std::process::Command::new(ps_program()).args(["-A", "-o", "pid=,pgid=,stat="]).output() {
         Ok(o) => o,
-        Err(_) => return vec![],
+        Err(e) => return GroupStatus::Unknown(format!("ps could not run: {e}")),
     };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            let pid: u32 = it.next()?.parse().ok()?;
-            let g: u32 = it.next()?.parse().ok()?;
-            // A zombie is already dead (only its exit status is left): it is not a survivor.
-            let zombie = it.next().is_some_and(|st| st.starts_with('Z'));
-            (g == pgid && !zombie).then_some(pid)
-        })
-        .collect()
+    if !out.status.success() {
+        return GroupStatus::Unknown(format!("ps exited {}", out.status));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut parsed = 0usize;
+    let mut members = vec![];
+    for l in text.lines() {
+        let mut it = l.split_whitespace();
+        let (Some(pid), Some(g)) = (it.next().and_then(|v| v.parse::<u32>().ok()), it.next().and_then(|v| v.parse::<u32>().ok()))
+        else {
+            continue;
+        };
+        parsed += 1;
+        // A zombie is already dead (only its exit status is left): it is not a survivor.
+        let zombie = it.next().is_some_and(|st| st.starts_with('Z'));
+        if g == pgid && !zombie {
+            members.push(pid);
+        }
+    }
+    // `ps -A` always lists at least this process: nothing parseable means the inspection failed.
+    if parsed == 0 {
+        return GroupStatus::Unknown("ps printed no process list".into());
+    }
+    if members.is_empty() { GroupStatus::Gone } else { GroupStatus::Live(members) }
+}
+#[cfg(not(unix))]
+pub fn group_status(_pgid: u32) -> GroupStatus {
+    GroupStatus::Unknown("process groups are not inspected on this platform".into())
+}
+
+/// The pgid recorded in `pgid_file` (first line), if the file holds one.
+pub fn recorded_pgid(pgid_file: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(pgid_file).ok()?;
+    text.lines().next()?.trim().parse().ok().filter(|p: &u32| *p > 1)
+}
+
+/// The strict view of a recorded group (readiness drill): None when nothing is recorded, else its status.
+pub fn recorded_group_status(pgid_file: &Path) -> Option<(u32, GroupStatus)> {
+    recorded_pgid(pgid_file).map(|g| (g, group_status(g)))
 }
 
 /// The pgid recorded in `pgid_file` if that group still has live members.
@@ -306,7 +375,21 @@ fn kill_recorded_group(pgid_file: &Path, grace: Duration, keep_on_failure: bool)
         Some(l) if l.starts_with("start=") => (Some(l.trim_start_matches("start=").trim().to_string()), rest[1..].join("\n")),
         _ => (None, rest.join("\n")),
     };
-    if group_members(pgid).is_empty() {
+    if keep_on_failure {
+        // Strict (readiness drill): "cannot tell" keeps the record and is a failure, never "already gone".
+        match group_status(pgid) {
+            GroupStatus::Gone => {
+                let _ = std::fs::remove_file(pgid_file);
+                return Ok(None);
+            }
+            GroupStatus::Unknown(why) => {
+                return Err(format!(
+                    "cannot tell whether process group {pgid} is still running ({why}): not killed, record kept"
+                ))
+            }
+            GroupStatus::Live(_) => {}
+        }
+    } else if group_members(pgid).is_empty() {
         let _ = std::fs::remove_file(pgid_file);
         return Ok(None);
     }
@@ -364,14 +447,15 @@ fn kill_recorded_group(pgid_file: &Path, grace: Duration, keep_on_failure: bool)
         how = "SIGKILL";
         std::thread::sleep(Duration::from_millis(200));
     }
-    let gone = group_members(pgid).is_empty();
+    // Strict: only a group `ps` positively lists as gone counts as stopped.
+    let gone = if keep_on_failure { group_status(pgid) == GroupStatus::Gone } else { group_members(pgid).is_empty() };
     if gone || !keep_on_failure {
         let _ = std::fs::remove_file(pgid_file);
     }
     if gone {
         Ok(Some(format!("killed orphaned hook process group {pgid} ({how}): `{cmd}`")))
     } else {
-        Err(format!("orphaned hook process group {pgid} (`{cmd}`) survived SIGKILL"))
+        Err(format!("orphaned hook process group {pgid} (`{cmd}`) survived SIGKILL (or cannot be verified gone)"))
     }
 }
 #[cfg(not(unix))]
@@ -395,14 +479,49 @@ pub fn run_shell_timeout(cmd: &str, timeout: Duration) -> Result<String, String>
     run_shell_timeout_tracked(cmd, timeout, None)
 }
 
-/// Removes the recorded hook process-group file when the hook finishes (any path out).
-struct PgidRecord(Option<PathBuf>);
+/// Removes the recorded hook process-group file when the hook finishes (any path out), unless [`PgidRecord::keep`]
+/// was called (strict runs keep the record while the group cannot be verified gone).
+struct PgidRecord(Option<PathBuf>, std::cell::Cell<bool>);
+impl PgidRecord {
+    fn keep(&self) {
+        self.1.set(true);
+    }
+}
 impl Drop for PgidRecord {
     fn drop(&mut self) {
-        if let Some(p) = &self.0 {
+        if let (Some(p), false) = (&self.0, self.1.get()) {
             let _ = std::fs::remove_file(p);
         }
     }
+}
+
+/// Write a process-group record as a NEW inode (r30 round 4): a name already at `path` (a stale record, a symlink,
+/// a hard link planted after a preflight check) is unlinked first, which never touches the file it pointed at; the
+/// record is created with O_CREAT|O_EXCL|O_NOFOLLOW and must have exactly one name.
+pub fn write_pgid_record(path: &Path, contents: &str) -> Result<(), String> {
+    use std::io::Write;
+    if std::fs::symlink_metadata(path).is_ok() {
+        std::fs::remove_file(path).map_err(|e| format!("replace {}: {e}", path.display()))?;
+    }
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = o.open(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = f.metadata().map_err(|e| format!("stat {}: {e}", path.display()))?;
+        if m.nlink() != 1 {
+            let _ = std::fs::remove_file(path);
+            return Err(format!("{} has {} names right after creation: refused", path.display(), m.nlink()));
+        }
+    }
+    f.write_all(contents.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))?;
+    f.sync_all().map_err(|e| format!("fsync {}: {e}", path.display()))
 }
 
 /// `run_shell_timeout`, additionally recording the hook's process-group id in `pgid_file` while
@@ -427,15 +546,62 @@ pub fn run_shell_cancellable(cmd: &str, timeout: Duration, pgid_file: Option<&Pa
     run_shell_inner(cmd, timeout, pgid_file, Some(cancel))
 }
 
-fn run_shell_inner(cmd: &str, timeout: Duration, pgid_file: Option<&Path>, mut cancel: Option<&mut dyn FnMut() -> bool>)
+fn run_shell_inner(cmd: &str, timeout: Duration, pgid_file: Option<&Path>, cancel: Option<&mut dyn FnMut() -> bool>)
     -> Result<Option<String>, String> {
+    let mut command = std::process::Command::new("sh");
+    command.arg("-c").arg(cmd);
+    run_command_inner(command, cmd, timeout, pgid_file, cancel, false)
+}
+
+/// Run a program by argument vector (no shell) in its own process group, STRICT (the readiness drill, r30 round 4):
+/// its record is written as a fresh inode and is only removed once `ps` positively shows the whole group gone; a
+/// group that survives the kill, or cannot be inspected, keeps its record and makes the run fail as INCOMPLETE, so
+/// the drill keeps showing as running and a ceremony keeps refusing to ARM.
+pub fn run_argv_cancellable_strict(argv: &[String], timeout: Duration, pgid_file: Option<&Path>,
+                                   cancel: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
+    let Some((prog, args)) = argv.split_first() else { return Err("empty argument vector".into()) };
+    if cancel() {
+        return Ok(None);
+    }
+    let mut command = std::process::Command::new(prog);
+    command.args(args);
+    let display = argv.iter().map(|a| format!("'{a}'")).collect::<Vec<_>>().join(" ");
+    run_command_inner(command, &display, timeout, pgid_file, Some(cancel), true)
+}
+
+/// After a strict run's group was signalled: wait briefly until `ps` shows it gone (re-sending SIGKILL), then
+/// Ok(()) or the reason it cannot be verified gone.
+#[cfg(unix)]
+fn verify_group_gone(pgid: u32) -> Result<(), String> {
+    let end = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match group_status(pgid) {
+            GroupStatus::Gone => return Ok(()),
+            GroupStatus::Live(m) if std::time::Instant::now() >= end => {
+                return Err(format!("process group {pgid} still has members {m:?} after SIGKILL"))
+            }
+            GroupStatus::Unknown(why) if std::time::Instant::now() >= end => {
+                return Err(format!("cannot verify process group {pgid} is gone: {why}"))
+            }
+            _ => {
+                kill_group(pgid);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+#[cfg(not(unix))]
+fn verify_group_gone(_pgid: u32) -> Result<(), String> {
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_command_inner(mut command: std::process::Command, cmd: &str, timeout: Duration, pgid_file: Option<&Path>,
+                     mut cancel: Option<&mut dyn FnMut() -> bool>, strict: bool) -> Result<Option<String>, String> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc;
-    let mut command = std::process::Command::new("sh");
     command
-        .arg("-c")
-        .arg(cmd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -451,15 +617,57 @@ fn run_shell_inner(cmd: &str, timeout: Duration, pgid_file: Option<&Path>, mut c
                 p.display()
             ));
         }
+        // Strict: a recorded group whose state cannot be inspected is not "gone" either.
+        if strict {
+            if let Some((g, GroupStatus::Unknown(why))) = recorded_group_status(p) {
+                return Err(format!(
+                    "refusing to start `{cmd}`: cannot tell whether process group {g} recorded in {} is still running \
+                     ({why})",
+                    p.display()
+                ));
+            }
+        }
     }
     let mut child = command.spawn().map_err(|e| format!("spawn `{cmd}`: {e}"))?;
     let pid = child.id();
-    let _record = PgidRecord(pgid_file.and_then(|p| {
-        // pgid (= the shell's pid: process_group(0)), the leader's start time (recycled-pid guard)
-        // and the command, for the operator.
+    // pgid (= the leader's pid: process_group(0)), the leader's start time (recycled-pid guard) and the command, for
+    // the operator. Written as a fresh inode, never through a link (r30 round 4).
+    let written = pgid_file.map(|p| {
         let start = process_start(pid).map(|s| format!("start={s}\n")).unwrap_or_default();
-        std::fs::write(p, format!("{pid}\n{start}{cmd}\n")).ok().map(|_| p.to_path_buf())
-    }));
+        write_pgid_record(p, &format!("{pid}\n{start}{cmd}\n")).map(|_| p.to_path_buf())
+    });
+    let record = match written {
+        None => PgidRecord(None, std::cell::Cell::new(false)),
+        Some(Ok(p)) => PgidRecord(Some(p), std::cell::Cell::new(false)),
+        Some(Err(e)) if strict => {
+            // A strict run without its record could not be found again if the agent died: stop it now.
+            kill_group(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("refusing to run `{cmd}` without its process-group record: {e}"));
+        }
+        Some(Err(_)) => PgidRecord(None, std::cell::Cell::new(false)),
+    };
+    // Strict runs end only once the whole group is verified gone; otherwise the record stays and the run fails.
+    let finish = |res: Result<Option<String>, String>| -> Result<Option<String>, String> {
+        if !strict {
+            return res;
+        }
+        #[cfg(unix)]
+        {
+            match group_status(pid) {
+                GroupStatus::Gone => return res,
+                _ => kill_group(pid),
+            }
+        }
+        match verify_group_gone(pid) {
+            Ok(()) => res,
+            Err(why) => {
+                record.keep();
+                Err(format!("INCOMPLETE: `{cmd}`: {why}; its process-group record is kept (work may still be running)"))
+            }
+        }
+    };
     // Drain pipes on threads (a chatty command can't block on a full pipe); results arrive on a
     // channel so waiting for them can be bounded instead of an unconditional join.
     let so = child.stdout.take().expect("piped");
@@ -482,7 +690,7 @@ fn run_shell_inner(cmd: &str, timeout: Duration, pgid_file: Option<&Path>, mut c
                             kill_group(pid);
                             let _ = child.kill();
                             let _ = child.wait();
-                            return Ok(None);
+                            return finish(Ok(None));
                         }
                     }
                 }
@@ -494,7 +702,7 @@ fn run_shell_inner(cmd: &str, timeout: Duration, pgid_file: Option<&Path>, mut c
         kill_group(pid);
         let _ = child.kill();
         let _ = child.wait();
-        return Err(format!("`{cmd}` timed out after {}s and was killed", timeout.as_secs()));
+        return finish(Err(format!("`{cmd}` timed out after {}s and was killed", timeout.as_secs())));
     };
     // The shell exited. Its pipes close unless a descendant still holds them.
     let deadline = std::time::Instant::now() + PIPE_GRACE;
@@ -510,11 +718,12 @@ fn run_shell_inner(cmd: &str, timeout: Duration, pgid_file: Option<&Path>, mut c
     }
     let stdout = String::from_utf8_lossy(&out.unwrap_or_default()).trim().to_string();
     let stderr = String::from_utf8_lossy(&err.unwrap_or_default()).trim().to_string();
-    if status.success() {
+    let res = if status.success() {
         Ok(Some(format!("{}{note}", if stdout.is_empty() { stderr } else { stdout })))
     } else {
         Err(format!("`{cmd}` exited {status}: {stderr} {stdout}{note}"))
-    }
+    };
+    finish(res)
 }
 
 /// Run a shell command, returning trimmed stdout (or stderr if stdout is
@@ -941,6 +1150,10 @@ impl ChainOps for HttpOps {
         run_shell_cancellable(cmd, LONG_STEP_DEADLINE, self.pgid_file.as_deref(), cancel)
     }
 
+    fn run_argv_cancellable(&self, argv: &[String], cancel: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
+        run_argv_cancellable_strict(argv, LONG_STEP_DEADLINE, self.pgid_file.as_deref(), cancel)
+    }
+
     fn get_json(&self, url: &str) -> Result<Option<Value>, String> {
         match self.agent.get(url).call() {
             Ok(r) => Ok(r.into_json::<Value>().ok()),
@@ -1099,6 +1312,81 @@ mod group_kill_tests {
         assert!(bystander.try_wait().unwrap().is_none(), "a process outside the group was NOT signalled");
         let _ = bystander.kill();
         let _ = bystander.wait();
+    }
+
+    /// R4-10: a failing process inspection is UNKNOWN, never "gone".
+    #[cfg(unix)]
+    #[test]
+    fn r4_unknown_process_inspection_is_never_gone_and_keeps_the_record() {
+        PS_PROGRAM.with(|p| *p.borrow_mut() = Some("false".into()));
+        assert!(matches!(group_status(4242), GroupStatus::Unknown(_)));
+        PS_PROGRAM.with(|p| *p.borrow_mut() = Some("/nonexistent/ps".into()));
+        assert!(matches!(group_status(4242), GroupStatus::Unknown(_)));
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("x.hook.pgid");
+        std::fs::write(&rec, "4242\nstart=x\nexport\n").unwrap();
+        let res = kill_recorded_hook_group_keep_evidence(&rec, Duration::from_millis(50));
+        PS_PROGRAM.with(|p| *p.borrow_mut() = None);
+        assert!(res.unwrap_err().contains("cannot tell"));
+        assert!(rec.exists(), "the record is kept while the group cannot be inspected");
+        // With a working ps, an absent group is Gone.
+        assert_eq!(group_status(u32::MAX - 7), GroupStatus::Gone);
+    }
+
+    /// R4-8: a strict (drill) run that is cancelled ends only once the group is verified gone; when that cannot be
+    /// verified the record is KEPT and the run fails as INCOMPLETE instead of returning a clean cancel.
+    #[cfg(unix)]
+    #[test]
+    fn r4_strict_runs_keep_their_record_unless_the_group_is_verified_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("d.hook.pgid");
+        let argv: Vec<String> = ["sh", "-c", "sleep 30"].iter().map(|s| s.to_string()).collect();
+        // Verified gone: a clean cancel, record removed.
+        let mut n = 0;
+        let r = run_argv_cancellable_strict(&argv, Duration::from_secs(60), Some(&rec), &mut || { n += 1; n > 3 });
+        assert_eq!(r.unwrap(), None);
+        assert!(!rec.exists());
+        // Cannot be verified (ps fails from the moment the run is cancelled): INCOMPLETE, record kept.
+        let mut n = 0;
+        let r = run_argv_cancellable_strict(&argv, Duration::from_secs(60), Some(&rec), &mut || {
+            n += 1;
+            if n > 3 {
+                PS_PROGRAM.with(|p| *p.borrow_mut() = Some("false".into()));
+                return true;
+            }
+            false
+        });
+        PS_PROGRAM.with(|p| *p.borrow_mut() = None);
+        let pgid = recorded_pgid(&rec);
+        if let Some(g) = pgid {
+            let _ = signal_group(g, libc::SIGKILL);
+        }
+        assert!(r.unwrap_err().contains("INCOMPLETE"));
+        assert!(pgid.is_some(), "the record is kept");
+        // The ceremony's shell runner keeps its old behaviour: a cancel returns Ok(None) and removes the record.
+        let crec = dir.path().join("c.hook.pgid");
+        let mut n = 0;
+        let r = run_shell_cancellable("sleep 30", Duration::from_secs(60), Some(&crec), &mut || { n += 1; n > 3 });
+        assert_eq!(r.unwrap(), None);
+        assert!(!crec.exists());
+    }
+
+    /// R4-9: a process-group record is written as a fresh inode, never through a link planted at its path (the
+    /// ceremony's runner and the drill's).
+    #[cfg(unix)]
+    #[test]
+    fn r4_pgid_records_never_write_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let protected = dir.path().join("journal.jsonl");
+        std::fs::write(&protected, "JOURNAL").unwrap();
+        let rec = dir.path().join("j.hook.pgid");
+        std::os::unix::fs::symlink(&protected, &rec).unwrap();
+        run_shell_timeout_tracked("true", Duration::from_secs(10), Some(&rec)).unwrap();
+        assert_eq!(std::fs::read_to_string(&protected).unwrap(), "JOURNAL");
+        std::fs::hard_link(&protected, &rec).unwrap();
+        let argv: Vec<String> = ["true"].iter().map(|s| s.to_string()).collect();
+        run_argv_cancellable_strict(&argv, Duration::from_secs(10), Some(&rec), &mut || false).unwrap();
+        assert_eq!(std::fs::read_to_string(&protected).unwrap(), "JOURNAL");
     }
 
     #[test]

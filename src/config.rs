@@ -549,6 +549,19 @@ pub struct Upstream {
     /// (export.sh's `rg` calls need the rg->grep patch on images without
     /// ripgrep — see README "Import backends".)
     pub export_cmd: String,
+    /// READINESS DRILL only (r30 round 4; the ceremony ignores it): the Leap 5.0.3 sidecar image the drill runs the
+    /// export in, ideally pinned by digest (`name@sha256:…`). A drill never runs `export_cmd` (it is shell): it runs
+    /// a fixed `docker run --rm --network none` argument vector with the snapshot, this image and
+    /// `export_tools_dir` mounted read-only (src/upstream.rs `drill_export_argv`).
+    #[serde(default)]
+    pub export_image: Option<String>,
+    /// READINESS DRILL only: the absolute directory holding the official `export.sh` (a plain file, not a link),
+    /// mounted read-only at /xce.
+    #[serde(default)]
+    pub export_tools_dir: Option<PathBuf>,
+    /// READINESS DRILL only: export.sh `--chain-state-db-size-mb` (12288 for XPR mainnet state).
+    #[serde(default)]
+    pub chain_state_db_size_mb: Option<u64>,
     /// xpr_import_check binary: `<chain_state_history.log> <arena-dir>
     /// [checkpoint]` — writes the Arena checkpoint + `.manifest.json`.
     pub import_bin: PathBuf,

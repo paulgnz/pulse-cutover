@@ -266,18 +266,21 @@ through a guard that refuses all of those. The compare result is the TRUE result
 and a pinned golden_state_root are ignored for a drill. Allowed on XPR mainnet (that is its purpose);
 rehearsal overrides in the config are still refused for mainnet at load, as always.
 
-The guard covers every call the agent makes, but it cannot sandbox shell: the drill runs the configured
-conversion commands (upstream export_cmd, import_bin, compare_bin, fingerprint_bin) as they are, and cannot vouch
-for what those commands do. Use the published conversion commands. A drill refuses when one of them (or a small
-script it names) references a hook, a source/target stop or start command, a chain-creation or ignite command,
-or a flip command.
+No shell runs in a drill (r30 round 4). It never runs upstream.export_cmd: the export is a fixed
+`docker run --rm --network none` argument vector built from [upstream] export_image, export_tools_dir (holding
+export.sh) and chain_state_db_size_mb, with the snapshot and tools mounted read-only; import_bin, compare_bin and
+fingerprint_bin must be absolute paths to native executables (ELF or Mach-O; not scripts, not links, not hard
+links, not group/other-writable) and run by argument vector. The guard refuses every shell command and every
+program but those four. A tool whose process group cannot be verified gone (it survived the kill, or `ps` cannot
+tell) keeps its process-group record and ends the drill FAILED-INCOMPLETE: it stays RUNNING until --cancel stops it.
 
-Refused when: the config is not import_backend = \"upstream\" with compare_bin and snapshot.dir; the
-ceremony journal is in progress, sealed, unfinished or LIVE, or its lock is held; another drill is running
-(the drill directory has its own lock too); any path the drill writes (the whole drill directory, latest.json,
-the journal lock) overlaps snapshot.staged_path, the journal, upstream.work_dir or snapshot.dir (symlinks
-resolved); a conversion command cannot be read unambiguously or reaches a hook, stop or chain command (also
-through a script it names); H < head + 20; a drill at H already ran. The other way round, a fresh ceremony refuses to ARM while a drill is RUNNING.
+Refused when: the config is not import_backend = \"upstream\" with compare_bin and snapshot.dir; export_image,
+export_tools_dir or chain_state_db_size_mb is missing or invalid, or a tool is not a plain native executable;
+source.producer_api_url carries a query, fragment or credentials; the ceremony journal is in progress, sealed,
+unfinished or LIVE, or its lock is held; another drill is running (the drill directory has its own lock too); any
+path the drill writes (the whole drill directory, latest.json, the journal lock) overlaps snapshot.staged_path, the
+journal, upstream.work_dir or snapshot.dir (symlinks resolved); H < head + 20; a drill at H already ran. The other
+way round, a fresh ceremony refuses to ARM while a drill is RUNNING.
 
 What it costs: CPU, RAM and disk (on XPR mainnet state the conversion took 9.6 min and 13.7 GB RAM,
 2026-10-13), and nodeos writes the snapshot at H synchronously, which on a producing node can cost blocks
