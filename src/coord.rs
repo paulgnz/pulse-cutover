@@ -150,7 +150,10 @@ pub fn mainnet_binding(cfg: &Config, chain_id: &str) -> Value {
 pub fn mainnet_binding_problem(cfg: &Config, journal_chain: Option<&str>, state: Option<crate::state::State>,
                                binding: Option<&Value>) -> Option<String> {
     let chain = journal_chain.filter(|c| crate::config::is_xpr_mainnet(c))?;
-    if cfg.is_shadow() || state.is_none() {
+    // A coordinated shadow (producer mode) is bound like a real cut: its fresh ARM journals the same record, and a
+    // roster or quorum trimmed between a crash and the resume is refused for it too. Only an uncoordinated shadow
+    // (API mode, which never has a fleet gate) has nothing to compare.
+    if state.is_none() || (cfg.is_shadow() && cfg.coordination.is_none()) {
         return None;
     }
     match binding {

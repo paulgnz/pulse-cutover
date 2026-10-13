@@ -6574,6 +6574,12 @@ fn r30_shadow_identity_is_bound_to_the_journal() {
     assert!(run_machine_result(&relabelled, &ops).unwrap_err().contains("fixed at ARM"));
     let rekeyed = shadow_config(dir.path(), |t| t.replace(&format!("[\"{SHADOW_KEY}\"]"), "[\"PUB_K1_otherkey\"]")).unwrap();
     assert!(run_machine_result(&rekeyed, &ops).unwrap_err().contains("fixed at ARM"));
+    // Round-3 F3: a coordinated shadow's signed-event binding is compared on resume like a real cut's: a quorum
+    // lowered between a crash and the resume is refused (offline, nothing changed).
+    assert_ne!(rec.state, Some(State::Armed), "the shadow got past ARM, so its binding was journaled");
+    let lowered = shadow_config(dir.path(), |t| t.replace("fleet_quorum = 2", "fleet_quorum = 1")).unwrap();
+    let err = run_machine_result(&lowered, &ops).unwrap_err();
+    assert!(err.contains("authenticated at ARM") && err.contains("quorum"), "{err}");
     assert!(pulse_cutover::shadow::journal_mismatch(&real, rec.armed_shadow.as_ref()).unwrap().contains("no longer a shadow"));
 }
 
