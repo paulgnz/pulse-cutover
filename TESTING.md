@@ -29,13 +29,21 @@ Budget about 40 minutes for a first run.
 ## Model checking the ceremony (for contributors)
 
 Besides the scenario tests, `tests/model.rs` drives the real state machine through seeded random scenarios (crashes at
-any operation, someone else pausing or resuming the producer, aborts, re-runs, plain and forced rollbacks, `unhalt`)
-and checks invariants at the moment of every action: no pause the agent made is left behind after a rollback, writes
-never reopen into a paused producer, someone else's pause is never resumed without a journaled release, nothing
-resumes the old chain past the point of no return, and the journal always replays. `r30r10_join_model_*` in
-`tests/machine.rs` does the same for `join` on the upstream backend. CI runs a few hundred scenarios; a long run:
-`MODEL_SCENARIOS=20000 cargo test --test model -- --nocapture`, `JOIN_MODEL_SCENARIOS=300 cargo test --test machine
-r30r10_join_model -- --nocapture`; replay one with `MODEL_SEED=<seed>` / `JOIN_MODEL_SEED=<seed>`.
+any operation, including right after a pause or a resume took effect; resume answers lost; someone else pausing or
+resuming the producer; aborts, re-runs, plain and forced rollbacks, `unhalt`), half of them with `schedule_at_h`, the
+mainnet freeze strategy. Invariants are checked at the moment of every action: I1 no pause the agent made is left
+behind after a rollback; I2 writes never reopen into a paused producer; I3 someone else's pause is never resumed unless
+a release was journaled after that pause began (each release authorizes one resume); I4 nothing resumes the old chain
+past the point of no return; I5 the journal always replays; I6 every step terminates and a plain re-run of a STRANDED
+journal never strands again; I7 a rollback that provably finished leaves writes open. `r30r10_join_model_*` in
+`tests/machine.rs` does the same for `join` on the upstream backend, including the join's own pause windows (the run
+asserts it reached them).
+
+CI runs 300 + 60 scenarios. Long runs: `MODEL_SCENARIOS=20000 cargo test --test model -- --nocapture`,
+`JOIN_MODEL_SCENARIOS=1000 cargo test --test machine r30r10_join_model -- --nocapture`; replay one with
+`MODEL_SEED=<seed>` / `JOIN_MODEL_SEED=<seed>`. Known-open violation classes (R10-1, R11-A, see `KNOWN_OPEN*` in
+`tests/model.rs`) are counted and printed, not failed; `MODEL_STRICT=1` fails them, and their `#[ignore]`d tests fail
+until the fix lands.
 
 ## It never touches production
 
