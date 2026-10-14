@@ -574,13 +574,16 @@ impl ChainOps for MockOps {
         self.model_op("resume");
         if self.model_on.get() {
             let j = self.model_journal_text();
-            if self.paused.get() && self.model_external_pause.get() && !self.resume_fails.get() && !self.resume_ignored.get() {
+            // I3 (round 13, run-local): every attempt to resume an EXTERNAL pause, whatever its outcome, needs a release
+            // journaled by THIS run since that pause began and not yet consumed; the attempt consumes it.
+            if self.paused.get() && self.model_external_pause.get() {
                 let now = self.model_releases();
-                if now <= self.model_release_baseline.get() {
-                    self.model_violate("I3", format!("the agent resumed an EXTERNAL pause with no release journaled since \
-                        that pause began (releases then {}, now {now})", self.model_release_baseline.get()));
+                let used = self.model_release_baseline.get();
+                if now <= used {
+                    self.model_violate("I3", format!("the agent attempted to resume an EXTERNAL pause with no unconsumed \
+                        release journaled by this run since that pause began (releases {now}, spent or stale {used})"));
                 } else {
-                    self.model_release_baseline.set(now); // consumed by this resume
+                    self.model_release_baseline.set(used + 1); // consumed by this attempt
                 }
             }
             if j.contains(r#""side_effect":"create_chain""#) || j.contains(r#""side_effect":"ignite_started""#)
@@ -8565,6 +8568,11 @@ fn join_scenario(seed: u64) -> (Vec<String>, Vec<String>) {
         let pick = if i == 0 { 0 } else { rng.below(10) };
         let label = match pick { 0..=4 => "join", 5..=6 => "rollback", 7 => "rollback --force-stranded", _ => "run" };
         ops.model_budget.set(ops.model_calls.get() + 200_000);
+        // Round 13: releases journaled by earlier runs authorize nothing in this one (I3); I7 remembers whether the
+        // rollback was already complete before this step.
+        ops.model_release_baseline.set(ops.model_releases());
+        let complete_before = Journal::replay(&cfg.journal_path)
+            .map(|r| r.state == Some(State::Aborted) && r.aborted_rollback_complete).unwrap_or(false);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<String, String> {
             let (j, rec) = Journal::open(&cfg.journal_path)?;
             let mut m = Machine::new(&cfg, &ops, j, rec);
@@ -8593,10 +8601,17 @@ fn join_scenario(seed: u64) -> (Vec<String>, Vec<String>) {
         match Journal::replay(&cfg.journal_path) {
             Err(e) => ops.model_violate("I5", format!("journal does not replay after {label}: {e}")),
             // I1: a rollback that provably finished leaves no pause of the AGENT's in place.
-            Ok(rec) => if rec.state == Some(State::Aborted) && rec.aborted_rollback_complete && ops.paused.get()
-                && !ops.model_external_pause.get() {
-                ops.model_violate("I1", format!("journal ABORTED (rolled back) after {label}, but the agent's pause is still in place"));
-            },
+            Ok(rec) => {
+                if rec.state == Some(State::Aborted) && rec.aborted_rollback_complete && ops.paused.get()
+                    && !ops.model_external_pause.get() {
+                    ops.model_violate("I1", format!("journal ABORTED (rolled back) after {label}, but the agent's pause is still in place"));
+                }
+                // I7 (round 13): a rollback completed in this step never leaves the producer paused, whoever paused it.
+                if rec.state == Some(State::Aborted) && rec.aborted_rollback_complete && !complete_before && ops.paused.get() {
+                    ops.model_violate("I7", format!("journal ABORTED with rollback_done after {label} while the producer is \
+                        still paused (external={})", ops.model_external_pause.get()));
+                }
+            }
         }
     }
     let state = Journal::replay(&cfg.journal_path).ok().and_then(|r| r.state).map(|s| s.as_str().to_string());

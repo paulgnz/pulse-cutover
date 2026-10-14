@@ -562,3 +562,23 @@ Found in the August rehearsals above. R1–R12 are in [DESIGN.md](DESIGN.md#2-ad
 | **R21** | hyperion-rs on an imported chain must index from cut + 1. `start_block = 0` asks SHiP for block 1, which the imported chain cannot serve, and the stream stays silent while `/v2/health` looks like a healthy idle chain. | The agent substitutes `{first_post_cut_block}` into `[hyperion].start_cmd`; `install.sh` ships a start script that sets `start_block`. |
 | **R22** | proton-cli ignores edits to `networks[].endpoints` in its config; only an `endpoints[]` override takes effect. A write proof meant for the rehearsal box landed on the real testnet. | Use the `endpoints` key and check with `proton chain:get` before signing. The misrouted transaction became the divergence control. |
 | **R23** | Public legacy Hyperion archives rate-limit: 429s to a 4 Hz probe (pre-flip `/v2` 93.3–93.5% vs 99.8–100% through the federator). Under 429s the federator could return HTTP 200 pages missing pre-cut rows (22 of 310 probes). | Federator hardening, after the recorded run: legacy health cached 5 s; partial answers flagged (`partial: true`, `total.relation: "gte"`, `source_errors`). A provider with its own old Elasticsearch avoids the dependency (same `LEGACY=` knob). |
+
+### Round 13: oracles matched to the rules (2026-10-15)
+
+The checker's own oracles were tightened to the code's exact rules (I3 run-local and consumed on every attempt; I7 also
+failing when a rollback completes over a paused producer in a ceremony that froze writes) and its generators widened
+(someone else un-pausing the agent's own pause, producer-API outages right after a resume, configs without `on_abort`,
+journals written by pre-round-6 agents, the operator-abort sequence). Run on the round-12 source:
+
+| Run | Scenarios | Result |
+|---|---|---|
+| main model, seeds 1–20,000 (7,138 `schedule_at_h`) | 20,000 (3,290 with a crash, 7,044 with an external pause, 845 external resumes of the agent's pause, 925 forced releases, 2,054 legacy journals, 4,073 without `on_abort`, 332 post-resume read outages) | 339 violations, all in three classes (below); no other violation |
+| join model, seeds 1–1,000 | 1,000 (934 segments, 146 join pause intents, 99 acks, 48 unacknowledged intents) | 0 violations |
+
+| Class | Seeds (of 20,000) | What happens | Owner |
+|---|---|---|---|
+| F1-A | 296 | in a config without `on_abort`, a rollback completes ABORTED over a paused producer: the producer-state confirmation only runs when a reopen hook is pending | source (round 13) |
+| R13-A | 22 | someone else un-pauses the agent's acknowledged pause and pauses again unseen; the agent later resumes that external pause as its own | source; only partly closable (the gap is invisible between two reads) |
+| R13-B | 21 | a pre-round-6 journal is stranded by this agent over someone else's pause; the legacy rule "STRANDED means the older agent paused" makes that pause look like ours and a plain rollback resumes it | source (round 13) |
+
+Each class has an `#[ignore]`d regression test in `tests/model.rs`; the default run fails on anything outside them.
