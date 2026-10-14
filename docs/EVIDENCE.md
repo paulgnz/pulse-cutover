@@ -499,6 +499,12 @@ Without them the rebuilt tool fails exactly like the official binary. So the imp
 is serialization, and live SHiP after the cut shares the same serializer. Reported upstream on #109. Not covered: a snapshot taken while a
 producer-schedule change is pending (the compare would then fail, the safe direction).
 
+**Re-run on the released v1.0.0 (same day).** Tools built from the release tag (`4a43d8bb`): `xpr_import_check`
+`3d2879cb…`, `xpr_19_table_compare` `00cdaa59…`, `xpr_state_fingerprint` `b7e59222…`; released `pulsevm` binary
+`d8ba5d97…`. Mainnet: export 164.2 s, import 198.5 s, compare 147.6 s, fingerprint 72.8 s, **total 583.1 s (9.7 min)**,
+same peak memory; **state roots identical** to the first run (mainnet `42b0a70f…`, testnet `ce806229…`) and the same
+compare failures. The pre-release and released tools produce the same state.
+
 **Proves:** the official pipeline runs on full XPR mainnet state; its duration (about 9.6 minutes on this
 hardware, roughly linear in state size: 8.2× the snapshot, 8.5× the time); the conversion's peak memory (13.7 GB
 in one process, on a host where nothing else ran). The 32 GB per node that `doctor` now asks for on mainnet is a
