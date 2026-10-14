@@ -467,7 +467,7 @@ answer is lost, a kill right after a pause or a resume takes effect, and someone
 | main model, seeds 1–20,000 (7,819 `schedule_at_h`) | 20,000 (3,379 with a crash, 6,397 with an external pause, 1,124 forced releases, 241 lost resume answers, 227 kills right after a resume) | 76 violations of class R10-1 and 1 of class R11-A (below); no other violation |
 | join model, seeds 1–1,000 | 1,000 (934 reached a join segment, 146 the join's own pause intent, 99 its ack, 48 an unacknowledged intent) | 0 violations |
 
-Open classes, both I3 (someone else's pause resumed) and both in the source, not yet fixed:
+The classes found on that run, all I3 (someone else's pause resumed) and all in the source, fixed in rounds 11 and 12:
 
 - **R10-1**: a resume that took effect but whose answer was lost, or after which the agent was killed before
   journaling it, leaves the agent's pause episode open, so a later pause by someone else is resumed as the agent's.
@@ -476,6 +476,13 @@ Open classes, both I3 (someone else's pause resumed) and both in the source, not
   a plain rollback resumes the new pause. Seed 13295.
 - A directed test reproduces Codex R10-2: production resumed for the snapshot (`pause_at_h` recovery) does not close
   the agent's pause episode, so a pause made right after it is resumed by the abort.
+
+**After the fixes (round 12, same checker, every violation fatal):**
+
+| Run | Scenarios | Result |
+|---|---|---|
+| main model, seeds 1–20,000 (7,819 `schedule_at_h`) | 20,000 (3,376 with a crash, 6,362 with an external pause, 1,239 forced releases, 220 lost resume answers, 222 kills right after a resume, 922 ownership-unknown outcomes) | **0 violations**; ended LIVE 7,790, ABORTED 8,942, STRANDED 1,647, IGNITED 984, HALTED 500, other 137 |
+| join model, seeds 1–1,000 | 1,000 (934 segments, 146 join pause intents, 99 acks, 48 unacknowledged intents) | **0 violations** |
 
 ## Mainnet conversion (2026-10-13)
 

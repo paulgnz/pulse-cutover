@@ -170,8 +170,6 @@ struct World {
     /// r30 round 11: a resume took effect without the agent learning it (answer lost, or killed right after): the
     /// precondition of class R10-1.
     r10_1_fired: Cell<bool>,
-    /// Violations classified as KNOWN-OPEN class R10-1 (an I3 after `r10_1_fired`).
-    known_open: RefCell<Vec<String>>,
 }
 
 impl World {
@@ -216,7 +214,6 @@ impl World {
             violations: RefCell::new(Vec::new()),
             trace: RefCell::new(Vec::new()),
             r10_1_fired: Cell::new(false),
-            known_open: RefCell::new(Vec::new()),
         }
     }
 
@@ -226,12 +223,9 @@ impl World {
 
     fn violate(&self, inv: &str, why: String) {
         let msg = format!("{inv}: {why}");
-        // Class R10-1 (Codex round 10), open until the source fix: an I3 after a resume took effect unbeknownst to the
-        // agent. Counted and printed on every run, not failed, unless MODEL_STRICT is set.
-        if inv == "I3" && self.r10_1_fired.get() && std::env::var("MODEL_STRICT").is_err() {
-            self.note(format!("KNOWN-OPEN R10-1 {msg}"));
-            self.known_open.borrow_mut().push(msg);
-            return;
+        // Round 12: classes R10-1, R10-2 and R11-A are fixed, so every violation fails (no known-open escape).
+        if inv == "I3" && self.r10_1_fired.get() {
+            self.note("class R10-1 shape (a resume took effect unseen)".to_string());
         }
         self.note(format!("VIOLATION {msg}"));
         self.violations.borrow_mut().push(msg);
@@ -863,32 +857,21 @@ fn quiet_panics() {
     });
 }
 
-/// Representative seeds of class R10-1 (Codex round 10) found on r30/integrate 972d37b: a resume that TOOK EFFECT
-/// but whose answer was lost, or after which the agent was killed before journaling it, leaves the agent's pause
-/// episode open; a later external pause is then resumed as ours. The runs classify every such I3 automatically
-/// (`r10_1_fired`) and print the count; `MODEL_STRICT=1` turns them back into failures. Fixed => run strict.
+/// Regression seeds of class R10-1 (Codex round 10, fixed in round 11): a resume that TOOK EFFECT but whose answer was
+/// lost, or after which the agent was killed before journaling it, used to leave the agent's pause episode open, so a
+/// later external pause was resumed as ours. Kept as a regression list (`model_known_open_seeds_all_clean`).
 const KNOWN_OPEN: &[u64] = &[287, 319, 675, 1447, 1959, 2067, 2225, 2553, 2558, 2659, 2866];
 
-/// Class R11-A (new, found by the round-11 checker on 972d37b): a STALE forced release. An operator's
-/// `rollback --force-stranded --i-understand` journals `external_pause_release` for external pause #1, but the resume
-/// RPC is refused; that party later resumes its own pause and pauses again; a plain rollback then resumes the NEW
-/// external pause as ours, because the earlier release still makes episode 1 "ours". Skipped (loudly) by the runs;
-/// `MODEL_STRICT=1` includes it. Fixed => remove from this list and un-ignore its test.
-const KNOWN_OPEN_UNCLASSIFIED: &[u64] = &[13295];
-
+/// Class R11-A (found by the round-11 checker, fixed in round 12): a STALE forced release used to authorize resuming a
+/// LATER external pause. Regression test: `model_i3_class_r11_a_stale_forced_release_seed_13295`.
 fn run_many(start: u64, count: u64) -> Vec<(u64, Vec<String>, Vec<String>)> {
     quiet_panics();
     let mut bad = Vec::new();
     let mut stats: std::collections::BTreeMap<String, u64> = Default::default();
     let mut open: Vec<u64> = Vec::new();
-    let strict = std::env::var("MODEL_STRICT").is_ok();
-    let skipped: Vec<u64> = (start..start + count).filter(|s| !strict && KNOWN_OPEN_UNCLASSIFIED.contains(s)).collect();
-    if !skipped.is_empty() {
-        eprintln!("MODEL: skipping KNOWN-OPEN class R11-A seed(s) {skipped:?} (stale forced release; MODEL_STRICT=1 runs them)");
-    }
-    for seed in (start..start + count).filter(|s| !skipped.contains(s)) {
+    for seed in start..start + count {
         let (v, t) = scenario(seed);
-        if t.iter().any(|l| l.starts_with("KNOWN-OPEN R10-1")) {
+        if t.iter().any(|l| l.starts_with("class R10-1 shape")) {
             open.push(seed);
         }
         if let Some(tags) = t.last().and_then(|l| l.strip_prefix("TAGS ")) {
@@ -902,8 +885,7 @@ fn run_many(start: u64, count: u64) -> Vec<(u64, Vec<String>, Vec<String>)> {
     }
     eprintln!("MODEL STATS over {count} scenarios: {stats:?}");
     if !open.is_empty() {
-        eprintln!("MODEL: {} scenario(s) hit KNOWN-OPEN class R10-1 (I3 after a resume that took effect unseen; \
-            MODEL_STRICT=1 fails them): first seeds {:?}", open.len(), &open[..open.len().min(20)]);
+        eprintln!("MODEL: {} scenario(s) reached the class R10-1 shape (a resume that took effect unseen)", open.len());
     }
     bad
 }
@@ -1022,7 +1004,9 @@ fn directed_r10_2(dir: &Path) -> Vec<String> {
         check_after_step(&world, "rollback");
     }
     let j = world.journal_text();
-    assert!(j.contains("resumed_production_for_snapshot"), "the scenario must reach the snapshot resume:\n{}",
+    // Round 12: the scenario must reach the snapshot resume ATTEMPT (its intent); with the external pause right after
+    // it, the outcome is ownership unknown, so there is no `resumed_production_for_snapshot` record any more.
+    assert!(j.contains("\"during\":\"resuming production for the snapshot\""), "the scenario must reach the snapshot resume:\n{}",
         world.trace.borrow().join("\n"));
     if std::env::var("MODEL_TRACE").is_ok() { eprintln!("{}", world.trace.borrow().join("\n")); }
     let v = world.violations.borrow().clone();
@@ -1035,7 +1019,6 @@ fn directed_r10_2(dir: &Path) -> Vec<String> {
 /// FAILS on r30/integrate 972d37b (I3, Codex R10-2): `resumed_production_for_snapshot` does not close the agent's
 /// pause episode, so a pause someone else makes right after it is resumed by the abort as if it were ours.
 #[test]
-#[ignore = "fails until the R10-2 fix lands: the snapshot resume must close the agent's pause episode"]
 fn directed_i3_codex_r10_2_pause_at_h_snapshot_resume() {
     let dir = tempfile::tempdir().unwrap();
     let v = directed_r10_2(dir.path());
@@ -1049,32 +1032,27 @@ fn assert_r11_seed(seed: u64) {
 }
 
 #[test]
-#[ignore = "class R10-1, open until the source fix lands (resume ownership must be relinquished before the RPC)"]
 fn model_i3_class_r10_1_lost_resume_answer_seed_319() {
     assert_r11_seed(319);
 }
 
 #[test]
-#[ignore = "class R10-1, open until the source fix lands"]
 fn model_i3_class_r10_1_crash_after_resume_seed_1959() {
     assert_r11_seed(1959);
 }
 
 #[test]
-#[ignore = "class R10-1, open until the source fix lands"]
 fn model_i3_class_r10_1_crash_after_pause_and_resume_seed_675() {
     assert_r11_seed(675);
 }
 
 #[test]
-#[ignore = "class R10-1, open until the source fix lands"]
 fn model_i3_class_r10_1_lost_resume_after_release_seed_2067() {
     assert_r11_seed(2067);
 }
 
 /// Every KNOWN_OPEN seed, in one test: un-ignore with the fix and empty KNOWN_OPEN.
 #[test]
-#[ignore = "class R10-1, open until the source fix lands"]
 fn model_known_open_seeds_all_clean() {
     for &seed in KNOWN_OPEN {
         assert_r11_seed(seed);
@@ -1083,7 +1061,6 @@ fn model_known_open_seeds_all_clean() {
 
 /// Class R11-A: a stale forced release authorizes resuming a LATER external pause. FAILS on 972d37b.
 #[test]
-#[ignore = "class R11-A, open until the source fix lands: a forced release must authorize only the resume of the pause it released"]
 fn model_i3_class_r11_a_stale_forced_release_seed_13295() {
     assert_r11_seed(13295);
 }

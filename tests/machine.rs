@@ -3938,8 +3938,16 @@ fn r6_forced_rollback_fences_on_every_attempt() {
     let out = rollback_with(&cfg, &ops, true).unwrap();
     assert!(!out.failed.is_empty(), "fixture: the resume failed: {out:?}");
     assert!(ops.events.borrow().iter().any(|e| e == "hook:stop-target"));
+    // r30 round 12: the failed resume left the producer paused, so whose pause that is is unknown (our resume may
+    // have applied and someone else paused since): the retry needs the operator's explicit release on top of the
+    // forced-after-ignite override, and the fence still runs in THIS attempt before the resume.
     let ops2 = MockOps::new(dir.path(), 200);
-    let out = rollback_with(&cfg, &ops2, true).unwrap();
+    ops2.paused.set(true);
+    let plain = rollback_with(&cfg, &ops2, true);
+    assert!(plain.as_ref().err().is_some_and(|e| e.contains("whose pause it is is unknown")), "{plain:?}");
+    assert!(!ops2.events.borrow().iter().any(|e| e == "resume"), "an unknown pause is never resumed without a release");
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops2, j, rec).operator_rollback_opts(true, true).unwrap();
     assert!(out.failed.is_empty(), "{out:?}");
     let ev = ops2.events.borrow().clone();
     let fence = ev.iter().position(|e| e == "hook:stop-target").expect("fence re-run in THIS attempt");
@@ -8761,4 +8769,43 @@ fn r30r11_the_snapshot_recovery_resume_closes_its_episode() {
 fn rollback_with_stranded(cfg: &Config, ops: &MockOps) -> Result<pulse_cutover::machine::RollbackOutcome, String> {
     let (j, rec) = open_journal(&cfg.journal_path);
     Machine::new(cfg, ops, j, rec).operator_rollback_opts(false, true)
+}
+
+/// r30 round 12 (model class R11-A, item 2): a release authorizes only the resume of the run that journaled it. A
+/// forced rollback killed right after its `external_pause_release` record (before the resume settled) leaves a stale
+/// release; the external party may since have resumed and paused again. A later PLAIN rollback must not treat that
+/// pause as ours: it refuses, resumes nothing, and a fresh forced rollback journals its own release.
+#[test]
+fn r30r12_a_stale_release_from_a_killed_forced_rollback_authorizes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r7_sched_config(dir.path(), "freeze-writes");
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    *ops.panic_on_hook.borrow_mut() = Some("freeze-writes".into());
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_machine_result(&cfg, &ops)));
+    let ops2 = MockOps::new(dir.path(), 130);
+    ops2.schedule_ok.set(true);
+    ops2.paused.set(true);
+    ops2.burnoff_tx_per_block.set(1);
+    assert_eq!(run_machine(&cfg, &ops2), State::Stranded);
+    // A forced rollback that died right after journaling its intent and the release (nothing resumed yet).
+    {
+        let (mut j, rec) = open_journal(&cfg.journal_path);
+        let st = rec.state.unwrap();
+        j.evidence(st, serde_json::json!({"rollback_requested": true, "force_after_ignite": false})).unwrap();
+        j.evidence(st, serde_json::json!({"side_effect": "external_pause_release", "episode": 1, "by": "test"})).unwrap();
+    }
+    let resumes = ops2.resumes.get();
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let plain = Machine::new(&cfg, &ops2, j, rec).operator_rollback_opts(false, false);
+    assert!(plain.as_ref().err().is_some_and(|e| e.contains("unknown")), "{plain:?}");
+    assert_eq!(ops2.resumes.get(), resumes, "a stale release resumes nothing");
+    assert!(!ops2.hooks.borrow().iter().any(|h| h == "reopen-writes"));
+    // A fresh forced rollback journals its own release and resumes.
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops2, j, rec).operator_rollback_opts(false, true).unwrap();
+    assert!(out.failed.is_empty(), "{:?}", out.failed);
+    assert_eq!(ops2.resumes.get(), resumes + 1);
+    let releases = journal_entries(&cfg).iter().filter(|v| v["data"]["side_effect"] == "external_pause_release").count();
+    assert_eq!(releases, 2, "the forced rollback journaled its own release");
 }

@@ -41,9 +41,8 @@ asserts it reached them).
 
 CI runs 300 + 60 scenarios. Long runs: `MODEL_SCENARIOS=20000 cargo test --test model -- --nocapture`,
 `JOIN_MODEL_SCENARIOS=1000 cargo test --test machine r30r10_join_model -- --nocapture`; replay one with
-`MODEL_SEED=<seed>` / `JOIN_MODEL_SEED=<seed>`. Known-open violation classes (R10-1, R11-A, see `KNOWN_OPEN*` in
-`tests/model.rs`) are counted and printed, not failed; `MODEL_STRICT=1` fails them, and their `#[ignore]`d tests fail
-until the fix lands.
+`MODEL_SEED=<seed>` / `JOIN_MODEL_SEED=<seed>`. Every violation fails the run: the classes the checker found (A, B,
+R10-1, R10-2, R11-A) are fixed and kept as regression tests in `tests/model.rs`.
 
 ## It never touches production
 

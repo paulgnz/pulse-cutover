@@ -790,10 +790,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// outcome is never journaled (a crash, a lost response a read cannot settle), recovery finds the episode closing =
     /// ownership UNKNOWN and never resumes it again: the producer may have resumed and someone else paused it since. A
     /// failed RPC is settled by a fresh (retried) read: producing = the resume happened (Ok, the caller closes the
-    /// episode); paused = it did not (`source_resume_cancelled`, the episode is ours again, Err); unreadable = unknown
-    /// (the intent stands, Err). Between a failed RPC and that read someone else could pause the producer: that pause
-    /// would be taken for ours (the same unavoidable window as the pause side), and the reopen invariant still never
-    /// sends writes into a paused chain.
+    /// episode); paused or unreadable = ownership UNKNOWN (round 12: `source_resume_outcome_unknown`, the episode stays
+    /// closing, Err). A paused read cannot tell "our resume did not apply" from "it applied and someone else paused the
+    /// producer since", so it never settles back to ours; only an operator's forced release resumes it.
     fn src_resume(&mut self, what: &str) -> Result<(), String> {
         self.shadow_mutation_gate("resuming the source producer")?;
         self.shadow_producer_gate("resuming the source producer")?;
@@ -810,10 +809,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 Ok(())
             }
             Ok(true) => {
-                self.journal.evidence(self.state, json!({"source_resume_cancelled": episode, "error": err,
-                    "note": "the resume RPC failed and the producer is still paused: this ceremony's pause stands"}))?;
-                self.push_pause_event(crate::journal::PauseEvent::ResumeCancel);
-                Err(err)
+                // r30 round 12: a paused read after a resume attempt cannot tell "our resume did not apply" from "it
+                // applied and someone else paused the producer since": ownership is UNKNOWN from here on (the episode
+                // stays closing), never settled back to ours. Only an operator's forced release resumes it.
+                self.journal.evidence(self.state, json!({"source_resume_outcome_unknown": episode, "error": err,
+                    "producer_paused": true,
+                    "note": "the resume RPC failed and the producer is paused: whether that is still this ceremony's pause \
+                             or someone else's since is unknown; this ceremony will not resume it again on its own authority"}))?;
+                Err(format!("{err} (the producer is paused: ownership of that pause is now unknown)"))
             }
             Err(re) => {
                 self.journal.evidence(self.state, json!({"source_resume_outcome_unknown": episode, "error": err,
@@ -1727,12 +1730,23 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // Round 9 (Codex R9-6): the release itself is journaled only AFTER this rollback's intent (`rollback_requested`),
         // so a crash between them always recovers a pending rollback, never a released pause with no rollback behind it.
         let mut release_pending = false;
-        if self.cfg.ceremony.mode == Mode::Producer && !self.paused_by_us && self.writes_closed_by_us
-            && self.cfg.hooks.on_abort.is_some() && !self.step_done("on_abort")
+        // r30 round 12: a pause whose ownership is UNKNOWN (an interrupted pause or resume of this ceremony, or a resume
+        // attempt followed by a paused read) is never resumed and never left in place under a "rolled back" verdict:
+        // it needs the same explicit release, whether or not writes would reopen.
+        let unknown_pause_held = self.pause_unknown;
+        if self.cfg.ceremony.mode == Mode::Producer && !self.paused_by_us
+            && (unknown_pause_held
+                || (self.writes_closed_by_us && self.cfg.hooks.on_abort.is_some() && !self.step_done("on_abort")))
             && !(self.state == State::Aborted && self.aborted_rollback_complete)
             && matches!(self.ops.producer_paused(), Ok(true))
         {
             if !force_stranded {
+                if unknown_pause_held {
+                    return Err("refusing to roll back: the source producer is paused and whose pause it is is unknown (a \
+                        pause or resume of this ceremony was interrupted, or a resume was followed by a paused read). This \
+                        ceremony never resumes it on its own authority: check the producer, then release it explicitly \
+                        with `pulse-cutover rollback --force-stranded --i-understand`. Nothing was changed.".into());
+                }
                 return Err(format!("refusing to roll back: {EXTERNAL_PAUSE_HELD}. Nothing was changed."));
             }
             release_pending = true;
@@ -1831,7 +1845,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "note": "the operator releases the external pause: this rollback resumes the producer and reopens writes \
                          only if it then produces",
                 "by": std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "unknown".into())}))?;
-            self.push_pause_event(crate::journal::PauseEvent::Release);
+            self.push_pause_event(crate::journal::PauseEvent::Release { live: true });
             self.adopted_released = true;
             notes.push("the external pause was released by the operator (journaled): the producer is resumed, and writes \
                         reopen once it produces".into());
@@ -2855,12 +2869,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 let episode = self.current_episode();
                 self.src_resume("resuming production for the snapshot")?;
                 if self.read_paused_retrying(PAUSE_READ_RETRY_MS, "confirming the resume for the snapshot")? {
-                    // The RPC answered but the producer is still paused: our pause stands (no closing record).
-                    self.journal.evidence(State::Frozen, json!({"source_resume_cancelled": episode,
-                        "error": "the resume RPC succeeded but the producer is still paused"}))?;
-                    self.push_pause_event(crate::journal::PauseEvent::ResumeCancel);
-                    return Err("resuming production for the snapshot did not take effect: the producer is still paused \
-                                (re-run to retry)".into());
+                    // r30 round 12 (model R10-2): the RPC answered but the producer is paused. That is either our resume
+                    // not applying or someone else pausing right after it; ownership is unknown (the episode stays
+                    // closing). A re-run adopts the pause for the cut; a rollback never resumes it on its own authority.
+                    self.journal.evidence(State::Frozen, json!({"source_resume_outcome_unknown": episode,
+                        "producer_paused": true,
+                        "error": "the resume RPC succeeded but the producer is paused"}))?;
+                    return Err("resuming production for the snapshot: the producer is still paused after the resume, and \
+                                whose pause that is is now unknown (a re-run adopts it for the cut and never resumes it)".into());
                 }
                 self.journal.evidence(
                     State::Frozen,

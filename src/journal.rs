@@ -180,16 +180,16 @@ pub enum PauseEvent {
     /// episode.
     Resume,
     /// The operator's journaled release of an external pause (`rollback --force-stranded --i-understand`).
-    Release,
+    /// r30 round 12 (model class R11-A): a release authorizes ONE resume, by the run that journaled it (`live`). A
+    /// release recovered from the journal (`live: false`, a forced rollback that died or whose resume did not settle)
+    /// authorizes nothing: the episode it named is ownership unknown, and a later forced rollback journals its own.
+    Release { live: bool },
     /// r30 round 11 (Codex R10-1): this ceremony is ABOUT to resume its own pause (`side_effect: source_resume`, written
     /// before the resume RPC). It gives up ownership at once: the episode is CLOSING. If the resume's outcome is never
     /// journaled (a crash, or a lost response that a read could not settle), the episode stays closing = ownership
     /// unknown, never resumed again on this ceremony's own authority (the producer may have resumed and someone else
     /// paused it since).
     ResumeIntent,
-    /// r30 round 11: the resume RPC failed and a fresh read showed the producer still paused (`source_resume_cancelled`):
-    /// the resume did not happen, the closing episode is ours again.
-    ResumeCancel,
 }
 
 /// r30 round 9/10: the folded pause-episode log.
@@ -243,21 +243,17 @@ pub fn pause_episodes(events: &[PauseEvent], legacy_paused: bool, acks_tracked: 
                     ep.1 = false;
                 }
             }
-            PauseEvent::Release => match eps.iter_mut().rev().find(|(_, open)| *open) {
-                Some(ep) => ep.0 = Owner::Ours,
-                None => eps.push((Owner::Ours, true)),
-            },
+            PauseEvent::Release { live } => {
+                let owner = if *live { Owner::Ours } else { Owner::Unknown };
+                match eps.iter_mut().rev().find(|(_, open)| *open) {
+                    Some(ep) => ep.0 = owner,
+                    None => eps.push((owner, true)),
+                }
+            }
             PauseEvent::ResumeIntent => {
                 if let Some(ep) = eps.iter_mut().rev().find(|(_, open)| *open) {
                     if ep.0 == Owner::Ours {
                         ep.0 = Owner::Closing;
-                    }
-                }
-            }
-            PauseEvent::ResumeCancel => {
-                if let Some(ep) = eps.iter_mut().rev().find(|(_, open)| *open) {
-                    if ep.0 == Owner::Closing {
-                        ep.0 = Owner::Ours;
                     }
                 }
             }
@@ -612,10 +608,9 @@ impl Journal {
             if entry.data.get("source_pause_ack").is_some() {
                 out.pause_events.push(PauseEvent::Ack);
             }
-            // r30 round 11: a resume that was started and then found not to have happened.
-            if entry.data.get("source_resume_cancelled").is_some() {
-                out.pause_events.push(PauseEvent::ResumeCancel);
-            }
+            // r30 round 12: a resume attempt followed by a paused (or unreadable) read is never settled back to "ours"
+            // (`source_resume_outcome_unknown`): the episode stays closing = ownership unknown. A round-11
+            // `source_resume_cancelled` record is read the same way.
             // r30 round 11 (Codex R10-2): the pause_at_h recovery resume closes its episode like a rollback's resume.
             if entry.data.get("resumed_production_for_snapshot").and_then(|v| v.as_bool()) == Some(true) {
                 out.pause_events.push(PauseEvent::Resume);
@@ -625,7 +620,7 @@ impl Journal {
                     "source_pause" => out.pause_events.push(PauseEvent::Pause {
                         ours: entry.data.get("adopted").and_then(|v| v.as_bool()) != Some(true),
                     }),
-                    "external_pause_release" => out.pause_events.push(PauseEvent::Release),
+                    "external_pause_release" => out.pause_events.push(PauseEvent::Release { live: false }),
                     "source_resume" => out.pause_events.push(PauseEvent::ResumeIntent),
                     "write_freeze" => out.writes_closed = true,
                     _ => {}
