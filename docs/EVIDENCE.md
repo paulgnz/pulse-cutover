@@ -455,6 +455,28 @@ episodes in round 9, the pause acknowledgement in round 10) and kept as regressi
 nodeos, metalgo or network behaviour; scenarios the generator does not produce (API and hyperion modes, shadow, the
 drill, mainnet `lock_dir`).
 
+### Round 11: the checker's reach widened (2026-10-15)
+
+A review of the checker itself found it weaker than its claims: I3 accepted any `external_pause_release` anywhere in
+the journal, the join model could not reach the join's own pause, I6 and I7 were not asserted, and no scenario used
+`schedule_at_h`. All four were fixed in the tests, and new faults were added: a resume that takes effect while its
+answer is lost, a kill right after a pause or a resume takes effect, and someone else pausing right after a resume.
+
+| Run | Scenarios | Result |
+|---|---|---|
+| main model, seeds 1–20,000 (7,819 `schedule_at_h`) | 20,000 (3,379 with a crash, 6,397 with an external pause, 1,124 forced releases, 241 lost resume answers, 227 kills right after a resume) | 76 violations of class R10-1 and 1 of class R11-A (below); no other violation |
+| join model, seeds 1–1,000 | 1,000 (934 reached a join segment, 146 the join's own pause intent, 99 its ack, 48 an unacknowledged intent) | 0 violations |
+
+Open classes, both I3 (someone else's pause resumed) and both in the source, not yet fixed:
+
+- **R10-1**: a resume that took effect but whose answer was lost, or after which the agent was killed before
+  journaling it, leaves the agent's pause episode open, so a later pause by someone else is resumed as the agent's.
+  Representative seeds 319, 675, 1959, 2067.
+- **R11-A**: a forced release whose resume was refused stays in force; after that party resumes and later pauses again,
+  a plain rollback resumes the new pause. Seed 13295.
+- A directed test reproduces Codex R10-2: production resumed for the snapshot (`pause_at_h` recovery) does not close
+  the agent's pause episode, so a pause made right after it is resumed by the abort.
+
 ## Mainnet conversion (2026-10-13)
 
 The upstream conversion pipeline, run once per stage exactly as the agent's upstream backend invokes it

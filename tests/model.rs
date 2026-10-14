@@ -8,10 +8,17 @@
 //!
 //! - I1 no pause the AGENT made is left in place once the journal ends ABORTED (rolled back);
 //! - I2 writes are never reopened on the old chain while its producer is paused;
-//! - I3 an EXTERNAL pause is never resumed except after a journaled explicit release (`external_pause_release`);
+//! - I3 an EXTERNAL pause is never resumed except after a journaled explicit release (`external_pause_release`)
+//!   written AFTER that pause began, and each release authorizes one resume (per pause episode, round 11);
 //! - I4 the source is never resumed after this journal's chain-creation / ignition intent;
 //! - I5 the journal always replays;
-//! - I6 every step terminates (no loop) and STRANDED is never re-entered without new cause on a plain re-run.
+//! - I6 every step terminates (no loop), and a plain re-run of a STRANDED journal with nothing changed in the world
+//!   never appends another STRANDED transition (no strand loop);
+//! - I7 a journal that ends ABORTED with its rollback provably done (`rollback_done`) leaves the old chain's writes
+//!   open (or never froze them): a rollback that cannot reopen writes must end STRANDED (sealed, paged) instead.
+//!
+//! About half the scenarios use `schedule_at_h` (the mainnet freeze strategy: the snapshot is scheduled at ARM and
+//! the world's scheduler writes `snapshot-<id of H>.bin` once H is final), the rest the `pause_at_h` fallback.
 //!
 //! Crashes are injected faithfully: the world panics on the N-th operation the agent performs, so everything the
 //! agent journaled (fsynced) before that call survives and nothing after it happened. Then the scenario continues
@@ -130,14 +137,41 @@ struct World {
     resume_fails: Cell<u32>,
     /// The next N resume() calls answer Ok but the producer stays paused (a stuck node).
     resume_ignored: Cell<u32>,
+    /// r30 round 11 (Codex R10-1): the next N resume() calls TAKE EFFECT but the answer is lost (an error to the agent).
+    resume_lost: Cell<u32>,
+    /// r30 round 11 (Codex R10-1): the next resume() takes effect, then the agent is killed before it hears back.
+    crash_after_resume: Cell<bool>,
+    /// r30 round 11: the next pause() takes effect, then the agent is killed (before its ack / next record).
+    crash_after_pause: Cell<bool>,
+    /// r30 round 11: the agent is killed on its first source poll while its own pause holds (after the pause ack).
+    crash_on_poll_while_paused: Cell<bool>,
+    /// r30 round 11: right after any agent resume, someone else pauses the producer on the next source poll.
+    ext_pause_after_resume: Cell<bool>,
+    ext_pause_armed: Cell<bool>,
+    /// r30 round 11: someone else pauses the producer the instant an agent resume returns (no poll in between).
+    ext_pause_right_after_resume: Cell<bool>,
     /// The new chain never produces past the cut (LIVE gate fails → HALT).
     target_stuck: Cell<bool>,
+    /// r30 round 11: `schedule_at_h` scenarios. The scheduler accepts `schedule_snapshot(H)` and writes
+    /// `snapshot-<id of H>.bin` into `snap_dir` once LIB >= H (like nodeos), never earlier.
+    scheduler: Cell<bool>,
+    scheduled_h: Cell<u64>,
+    snap_dir: PathBuf,
+    /// r30 round 11 (I3 per pause episode): the number of `external_pause_release` records the journal held when the
+    /// current EXTERNAL pause began (or when the last release was consumed by a resume). Resuming that pause is legal
+    /// only once the journal holds a NEWER release, and each release authorizes one resume.
+    release_baseline: Cell<usize>,
     /// Signed coordinator abort is served from this tick on (0 = never; coordinated configs only).
     coord_abort_tick: Cell<u64>,
     now: Cell<u64>,
     // --- observations ---
     violations: RefCell<Vec<String>>,
     trace: RefCell<Vec<String>>,
+    /// r30 round 11: a resume took effect without the agent learning it (answer lost, or killed right after): the
+    /// precondition of class R10-1.
+    r10_1_fired: Cell<bool>,
+    /// Violations classified as KNOWN-OPEN class R10-1 (an I3 after `r10_1_fired`).
+    known_open: RefCell<Vec<String>>,
 }
 
 impl World {
@@ -163,6 +197,17 @@ impl World {
             paused_read_fails: Cell::new(0),
             burnoff_tx: Cell::new(0),
             target_stuck: Cell::new(false),
+            crash_after_pause: Cell::new(false),
+            crash_on_poll_while_paused: Cell::new(false),
+            ext_pause_after_resume: Cell::new(false),
+            ext_pause_armed: Cell::new(false),
+            ext_pause_right_after_resume: Cell::new(false),
+            resume_lost: Cell::new(0),
+            crash_after_resume: Cell::new(false),
+            scheduler: Cell::new(false),
+            scheduled_h: Cell::new(0),
+            snap_dir: dir.join("snapshots"),
+            release_baseline: Cell::new(0),
             reopen_fails: Cell::new(0),
             resume_fails: Cell::new(0),
             resume_ignored: Cell::new(0),
@@ -170,6 +215,8 @@ impl World {
             now: Cell::new(1_000_000),
             violations: RefCell::new(Vec::new()),
             trace: RefCell::new(Vec::new()),
+            r10_1_fired: Cell::new(false),
+            known_open: RefCell::new(Vec::new()),
         }
     }
 
@@ -179,12 +226,23 @@ impl World {
 
     fn violate(&self, inv: &str, why: String) {
         let msg = format!("{inv}: {why}");
+        // Class R10-1 (Codex round 10), open until the source fix: an I3 after a resume took effect unbeknownst to the
+        // agent. Counted and printed on every run, not failed, unless MODEL_STRICT is set.
+        if inv == "I3" && self.r10_1_fired.get() && std::env::var("MODEL_STRICT").is_err() {
+            self.note(format!("KNOWN-OPEN R10-1 {msg}"));
+            self.known_open.borrow_mut().push(msg);
+            return;
+        }
         self.note(format!("VIOLATION {msg}"));
         self.violations.borrow_mut().push(msg);
     }
 
     fn journal_text(&self) -> String {
         std::fs::read_to_string(&self.journal).unwrap_or_default()
+    }
+
+    fn releases(&self) -> usize {
+        self.journal_text().matches("\"side_effect\":\"external_pause_release\"").count()
     }
 
     /// Every agent operation passes through here: the crash point and the progress budget.
@@ -206,6 +264,7 @@ impl World {
         if !self.paused.get() {
             self.paused.set(true);
             self.owner.set(Some(Owner::External));
+            self.release_baseline.set(self.releases());
             self.note(format!("external pause at head {}", self.head.get()));
         }
     }
@@ -215,6 +274,21 @@ impl World {
             self.paused.set(false);
             self.owner.set(None);
             self.note(format!("external resume at head {}", self.head.get()));
+        }
+    }
+
+    /// The scheduler writes the snapshot of H once H is final (LIB = head - 1 in this model).
+    fn scheduler_tick(&self) {
+        let h = self.scheduled_h.get();
+        if h == 0 || self.head.get().saturating_sub(1) < h {
+            return;
+        }
+        let file = self.snap_dir.join(format!("snapshot-{}.bin", self.block_id(h)));
+        if !file.exists() {
+            let _ = std::fs::create_dir_all(&self.snap_dir);
+            let _ = std::fs::write(&file, mini(h as u32).build());
+            self.target_head.set(h);
+            self.note(format!("scheduler wrote the snapshot of H={h} (head {})", self.head.get()));
         }
     }
 
@@ -248,6 +322,11 @@ fn mock_event() -> serde_json::Value {
 impl ChainOps for World {
     fn source_info(&self) -> Result<ChainInfo, String> {
         self.op("source_info");
+        if self.crash_on_poll_while_paused.get() && self.agent_paused.get() {
+            self.crash_on_poll_while_paused.set(false);
+            self.note("crash on a source poll while the agent's pause holds");
+            panic!("{CRASH}");
+        }
         let t = self.ticks.get() + 1;
         self.ticks.set(t);
         if self.ext_pause_tick.get() == t {
@@ -256,9 +335,14 @@ impl ChainOps for World {
         if self.ext_resume_tick.get() == t {
             self.external_resume();
         }
+        if self.ext_pause_armed.get() {
+            self.ext_pause_armed.set(false);
+            self.external_pause();
+        }
         if !self.agent_paused.get() {
             self.head.set(self.head.get() + 1);
         }
+        self.scheduler_tick();
         Ok(self.info(self.head.get()))
     }
 
@@ -291,14 +375,26 @@ impl ChainOps for World {
         } else {
             self.note(format!("agent pause on an already paused producer (owner {:?})", self.owner.get()));
         }
+        if self.crash_after_pause.get() {
+            self.crash_after_pause.set(false);
+            self.note("crash right after the pause took effect");
+            panic!("{CRASH}");
+        }
         Ok(())
     }
 
     fn resume(&self) -> Result<(), String> {
         self.op("resume");
         let j = self.journal_text();
-        if self.paused.get() && self.owner.get() == Some(Owner::External) && !j.contains("external_pause_release") {
-            self.violate("I3", format!("agent resumed an EXTERNAL pause with no journaled release (head {})", self.head.get()));
+        if self.paused.get() && self.owner.get() == Some(Owner::External) && self.resume_fails.get() == 0
+            && self.resume_ignored.get() == 0 {
+            let now = self.releases();
+            if now <= self.release_baseline.get() {
+                self.violate("I3", format!("agent resumed an EXTERNAL pause with no release journaled since that pause began \
+                    (releases then {}, now {now}; head {})", self.release_baseline.get(), self.head.get()));
+            } else {
+                self.release_baseline.set(now); // that release is consumed by this resume
+            }
         }
         if j.contains("\"ignite_started\"") || j.contains("\"side_effect\":\"create_chain\"") {
             self.violate("I4", "agent resumed the source after this journal's ignition / creation intent".into());
@@ -319,6 +415,24 @@ impl ChainOps for World {
         self.paused.set(false);
         self.owner.set(None);
         self.agent_paused.set(false);
+        if self.ext_pause_after_resume.get() {
+            self.ext_pause_armed.set(true);
+        }
+        if self.ext_pause_right_after_resume.replace(false) {
+            self.external_pause();
+        }
+        if self.crash_after_resume.get() {
+            self.crash_after_resume.set(false);
+            self.r10_1_fired.set(true);
+            self.note("crash right after the resume took effect (the agent never hears back)");
+            panic!("{CRASH}");
+        }
+        if self.resume_lost.get() > 0 {
+            self.resume_lost.set(self.resume_lost.get() - 1);
+            self.r10_1_fired.set(true);
+            self.note("resume took effect but the answer was lost");
+            return Err("producer API: connection reset after the request was sent (model)".into());
+        }
         Ok(())
     }
 
@@ -335,9 +449,14 @@ impl ChainOps for World {
         Ok(SnapshotResult { snapshot_name: path.display().to_string(), head_block_num: cut, head_block_id: self.block_id(cut) })
     }
 
-    fn schedule_snapshot(&self, _height: u64) -> Result<(), String> {
+    fn schedule_snapshot(&self, height: u64) -> Result<(), String> {
         self.op("schedule_snapshot");
-        Err("snapshot scheduler unavailable (model: pause_at_h)".into())
+        if !self.scheduler.get() {
+            return Err("snapshot scheduler unavailable (model: pause_at_h)".into());
+        }
+        self.scheduled_h.set(height);
+        self.note(format!("snapshot scheduled at H={height}"));
+        Ok(())
     }
 
     fn target_info(&self) -> Result<Option<ChainInfo>, String> {
@@ -425,6 +544,10 @@ impl ChainOps for World {
 // ---------------------------------------------------------------- config --
 
 fn model_config(dir: &Path, coordinated: bool, fail_freeze: bool) -> Config {
+    model_config_with(dir, coordinated, fail_freeze, false)
+}
+
+fn model_config_with(dir: &Path, coordinated: bool, fail_freeze: bool, scheduled: bool) -> Config {
     let mut text = format!(
         r#"
 journal_path = "{d}/journal.jsonl"
@@ -433,6 +556,7 @@ poll_ms = 1
 [ceremony]
 rehearsal = true
 freeze_height = {H}
+{strategy}
 quiescence_polls = 3
 quiescence_timeout_secs = 5
 
@@ -444,7 +568,7 @@ snapshot_timeout_secs = 20
 [snapshot]
 staged_path = "{d}/staged.bin"
 capture_roots = "{d}/captured-roots.txt"
-
+{snapdir}
 [target]
 metalgo_unit = "mock.service"
 rpc_url = "http://mock"
@@ -460,7 +584,12 @@ on_halt = "page"
 "#,
         d = dir.display(),
         freeze = if fail_freeze { "fail-freeze" } else { "freeze-writes" },
+        strategy = if scheduled { "freeze_strategy = \"schedule_at_h\"" } else { "" },
+        snapdir = if scheduled { format!("dir = \"{}/snapshots\"\n", dir.display()) } else { String::new() },
     );
+    if scheduled {
+        std::fs::create_dir_all(dir.join("snapshots")).unwrap();
+    }
     if coordinated {
         use ed25519_dalek::SigningKey;
         let key = hex::encode(SigningKey::from_bytes(&[42u8; 32]).verifying_key().to_bytes());
@@ -533,6 +662,10 @@ fn step_unhalt(cfg_path: &Path) -> Result<String, String> {
     if out.status.success() { Ok("unhalted".into()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
 }
 
+fn strand_transitions(world: &World) -> usize {
+    world.journal_text().lines().filter(|l| l.contains("\"kind\":\"transition\"") && l.contains("\"state\":\"STRANDED\"")).count()
+}
+
 fn journal_state(world: &World) -> Result<Option<State>, String> {
     Journal::replay(&world.journal).map(|r| r.state)
 }
@@ -546,19 +679,35 @@ fn check_after_step(world: &World, label: &str) {
                 && world.paused.get() && world.owner.get() == Some(Owner::Agent) {
                 world.violate("I1", format!("journal ABORTED (rolled back) after {label}, but the AGENT's pause is still in place"));
             }
+            // I7: a rollback that provably finished leaves the old chain writable (unless it never froze writes).
+            let complete = Journal::replay(&world.journal).map(|r| r.aborted_rollback_complete).unwrap_or(false);
+            if state == Some(State::Aborted) && complete && !world.writes_open.get() && !world.edge_new.get() {
+                world.violate("I7", format!("journal ABORTED with rollback_done after {label}, but the old chain's writes are \
+                    still frozen (a rollback that cannot reopen writes must strand and page)"));
+            }
         }
     }
 }
 
 /// One seeded scenario. Returns the violations (empty = clean).
 fn scenario(seed: u64) -> (Vec<String>, Vec<String>) {
+    scenario_with(seed, true)
+}
+
+/// `r11 = false` replays the round-10 generator exactly (the class A/B regression seeds were found with it): every
+/// round-11 addition (schedule_at_h, lost/crashed resumes, crashes after a pause, pauses right after a resume) draws
+/// from a second, independent PRNG, so the original draw sequence is unchanged.
+fn scenario_with(seed: u64, r11: bool) -> (Vec<String>, Vec<String>) {
     let mut rng = Rng::new(seed);
+    let mut rng2 = Rng::new(seed ^ 0x5EED_0011_D00D_F00D);
     let dir = tempfile::tempdir().unwrap();
     let coordinated = rng.chance(40);
     let fail_freeze = rng.chance(8);
-    let cfg = model_config(dir.path(), coordinated, fail_freeze);
+    let scheduled = r11 && rng2.chance(50);
+    let cfg = model_config_with(dir.path(), coordinated, fail_freeze, scheduled);
     let world = World::new(dir.path());
-    world.note(format!("seed {seed}: coordinated={coordinated} fail_freeze={fail_freeze}"));
+    world.scheduler.set(scheduled);
+    world.note(format!("seed {seed}: coordinated={coordinated} fail_freeze={fail_freeze} scheduled={scheduled}"));
 
     // Faults.
     if rng.chance(45) {
@@ -585,6 +734,23 @@ fn scenario(seed: u64) -> (Vec<String>, Vec<String>) {
     if rng.chance(10) {
         world.resume_ignored.set(1);
     }
+    if r11 {
+        if rng2.chance(10) {
+            world.resume_lost.set(1);
+        }
+        if rng2.chance(8) {
+            world.crash_after_resume.set(true);
+        }
+        if rng2.chance(10) {
+            world.crash_after_pause.set(true);
+        }
+        if rng2.chance(10) {
+            world.ext_pause_after_resume.set(true);
+        }
+        if rng2.chance(5) {
+            world.ext_pause_right_after_resume.set(true);
+        }
+    }
     if coordinated && rng.chance(35) {
         world.coord_abort_tick.set(1 + rng.below(40));
     }
@@ -595,6 +761,8 @@ fn scenario(seed: u64) -> (Vec<String>, Vec<String>) {
         world.ext_pause_tick.get(), world.ext_resume_tick.get(), world.paused_read_fails.get(), world.burnoff_tx.get(),
         world.target_stuck.get(), world.coord_abort_tick.get(), world.crash_at.get(), world.reopen_fails.get(),
         world.resume_fails.get(), world.resume_ignored.get()));
+    world.note(format!("faults(r11): resume_lost={} crash_after_resume={} crash_after_pause={} ext_pause_after_resume={}",
+        world.resume_lost.get(), world.crash_after_resume.get(), world.crash_after_pause.get(), world.ext_pause_after_resume.get()));
 
     // Step 1: the ceremony runs (maybe crashing).
     let first = step_run(&cfg, &world);
@@ -626,6 +794,9 @@ fn scenario(seed: u64) -> (Vec<String>, Vec<String>) {
             world.crash_at.set(world.calls.get() + 1 + rng.below(120));
         }
         let pick = rng.below(10);
+        let stranded_before = state == Some(State::Stranded);
+        let strands_before = strand_transitions(&world);
+        let world_before = (world.paused.get(), world.owner.get(), world.writes_open.get());
         let (label, res) = match (state, pick) {
             (Some(State::Halted), 0..=4) => {
                 let r = step_unhalt(&dir.path().join("ceremony.toml"));
@@ -646,16 +817,28 @@ fn scenario(seed: u64) -> (Vec<String>, Vec<String>) {
         }
         if label == "run" && journal_state(&world).ok().flatten() == Some(State::Stranded) {
             strand_runs += 1;
+            // I6 (strand loop): a plain re-run of a STRANDED journal, with nothing changed in the world since the step
+            // began and no crash in it, stays sealed without writing another STRANDED transition.
+            let unchanged = world_before == (world.paused.get(), world.owner.get(), world.writes_open.get());
+            if stranded_before && unchanged && !matches!(res, StepResult::Crashed) && strand_transitions(&world) > strands_before {
+                world.violate("I6", "a plain re-run of a STRANDED journal (nothing changed) wrote another STRANDED transition".into());
+            }
         }
         check_after_step(&world, label);
     }
-    let _ = strand_runs;
+    if strand_runs > 0 {
+        world.note(format!("plain runs that ended STRANDED: {strand_runs}"));
+    }
     let fin = journal_state(&world).ok().flatten().map(|s| s.as_str().to_string()).unwrap_or_else(|| "none".into());
     let j = world.journal_text();
     let mut tags = vec![format!("final:{fin}")];
     for (k, needle) in [("crashed", "crash at op"), ("ext_pause", "external pause"), ("adopted", "\"adopted\":true"),
                         ("forced_release", "external_pause_release"), ("writes_kept_frozen", "writes_kept_frozen"),
-                        ("nothing_to_undo", "nothing_to_undo")] {
+                        ("nothing_to_undo", "nothing_to_undo"), ("scheduled", "snapshot_scheduled_at"),
+                        ("sched_file_wait", "scheduled_snapshot_file"), ("kept_paused_on_resume", "kept_paused_on_resume"),
+                        ("resumed_for_snapshot", "resumed_production_for_snapshot"), ("ownership_unknown", "\"pause_ownership_unknown\":true"),
+                        ("pause_ack", "source_pause_ack"), ("resume_lost", "resume took effect but the answer"),
+                        ("crash_after_resume", "crash right after the resume")] {
         let hay = if needle.starts_with('"') || needle.contains('_') { &j } else { &world.trace.borrow().join("\n") };
         if hay.contains(needle) { tags.push(k.to_string()); }
     }
@@ -680,12 +863,34 @@ fn quiet_panics() {
     });
 }
 
+/// Representative seeds of class R10-1 (Codex round 10) found on r30/integrate 972d37b: a resume that TOOK EFFECT
+/// but whose answer was lost, or after which the agent was killed before journaling it, leaves the agent's pause
+/// episode open; a later external pause is then resumed as ours. The runs classify every such I3 automatically
+/// (`r10_1_fired`) and print the count; `MODEL_STRICT=1` turns them back into failures. Fixed => run strict.
+const KNOWN_OPEN: &[u64] = &[287, 319, 675, 1447, 1959, 2067, 2225, 2553, 2558, 2659, 2866];
+
+/// Class R11-A (new, found by the round-11 checker on 972d37b): a STALE forced release. An operator's
+/// `rollback --force-stranded --i-understand` journals `external_pause_release` for external pause #1, but the resume
+/// RPC is refused; that party later resumes its own pause and pauses again; a plain rollback then resumes the NEW
+/// external pause as ours, because the earlier release still makes episode 1 "ours". Skipped (loudly) by the runs;
+/// `MODEL_STRICT=1` includes it. Fixed => remove from this list and un-ignore its test.
+const KNOWN_OPEN_UNCLASSIFIED: &[u64] = &[13295];
+
 fn run_many(start: u64, count: u64) -> Vec<(u64, Vec<String>, Vec<String>)> {
     quiet_panics();
     let mut bad = Vec::new();
     let mut stats: std::collections::BTreeMap<String, u64> = Default::default();
-    for seed in start..start + count {
+    let mut open: Vec<u64> = Vec::new();
+    let strict = std::env::var("MODEL_STRICT").is_ok();
+    let skipped: Vec<u64> = (start..start + count).filter(|s| !strict && KNOWN_OPEN_UNCLASSIFIED.contains(s)).collect();
+    if !skipped.is_empty() {
+        eprintln!("MODEL: skipping KNOWN-OPEN class R11-A seed(s) {skipped:?} (stale forced release; MODEL_STRICT=1 runs them)");
+    }
+    for seed in (start..start + count).filter(|s| !skipped.contains(s)) {
         let (v, t) = scenario(seed);
+        if t.iter().any(|l| l.starts_with("KNOWN-OPEN R10-1")) {
+            open.push(seed);
+        }
         if let Some(tags) = t.last().and_then(|l| l.strip_prefix("TAGS ")) {
             for tag in tags.split(',') {
                 *stats.entry(tag.to_string()).or_default() += 1;
@@ -696,6 +901,10 @@ fn run_many(start: u64, count: u64) -> Vec<(u64, Vec<String>, Vec<String>)> {
         }
     }
     eprintln!("MODEL STATS over {count} scenarios: {stats:?}");
+    if !open.is_empty() {
+        eprintln!("MODEL: {} scenario(s) hit KNOWN-OPEN class R10-1 (I3 after a resume that took effect unseen; \
+            MODEL_STRICT=1 fails them): first seeds {:?}", open.len(), &open[..open.len().min(20)]);
+    }
     bad
 }
 
@@ -757,9 +966,14 @@ fn directed_i3_codex_r9_2_external_pause_after_a_completed_resume() {
 }
 
 fn assert_seed_clean(seed: u64) {
+    assert_seed_clean_with(seed, false);
+}
+
+fn assert_seed_clean_with(seed: u64, r11: bool) {
     quiet_panics();
-    let (v, t) = scenario(seed);
-    assert!(v.is_empty(), "seed {seed}: {}\n{}", v.join(" | "), t.join("\n"));
+    let (v, t) = scenario_with(seed, r11);
+    let open: Vec<&String> = t.iter().filter(|l| l.starts_with("KNOWN-OPEN")).collect();
+    assert!(v.is_empty() && open.is_empty(), "seed {seed}: {} {open:?}\n{}", v.join(" | "), t.join("\n"));
 }
 
 /// Class A (= Codex R9-2), found by the checker: own pause resumed, on_abort fails, someone else pauses, a later
@@ -784,4 +998,92 @@ fn model_i3_class_b_seed_3470() {
 #[test]
 fn model_i3_class_b_seed_4771() {
     assert_seed_clean(4771);
+}
+
+/// Directed, Codex round 10 (R10-2): `pause_at_h` recovery. The agent's own pause is acknowledged, the agent is killed
+/// during quiescence, the re-run finds its own pause at the start of FROZEN and resumes production for the snapshot
+/// (`resumed_production_for_snapshot`); someone else then pauses the producer; the burn-off audit aborts. The episode
+/// the snapshot resume closed must not make that external pause "ours" (I3).
+fn directed_r10_2(dir: &Path) -> Vec<String> {
+    quiet_panics();
+    let cfg = model_config(dir, false, false);
+    let world = World::new(dir);
+    world.crash_on_poll_while_paused.set(true);
+    let r = step_run(&cfg, &world);
+    world.note(format!("run: {r:?}"));
+    check_after_step(&world, "run");
+    world.ext_pause_right_after_resume.set(true);
+    let r = step_run(&cfg, &world);
+    world.note(format!("re-run: {r:?}"));
+    check_after_step(&world, "re-run");
+    for _ in 0..2 {
+        let r = step_rollback(&cfg, &world, false);
+        world.note(format!("rollback: {r:?}"));
+        check_after_step(&world, "rollback");
+    }
+    let j = world.journal_text();
+    assert!(j.contains("resumed_production_for_snapshot"), "the scenario must reach the snapshot resume:\n{}",
+        world.trace.borrow().join("\n"));
+    if std::env::var("MODEL_TRACE").is_ok() { eprintln!("{}", world.trace.borrow().join("\n")); }
+    let v = world.violations.borrow().clone();
+    if !v.is_empty() {
+        eprintln!("{}", world.trace.borrow().join("\n"));
+    }
+    v
+}
+
+/// FAILS on r30/integrate 972d37b (I3, Codex R10-2): `resumed_production_for_snapshot` does not close the agent's
+/// pause episode, so a pause someone else makes right after it is resumed by the abort as if it were ours.
+#[test]
+#[ignore = "fails until the R10-2 fix lands: the snapshot resume must close the agent's pause episode"]
+fn directed_i3_codex_r10_2_pause_at_h_snapshot_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let v = directed_r10_2(dir.path());
+    assert!(v.is_empty(), "{v:?}");
+}
+
+// ---- class R10-1 (Codex round 10): lost or crashed resume leaves the episode open. FAIL on 972d37b. ----
+
+fn assert_r11_seed(seed: u64) {
+    assert_seed_clean_with(seed, true);
+}
+
+#[test]
+#[ignore = "class R10-1, open until the source fix lands (resume ownership must be relinquished before the RPC)"]
+fn model_i3_class_r10_1_lost_resume_answer_seed_319() {
+    assert_r11_seed(319);
+}
+
+#[test]
+#[ignore = "class R10-1, open until the source fix lands"]
+fn model_i3_class_r10_1_crash_after_resume_seed_1959() {
+    assert_r11_seed(1959);
+}
+
+#[test]
+#[ignore = "class R10-1, open until the source fix lands"]
+fn model_i3_class_r10_1_crash_after_pause_and_resume_seed_675() {
+    assert_r11_seed(675);
+}
+
+#[test]
+#[ignore = "class R10-1, open until the source fix lands"]
+fn model_i3_class_r10_1_lost_resume_after_release_seed_2067() {
+    assert_r11_seed(2067);
+}
+
+/// Every KNOWN_OPEN seed, in one test: un-ignore with the fix and empty KNOWN_OPEN.
+#[test]
+#[ignore = "class R10-1, open until the source fix lands"]
+fn model_known_open_seeds_all_clean() {
+    for &seed in KNOWN_OPEN {
+        assert_r11_seed(seed);
+    }
+}
+
+/// Class R11-A: a stale forced release authorizes resuming a LATER external pause. FAILS on 972d37b.
+#[test]
+#[ignore = "class R11-A, open until the source fix lands: a forced release must authorize only the resume of the pause it released"]
+fn model_i3_class_r11_a_stale_forced_release_seed_13295() {
+    assert_r11_seed(13295);
 }

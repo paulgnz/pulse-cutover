@@ -101,6 +101,14 @@ struct MockOps {
     model_crash_at: Cell<u64>,
     /// The current pause is someone else's (the model's external actor), not this agent's.
     model_external_pause: Cell<bool>,
+    /// r30 round 11 (I3 per pause episode): `external_pause_release` records in the journal when the current external
+    /// pause began, or when the last release was consumed by a resume. A resume of that pause is legal only once a
+    /// newer release exists, and each release authorizes one resume.
+    model_release_baseline: Cell<usize>,
+    /// r30 round 11 (I6): operations allowed in the current step (0 = unbounded); exceeding it = no progress.
+    model_budget: Cell<u64>,
+    /// r30 round 11: the next pause() takes effect and the agent is killed before it can journal the ack.
+    model_crash_after_pause: Cell<bool>,
     model_violations: RefCell<Vec<String>>,
     now: Cell<u64>,
     // --- api-mode world ---
@@ -250,6 +258,10 @@ impl MockOps {
         }
         let n = self.model_calls.get() + 1;
         self.model_calls.set(n);
+        if self.model_budget.get() > 0 && n > self.model_budget.get() {
+            self.model_budget.set(0);
+            panic!("MODEL-NO-PROGRESS after {n} operations (last: {name})");
+        }
         if self.model_crash_at.get() == n {
             self.model_crash_at.set(0);
             panic!("MODEL-CRASH-INJECTED at op {n} ({name})");
@@ -258,6 +270,10 @@ impl MockOps {
 
     fn model_journal_text(&self) -> String {
         self.model_journal.borrow().as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default()
+    }
+
+    fn model_releases(&self) -> usize {
+        self.model_journal_text().matches(r#""side_effect":"external_pause_release""#).count()
     }
 
     fn model_violate(&self, inv: &str, why: String) {
@@ -288,6 +304,9 @@ impl MockOps {
             model_calls: Cell::new(0),
             model_crash_at: Cell::new(0),
             model_external_pause: Cell::new(false),
+            model_release_baseline: Cell::new(0),
+            model_budget: Cell::new(0),
+            model_crash_after_pause: Cell::new(false),
             model_violations: RefCell::new(Vec::new()),
             now: Cell::new(1_000_000),
             drift: Cell::new(1),
@@ -528,6 +547,9 @@ impl ChainOps for MockOps {
             }
             self.paused.set(true);
         }
+        if self.model_on.get() && self.model_crash_after_pause.replace(false) {
+            panic!("MODEL-CRASH-INJECTED after the pause took effect");
+        }
         Ok(())
     }
 
@@ -535,8 +557,14 @@ impl ChainOps for MockOps {
         self.model_op("resume");
         if self.model_on.get() {
             let j = self.model_journal_text();
-            if self.paused.get() && self.model_external_pause.get() && !j.contains("external_pause_release") {
-                self.model_violate("I3", "the agent resumed an EXTERNAL pause with no journaled release".into());
+            if self.paused.get() && self.model_external_pause.get() && !self.resume_fails.get() && !self.resume_ignored.get() {
+                let now = self.model_releases();
+                if now <= self.model_release_baseline.get() {
+                    self.model_violate("I3", format!("the agent resumed an EXTERNAL pause with no release journaled since \
+                        that pause began (releases then {}, now {now})", self.model_release_baseline.get()));
+                } else {
+                    self.model_release_baseline.set(now); // consumed by this resume
+                }
             }
             if j.contains(r#""side_effect":"create_chain""#) || j.contains(r#""side_effect":"ignite_started""#)
                 || j.contains(r#""side_effect":"join""#) {
@@ -8464,6 +8492,16 @@ fn join_scenario(seed: u64) -> (Vec<String>, Vec<String>) {
     let live = rc23_live_peers(&ours, &["bp2", "bp3", "bp4", "bp5"]);
     let all_aborted = rc23_status(&[("bp2", serde_json::json!({"state": "ABORTED"})), ("bp3", serde_json::json!({"state": "ABORTED"})),
         ("bp4", serde_json::json!({"state": "ABORTED"})), ("bp5", serde_json::json!({"state": "ABORTED"}))]);
+    // r30 round 11 (reach): in half the scenarios the source does not drift: an unpaused source whose head stays at
+    // the journaled pause head (its peers paused), so `join_checks` pass and the join's own re-freeze, pause intent,
+    // ack and unknown-ownership windows are reached (with drift a resumed source always fails the pause-head check).
+    if rng.chance(50) {
+        ops.drift.set(0);
+        if let Some(hp) = Journal::replay(&cfg.journal_path).ok().and_then(|r| r.head_at_pause) {
+            ops.head.set(hp);
+        }
+        trace.push(format!("stationary source at {}", ops.head.get()));
+    }
     // From here the model watches.
     *ops.model_journal.borrow_mut() = Some(cfg.journal_path.clone());
     ops.model_on.set(true);
@@ -8471,6 +8509,7 @@ fn join_scenario(seed: u64) -> (Vec<String>, Vec<String>) {
         if pause && !ops.paused.get() {
             ops.paused.set(true);
             ops.model_external_pause.set(true);
+            ops.model_release_baseline.set(ops.model_releases());
             trace.push("external pause".into());
         } else if !pause && ops.paused.get() && ops.model_external_pause.get() {
             ops.paused.set(false);
@@ -8489,8 +8528,10 @@ fn join_scenario(seed: u64) -> (Vec<String>, Vec<String>) {
         if rng.chance(60) {
             ops.model_crash_at.set(ops.model_calls.get() + 1 + rng.below(60));
         }
+        ops.model_crash_after_pause.set(rng.chance(35));
         let pick = if i == 0 { 0 } else { rng.below(10) };
         let label = match pick { 0..=4 => "join", 5..=6 => "rollback", 7 => "rollback --force-stranded", _ => "run" };
+        ops.model_budget.set(ops.model_calls.get() + 200_000);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<String, String> {
             let (j, rec) = Journal::open(&cfg.journal_path)?;
             let mut m = Machine::new(&cfg, &ops, j, rec);
@@ -8502,22 +8543,62 @@ fn join_scenario(seed: u64) -> (Vec<String>, Vec<String>) {
             }
         }));
         ops.model_crash_at.set(0);
+        ops.model_budget.set(0);
         let shown = match &r {
             Ok(x) => format!("{x:?}"),
             Err(p) => {
                 let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
-                if !msg.starts_with("MODEL-CRASH-INJECTED") {
+                if msg.starts_with("MODEL-NO-PROGRESS") {
+                    ops.model_violate("I6", format!("{label} made no progress: {msg}"));
+                } else if !msg.starts_with("MODEL-CRASH-INJECTED") {
                     ops.model_violate("PANIC", format!("unexpected panic in {label}: {msg}"));
                 }
                 msg
             }
         };
         trace.push(format!("{label}: {shown} (paused={} external={})", ops.paused.get(), ops.model_external_pause.get()));
-        if let Err(e) = Journal::replay(&cfg.journal_path) {
-            ops.model_violate("I5", format!("journal does not replay after {label}: {e}"));
+        match Journal::replay(&cfg.journal_path) {
+            Err(e) => ops.model_violate("I5", format!("journal does not replay after {label}: {e}")),
+            // I1: a rollback that provably finished leaves no pause of the AGENT's in place.
+            Ok(rec) => if rec.state == Some(State::Aborted) && rec.aborted_rollback_complete && ops.paused.get()
+                && !ops.model_external_pause.get() {
+                ops.model_violate("I1", format!("journal ABORTED (rolled back) after {label}, but the agent's pause is still in place"));
+            },
         }
     }
     let state = Journal::replay(&cfg.journal_path).ok().and_then(|r| r.state).map(|s| s.as_str().to_string());
+    // Coverage tags (r30 round 11): which join windows this scenario reached, from the journal after a segment start.
+    let jt = std::fs::read_to_string(&cfg.journal_path).unwrap_or_default();
+    let after_segment = jt.find("segment_start").map(|i| &jt[i..]).unwrap_or("");
+    let mut tags = Vec::new();
+    for (k, needle) in [("segment", "segment_start"), ("join_refreeze", r#""side_effect":"write_freeze""#),
+                        ("join_pause_ack", "source_pause_ack"), ("join_unknown", r#""pause_ownership_unknown":true"#),
+                        ("join_record", r#""side_effect":"join""#)] {
+        if after_segment.contains(needle) {
+            tags.push(k);
+        }
+    }
+    // An own pause intent (not an adoption record): `{"episode":n,"side_effect":"source_pause"}`; one whose episode
+    // never got its `source_pause_ack` is the unknown-ownership window (a kill between the pause and its ack).
+    let mut intents = Vec::new();
+    let mut acks = Vec::new();
+    for l in after_segment.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(l) else { continue };
+        let d = &v["data"];
+        if d["side_effect"] == "source_pause" && d["adopted"] != true {
+            intents.push(d["episode"].as_u64().unwrap_or(0));
+        }
+        if let Some(a) = d["source_pause_ack"].as_u64() {
+            acks.push(a);
+        }
+    }
+    if !intents.is_empty() {
+        tags.push("join_pause_intent");
+    }
+    if intents.iter().any(|e| !acks.contains(e)) {
+        tags.push("join_intent_unacked");
+    }
+    trace.push(format!("COVER {}", tags.join(",")));
     trace.push(format!("final: {state:?}"));
     let v = ops.model_violations.borrow().clone();
     (v, trace)
@@ -8532,14 +8613,27 @@ fn r30r10_join_model_finds_no_invariant_violation() {
     };
     let mut bad = Vec::new();
     let mut finals: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut cover: std::collections::BTreeMap<String, u64> = Default::default();
     for seed in start..start + count {
         let (v, t) = join_scenario(seed);
         *finals.entry(t.last().cloned().unwrap_or_default()).or_default() += 1;
+        if let Some(c) = t.iter().find_map(|l| l.strip_prefix("COVER ")) {
+            for k in c.split(',').filter(|k| !k.is_empty()) {
+                *cover.entry(k.to_string()).or_default() += 1;
+            }
+        }
         if !v.is_empty() {
             bad.push((seed, v, t));
         }
     }
-    eprintln!("JOIN MODEL over {count} scenarios: {finals:?}");
+    eprintln!("JOIN MODEL over {count} scenarios: {finals:?}; coverage {cover:?}");
+    // r30 round 11: the default run must actually reach the join's own pause windows (a model that never gets there
+    // proves nothing about them).
+    if count >= 60 {
+        for k in ["segment", "join_pause_intent", "join_pause_ack", "join_intent_unacked"] {
+            assert!(cover.get(k).copied().unwrap_or(0) > 0, "join model never reached `{k}` in {count} scenarios: {cover:?}");
+        }
+    }
     let report: String = bad.iter().take(10).map(|(s, v, t)| format!("\n=== seed {s}: {}\n    {}", v.join(" | "), t.join("\n    "))).collect();
     assert!(bad.is_empty(), "{} of {count} join scenarios violated an invariant:{report}", bad.len());
 }
