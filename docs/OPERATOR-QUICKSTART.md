@@ -296,3 +296,12 @@ journal is now STRANDED with writes still frozen. Exit 4 never means "rolled bac
 paused it? is it producing?), then run `rollback` again. A forced release (`--force-stranded --i-understand`) is
 journaled only after the rollback's own intent, so a crash between them leaves a pending rollback that `run` refuses
 to continue and a re-run of `rollback` finishes.
+
+**Stopping the agent (round 13).** `./cutover.sh abort` now sends SIGTERM and **waits** (default 30 s, set
+`PULSE_CUTOVER_STOP_WAIT`) for the agent to exit before it runs `rollback`. The agent stops only at a safe point (never
+in the middle of pausing or resuming the producer), journals `stopped_by_signal` and exits **6**; `pulse-cutover run`
+resumes it, `rollback` rolls it back. Only if it has not exited after the wait does the script SIGKILL it, with a
+warning: then the rollback may report a pause of unknown ownership and ask for `--force-stranded --i-understand` after
+you check the producer. Do not pause or resume the producer by hand while a rollback runs: a rollback reopens writes
+only after reading "producing" right before it does, and withholds the reopen (exit 4) if the producer was paused in
+between (risk register A-20).

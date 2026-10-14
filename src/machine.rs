@@ -311,6 +311,10 @@ impl UpstreamVerified {
 const PAUSE_READ_RETRY_MS: u64 = 30_000;
 
 /// r30 round 7: why an abort of a ceremony whose producer someone else paused seals instead of rolling back.
+/// r30 round 13: the error a resume returns when its RPC answered ok but a confirming read still shows the producer
+/// paused (ownership of that pause is then unknown).
+const RESUME_IGNORED: &str = "the resume RPC answered ok but the producer is still paused";
+
 const EXTERNAL_PAUSE_HELD: &str = "the source producer was paused by someone else after this ceremony froze writes \
     (adopted for the cut): this ceremony never resumes another process's pause and never reopens writes into a paused \
     chain. Find out who paused it; then `pulse-cutover rollback --config <file> --force-stranded --i-understand` resumes \
@@ -800,7 +804,29 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.journal.evidence(self.state, json!({"side_effect": "source_resume", "episode": episode, "during": what}))?;
         self.push_pause_event(crate::journal::PauseEvent::ResumeIntent);
         let err = match self.ops.resume() { // ungated: this IS the gate
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // r30 round 13 (Codex R12-F1a): an Ok answer is not proof. Only a confirming "producing" read (retried)
+                // closes the episode; a paused or unreadable producer after an Ok resume is ownership UNKNOWN, exactly as
+                // after a failed one (the resume may have been ignored, or applied and someone else paused since).
+                match self.read_paused_retrying(PAUSE_READ_RETRY_MS, "confirming this ceremony's resume took effect") {
+                    Ok(false) => return Ok(()),
+                    Ok(true) => {
+                        self.journal.evidence(self.state, json!({"source_resume_outcome_unknown": episode,
+                            "rpc": "ok", "producer_paused": true,
+                            "note": "the resume RPC answered ok but the producer is still paused: whether the resume was \
+                                     ignored or someone else paused it since is unknown; this ceremony will not resume it \
+                                     again on its own authority"}))?;
+                        return Err(format!("{RESUME_IGNORED} (ownership of that pause is now unknown)"));
+                    }
+                    Err(re) => {
+                        self.journal.evidence(self.state, json!({"source_resume_outcome_unknown": episode, "rpc": "ok",
+                            "read_error": re,
+                            "note": "the resume RPC answered ok but the producer state cannot be confirmed: ownership of \
+                                     this pause is unknown from here on"}))?;
+                        return Err(format!("the resume RPC answered ok but whether the producer resumed cannot be read ({re})"));
+                    }
+                }
+            }
             Err(e) => e,
         };
         match self.read_paused_retrying(PAUSE_READ_RETRY_MS, "settling a resume RPC that failed") {
@@ -872,6 +898,21 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             Some(why) => Err(format!("{why}. Journal: {}", self.journal.path().display())),
             None => Ok(()),
         }
+    }
+
+    /// r30 round 13: a safe stop point. Called only between states and inside long waits, never inside a pause or
+    /// resume episode (`src_pause` / `src_resume` run to their ack or closing record before control comes back here),
+    /// so a SIGTERM from `cutover.sh abort` can no longer cut an episode in half and leave the agent's own pause with
+    /// "ownership unknown".
+    fn stop_point(&mut self) -> Result<(), String> {
+        if !crate::stop::requested() {
+            return Ok(());
+        }
+        self.journal.evidence(self.state, json!({"stopped_by_signal": true, "state": self.state.as_str(),
+            "note": "SIGTERM/SIGINT: stopped at a safe point (no pause or resume half-done); `pulse-cutover run` resumes \
+                     the ceremony, `pulse-cutover rollback` rolls it back"}))?;
+        Err(format!("{}: stopped at a safe point in {} (journaled). Resume with `pulse-cutover run`, or roll back with \
+            `pulse-cutover rollback`", crate::stop::STOPPED, self.state))
     }
 
     fn h(&self) -> u64 {
@@ -1055,6 +1096,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.preflight(&info, false)?;
         }
         loop {
+            // r30 round 13: between two states nothing is in flight: honour a SIGTERM / SIGINT here.
+            if !matches!(self.state, State::Live | State::Aborted | State::Halted | State::Stranded) {
+                self.stop_point()?;
+            }
             match self.state {
                 State::Armed => self.step_armed()?,
                 State::Frozen => self.step_frozen()?,
@@ -1734,18 +1779,25 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // attempt followed by a paused read) is never resumed and never left in place under a "rolled back" verdict:
         // it needs the same explicit release, whether or not writes would reopen.
         let unknown_pause_held = self.pause_unknown;
-        if self.cfg.ceremony.mode == Mode::Producer && !self.paused_by_us
+        let candidate = self.cfg.ceremony.mode == Mode::Producer && !self.paused_by_us
             && (unknown_pause_held
                 || (self.writes_closed_by_us && self.cfg.hooks.on_abort.is_some() && !self.step_done("on_abort")))
-            && !(self.state == State::Aborted && self.aborted_rollback_complete)
-            && matches!(self.ops.producer_paused(), Ok(true))
-        {
+            && !(self.state == State::Aborted && self.aborted_rollback_complete);
+        // r30 round 13 (Codex R12-F1b): a failed read can never bypass the unknown-pause refusal. The read is retried;
+        // for an unknown pause anything but a confirmed "producing" holds it (paused, or unreadable).
+        let held = candidate && match self.read_paused_retrying(PAUSE_READ_RETRY_MS, "checking the producer before an operator rollback") {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(_) => unknown_pause_held,
+        };
+        if held {
             if !force_stranded {
                 if unknown_pause_held {
-                    return Err("refusing to roll back: the source producer is paused and whose pause it is is unknown (a \
-                        pause or resume of this ceremony was interrupted, or a resume was followed by a paused read). This \
-                        ceremony never resumes it on its own authority: check the producer, then release it explicitly \
-                        with `pulse-cutover rollback --force-stranded --i-understand`. Nothing was changed.".into());
+                    return Err("refusing to roll back: the source producer is paused (or its state cannot be read) and \
+                        whose pause it is is unknown (a pause or resume of this ceremony was interrupted, or a resume was \
+                        followed by a paused read). This ceremony never resumes it on its own authority: check the \
+                        producer, then release it explicitly with `pulse-cutover rollback --force-stranded \
+                        --i-understand`. Nothing was changed.".into());
                 }
                 return Err(format!("refusing to roll back: {EXTERNAL_PAUSE_HELD}. Nothing was changed."));
             }
@@ -2431,8 +2483,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // intent is journaled first, so a crash before the transition completes the strand on the next run.
         let reopen_pending = self.cfg.hooks.on_abort.is_some() && self.writes_closed_by_us && !self.step_done("on_abort");
         let resume_failed = rollback.get("source_producer_resume_error").is_some();
-        let keep_frozen = if reopen_pending { self.writes_may_reopen(resumed_now)? } else { None };
-        if let (true, Some(why)) = (perform && !resume_failed, keep_frozen.as_ref()) {
+        // r30 round 13 (Codex R12-F1): a producer rollback that resumed, or that met a pause whose ownership is unknown,
+        // is confirmed by a fresh "producing" read whatever hooks are configured: without it, a config with no on_abort
+        // ended ABORTED + rollback_done with the producer still paused.
+        let must_confirm = perform && self.cfg.ceremony.mode == Mode::Producer && (resumed_now || self.pause_unknown);
+        let keep_frozen = if reopen_pending || must_confirm { self.writes_may_reopen(resumed_now)? } else { None };
+        // A resume that answered ok while the producer stays paused seals (it did not take effect, or someone else paused
+        // it since); a resume RPC that failed stays an INCOMPLETE rollback (exit 4), as before.
+        let resume_ignored = rollback.get("source_producer_resume_error").and_then(|v| v.as_str())
+            .is_some_and(|e| e.starts_with(RESUME_IGNORED));
+        let seal = perform && (!resume_failed || (resume_ignored && self.observed_paused == Some(true)));
+        if let (true, Some(why)) = (seal, keep_frozen.as_ref()) {
             self.journal.evidence(self.state, json!({"strand_intent": true, "writes_kept_frozen": why, "reason": reason,
                 "note": "writes are not reopened into a chain that is not producing; sealing instead"}))?;
             self.strand_intent = true;
@@ -2458,6 +2519,25 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         if let Some(hook) = self.cfg.hooks.on_abort.clone().filter(|_| source_back && self.writes_closed_by_us) {
             if !self.step_done("on_abort") {
+                // r30 round 13 (Codex R12-F2): read again immediately before reopening, after the ABORTED record, to
+                // narrow the window in which someone else pauses the producer between the R2 read and the reopen. A
+                // pause or an unreadable producer here withholds the reopen (the rollback stays incomplete; a later
+                // `rollback` applies R2 again). The window cannot be closed completely: pause / resume by another
+                // process is not something this agent controls (docs/RISK-REGISTER.md A-20).
+                if self.cfg.ceremony.mode == Mode::Producer {
+                    let last = self.ops.producer_paused();
+                    if !matches!(last, Ok(false)) {
+                        let why = match &last { Ok(_) => "producer paused".to_string(), Err(e) => format!("producer state unknown ({e})") };
+                        self.journal.evidence(State::Aborted, json!({"on_abort_withheld": why,
+                            "note": "the source stopped producing between the reopen check and the reopen: writes stay frozen"}))?;
+                        failed.push(format!("on_abort withheld: {why} right before reopening writes; re-run \
+                            `pulse-cutover rollback` once the producer produces (or release a pause someone else made with \
+                            --force-stranded --i-understand)"));
+                        self.unstage(unstage_any, &mut failed, &mut notes)?;
+                        self.journal.evidence(State::Aborted, json!({"rollback_incomplete": failed, "rollback_complete": false}))?;
+                        return Ok((failed, notes));
+                    }
+                }
                 let result = self.hook(&hook);
                 self.journal.evidence(State::Aborted, json!({"on_abort_hook": format!("{result:?}")}))?;
                 match result {
@@ -2546,6 +2626,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 )?;
                 last_heartbeat = now;
             }
+            self.stop_point()?; // r30 round 13: a safe stop point (nothing frozen or paused by this wait)
             self.ops.sleep_ms(self.cfg.poll_ms);
         };
 
@@ -2622,6 +2703,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 )?;
                 last_heartbeat = now;
             }
+            self.stop_point()?; // r30 round 13: a safe stop point (nothing frozen or paused by this wait)
             self.ops.sleep_ms(self.cfg.poll_ms);
         };
         if !self.production_gate()? {
@@ -2802,6 +2884,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 )?;
                 last_heartbeat = now;
             }
+            self.stop_point()?; // r30 round 13: a safe stop point (waiting for H to finalize; no pause in flight)
             self.ops.sleep_ms(self.cfg.poll_ms);
         }
         let (id_h, _ts) = self.ops.source_block_id(h)?;
@@ -2821,6 +2904,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 )?;
                 return Ok(None);
             }
+            self.stop_point()?; // r30 round 13: a safe stop point (waiting for the snapshot file)
             self.ops.sleep_ms(self.cfg.poll_ms);
         }
         self.journal.evidence(

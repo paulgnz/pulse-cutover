@@ -168,6 +168,17 @@ stateDiagram-v2
   or the operator rollback's refusal) until `--force-stranded --i-understand`. The `pause_at_h` recovery resume (R10-2)
   now closes its episode, so the next pause needs a fresh intent and ack and a later pause by someone else is adopted,
   never taken for ours. Journals written before round 11 contain no resume intents and are folded exactly as before.
+  **Round 13.** (a) A graceful stop: SIGTERM / SIGINT only set a flag, checked between states and inside the ARMED and
+  snapshot waits, never inside a pause or resume episode; the run journals `stopped_by_signal` and exits 6.
+  `cutover.sh abort` sends SIGTERM, waits (default 30 s, `PULSE_CUTOVER_STOP_WAIT`) for the agent to exit and only
+  then runs `rollback`; SIGKILL only after the wait, loudly. So the common operator abort can no longer leave the
+  agent's own pause with "ownership unknown". (b) A resume whose RPC answers ok is confirmed by a (retried) read:
+  still paused or unreadable is ownership unknown, as after a failed RPC. A producer rollback that resumed, or met an
+  unknown pause, completes only after a confirming "producing" read, whatever hooks are configured (a resume that
+  answered ok but did not take effect seals: STRANDED). A failed read never bypasses the unknown-pause refusal of an
+  operator rollback. (c) Known limit, narrowed not closed: writes reopen (`on_abort`) after a fresh read made right
+  before the hook, after the ABORTED record; a pause made by another process in the remaining instant between that
+  read and the hook is not something this agent can prevent (RISK-REGISTER A-20).
   **Round 12 (model checker classes R10-2 and R11-A).** A paused (or unreadable) read after ANY resume attempt, whether
   the RPC answered or failed, is ownership unknown (`source_resume_outcome_unknown`), never "ours again": it cannot
   tell "our resume did not apply" from "it applied and someone else paused the producer since". A run adopts that
@@ -363,6 +374,9 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 | A resume of this ceremony's pause was started (`source_resume` intent) and its outcome never journaled (a crash, a lost response a read could not settle), then the producer is found paused | resume intent (r30 round 11) | FROZEN–VERIFIED / ABORTED | ownership unknown: never resumed on this ceremony's authority; adopted with `pause_ownership_unknown`; an abort keeps writes frozen (STRANDED), a plain operator rollback refuses; `--force-stranded --i-understand` releases it. Producer found producing instead: nothing to resume, R2 may reopen writes |
 | The resume RPC fails, or answers but the producer is still paused | resume settlement read (r30 rounds 11–12) | any rollback / FROZEN | a fresh read decides: producing = the resume happened (episode closed); paused or unreadable = ownership unknown (`source_resume_outcome_unknown`, never ours again): never resumed on this ceremony's authority; a plain operator rollback refuses (nothing changed); `--force-stranded --i-understand` releases it |
 | A forced rollback is killed after journaling `external_pause_release`, before its resume settled | release scoping (r30 round 12) | any rollback | the recovered release authorizes nothing (the pause is ownership unknown); a later forced rollback journals a new release |
+| `cutover.sh abort` / SIGTERM while the agent runs | stop flag (r30 round 13) | any | the agent stops at the next safe point (never inside a pause or resume), journals `stopped_by_signal`, exits 6; `cutover.sh` then runs `rollback`; SIGKILL only after a bounded wait |
+| A resume RPC answers ok but the producer stays paused | confirming read (r30 round 13) | rollback | ownership unknown; the rollback seals (STRANDED, on_halt pages) instead of recording `rollback_done` |
+| The producer is paused by someone else between the reopen check and `on_abort` | read right before the hook (r30 round 13) | rollback | `on_abort_withheld`: writes stay frozen, the rollback stays incomplete (exit 4); a pause in the remaining instant cannot be prevented (A-20) |
 | Head keeps moving after the pause | quiescence window | FROZEN | late blocks journaled; the window waits up to `quiescence_timeout_secs` (default 120), then ABORT (before ignition: `on_abort` reopens writes) |
 | Snapshot block id ≠ chain's block id at H (fork at the cut); chain_id changed | block lookup | FROZEN | abort |
 | Any transaction in H+1…pause, or an unreadable block, or an answer that is not that block with a `transactions` array | burn-off audit (fails closed) | FROZEN | abort |

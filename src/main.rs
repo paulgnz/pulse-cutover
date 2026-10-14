@@ -60,7 +60,8 @@ has started (journaled before the ignite command runs), a failure HALTS: nothing
 is rolled back and the journal is sealed until an operator runs `unhalt`. Most operators run ./cutover.sh instead, which
 wraps this with preflight checks and plain-language output.
 
-Exit codes: 0 = LIVE, 1 = did not reach LIVE (journal has the reason).
+Exit codes: 0 = LIVE, 1 = did not reach LIVE (journal has the reason), 4 = ABORTED with the rollback incomplete,
+6 = stopped by SIGTERM / SIGINT at a safe point (journaled `stopped_by_signal`; never inside a pause or resume).
 If the process dies, re-run the same command — it resumes from the journal.
 
 EXAMPLES
@@ -398,6 +399,11 @@ fn main() {
         }
         return;
     }
+    // r30 round 13: a ceremony stops on SIGTERM / SIGINT only at a safe point (never inside a pause or resume
+    // episode), journals `stopped_by_signal` and exits 6; `cutover.sh abort` waits for that before `rollback`.
+    if matches!(command, "run" | "join" | "loop") {
+        pulse_cutover::stop::install();
+    }
     let result = match command {
         "run" => cmd_run(&args),
         "loop" => cmd_loop(&args),
@@ -419,6 +425,9 @@ fn main() {
     };
     if let Err(e) = result {
         eprintln!("pulse-cutover: {e}");
+        if e.starts_with(pulse_cutover::stop::STOPPED) {
+            std::process::exit(pulse_cutover::stop::EXIT_STOPPED);
+        }
         std::process::exit(1);
     }
 }

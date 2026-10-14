@@ -109,6 +109,11 @@ struct MockOps {
     model_budget: Cell<u64>,
     /// r30 round 11: the next pause() takes effect and the agent is killed before it can journal the ack.
     model_crash_after_pause: Cell<bool>,
+    /// r30 round 13: a SIGTERM arriving right before the pause RPC (sets this thread's stop request).
+    stop_on_pause: Cell<bool>,
+    /// r30 round 13: someone pauses the producer once the ABORTED record exists (between the reopen check and the
+    /// reopen); reads the journal at `model_journal`.
+    ext_pause_once_aborted: Cell<bool>,
     model_violations: RefCell<Vec<String>>,
     now: Cell<u64>,
     // --- api-mode world ---
@@ -307,6 +312,8 @@ impl MockOps {
             model_release_baseline: Cell::new(0),
             model_budget: Cell::new(0),
             model_crash_after_pause: Cell::new(false),
+            stop_on_pause: Cell::new(false),
+            ext_pause_once_aborted: Cell::new(false),
             model_violations: RefCell::new(Vec::new()),
             now: Cell::new(1_000_000),
             drift: Cell::new(1),
@@ -524,6 +531,13 @@ impl ChainOps for MockOps {
 
     fn producer_paused(&self) -> Result<bool, String> {
         self.model_op("producer_paused");
+        if self.ext_pause_once_aborted.get() && !self.paused.get()
+            && self.model_journal_text().contains(r#""kind":"transition","state":"ABORTED""#)
+        {
+            self.ext_pause_once_aborted.set(false);
+            self.paused.set(true);
+            self.model_external_pause.set(true);
+        }
         if self.paused_read_fails.get() {
             return Err("http://mock/v1/producer/paused: connection refused".into());
         }
@@ -540,6 +554,9 @@ impl ChainOps for MockOps {
 
     fn pause(&self) -> Result<(), String> {
         self.model_op("pause");
+        if self.stop_on_pause.replace(false) {
+            pulse_cutover::stop::request_for_this_thread();
+        }
         self.pauses.set(self.pauses.get() + 1);
         if !self.pause_ignored.get() {
             if !self.paused.get() {
@@ -3129,7 +3146,7 @@ fn r3_rollback_refuses_without_affirmative_evidence() {
     let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
     assert_eq!(out.status.code(), Some(3), "missing journal is not proof that ignition never started: {}", String::from_utf8_lossy(&out.stderr));
     assert!(!dir.path().join("journal.jsonl").exists());
-    let (url, _hits) = stub_http(|_m, _p| (200, "{}".into()));
+    let (url, _hits) = stub_http(|_m, p| (200, if p.ends_with("/v1/producer/paused") { "false".into() } else { "{}".into() }));
     point_producer_at(dir.path(), &url);
     let out = run_bin(&["rollback", "--wait", "1", "--no-journal-i-know"], &cfgp);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -3147,7 +3164,7 @@ fn r3_rollback_refuses_after_ignition_started_unless_forced() {
     let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
     assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(std::fs::read_to_string(&cfg.journal_path).unwrap(), before, "a refused rollback changes nothing");
-    let (url, _hits) = stub_http(|_m, _p| (200, "{}".into()));
+    let (url, _hits) = stub_http(|_m, p| (200, if p.ends_with("/v1/producer/paused") { "false".into() } else { "{}".into() }));
     point_producer_at(dir.path(), &url);
     set_target_line(dir.path(), "stop_cmd = \"true\"");
     let out = run_bin(&["rollback", "--wait", "1", "--force-after-ignite"], &cfgp);
@@ -3172,7 +3189,7 @@ fn r3_rollback_before_ignition_is_journaled_and_waits_for_the_lock() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("holds"), "{}", String::from_utf8_lossy(&out.stderr));
     drop(held);
     // The binary talks to a real producer API: serve one that accepts the resume.
-    let (url, _hits) = stub_http(|_m, _p| (200, "{}".into()));
+    let (url, _hits) = stub_http(|_m, p| (200, if p.ends_with("/v1/producer/paused") { "false".into() } else { "{}".into() }));
     point_producer_at(dir.path(), &url);
     let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -3322,17 +3339,24 @@ fn r4_a_second_rollback_after_a_complete_one_does_nothing() {
     // Review §2.7: repeat rollbacks re-resumed and re-ran on_abort.
     let dir = tempfile::tempdir().unwrap();
     let _cfg = pre_ignite_journal(dir.path());
-    let (url, hits) = stub_http(|_m, _p| (200, "{}".into()));
+    // r30 round 13: the rollback also reads /v1/producer/paused (confirming its resume), so count the resume calls.
+    let resumes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let r = resumes.clone();
+    let (url, _hits) = stub_http(move |_m, p| {
+        if p.ends_with("/v1/producer/resume") {
+            r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        (200, if p.ends_with("/v1/producer/paused") { "false".into() } else { "{}".into() })
+    });
     point_producer_at(dir.path(), &url);
     let cfgp = dir.path().join("ceremony.toml");
     let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let after_first = hits.load(std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(after_first, 1, "one resume call");
+    assert_eq!(resumes.load(std::sync::atomic::Ordering::SeqCst), 1, "one resume call");
     let out = run_bin(&["rollback", "--wait", "1"], &cfgp);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("already rolled back"), "{}", String::from_utf8_lossy(&out.stdout));
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "no second resume");
+    assert_eq!(resumes.load(std::sync::atomic::Ordering::SeqCst), 1, "no second resume");
 }
 
 #[test]
@@ -3415,7 +3439,7 @@ fn r4_no_journal_rollback_leaves_no_ceremony_journal_behind() {
     // that box did nothing.
     let dir = tempfile::tempdir().unwrap();
     let _ = test_config(dir.path(), 120);
-    let (url, _hits) = stub_http(|_m, _p| (200, "{}".into()));
+    let (url, _hits) = stub_http(|_m, p| (200, if p.ends_with("/v1/producer/paused") { "false".into() } else { "{}".into() }));
     point_producer_at(dir.path(), &url);
     let cfgp = dir.path().join("ceremony.toml");
     let out = run_bin(&["rollback", "--wait", "1", "--no-journal-i-know"], &cfgp);
@@ -3821,7 +3845,7 @@ fn r5_no_journal_rollback_leaves_no_lock_file_litter() {
     // Review N7: --no-journal-i-know left <journal>.rollback-<ms>.jsonl.lock behind.
     let dir = tempfile::tempdir().unwrap();
     let _ = test_config(dir.path(), 120);
-    let (url, _hits) = stub_http(|_m, _p| (200, "{}".into()));
+    let (url, _hits) = stub_http(|_m, p| (200, if p.ends_with("/v1/producer/paused") { "false".into() } else { "{}".into() }));
     point_producer_at(dir.path(), &url);
     let out = run_bin(&["rollback", "--wait", "1", "--no-journal-i-know"], &dir.path().join("ceremony.toml"));
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -7272,7 +7296,7 @@ fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
     // Round-4 review (F3): scan EVERY src/*.rs (outside its #[cfg(test)] module) for EVERY mutating ChainOps call,
     // through any receiver (`self.ops.x(`, `ops.x(`, `o.x(` after a rebinding, `ChainOps::x(`). Each one must carry an
     // explicit `// ungated: <reason>` marker, or (src/drill.rs, owned by the drill's own guard) be listed exactly below.
-    let files: [(&str, &str); 22] = [
+    let files: [(&str, &str); 23] = [
         ("beacon.rs", include_str!("../src/beacon.rs")), ("config.rs", include_str!("../src/config.rs")),
         ("coord.rs", include_str!("../src/coord.rs")), ("doctor.rs", include_str!("../src/doctor.rs")),
         ("drill.rs", include_str!("../src/drill.rs")), ("fleet.rs", include_str!("../src/fleet.rs")),
@@ -7283,6 +7307,7 @@ fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
         ("report.rs", include_str!("../src/report.rs")), ("sanitize.rs", include_str!("../src/sanitize.rs")),
         ("scan.rs", include_str!("../src/scan.rs")), ("secrets.rs", include_str!("../src/secrets.rs")),
         ("shadow.rs", include_str!("../src/shadow.rs")), ("state.rs", include_str!("../src/state.rs")),
+        ("stop.rs", include_str!("../src/stop.rs")),
         ("upstream.rs", include_str!("../src/upstream.rs")), ("verify.rs", include_str!("../src/verify.rs")),
     ];
     // The drill's own guarded calls (DrillGuard forwards only the request it scheduled; tests/drill.rs proves it).
@@ -8808,4 +8833,80 @@ fn r30r12_a_stale_release_from_a_killed_forced_rollback_authorizes_nothing() {
     assert_eq!(ops2.resumes.get(), resumes + 1);
     let releases = journal_entries(&cfg).iter().filter(|v| v["data"]["side_effect"] == "external_pause_release").count();
     assert_eq!(releases, 2, "the forced rollback journaled its own release");
+}
+
+/// r30 round 13 (review F1): a SIGTERM arriving between this ceremony's pause intent and its pause RPC no longer cuts
+/// the episode in half. The RPC and its ack complete, the run stops at the next safe point (journaled
+/// `stopped_by_signal`), and a PLAIN rollback resumes the agent's own pause (no --force-stranded needed).
+#[test]
+fn r30r13_sigterm_mid_pause_lets_the_episode_finish_and_a_plain_rollback_resumes() {
+    pulse_cutover::stop::clear_for_this_thread();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r7_sched_config(dir.path(), "freeze-writes");
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    ops.stop_on_pause.set(true);
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    pulse_cutover::stop::clear_for_this_thread();
+    assert!(err.starts_with(pulse_cutover::stop::STOPPED), "{err}");
+    let e = journal_entries(&cfg);
+    assert!(e.iter().any(|v| v["data"]["source_pause_ack"].is_number()), "the pause episode reached its ack");
+    assert!(e.iter().any(|v| v["data"]["stopped_by_signal"] == true), "the stop is journaled");
+    assert!(ops.paused.get(), "the agent's own pause is in place");
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let out = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false).unwrap();
+    assert!(out.failed.is_empty(), "{:?}", out.failed);
+    assert_eq!(ops.resumes.get(), 1, "a plain rollback resumed the agent's own pause");
+    assert!(!ops.paused.get());
+    assert!(ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "writes reopened into a producing chain");
+}
+
+/// r30 round 13 (Codex R12-F1): (a) with no on_abort hook, a resume that answers ok but does not take effect used to end
+/// ABORTED + rollback_done with the producer still paused; the confirming read now runs whatever hooks are configured,
+/// and the rollback seals instead. (b) An unknown pause plus an unreadable producer can never bypass the refusal.
+#[test]
+fn r30r13_a_rollback_is_complete_only_after_a_confirming_producing_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = r7_sched_config(dir.path(), "freeze-writes");
+    let text = std::fs::read_to_string(dir.path().join("r7.toml")).unwrap().replace("on_abort = \"reopen-writes\"\n", "");
+    let cfg = load_toml(dir.path(), "r7-no-on-abort.toml", &text).unwrap();
+    assert!(cfg.hooks.on_abort.is_none());
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    ops.burnoff_tx_per_block.set(1); // an abort after this ceremony paused the producer
+    ops.resume_ignored.set(true); // the resume RPC answers ok, the producer stays paused
+    let end = run_machine_result(&cfg, &ops);
+    let rec = pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap();
+    assert!(!rec.aborted_rollback_complete, "never a complete rollback with the producer paused: {end:?}");
+    assert_eq!(rec.state, Some(State::Stranded), "sealed and paged instead");
+    assert!(ops.paused.get());
+    // (b) the producer cannot be read: a plain rollback refuses (it must not slip past the unknown-pause refusal).
+    ops.resume_ignored.set(false);
+    ops.paused_read_fails.set(true);
+    let resumes = ops.resumes.get();
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let plain = Machine::new(&cfg, &ops, j, rec).operator_rollback_opts(false, false);
+    assert!(plain.as_ref().err().is_some_and(|e| e.contains("unknown")), "{plain:?}");
+    assert_eq!(ops.resumes.get(), resumes, "nothing resumed");
+}
+
+/// r30 round 13 (Codex R12-F2, narrowed not closed): someone pauses the producer after the reopen check and before the
+/// reopen. A read right before on_abort now withholds it: writes stay frozen, the rollback stays incomplete.
+#[test]
+fn r30r13_a_pause_between_the_reopen_check_and_the_reopen_withholds_on_abort() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r7_sched_config(dir.path(), "freeze-writes");
+    let ops = MockOps::new(dir.path(), 110);
+    ops.schedule_ok.set(true);
+    ops.burnoff_tx_per_block.set(1);
+    *ops.model_journal.borrow_mut() = Some(cfg.journal_path.clone());
+    ops.ext_pause_once_aborted.set(true);
+    let _ = run_machine_result(&cfg, &ops);
+    assert_eq!(ops.resumes.get(), 1, "our own pause was resumed");
+    assert!(ops.paused.get(), "someone else paused it right after the ABORTED record");
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "writes were not reopened into a paused producer");
+    let e = journal_entries(&cfg);
+    assert!(e.iter().any(|v| v["data"]["on_abort_withheld"].is_string()), "the withheld reopen is journaled");
+    let rec = pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap();
+    assert!(!rec.aborted_rollback_complete);
 }

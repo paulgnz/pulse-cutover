@@ -20,5 +20,6 @@ pub mod scan;
 pub mod secrets;
 pub mod shadow;
 pub mod state;
+pub mod stop;
 pub mod upstream;
 pub mod verify;

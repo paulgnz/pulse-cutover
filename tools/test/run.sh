@@ -421,4 +421,45 @@ for f in ceremony.toml ceremony-bp.toml; do
     && ok "$f: [coordination] and [beacon] present" || bad "$f: [coordination]/[beacon] missing"
 done
 
+echo "cutover.sh abort (graceful stop before rollback)"
+# r30 round 13: abort sends SIGTERM, WAITS for the agent to exit, and only then runs `pulse-cutover rollback`; SIGKILL
+# only after the wait, with a warning. Stubs on PATH record the order of every call.
+ROOT=$(cd "$HERE/.." && pwd)
+SB="$T/abort-stubs"; mkdir -p "$SB"; LOG="$T/abort.log"
+cat > "$SB/pkill" <<'S'
+#!/usr/bin/env bash
+echo "pkill $*" >> "$ABORT_LOG"; exit 0
+S
+cat > "$SB/pgrep" <<'S'
+#!/usr/bin/env bash
+n=$(cat "$ABORT_STATE" 2>/dev/null || echo 0); echo $((n+1)) > "$ABORT_STATE"
+echo "pgrep" >> "$ABORT_LOG"
+[ "$n" -lt "$ABORT_ALIVE_FOR" ] && exit 0 || exit 1
+S
+cat > "$SB/sleep" <<'S'
+#!/usr/bin/env bash
+exit 0
+S
+cat > "$SB/pulse-cutover" <<'S'
+#!/usr/bin/env bash
+echo "pulse-cutover $1" >> "$ABORT_LOG"; exit 0
+S
+chmod +x "$SB"/*
+printf 'journal_path = "%s/j.jsonl"\nmode = "producer"\n' "$T" > "$T/abort.toml"
+run_abort() { : > "$LOG"; rm -f "$T/abort.state"; ABORT_LOG="$LOG" ABORT_STATE="$T/abort.state" ABORT_ALIVE_FOR="$1" \
+  PULSE_CUTOVER_STOP_WAIT="$2" PULSE_CUTOVER_CONFIG="$T/abort.toml" PATH="$SB:$PATH" bash "$ROOT/cutover.sh" abort >"$T/abort.out" 2>&1; }
+run_abort 2 30
+order=$(tr '\n' '|' < "$LOG")
+case "$order" in
+  "pkill -TERM -f pulse-cutover run|pgrep|pgrep|pgrep|pgrep|pulse-cutover rollback|") ok "abort: SIGTERM, waits until the agent exits, then rollback (no SIGKILL)";;
+  *) bad "abort: SIGTERM/wait/rollback order (got: $order)";;
+esac
+run_abort 99 2
+order=$(tr '\n' '|' < "$LOG")
+case "$order" in
+  pkill\ -TERM*pkill\ -KILL*"pulse-cutover rollback|") ok "abort: SIGKILL only after the bounded wait, before rollback";;
+  *) bad "abort: SIGKILL after the wait (got: $order)";;
+esac
+grep -q "did not stop within 2s of SIGTERM" "$T/abort.out" && ok "abort: a forced kill is announced loudly" || bad "abort: missing SIGKILL warning"
+
 echo; echo "$PASS passed, $FAIL failed"; [ "$FAIL" = 0 ]
