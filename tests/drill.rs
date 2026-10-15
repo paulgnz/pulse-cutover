@@ -1790,9 +1790,10 @@ fn r4_a_recorded_live_group_keeps_a_finished_drill_running() {
     let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
     std::fs::create_dir_all(drill::drill_dir(&cfg, 9)).unwrap();
     use std::os::unix::process::CommandExt;
-    let mut child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("sleep 30")
+    // `sleep` itself leads the group: a `sh -c` wrapper (dash on Linux) would leave the sleep alive in the group after
+    // the wrapper is killed, so the group would never be gone.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
         .process_group(0)
         .spawn()
         .unwrap();
