@@ -137,9 +137,9 @@ struct World {
     resume_fails: Cell<u32>,
     /// The next N resume() calls answer Ok but the producer stays paused (a stuck node).
     resume_ignored: Cell<u32>,
-    /// r30 round 11 (Codex R10-1): the next N resume() calls TAKE EFFECT but the answer is lost (an error to the agent).
+    /// r30 round 11 (review R10-1): the next N resume() calls TAKE EFFECT but the answer is lost (an error to the agent).
     resume_lost: Cell<u32>,
-    /// r30 round 11 (Codex R10-1): the next resume() takes effect, then the agent is killed before it hears back.
+    /// r30 round 11 (review R10-1): the next resume() takes effect, then the agent is killed before it hears back.
     crash_after_resume: Cell<bool>,
     /// r30 round 11: the next pause() takes effect, then the agent is killed (before its ack / next record).
     crash_after_pause: Cell<bool>,
@@ -1014,7 +1014,7 @@ fn quiet_panics() {
     });
 }
 
-/// Regression seeds of class R10-1 (Codex round 10, fixed in round 11): a resume that TOOK EFFECT but whose answer was
+/// Regression seeds of class R10-1 (review round 10, fixed in round 11): a resume that TOOK EFFECT but whose answer was
 /// lost, or after which the agent was killed before journaling it, used to leave the agent's pause episode open, so a
 /// later external pause was resumed as ours. Kept as a regression list (`model_known_open_seeds_all_clean`).
 const KNOWN_OPEN: &[u64] = &[287, 319, 675, 1447, 1959, 2067, 2225, 2553, 2558, 2659, 2866];
@@ -1055,7 +1055,7 @@ fn run_many(start: u64, count: u64) -> Vec<(u64, Vec<String>, Vec<String>)> {
 }
 
 /// Round 13: the class of a violating scenario (for the long-run report and the regression tests).
-/// - F1-A (Codex final round, F1): a rollback completes ABORTED over a paused producer in a config without `on_abort`
+/// - F1-A (review final round, F1): a rollback completes ABORTED over a paused producer in a config without `on_abort`
 ///   (the producer-state confirmation only runs when a reopen hook is pending);
 /// - R13-A: the agent's acknowledged pause is un-paused by someone else and paused again, unseen; the agent later
 ///   resumes that external pause as its own;
@@ -1113,7 +1113,7 @@ fn model_checker_finds_no_invariant_violation() {
 /// list as each fix lands (and un-ignore its class test).
 const OPEN_CLASSES: &[&str] = &[];
 
-/// Directed: Codex round 9, R9-2. The ceremony pauses (ours), a coordinator abort makes it resume its own pause, the
+/// Directed: review round 9, R9-2. The ceremony pauses (ours), a coordinator abort makes it resume its own pause, the
 /// write-reopen hook fails, someone else then pauses the producer, and an operator runs plain rollbacks. An external
 /// pause must never be resumed without a journaled release.
 fn directed_r9_2(dir: &Path, force_last: bool) -> Vec<String> {
@@ -1141,7 +1141,7 @@ fn directed_r9_2(dir: &Path, force_last: bool) -> Vec<String> {
 
 /// FAILS on r30/integrate 5518752 (I3): un-ignore once round 9's pause-episode fix lands.
 #[test]
-fn directed_i3_codex_r9_2_external_pause_after_a_completed_resume() {
+fn directed_i3_review_r9_2_external_pause_after_a_completed_resume() {
     let dir = tempfile::tempdir().unwrap();
     let v = directed_r9_2(dir.path(), false);
     assert!(v.is_empty(), "{v:?}");
@@ -1158,7 +1158,7 @@ fn assert_seed_clean_with(seed: u64, r11: bool) {
     assert!(v.is_empty() && open.is_empty(), "seed {seed}: {} {open:?}\n{}", v.join(" | "), t.join("\n"));
 }
 
-/// Class A (= Codex R9-2), found by the checker: own pause resumed, on_abort fails, someone else pauses, a later
+/// Class A (= review R9-2), found by the checker: own pause resumed, on_abort fails, someone else pauses, a later
 /// rollback (plain or --force-stranded) resumes that external pause as if it were ours (no release journaled).
 #[test]
 fn model_i3_class_a_seed_1300() {
@@ -1182,7 +1182,7 @@ fn model_i3_class_b_seed_4771() {
     assert_seed_clean(4771);
 }
 
-/// Directed, Codex round 10 (R10-2): `pause_at_h` recovery. The agent's own pause is acknowledged, the agent is killed
+/// Directed, review round 10 (R10-2): `pause_at_h` recovery. The agent's own pause is acknowledged, the agent is killed
 /// during quiescence, the re-run finds its own pause at the start of FROZEN and resumes production for the snapshot
 /// (`resumed_production_for_snapshot`); someone else then pauses the producer; the burn-off audit aborts. The episode
 /// the snapshot resume closed must not make that external pause "ours" (I3).
@@ -1216,16 +1216,16 @@ fn directed_r10_2(dir: &Path) -> Vec<String> {
     v
 }
 
-/// FAILS on r30/integrate 972d37b (I3, Codex R10-2): `resumed_production_for_snapshot` does not close the agent's
+/// FAILS on r30/integrate 972d37b (I3, review R10-2): `resumed_production_for_snapshot` does not close the agent's
 /// pause episode, so a pause someone else makes right after it is resumed by the abort as if it were ours.
 #[test]
-fn directed_i3_codex_r10_2_pause_at_h_snapshot_resume() {
+fn directed_i3_review_r10_2_pause_at_h_snapshot_resume() {
     let dir = tempfile::tempdir().unwrap();
     let v = directed_r10_2(dir.path());
     assert!(v.is_empty(), "{v:?}");
 }
 
-// ---- class R10-1 (Codex round 10): lost or crashed resume leaves the episode open. FAIL on 972d37b. ----
+// ---- class R10-1 (review round 10): lost or crashed resume leaves the episode open. FAIL on 972d37b. ----
 
 fn assert_r11_seed(seed: u64) {
     assert_seed_clean_with(seed, true);
@@ -1324,7 +1324,7 @@ fn oracle_i7_ignores_a_refused_arm_over_someone_elses_pause() {
     assert_seed_clean_r13(46);
 }
 
-/// Class F1-A (Codex final round, F1), found by the round-13 checker: in a config without `on_abort`, a rollback
+/// Class F1-A (review final round, F1), found by the round-13 checker: in a config without `on_abort`, a rollback
 /// completes ABORTED over a paused producer, because the producer-state confirmation only runs when a reopen hook is
 /// pending. Seed 52: someone else's pause, the agent's freeze hook failed. Seed 233: an older agent's own pause whose
 /// resume answered Ok without effect.

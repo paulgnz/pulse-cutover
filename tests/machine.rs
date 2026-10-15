@@ -4672,7 +4672,7 @@ fn d10_mainnet_producer_ceremony_must_be_coordinated() {
     assert!(transition(&journal_entries(&cfg), "FROZEN").is_some(), "testnet: the rule does not apply");
 }
 
-/// RISK-REGISTER D-10 (Codex review): field presence is not authorization. At a fresh mainnet ARM the relay must
+/// RISK-REGISTER D-10 (review): field presence is not authorization. At a fresh mainnet ARM the relay must
 /// serve the signed event the config was derived from, and the payload must bind this chain, H, roster and quorum;
 /// every mismatch, a bad signature, another payload under the same id, and a relay that does not answer refuse
 /// before anything freezes.
@@ -6867,7 +6867,7 @@ fn shadow_journal_at_verified(dir: &std::path::Path) -> Config {
     cfg
 }
 
-/// Codex round 2, HIGH 1: the refusal is authoritative from its FIRST durable record. A crash right after it (before the
+/// Review round 2, HIGH 1: the refusal is authoritative from its FIRST durable record. A crash right after it (before the
 /// ABORTED and rollback_done records) must not reopen a rollback that resumes the source or runs on_abort, even if the
 /// identity would pass now.
 #[test]
@@ -6913,7 +6913,7 @@ fn r30r2_shadow_refusal_is_authoritative_from_its_first_record() {
     assert_eq!(Journal::replay(&cfg.journal_path).unwrap().state, Some(State::Aborted));
 }
 
-/// Codex round 2, HIGH 2: a shadow resumed at VERIFIED whose resume preflight fails for an ordinary reason reaches
+/// Review round 2, HIGH 2: a shadow resumed at VERIFIED whose resume preflight fails for an ordinary reason reaches
 /// abort() before step_verified re-proves the identity. With the source now looking real (retargeted), the abort must
 /// refuse without resuming; with the identity intact it re-proves and carries on with the normal abort.
 #[test]
@@ -6948,7 +6948,7 @@ fn r30r2_shadow_abort_at_verified_reproves_identity_before_resuming() {
     assert!(!Journal::replay(&cfg.journal_path).unwrap().shadow_refused);
 }
 
-/// Codex round 2, HIGH 4: the identity reads and the producer mutations must hit the same API base, path included.
+/// Review round 2, HIGH 4: the identity reads and the producer mutations must hit the same API base, path included.
 #[test]
 fn r30r2_shadow_source_urls_must_share_the_whole_api_base() {
     let dir = tempfile::tempdir().unwrap();
@@ -7007,7 +7007,7 @@ fn r30r2_a_lagging_public_endpoint_proves_nothing() {
     }
 }
 
-/// Codex round 2, HIGH 3 + reviewer N1: the D-10 authentication cannot be skipped by a crash after ARMED, and a resumed
+/// Review round 2, HIGH 3 + reviewer N1: the D-10 authentication cannot be skipped by a crash after ARMED, and a resumed
 /// mainnet journal continues only with the event that was authenticated (offline comparison).
 #[test]
 fn r30r2_mainnet_event_binding_survives_crashes_and_config_edits() {
@@ -7078,7 +7078,7 @@ fn shadow_journal_stranded(dir: &std::path::Path) -> Config {
     cfg
 }
 
-/// Codex round 3, HIGH 1: a valid STRANDED shadow journal whose source URLs now point at a REAL producer (label, network
+/// Review round 3, HIGH 1: a valid STRANDED shadow journal whose source URLs now point at a REAL producer (label, network
 /// and keys unchanged) must not be touched by `run` (its pause retry), `rollback` (strand's pause / the resume) or `join`
 /// (on_freeze, the pause): every source mutation waits for a fresh identity proof in this run.
 #[test]
@@ -7130,7 +7130,7 @@ fn r30r3_shadow_recovery_never_touches_a_retargeted_source_before_the_proof() {
     assert!(!Journal::replay(&cfg.journal_path).unwrap().shadow_refused);
 }
 
-/// Codex round 3, HIGH 2: a crash right after ARMED (before the D-10 authentication), then a resume with a config AND a
+/// Review round 3, HIGH 2: a crash right after ARMED (before the D-10 authentication), then a resume with a config AND a
 /// valid signed event for another H: the journal executes the ARMED record's H, so the authorization for the other H
 /// must refuse before anything is scheduled or frozen.
 #[test]
@@ -7214,7 +7214,7 @@ fn r30r3_far_ahead_is_judged_on_the_highest_public_head() {
 /// Round-3 review: every source-side mutation in the state machine goes through the shadow gate (`src_pause`,
 /// `src_resume`, `hook`). A raw `self.ops.pause()` / `resume()` / `run_hook(` is allowed only on a line marked `ungated`
 /// (the gate itself and the paging-only on_halt), so a new call site cannot skip the shadow identity proof.
-/// Round 5 (Codex R5-7): the code of a Rust source with every comment and string/char literal blanked (newlines kept, so
+/// Round 5 (review R5-7): the code of a Rust source with every comment and string/char literal blanked (newlines kept, so
 /// line numbers stay), and every `#[cfg(test)] mod … { … }` block removed. Other `#[cfg(test)]` items stay scanned.
 fn rust_code_mask(text: &str) -> String {
     let c: Vec<char> = text.chars().collect();
@@ -7336,7 +7336,7 @@ fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
     // The scanner itself flags the shapes that used to escape it.
     for sneaky in ["let o = self.ops; o.resume();", "ChainOps::pause(self.ops)?;", "self.ops.unschedule_snapshot_request(1, 2)?;",
                    "ops.ignite()?;", "self.ops.run_hook(\"x\") // ungated: no",
-                   // round 5 (Codex R5-7): a call split across lines, and production code after a NON-module
+                   // round 5 (review R5-7): a call split across lines, and production code after a NON-module
                    // #[cfg(test)] item (the old scan stopped at the first #[cfg(test)] it saw).
                    "fn f() {\n    self.ops.pause\n        ()?;\n}",
                    "#[cfg(test)]\nthread_local! { static X: u8 = 0; }\nfn f() { self.ops.resume().ok(); }",
@@ -7356,7 +7356,7 @@ fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
     assert_eq!(raw, 5, "exactly the three gate bodies and the two on_halt pages call pause/resume/run_hook directly");
 }
 
-/// Round-4 review (Codex R4-1): a proxy can route `/v1/chain/*` to the shadow node and `/v1/producer/*` to a real
+/// Round-4 review (review R4-1): a proxy can route `/v1/chain/*` to the shadow node and `/v1/producer/*` to a real
 /// producer behind an identical base URL. The identity proof is therefore also made THROUGH the producer API (its head
 /// block must be the chain API's block at that height and not public mainnet's), with the rest of the proof and again
 /// right before every pause/resume. A producer API that answers with a real mainnet block is refused; nothing is paused,
@@ -7403,7 +7403,7 @@ fn r30r4_a_producer_api_routed_to_a_real_producer_is_refused_before_any_pause() 
     assert!(Journal::replay(&cfg.journal_path).unwrap().shadow_refused);
 }
 
-/// Round-4 review (Codex R4-7): a resumed ceremony skipped the drill check and only journaled a busy drill lock.
+/// Round-4 review (review R4-7): a resumed ceremony skipped the drill check and only journaled a busy drill lock.
 /// Resumed while still ARMED (nothing frozen yet) it now refuses next to a live drill like a fresh ARM; resumed AFTER
 /// the freeze it is never refused (the cut continues) but stops the drill on this box first, and journals a loud
 /// warning when the drill cannot be verified stopped.
@@ -7488,7 +7488,7 @@ fn r30r4_a_resumed_ceremony_handles_a_live_readiness_drill() {
     not_for_the_drill(&cfg);
 }
 
-/// Round 5 (Codex R5-4): `loop` ran `[loop] reset_cmd` (service commands on the source) before any machine existed or
+/// Round 5 (review R5-4): `loop` ran `[loop] reset_cmd` (service commands on the source) before any machine existed or
 /// any shadow identity was proven. Now every reset is gated: the chain must be pinned in the config, never real XPR
 /// mainnet (unless a shadow), a source that answers must report that chain, a shadow's identity is proven (parts 1-4)
 /// right before EVERY reset, and no ceremony or drill may hold this box's locks. A refused gate runs nothing.
@@ -7553,7 +7553,7 @@ fn r30r5_loop_never_runs_reset_cmd_before_its_gate() {
     assert!(marker.exists(), "a proven shadow loop runs its reset");
 }
 
-/// Round 5 (Codex R5-5): a ceremony resumed after its freeze asks a live drill to stop by writing the drill's cancel
+/// Round 5 (review R5-5): a ceremony resumed after its freeze asks a live drill to stop by writing the drill's cancel
 /// file. That write opened the name with truncate and only O_NOFOLLOW, so a hard link planted at the cancel path
 /// truncated whatever it named: here, the ceremony's own journal. It now unlinks the name and creates a fresh inode;
 /// the journal keeps every record and the ceremony continues (a loud warning: the drill could not be stopped).
@@ -7585,7 +7585,7 @@ fn r30r5_drill_cancel_write_never_truncates_through_a_hard_link() {
     assert!(text.contains("readiness_drill_not_stopped"), "{text}");
 }
 
-/// R5-6 (Codex, ceremony side): a readiness drill on the SAME producer under ANOTHER journal directory holds the
+/// R5-6 (review, ceremony side): a readiness drill on the SAME producer under ANOTHER journal directory holds the
 /// producer's lock; before round 5 the ceremony only looked at its own journal directory and armed next to it. Now a
 /// fresh ARM refuses before anything freezes.
 #[test]
@@ -7618,7 +7618,7 @@ fn r30r5_a_fresh_ceremony_refuses_next_to_a_drill_on_the_same_producer_in_anothe
 }
 
 
-/// r30 round 6 (Codex R6-1): undo only what this ceremony did. A preflight refusal (a producer someone else paused,
+/// r30 round 6 (review R6-1): undo only what this ceremony did. A preflight refusal (a producer someone else paused,
 /// a busy producer lock) must never resume that producer or reopen writes another process closed; a normal abort
 /// after this ceremony froze and paused still resumes and reopens (regression check).
 #[test]
@@ -7679,7 +7679,7 @@ fn r30r6_a_refused_arm_undoes_nothing_a_real_abort_still_undoes_what_it_did() {
     assert!(ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "the ceremony's own freeze is undone: {:?}", ops.hooks.borrow());
 }
 
-/// r30 round 6 (Codex R6-6/R6-7, reviewer R6-F1/F2): the producer lock lives in an agent-owned `lock_dir`, keyed on
+/// r30 round 6 (review R6-6/R6-7, reviewer R6-F1/F2): the producer lock lives in an agent-owned `lock_dir`, keyed on
 /// nodeos's canonical snapshot directory. Nothing is written into the snapshot directory (a read-only one still
 /// arms), spelling aliases of the producer API share one lock, and a lock_dir the agent cannot use is a journaled
 /// warning, never a refusal.
@@ -7732,7 +7732,7 @@ fn r30r6_producer_lock_lives_in_lock_dir_keyed_on_the_snapshot_dir() {
     assert!(transition(&e, "FROZEN").is_some(), "an unusable lock_dir must not refuse the cut");
 }
 
-/// r30 round 6 (Codex R6-5): a drill's work that survives its process (export container, pipeline group) is named by
+/// r30 round 6 (review R6-5): a drill's work that survives its process (export container, pipeline group) is named by
 /// the producer's work marker, so a ceremony under ANOTHER journal directory still refuses to arm next to it, and
 /// arms once the work is verified gone.
 #[test]
@@ -7778,7 +7778,7 @@ fn r30r6_orphan_drill_work_blocks_a_ceremony_in_another_directory() {
     assert!(transition(&journal_entries(&cfg2), "FROZEN").is_some());
 }
 
-/// r30 round 6 (Codex R6-3/R6-4): `loop` fails closed when the source does not answer (its chain cannot be checked
+/// r30 round 6 (review R6-3/R6-4): `loop` fails closed when the source does not answer (its chain cannot be checked
 /// before reset_cmd), unless `[loop] reset_when_source_down = true` (refused for a mainnet chain_id), and it takes the
 /// producer's lock: a ceremony or drill on the same producer under another journal directory blocks the reset.
 #[test]
@@ -7891,7 +7891,7 @@ fn r30r7_an_operator_pause_after_the_freeze_is_adopted_and_the_cut_goes_live() {
     assert_eq!(ops.resumes.get(), 0, "never resumed");
 }
 
-/// r30 round 7 (Codex R7-1): the external pause is found after a crash with H already final. Ownership is decided
+/// r30 round 7 (review R7-1): the external pause is found after a crash with H already final. Ownership is decided
 /// BEFORE the H-final branch: adopted, never turned into this ceremony's pause, and the cut goes LIVE.
 #[test]
 fn r30r7_an_external_pause_with_h_already_final_is_adopted_not_converted() {
@@ -8008,7 +8008,7 @@ fn r30r7_mainnet_requires_an_explicit_lock_dir_and_the_default_is_loud() {
 }
 
 
-/// r30 round 8 (Codex R8-1): someone else pauses the producer DURING the scheduled-snapshot wait (after the step's
+/// r30 round 8 (review R8-1): someone else pauses the producer DURING the scheduled-snapshot wait (after the step's
 /// first ownership check). The pause is never recorded as ours (no own `source_pause`, no pause RPC); the cut carries on
 /// with it adopted, and an abort then never resumes it and keeps writes frozen: STRANDED, on_halt pages.
 #[test]
@@ -8029,7 +8029,7 @@ fn r30r8_an_external_pause_during_the_snapshot_wait_is_never_ours() {
     assert!(journal_entries(&cfg).iter().any(|v| v["data"]["writes_kept_frozen"] == "producer paused"));
 }
 
-/// r30 round 8 (Codex R8-2): the agent dies right after freezing writes; someone else pauses the producer; a plain
+/// r30 round 8 (review R8-2): the agent dies right after freezing writes; someone else pauses the producer; a plain
 /// operator rollback must not reopen writes into the paused chain (nor resume someone else's pause).
 #[test]
 fn r30r8_rollback_before_adoption_never_reopens_into_a_paused_producer() {
@@ -8054,7 +8054,7 @@ fn r30r8_rollback_before_adoption_never_reopens_into_a_paused_producer() {
     assert!(!ops3.hooks.borrow().iter().any(|h| h == "reopen-writes"), "writes not reopened into an unknown state");
 }
 
-/// r30 round 8 (Codex R8-3): an older agent's journal never fabricates ownership. ARMED only (it never paused):
+/// r30 round 8 (review R8-3): an older agent's journal never fabricates ownership. ARMED only (it never paused):
 /// a rollback resumes nothing. Past its pause (SNAPSHOTTED with a pause head): the rollback resumes, as before.
 #[test]
 fn r30r8_old_journals_resume_only_a_pause_the_old_agent_made() {
@@ -8088,7 +8088,7 @@ fn r30r8_old_journals_resume_only_a_pause_the_old_agent_made() {
     assert!(ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "and writes reopen into the producing chain");
 }
 
-/// r30 round 8 (Codex R8-4): a run resumed while still ARMED that never froze writes is a fresh ARM: a producer
+/// r30 round 8 (review R8-4): a run resumed while still ARMED that never froze writes is a fresh ARM: a producer
 /// someone else paused is refused, nothing undone.
 #[test]
 fn r30r8_a_resumed_armed_run_refuses_an_externally_paused_producer() {
@@ -8109,7 +8109,7 @@ fn r30r8_a_resumed_armed_run_refuses_an_externally_paused_producer() {
     assert!(!ops.hooks.borrow().iter().any(|h| h == "freeze-writes" || h == "reopen-writes"));
 }
 
-/// r30 round 8 (Codex R8-6): an abort journaled that it keeps writes frozen (strand intent), then the agent died
+/// r30 round 8 (review R8-6): an abort journaled that it keeps writes frozen (strand intent), then the agent died
 /// before the STRANDED transition. The next run completes the strand: nothing resumed, nothing reopened.
 #[test]
 fn r30r8_a_journaled_strand_intent_is_completed_on_the_next_run() {
@@ -8204,7 +8204,7 @@ fn r30r8_resume_ours_reopen_only_into_a_producing_chain() {
 }
 
 
-/// r30 round 9 (Codex R9-1): an R2 strand (the agent kept writes frozen because the source was not producing) journals a
+/// r30 round 9 (review R9-1): an R2 strand (the agent kept writes frozen because the source was not producing) journals a
 /// strand intent before its STRANDED transition. The transition satisfies it: a later, valid `join` reaches LIVE instead
 /// of being stranded again by the old intent (also for round 7's `external_pause_held` record).
 #[test]
@@ -8234,7 +8234,7 @@ fn r30r9_a_join_after_an_r2_strand_reaches_live() {
     assert_eq!(Machine::new(&cfg, &ops, j, rec).join("e1").unwrap(), State::Live, "the join is not re-stranded");
 }
 
-/// r30 round 9 (Codex R9-3): a join from ABORTED starts a new journal segment before its first side effect, so the
+/// r30 round 9 (review R9-3): a join from ABORTED starts a new journal segment before its first side effect, so the
 /// earlier, completed rollback never covers what the join did. (a) Killed inside the re-freeze hook: `rollback` reopens
 /// writes (never "already rolled back"). (b) Killed after the join's own pause took effect but before its `join` side
 /// effect was journaled: `rollback` resumes that pause and reopens writes.
@@ -8318,7 +8318,7 @@ fn r30r9_a_crashed_join_is_rolled_back_by_its_own_segment() {
     assert!(ops.paused.get());
 }
 
-/// r30 round 9 (Codex R9-2): this ceremony resumed its own pause, then on_abort failed, then someone else paused the
+/// r30 round 9 (review R9-2): this ceremony resumed its own pause, then on_abort failed, then someone else paused the
 /// producer. A completed resume never authorizes resuming a later pause: plain rollbacks never resume it.
 #[test]
 fn r30r9_a_resumed_then_externally_repaused_producer_is_not_resumed_by_a_plain_rollback() {
@@ -8340,7 +8340,7 @@ fn r30r9_a_resumed_then_externally_repaused_producer_is_not_resumed_by_a_plain_r
     assert_eq!(ops.hooks.borrow().iter().filter(|h| *h == "reopen-writes").count(), 1, "writes never reopened into a paused chain");
 }
 
-/// r30 round 9 (Codex R9-4): an operator rollback that cannot finish (the released pause's resume did not take effect,
+/// r30 round 9 (review R9-4): an operator rollback that cannot finish (the released pause's resume did not take effect,
 /// so writes stay frozen and the journal is STRANDED) reports a failure with the truth: never "rolled back".
 #[test]
 fn r30r9_a_stranded_operator_rollback_reports_failure() {
@@ -8360,7 +8360,7 @@ fn r30r9_a_stranded_operator_rollback_reports_failure() {
         "{:?}", out.failed);
 }
 
-/// r30 round 9 (Codex R9-5): an XPR mainnet ceremony that died inside its freeze hook (a write-freeze intent journaled,
+/// r30 round 9 (review R9-5): an XPR mainnet ceremony that died inside its freeze hook (a write-freeze intent journaled,
 /// still ARMED) resumes past the freeze even when the config has no lock_dir: a warning, never a refusal.
 #[test]
 fn r30r9_a_frozen_armed_mainnet_journal_without_lock_dir_resumes() {
@@ -8393,7 +8393,7 @@ fn r30r9_a_frozen_armed_mainnet_journal_without_lock_dir_resumes() {
         "never refused for it");
 }
 
-/// r30 round 9 (Codex R9-6): a forced rollback that releases an external pause journals its rollback intent FIRST: a
+/// r30 round 9 (review R9-6): a forced rollback that releases an external pause journals its rollback intent FIRST: a
 /// crash between the two records always recovers a pending rollback (run refuses, rollback finishes), never a released
 /// pause with nothing behind it.
 #[test]
@@ -8687,7 +8687,7 @@ fn r30r10_join_model_finds_no_invariant_violation() {
 }
 
 // ------------------------------------------------------------------------------------------------------------------
-// r30 round 11 (Codex R10-1, R10-2): a resume gives up ownership BEFORE its RPC (`side_effect: source_resume`); an
+// r30 round 11 (review R10-1, R10-2): a resume gives up ownership BEFORE its RPC (`side_effect: source_resume`); an
 // unsettled resume leaves the episode's ownership unknown (never resumed again on this ceremony's own authority), and the
 // pause_at_h snapshot-recovery resume closes its episode like any other.
 // ------------------------------------------------------------------------------------------------------------------
@@ -8876,7 +8876,7 @@ fn r30r13_sigterm_mid_pause_lets_the_episode_finish_and_a_plain_rollback_resumes
     assert!(ops.hooks.borrow().iter().any(|h| h == "reopen-writes"), "writes reopened into a producing chain");
 }
 
-/// r30 round 13 (Codex R12-F1): (a) with no on_abort hook, a resume that answers ok but does not take effect used to end
+/// r30 round 13 (review R12-F1): (a) with no on_abort hook, a resume that answers ok but does not take effect used to end
 /// ABORTED + rollback_done with the producer still paused; the confirming read now runs whatever hooks are configured,
 /// and the rollback seals instead. (b) An unknown pause plus an unreadable producer can never bypass the refusal.
 #[test]
@@ -8905,7 +8905,7 @@ fn r30r13_a_rollback_is_complete_only_after_a_confirming_producing_read() {
     assert_eq!(ops.resumes.get(), resumes, "nothing resumed");
 }
 
-/// r30 round 13 (Codex R12-F2, narrowed not closed): someone pauses the producer after the reopen check and before the
+/// r30 round 13 (review R12-F2, narrowed not closed): someone pauses the producer after the reopen check and before the
 /// reopen. A read right before on_abort now withholds it: writes stay frozen, the rollback stays incomplete.
 #[test]
 fn r30r13_a_pause_between_the_reopen_check_and_the_reopen_withholds_on_abort() {

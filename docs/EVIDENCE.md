@@ -474,7 +474,7 @@ The classes found on that run, all I3 (someone else's pause resumed) and all in 
   Representative seeds 319, 675, 1959, 2067.
 - **R11-A**: a forced release whose resume was refused stays in force; after that party resumes and later pauses again,
   a plain rollback resumes the new pause. Seed 13295.
-- A directed test reproduces Codex R10-2: production resumed for the snapshot (`pause_at_h` recovery) does not close
+- A directed test reproduces review R10-2: production resumed for the snapshot (`pause_at_h` recovery) does not close
   the agent's pause episode, so a pause made right after it is resumed by the abort.
 
 **After the fixes (round 12, same checker, every violation fatal):**

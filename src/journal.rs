@@ -150,22 +150,22 @@ pub struct Recovered {
     /// resume the source or run on_abort on this journal, whatever records follow (a crash between the refusal's
     /// records must not reopen a rollback that resumes a node which may be real).
     pub shadow_refused: bool,
-    /// r30 round 8 (Codex R8-6): an abort decided to keep writes frozen and seal (STRANDED) because the producer was
+    /// r30 round 8 (review R8-6): an abort decided to keep writes frozen and seal (STRANDED) because the producer was
     /// paused (or unreadable) when writes would have reopened (`strand_intent`, or round 7's `external_pause_held`). A
     /// crash before the STRANDED transition must not let a later run carry on: the next run completes the strand.
     pub strand_intent: bool,
     /// Round-2 review (D-10): the bindings a fresh XPR mainnet ARM authenticated (`mainnet_event_verified`), compared
     /// offline with the config on every later run, join, rollback and unhalt (coord::mainnet_binding_problem).
     pub mainnet_event_binding: Option<Value>,
-    /// r30 round 9 (Codex R9-2): every pause, resume and operator release, in journal order (pause EPISODES). A pause by
+    /// r30 round 9 (review R9-2): every pause, resume and operator release, in journal order (pause EPISODES). A pause by
     /// this ceremony (`side_effect: source_pause`, written before the RPC) or an adopted external one opens an episode;
     /// a journaled resume (`rollback_step: resume`) closes the latest open one; an operator's `external_pause_release`
     /// makes the latest open external episode ours. Never cleared: an old, completed resume can never authorize a later one.
     pub pause_events: Vec<PauseEvent>,
-    /// r30 round 9 (Codex R9-3): writes this journal froze in its CURRENT segment (a `write_freeze` intent in it, or a
+    /// r30 round 9 (review R9-3): writes this journal froze in its CURRENT segment (a `write_freeze` intent in it, or a
     /// freeze carried over from the previous segment whose on_abort never reopened them).
     pub writes_closed: bool,
-    /// r30 round 9 (Codex R9-1/R9-3): the journal segment (0 = the original ceremony). A `join` that re-enters an
+    /// r30 round 9 (review R9-1/R9-3): the journal segment (0 = the original ceremony). A `join` that re-enters an
     /// ABORTED or STRANDED ceremony journals `segment_start` before its first side effect: undo bookkeeping
     /// (rollback steps, rollback_done, strand intent) belongs to one segment only.
     pub segment: u64,
@@ -188,7 +188,7 @@ pub enum PauseEvent {
     /// release recovered from the journal (`live: false`, a forced rollback that died or whose resume did not settle)
     /// authorizes nothing: the episode it named is ownership unknown, and a later forced rollback journals its own.
     Release { live: bool },
-    /// r30 round 11 (Codex R10-1): this ceremony is ABOUT to resume its own pause (`side_effect: source_resume`, written
+    /// r30 round 11 (review R10-1): this ceremony is ABOUT to resume its own pause (`side_effect: source_resume`, written
     /// before the resume RPC). It gives up ownership at once: the episode is CLOSING. If the resume's outcome is never
     /// journaled (a crash, or a lost response that a read could not settle), the episode stays closing = ownership
     /// unknown, never resumed again on this ceremony's own authority (the producer may have resumed and someone else
@@ -581,7 +581,7 @@ impl Journal {
             {
                 out.shadow_refused = true;
             }
-            // r30 round 9 (Codex R9-1): a strand intent is satisfied by the STRANDED transition it caused (the transition
+            // r30 round 9 (review R9-1): a strand intent is satisfied by the STRANDED transition it caused (the transition
             // itself carries `external_pause_held` as a display field and is not an intent).
             if entry.kind != "transition"
                 && (entry.data.get("strand_intent").and_then(|v| v.as_bool()) == Some(true)
@@ -592,7 +592,7 @@ impl Journal {
             if entry.kind == "transition" && entry.state == State::Stranded.as_str() {
                 out.strand_intent = false;
             }
-            // r30 round 9 (Codex R9-3): a new segment (a join re-entering this ceremony) starts with no undo of its own
+            // r30 round 9 (review R9-3): a new segment (a join re-entering this ceremony) starts with no undo of its own
             // done; writes the previous segment froze and never reopened stay ours to reopen.
             if let Some(seg) = entry.data.get("segment_start").and_then(|v| v.as_u64()) {
                 let legacy_froze = out.undo_tracking == Some(false) && out.frozen_ts_ms.is_some();
@@ -623,7 +623,7 @@ impl Journal {
             // r30 round 12: a resume attempt followed by a paused (or unreadable) read is never settled back to "ours"
             // (`source_resume_outcome_unknown`): the episode stays closing = ownership unknown. A round-11
             // `source_resume_cancelled` record is read the same way.
-            // r30 round 11 (Codex R10-2): the pause_at_h recovery resume closes its episode like a rollback's resume.
+            // r30 round 11 (review R10-2): the pause_at_h recovery resume closes its episode like a rollback's resume.
             if entry.data.get("resumed_production_for_snapshot").and_then(|v| v.as_bool()) == Some(true) {
                 out.pause_events.push(PauseEvent::Resume);
             }

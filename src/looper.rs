@@ -143,7 +143,7 @@ pub fn run_loop<O: ChainOps>(cfg: &Config, ops: &O, runs: u32) -> Result<(), Str
 
     for run in 1..=runs {
         eprintln!("=== loop run {run}/{runs}: reset ===");
-        // Round 5 (Codex R5-4): reset_cmd runs service commands on the source BEFORE any ceremony exists, so it is gated
+        // Round 5 (review R5-4): reset_cmd runs service commands on the source BEFORE any ceremony exists, so it is gated
         // like every other source mutation: the chain must be known, never real XPR mainnet, a shadow's identity must be
         // proven (parts 1-4) right before EVERY reset, and no ceremony or drill may be active on this box.
         let locks = loop_gate(cfg, ops)?;
@@ -225,7 +225,7 @@ pub fn loop_gate<O: ChainOps>(cfg: &Config, ops: &O) -> Result<(std::fs::File, s
         return Err("loop refused: ceremony.chain_id is XPR MAINNET and this is not a shadow config (`loop` is a \
                     rehearsal harness and never runs against mainnet)".into());
     }
-    // Round 6 (Codex R6-3): fail closed. A source that does not answer cannot be identified, so the reset is refused,
+    // Round 6 (review R6-3): fail closed. A source that does not answer cannot be identified, so the reset is refused,
     // unless the config explicitly allows resetting a stopped node (never for a mainnet chain_id).
     match ops.source_info() {
         Ok(info) => {
@@ -255,7 +255,7 @@ pub fn loop_gate<O: ChainOps>(cfg: &Config, ops: &O) -> Result<(std::fs::File, s
         .map_err(|e| format!("loop refused: a ceremony holds this box's journal lock ({e})"))?;
     let drill_lock = Journal::lock(&crate::drill::root_lock_base(cfg))
         .map_err(|e| format!("loop refused: a readiness drill or ceremony holds the drill lock ({e})"))?;
-    // Round 6 (Codex R6-4): and the producer's lock (order: journal, drill root, producer), held through reset_cmd.
+    // Round 6 (review R6-4): and the producer's lock (order: journal, drill root, producer), held through reset_cmd.
     let producer_lock = match Journal::try_lock(&crate::drill::producer_lock_base(cfg)) {
         Ok(f) => Some(f),
         Err(crate::journal::LockError::Held(e)) => return Err(format!(

@@ -370,7 +370,7 @@ fn r7_a_mainnet_drill_needs_an_explicit_lock_dir() {
     assert_eq!(markers, 0, "no work marker was left behind");
 }
 
-/// r30 round 8 (Codex R8-7): the discovered-mainnet lock_dir check needs a SUCCESSFUL discovery: a source that does
+/// r30 round 8 (review R8-7): the discovered-mainnet lock_dir check needs a SUCCESSFUL discovery: a source that does
 /// not answer is refused (never read as "not mainnet"), and the drill reuses that one checked answer.
 #[test]
 fn r8_a_drill_refuses_when_the_source_chain_cannot_be_discovered() {
@@ -1203,7 +1203,7 @@ fn r4_a_recorded_live_group_keeps_a_finished_drill_running() {
 }
 
 
-/// R5-2 (Codex): a native-executable check alone admitted `/bin/bash` as a tool (the import step would then run the
+/// R5-2 (review): a native-executable check alone admitted `/bin/bash` as a tool (the import step would then run the
 /// export-produced log as shell). A drill runs a program only when its CONTENT matches its configured pin, and the
 /// export image only by digest; docker only by absolute path, pinned, against an explicit local socket.
 #[test]
@@ -1261,7 +1261,7 @@ fn r5_a_drill_runs_only_pinned_content_never_a_host_shell() {
     assert!(!chain.called("run_argv"));
 }
 
-/// R5-3 (Codex): killing the docker CLI does not stop the daemon-managed export container. The drill names the
+/// R5-3 (review): killing the docker CLI does not stop the daemon-managed export container. The drill names the
 /// container before it exists, stops it (kill, rm -f) and verifies it gone through the pinned CLI; until then the drill
 /// counts as running (a ceremony keeps refusing) and a cancel is INCOMPLETE.
 #[test]
@@ -1316,7 +1316,7 @@ fn r5_an_export_container_that_outlives_the_docker_cli_keeps_the_drill_running_u
     assert_eq!(drill::activity(&cfg), drill::DrillActivity::Idle);
 }
 
-/// R5-6 (Codex): exclusion was keyed on the journal directory. Two configs on the SAME producer (same producer API,
+/// R5-6 (review): exclusion was keyed on the journal directory. Two configs on the SAME producer (same producer API,
 /// same nodeos snapshot dir) under different journal directories now share one producer lock: a second drill (or a
 /// ceremony) is refused while the first holds it.
 #[test]
@@ -1347,7 +1347,7 @@ fn r5_drills_on_the_same_producer_exclude_each_other_across_journal_directories(
     assert_ne!(drill::producer_lock_base(&cfg_a), drill::producer_lock_base(&cfg_c));
 }
 
-/// R7-3 (Codex): a drill released its locks and then cleaned up the producer's work marker by reading `latest.json`;
+/// R7-3 (review): a drill released its locks and then cleaned up the producer's work marker by reading `latest.json`;
 /// a newer drill could have written ITS marker in between (latest.json still naming the old, finished drill), and the
 /// old drill's cleanup deleted it. Now every marker names its drill (`drill_id`, also in that drill's latest.json),
 /// only that drill removes it, under its locks; and a marker whose drill never published and is not running is

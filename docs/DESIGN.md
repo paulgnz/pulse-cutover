@@ -136,7 +136,7 @@ stateDiagram-v2
   **Round 9 makes both precise.** *Pause episodes*: every pause (ours, journaled before the RPC, or someone else's,
   adopted as evidence), every journaled resume and every operator release carries an episode number; R1 resumes only
   when the LATEST open episode is ours, so a resume journaled earlier closes its episode and never authorizes resuming a
-  later pause (Codex R9-2). *Journal segments*: a `join` that re-enters an ABORTED or STRANDED ceremony journals
+  later pause (review R9-2). *Journal segments*: a `join` that re-enters an ABORTED or STRANDED ceremony journals
   `segment_start` before its first side effect (the re-freeze, a pause, or its commit); rollback steps, `rollback_done`
   and a strand intent belong to one segment, so an earlier completed rollback never covers what the join did and an
   earlier strand intent never re-strands a valid join (R9-1, R9-3; a STRANDED transition also satisfies the intent it
@@ -156,7 +156,7 @@ stateDiagram-v2
   frozen and seals. The cost is conservative: a kill between a successful pause RPC and its ack leaves that pause to
   the operator (`rollback --force-stranded --i-understand`) instead of an automatic resume. Older journals keep their
   intent-only rule.
-  **Round 11: a resume gives up ownership before its RPC** (the mirror of round 10, Codex R10-1). Every resume (a
+  **Round 11: a resume gives up ownership before its RPC** (the mirror of round 10, review R10-1). Every resume (a
   rollback's, an operator's forced release, the `pause_at_h` recovery resume for the snapshot) first journals a
   `side_effect: source_resume` intent: the episode becomes CLOSING and is no longer "ours". It closes when the resume's
   outcome is journaled (`rollback_step: resume`, or `resumed_production_for_snapshot` after a confirming read). A failed

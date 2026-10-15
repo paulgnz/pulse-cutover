@@ -62,7 +62,7 @@ test('extractBlockIds reads /v1 and native receipt shapes', () => {
 });
 
 test('round 2: a receipt without a status is unknown, never a match', () => {
-  // Review (Codex r30-2 #10): a shadow receipt carrying only the transaction id used to default to "executed" and
+  // Review (review r30-2 #10): a shadow receipt carrying only the transaction id used to default to "executed" and
   // matched an executed mainnet transaction although its outcome was unknown.
   const ids = extractBlockIds({ transactions: [{ trx: 'ab'.repeat(32) }] });
   assert.equal(ids.get('ab'.repeat(32)), 'unknown');
@@ -548,14 +548,14 @@ test('CLI: the child process keeps its exit codes (usage error, dry run)', async
   } finally { source.close(); }
 });
 
-test('round 6: authority is exact pinned-URL provenance, never a hostname (Codex R6-2)', () => {
+test('round 6: authority is exact pinned-URL provenance, never a hostname (review R6-2)', () => {
   const pinned = ['https://pin-a.example', 'https://pin-b.example'];
   const refs = referenceEndpoints({ chainId: XPR_MAINNET_CHAIN_ID, pinned,
     mainnetAdded: ['http://pin-a.example', 'http://pin-b.example', 'https://pin-a.example:8443', 'https://pin-b.example/other'] });
   assert.deepEqual(refs.authorities, pinned, 'only the exact https pinned URLs are authorities');
   const A = (endpoint, over = {}) => ({ endpoint, host: hostOf(endpoint), chain_id: XPR_MAINNET_CHAIN_ID, block_at_cut_id: 'cut', block_after_cut_id: 'shadow-1001', ...over });
   const d = (answers) => decideReference({ answers, chainId: XPR_MAINNET_CHAIN_ID, cutId: 'cut', authorities: refs.authorities });
-  // pinned https down + two added http:// URLs on the pinned hostnames agreeing: refused (the Codex reproduction)
+  // pinned https down + two added http:// URLs on the pinned hostnames agreeing: refused (the review reproduction)
   const attack = d([A('https://pin-a.example', { error: 'HTTP 0' }), A('https://pin-b.example', { error: 'HTTP 0' }),
     A('http://pin-a.example'), A('http://pin-b.example')]);
   assert.ok(!attack.ok && attack.reasons.some((r) => r.includes('exact built-in pinned')), JSON.stringify(attack));
@@ -580,7 +580,7 @@ test('round 6: authority is exact pinned-URL provenance, never a hostname (Codex
   assert.deepEqual(referenceEndpoints({ chainId: XPR_MAINNET_CHAIN_ID, pinned: ['http://pin-a.example', 'https://pin-b.example'] }).authorities, ['https://pin-b.example']);
 });
 
-test('round 6 end to end: the Codex reproduction (pinned down, added http URLs on pinned hostnames vouching for a swap) sends nothing', async () => {
+test('round 6 end to end: the review reproduction (pinned down, added http URLs on pinned hostnames vouching for a swap) sends nothing', async () => {
   const cutBlock = { block_num: H, id: 'cutid', transactions: [] };
   const shadowAfter = { block_num: H + 1, id: 'shadow-own-1001', transactions: [] };
   // The supplied source is really a shadow; the target is "real mainnet".

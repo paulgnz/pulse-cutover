@@ -121,7 +121,7 @@ pub fn activity_at(journal_dir: &Path) -> DrillActivity {
         return DrillActivity::Idle;
     }
     let Some(h) = v["h"].as_u64() else { return DrillActivity::Idle };
-    // r30 round 5 (Codex R5-3): an export container that was started and not verified gone may still be running
+    // r30 round 5 (review R5-3): an export container that was started and not verified gone may still be running
     // (killing the docker CLI does not stop a daemon-managed container): the drill counts as running.
     let container_live = container_not_verified_gone(&v);
     if v["state"].as_str() != Some("RUNNING") {
@@ -440,7 +440,7 @@ pub fn valid_pin(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
-/// r30 round 5 (Codex R5-2): a native-executable check alone admits `/bin/bash` as a "tool" (it would then run the
+/// r30 round 5 (review R5-2): a native-executable check alone admits `/bin/bash` as a "tool" (it would then run the
 /// export-produced log as shell). A drill runs a program only when its CONTENT matches a configured pin: the plain
 /// file and native-executable checks, plus sha256(file) == pin. Checked at config time and right before each run.
 pub fn pinned_program_problem(key: &str, path: &Path, pin: Option<&String>) -> Option<String> {
@@ -655,7 +655,7 @@ pub fn producer_lock_base(cfg: &Config) -> PathBuf {
     lock_dir(cfg).join(format!("producer-{}", &key[..16]))
 }
 
-/// r30 round 6 (Codex R6-5): the drill work marker beside the producer lock (`<producer lock base>.work.json`).
+/// r30 round 6 (review R6-5): the drill work marker beside the producer lock (`<producer lock base>.work.json`).
 /// Written (fresh, never through a link) before a drill's work starts, naming its journal directory and H; removed
 /// only once that work is verified gone. The producer lock dies with the drill process, but a surviving export
 /// container or pipeline group does not: through the marker a ceremony under ANY journal directory still sees it.
@@ -745,7 +745,7 @@ pub fn marker_work(cfg: &Config) -> MarkerWork {
     };
     let journal_dir = PathBuf::from(dir);
     let marker_id = v["drill_id"].as_str().map(str::to_string);
-    // r30 round 7 (Codex R7-3): the marker is judged by ITS drill. Only when `latest.json` names the same drill id
+    // r30 round 7 (review R7-3): the marker is judged by ITS drill. Only when `latest.json` names the same drill id
     // does its state speak for the marker; a marker whose drill has not published (or published under another id)
     // is live while that drill's process or pipeline group is, and UNKNOWN otherwise (never "done": its container may
     // exist). A marker from before round 7 (no id) keeps the old reading.
@@ -1105,7 +1105,7 @@ fn run_guarded<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillO
     // Round 7 (F2): XPR mainnet needs an explicit `[ceremony] lock_dir`, also when the config leaves the chain to
     // discovery: a default that depends on who runs the drill could split it from the ceremony's lock. Checked before
     // the work marker exists, so a refusal leaves nothing behind.
-    // r30 round 8 (Codex R8-7): the discovery must succeed (an unreadable source is refused, never read as "not
+    // r30 round 8 (review R8-7): the discovery must succeed (an unreadable source is refused, never read as "not
     // mainnet"), and the drill reuses this checked answer instead of asking again.
     let info = ops.source_info()
         .map_err(|e| format!("cannot read the source chain before the drill ({e}): refused, nothing started"))?;
@@ -1675,7 +1675,7 @@ fn cancel_inner<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -
     let _locks = locks;
     log.view = read_view();
     let guard = DrillGuard::new(ops);
-    // Round 5 (Codex R5-3): the export container the dead drill started is stopped and verified gone through the
+    // Round 5 (review R5-3): the export container the dead drill started is stopped and verified gone through the
     // pinned docker CLI and the local socket; until then the cancel is INCOMPLETE and the drill keeps counting as
     // running.
     if container_not_verified_gone(&log.view) {
