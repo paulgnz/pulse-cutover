@@ -10888,7 +10888,8 @@ fn rust_code_mask(text: &str) -> String {
 }
 
 /// Every mutating call outside test modules, as (line number, original line), unless that line carries
-/// `// ungated: <reason of at least 10 chars>`. Mutating: the ChainOps calls that change the source, the producer or the
+/// `// ungated: <reason of at least 10 chars>` (or, for a line ending in `{` or `(`, the next line is that comment, where
+/// rustfmt puts it). Mutating: the ChainOps calls that change the source, the producer or the
 /// target, and `run_shell` (loop's reset_cmd and every other free-form shell command).
 fn mutation_scan(text: &str) -> Vec<(usize, String)> {
     let code = rust_code_mask(text);
@@ -10903,10 +10904,16 @@ fn mutation_scan(text: &str) -> Vec<(usize, String)> {
         } // a definition, not a call
         let n = code[..name.start()].matches('\n').count();
         let line = lines.get(n).copied().unwrap_or("");
-        let marked = line
-            .split("// ungated:")
-            .nth(1)
-            .is_some_and(|r| r.trim().len() >= 10);
+        let has_marker = |l: &str| {
+            l.split("// ungated:")
+                .nth(1)
+                .is_some_and(|r| r.trim().len() >= 10)
+        };
+        // rustfmt moves a comment after `match call() {` or `call(` to the next line: accept it there.
+        let next = lines.get(n + 1).copied().unwrap_or("");
+        let opens = line.trim_end().ends_with('{') || line.trim_end().ends_with('(');
+        let marked = has_marker(line)
+            || (opens && next.trim_start().starts_with("// ungated:") && has_marker(next));
         if !marked {
             out.push((n + 1, line.to_string()));
         }
@@ -10950,7 +10957,7 @@ fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
         "let id = self.inner.schedule_snapshot_request(height)?;",
         "self.inner.unschedule_snapshot_request(id, height)",
         "let rec = match ops.unschedule_snapshot_request(id, h) {",
-        "let request_id = ops.schedule_snapshot_request(h).map_err(|e| format!(\"schedule_snapshot({h}) failed: {e}\"))?;",
+        ".schedule_snapshot_request(h)", // `let request_id = ops` + this line + `.map_err(..)?` (rustfmt split)
     ];
     let scan = |name: &str, text: &str| -> Vec<String> {
         mutation_scan(text)
