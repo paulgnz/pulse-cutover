@@ -3,7 +3,7 @@
 Every known way the cutover can go wrong, what guards against it today, the evidence that the guard works,
 and what closes it. Start with [HOW-IT-WORKS.md](HOW-IT-WORKS.md) if you have not read it.
 
-*Last updated 2026-10-15 (pulse-cutover v0.5.0-rc.29, PulseVM v1.0.0). Add a row whenever something new is
+*Last updated 2026-10-15 (pulse-cutover v0.5.0-rc.30, PulseVM v1.0.0). Add a row whenever something new is
 found; never delete one, mark it closed with its evidence.*
 
 **Status**

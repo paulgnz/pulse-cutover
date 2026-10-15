@@ -6,7 +6,7 @@ ceremony is shaped the way it is: the adversarial review that changed the design
 **R-numbers** that appear in log messages, config comments and the README), the state machine,
 the config format, the failure and rollback table, and a sketch of a faster v2.
 
-It describes the code as of **v0.5.0-rc.29** (§3 and §5 carry the rc.21–rc.28 changes; rc.29's guard, authorization and
+It describes the code as of **v0.5.0-rc.30** (§3 and §5 carry the rc.21–rc.28 changes; rc.29's guard, authorization and
 relay changes are summarised in docs/OPERATOR-QUICKSTART.md §6 and ATOMICITY.md known limit 17; the
 review table in §2 was last re-checked at rc.11 and its "Today" column is dated that way). The
 first version of this design was written in August 2026, before the multi-producer rehearsal and

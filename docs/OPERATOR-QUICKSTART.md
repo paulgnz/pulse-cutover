@@ -22,7 +22,7 @@ Log in to the server that runs your **producer** nodeos. Download the installer 
 read it, then run it:
 
 ```bash
-V=v0.5.0-rc.29
+V=v0.5.0-rc.30
 curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 less beacon-install.sh          # you are about to run this as root: read it
 sudo bash beacon-install.sh

@@ -6,7 +6,7 @@ PulseVM validator. That can be the same box as your producer nodeos if it has ro
 Get the script from a **release tag**, read it, run it:
 
 ```bash
-V=v0.5.0-rc.29
+V=v0.5.0-rc.30
 git clone --branch "$V" --depth 1 https://github.com/paulgnz/pulse-cutover && cd pulse-cutover
 less tools/metal-install.sh        # you are about to run this as root: read it (the pins are near the top)
 sudo bash tools/metal-install.sh

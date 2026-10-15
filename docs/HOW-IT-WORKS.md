@@ -14,7 +14,7 @@ Status words used on this page, and nowhere loosely:
 | **Estimate** | arithmetic from measured parts; not itself measured |
 | **Not built** | a design or a requirement only |
 
-*Last updated 2026-10-13, pulse-cutover v0.5.0-rc.29, PulseVM v1.0.0.*
+*Last updated 2026-10-15, pulse-cutover v0.5.0-rc.30, PulseVM v1.0.0.*
 
 ---
 
