@@ -137,6 +137,10 @@ pub struct Recovered {
     /// undoes only those. Some(false) = an arming record from an older agent (rollback keeps its old behaviour).
     /// None = no arming record yet (nothing was done).
     pub undo_tracking: Option<bool>,
+    /// r30 round 14 (model R13-B): the ownership an agent of round 14+ derived ONCE, the first time it opened an older
+    /// agent's journal (`legacy_takeover` evidence: `{paused, froze}`). Later runs use it instead of re-deriving it from
+    /// states this agent wrote itself (a strand this agent wrote over someone else's pause is not the older agent's).
+    pub legacy_takeover: Option<(bool, bool)>,
     /// r30 round 10 (model checker, class B): the arming record's `pause_ack` flag. Some(true) = this journal writes a
     /// `source_pause_ack` record once its own pause RPC succeeded and a read confirmed the producer paused, and an own
     /// pause INTENT without its ack is ownership UNKNOWN (never resumed). Otherwise (older journals) an own intent
@@ -601,6 +605,14 @@ impl Journal {
             }
             if let Some(b) = entry.data.get("mainnet_event_verified").filter(|b| b.is_object()) {
                 out.mainnet_event_binding = Some(b.clone());
+            }
+            if out.legacy_takeover.is_none() {
+                if let Some(t) = entry.data.get("legacy_takeover").filter(|t| t.is_object()) {
+                    out.legacy_takeover = Some((
+                        t.get("paused").and_then(|v| v.as_bool()) == Some(true),
+                        t.get("froze").and_then(|v| v.as_bool()) == Some(true),
+                    ));
+                }
             }
             if entry.data.get("snapshot_scheduled_at").and_then(|v| v.as_u64()).is_some() {
                 out.scheduled = true;

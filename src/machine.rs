@@ -321,7 +321,7 @@ const EXTERNAL_PAUSE_HELD: &str = "the source producer was paused by someone els
     it and reopens writes (journaled), or `pulse-cutover join` follows a LIVE fleet";
 
 impl<'a, O: ChainOps> Machine<'a, O> {
-    pub fn new(cfg: &'a Config, ops: &'a O, journal: Journal, recovered: Recovered) -> Self {
+    pub fn new(cfg: &'a Config, ops: &'a O, mut journal: Journal, recovered: Recovered) -> Self {
         let resumed = recovered.state.is_some();
         let state = recovered.state.unwrap_or(State::Armed);
         // A resumed agent must assume any side effect it journaled as STARTED may have applied
@@ -342,15 +342,28 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // r30 round 8 (Codex R8-3): an older agent's journal never fabricates ownership. Its pause is ours only when
         // that agent demonstrably reached its pause step (a journaled pause head, a state past FROZEN, or a strand,
         // which pauses); its freeze only when it reached FROZEN.
-        let legacy_paused = legacy_undo
+        let derived_paused = legacy_undo
             && (recovered.head_at_pause.is_some()
                 || matches!(state, State::Snapshotted | State::Verified | State::Ignited | State::Flipped | State::Live
                     | State::Halted | State::Stranded));
-        let legacy_froze = legacy_undo
+        let derived_froze = legacy_undo
             && recovered.segment == 0
             && (recovered.frozen_ts_ms.is_some()
                 || matches!(state, State::Frozen | State::Snapshotted | State::Verified | State::Ignited | State::Flipped
                     | State::Live | State::Halted | State::Stranded));
+        // r30 round 14 (model R13-B): derive the older agent's ownership ONCE, from the journal as that agent left it,
+        // and journal it, so a state this agent writes later (a strand over someone else's pause) never counts as the
+        // older agent's pause. A failed write only means the next run derives it again from the same records.
+        let (legacy_paused, legacy_froze) = match recovered.legacy_takeover {
+            Some(t) if legacy_undo => t,
+            _ => {
+                if legacy_undo {
+                    let _ = journal.evidence(state, json!({"legacy_takeover": {"paused": derived_paused, "froze": derived_froze},
+                        "note": "an older agent's journal: its pause and freeze ownership is fixed here, once"}));
+                }
+                (derived_paused, derived_froze)
+            }
+        };
         // r30 round 7: an operator's forced release of an adopted external pause makes that pause ours to resume.
         let adopted_released = started("external_pause_release");
         // r30 round 9 (Codex R9-2): ownership is the LATEST open pause episode, never "some pause of ours ever".

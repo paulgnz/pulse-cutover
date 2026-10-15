@@ -1366,3 +1366,12 @@ fn model_residual_r13_a_unpause_and_repause_between_two_reads() {
 fn model_i3_class_r13_b_legacy_strand_fabricates_ownership_seed_242() {
     assert_seed_clean_r13(242);
 }
+
+/// Class R13-B, second shape (round 14, found by the 20,000-scenario run): this agent strands an older agent's journal
+/// over someone else's pause (preflight fails on an unreadable producer), and a later rollback re-derived the older
+/// agent's ownership from the STRANDED state this agent wrote. Round 14 fixes the older agent's ownership once, in a
+/// `legacy_takeover` record, the first time this agent opens the journal.
+#[test]
+fn model_i3_class_r13_b_legacy_takeover_seed_913() {
+    assert_seed_clean_r13(913);
+}
