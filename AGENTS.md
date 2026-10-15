@@ -27,7 +27,7 @@ and [docs/EXCHANGES.md](docs/EXCHANGES.md) (what exchanges, wallets and indexers
    from v0.5.0-rc.5 they refuse it, but rc.4 and earlier did not.
 4. **Never change H or the target config yourself.** H, the target genesis, `import_cpu_scale` (fork backend; inert and warned about on upstream) and pinned
    versions come from the coordinator and must be identical on every producer. A mismatch = stop and tell the human.
-5. **Never skip or reorder gates.** Never ignite before VERIFIED, never flip public traffic outside the agent's
+5. **Never pause or resume a producer by hand while a ceremony runs** (only the agent does; see OPERATOR-QUICKSTART, risk A-21). **Never skip or reorder gates.** Never ignite before VERIFIED, never flip public traffic outside the agent's
    own flip step (producer mode: the `on_live` hook, which runs *before* LIVE is journaled; api mode: the
    FLIPPED step), never edit the journal, never delete a non-terminal journal. ABORTED is a safe, designed outcome: report it, do not "fix" it by retrying blindly.
 6. **Never handle key material in the open.** Do not print, echo, log, commit or paste `PVT_…`, WIF keys,

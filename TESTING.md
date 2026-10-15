@@ -48,9 +48,11 @@ Round 13 tightened the oracles to the code's exact rules: I3 is run-local (a rel
 successful or not, by the run that journaled it, for a pause that began before it) and I7 also fails when a rollback
 completes over a paused producer in a ceremony that froze writes. New generators: someone else un-pausing the agent's
 own pause, producer-API outages right after a resume, configs without `on_abort`, journals written by pre-round-6
-agents, and the operator-abort sequence (a kill, then a plain rollback). Three classes it found are still open in the
-source and listed in `OPEN_CLASSES` (F1-A, R13-A, R13-B, each with an `#[ignore]`d regression test): the default run
-reports them but fails only on anything else; `MODEL_STRICT=1` fails on every violation.
+agents, and the operator-abort sequence (a kill, then a plain rollback). The three classes it found (F1-A, R13-A, R13-B) are
+closed in the source as of round 14, their regression tests run by default, and `OPEN_CLASSES` is empty, so every
+violation fails a run. One residual is inherent and documented, not open: an un-pause and re-pause of the agent's
+pause entirely between two of its reads (risk A-21). The model's injection waits for one agent read in between, and
+`model_residual_r13_a_unpause_and_repause_between_two_reads` (ignored, fails by design) shows the gap-free case.
 
 ## It never touches production
 

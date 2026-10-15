@@ -21,7 +21,7 @@ found; never delete one, mark it closed with its evidence.*
 *BPs* = block producers · *coord* = the cutover coordinator and governance · *ecosystem* = exchanges,
 wallets, apps, API and history providers.
 
-**Summary (2026-10-13), 89 risks:** 7 BLOCKER · 47 OPEN · 11 PARTIAL · 11 DECISION · 12 MITIGATED · 1 CLOSED.
+**Summary (2026-10-13), 90 risks:** 7 BLOCKER · 47 OPEN · 12 PARTIAL · 11 DECISION · 12 MITIGATED · 1 CLOSED.
 The seven blockers: A-1 split brain (sealed start, #113), A-6 compare fails on mainnet state (#109), A-9 source chain_id
 for signing (#108), B-1 CPU units (#106), B-2 per-producer keys (#107), C-1 MetalGo 1.14 on Metal mainnet, C-7 an
 election can halt the chain (#122).
@@ -52,6 +52,7 @@ election can halt the chain (#122).
 | A-18 | The pause is not durable: an out-of-memory kill, crash or `Restart=always` restarts nodeos unpaused and the old chain resumes | STRANDED keeps the agent sealed; mission control watches source heads | ATOMICITY #1, #15a | OPEN | agent + BPs | the source is fenced in config (no signature provider) before ignition; checked by the beacon |
 | A-19 | Insider writes in the last 24 blocks: the public edge returns 503 but a producer's private path can still land transactions up to H (legal, but a known 15-minute pause invites front-running) | — | — | OPEN | coord + BPs | every write in H−24…H audited by entry path after the cut; rule published in advance |
 | A-20 | Another process pauses the producer in the instant between the agent's last "producing" read and `on_abort` reopening writes, so writes reopen into a paused producer | a fresh read right before the hook, after the ABORTED record (r30 round 13); `on_abort_withheld` otherwise | directed test `r30r13_a_pause_between_the_reopen_check_and_the_reopen_withholds_on_abort` | PARTIAL | BPs + agent | operators do not pause or resume the producer by hand during a rollback (runbook); the window cannot be closed by the agent alone |
+| A-21 | Someone un-pauses the agent's own pause and pauses the producer again entirely between two of the agent's reads; Leap's producer API cannot say who paused, so a later rollback resumes the second pause as the agent's own | every producer-state read (and a read per late block in quiescence) that sees the producer running closes the agent's pause episode (round 14); operating rule in OPERATOR-QUICKSTART and AGENTS.md: never pause or resume a producer by hand during a ceremony | model checker: closed whenever a read falls between the two (`model_i3_class_r13_a…_seed_16`); the gap-free case is a documented ignored test (`model_residual_r13_a…`) | PARTIAL | agent + BPs | inherent with Leap's producer API; mitigated by the rule |
 
 ## B. The new chain after the cut
 

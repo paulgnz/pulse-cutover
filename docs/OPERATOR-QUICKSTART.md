@@ -281,6 +281,14 @@ resumed cut load it with a warning. Elsewhere the default is journaled (`produce
 
 ### Pausing the producer by hand during a cut (rc.30 round 7)
 
+> **Operating rule: during a ceremony, never pause or resume the producer by hand. Let the agent do it** (or stop it
+> with `./cutover.sh abort` and let `rollback` decide). Leap's producer API does not record who paused a producer, so
+> an un-pause and a re-pause by hand between two of the agent's reads cannot be told apart from the agent's own pause,
+> and a later rollback would resume the second one (risk A-21). The agent narrows this (round 14: whenever it sees the
+> producer running while its own pause should hold, it gives that pause up and treats any later pause as someone
+> else's), but cannot close it.
+
+
 If you (or a hook, or a scheduler) pause the producer **after** the ceremony froze writes, the agent adopts that pause
 for the cut: it journals it (`side_effect: source_pause` with `adopted: true`), never pauses it again and never
 resumes it, and the cut carries on. If the ceremony then has to stop, it does **not** resume your pause and does

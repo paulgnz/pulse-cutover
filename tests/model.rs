@@ -167,6 +167,11 @@ struct World {
     ext_resume_agent_tick: Cell<u64>,
     /// r30 round 13: a later external pause on this source poll (after an external resume of the agent's pause).
     ext_pause2_tick: Cell<u64>,
+    /// r30 round 14: the agent's own pause was un-paused by someone else and the agent has not read the producer state
+    /// since. The later external pause (`ext_pause2_tick`) waits for one agent read in between unless
+    /// `r13_gap_free` (the documented inherent residual: an un-pause and re-pause entirely between two reads).
+    ext_resume_agent_unread: Cell<bool>,
+    r13_gap_free: Cell<bool>,
     /// r30 round 13: after the next resume that takes effect, this many producer_paused() reads fail (an outage of the
     /// producer API right after a resume; a large value outlasts the agent's 30 s retry window).
     read_outage_after_resume: Cell<u32>,
@@ -222,6 +227,8 @@ impl World {
             snap_dir: dir.join("snapshots"),
             release_baseline: Cell::new(0),
             ext_resume_agent_tick: Cell::new(0),
+            ext_resume_agent_unread: Cell::new(false),
+            r13_gap_free: Cell::new(R13_GAP_FREE.with(|g| g.get())),
             ext_pause2_tick: Cell::new(0),
             read_outage_after_resume: Cell::new(0),
             complete_before: Cell::new(false),
@@ -298,6 +305,7 @@ impl World {
             self.paused.set(false);
             self.owner.set(None);
             self.agent_paused.set(false);
+            self.ext_resume_agent_unread.set(true);
             self.note(format!("external resume of the AGENT's pause at head {}", self.head.get()));
         }
     }
@@ -373,7 +381,12 @@ impl ChainOps for World {
             self.external_resume_of_agent_pause();
         }
         if self.ext_pause2_tick.get() == t {
-            self.external_pause();
+            if self.ext_resume_agent_unread.get() && !self.r13_gap_free.get() {
+                // Round 14: the claim tested is "seen by the next read"; the re-pause waits for one.
+                self.ext_pause2_tick.set(t + 1);
+            } else {
+                self.external_pause();
+            }
         }
         if self.ext_pause_armed.get() {
             self.ext_pause_armed.set(false);
@@ -398,6 +411,7 @@ impl ChainOps for World {
 
     fn producer_paused(&self) -> Result<bool, String> {
         self.op("producer_paused");
+        self.ext_resume_agent_unread.set(false);
         if self.paused_read_fails.get() > 0 {
             self.paused_read_fails.set(self.paused_read_fails.get() - 1);
             return Err("producer API: connection reset (model)".into());
@@ -1097,7 +1111,7 @@ fn model_checker_finds_no_invariant_violation() {
 
 /// Classes found by the round-13 checker and still open in the source (F1-A, R13-A, R13-B; see `classify`). Empty this
 /// list as each fix lands (and un-ignore its class test).
-const OPEN_CLASSES: &[&str] = &["F1-A", "R13-A", "R13-B"];
+const OPEN_CLASSES: &[&str] = &[];
 
 /// Directed: Codex round 9, R9-2. The ceremony pauses (ours), a coordinator abort makes it resume its own pause, the
 /// write-reopen hook fails, someone else then pauses the producer, and an operator runs plain rollbacks. An external
@@ -1253,6 +1267,11 @@ fn model_i3_class_r11_a_stale_forced_release_seed_13295() {
 
 // ---- round 13: the oracles themselves, and the classes the round-13 checker found (open until the source fixes). ----
 
+thread_local! {
+    /// Round 14: set by the residual test only (see `model_residual_r13_a_unpause_and_repause_between_two_reads`).
+    static R13_GAP_FREE: Cell<bool> = const { Cell::new(false) };
+}
+
 fn assert_seed_clean_r13(seed: u64) {
     quiet_panics();
     let (v, t) = scenario(seed);
@@ -1310,13 +1329,11 @@ fn oracle_i7_ignores_a_refused_arm_over_someone_elses_pause() {
 /// pending. Seed 52: someone else's pause, the agent's freeze hook failed. Seed 233: an older agent's own pause whose
 /// resume answered Ok without effect.
 #[test]
-#[ignore = "class F1-A open until the source fix lands: confirm the producer is producing before any completed rollback, hooks or not"]
 fn model_i7_class_f1_a_no_abort_hook_external_pause_seed_52() {
     assert_seed_clean_r13(52);
 }
 
 #[test]
-#[ignore = "class F1-A open until the source fix lands"]
 fn model_i1_class_f1_a_no_abort_hook_ignored_resume_seed_233() {
     assert_seed_clean_r13(233);
 }
@@ -1325,8 +1342,20 @@ fn model_i1_class_f1_a_no_abort_hook_ignored_resume_seed_233() {
 /// again later without the agent observing the gap; the agent then resumes that external pause as its own (seed 16).
 /// The gap is only observable through a producer read while the agent believes its pause holds.
 #[test]
-#[ignore = "class R13-A open: an own acknowledged pause released and re-paused externally, unseen"]
 fn model_i3_class_r13_a_external_resume_of_agent_pause_seed_16() {
+    // Round 14: closed for the case the agent can see: a read between the un-pause and the re-pause closes its episode.
+    assert_seed_clean_r13(16);
+}
+
+/// The INHERENT residual of R13-A (round 14, docs/RISK-REGISTER.md A-21): someone un-pauses this ceremony's pause and
+/// pauses the producer again entirely between two of the agent's reads. Leap's producer API does not say who paused,
+/// so no read can tell the two pauses apart, and a later rollback resumes the second pause as the agent's own. This
+/// test fails by design and stays ignored: it documents the limit. The mitigation is operational (never pause or
+/// resume a producer by hand during a ceremony) and the agent closes its episode whenever it sees the producer running.
+#[test]
+#[ignore = "documents an inherent residual (A-21): an un-pause and re-pause between two agent reads cannot be detected"]
+fn model_residual_r13_a_unpause_and_repause_between_two_reads() {
+    R13_GAP_FREE.with(|g| g.set(true));
     assert_seed_clean_r13(16);
 }
 
@@ -1334,7 +1363,6 @@ fn model_i3_class_r13_a_external_resume_of_agent_pause_seed_16() {
 /// THIS agent over someone else's pause ("already paused"); the legacy rule "a STRANDED state means the older agent
 /// paused" then makes that external pause look like ours, and a plain rollback resumes it with no release (seed 242).
 #[test]
-#[ignore = "class R13-B open until the source fix lands: a strand written by this agent must not count as the older agent's pause"]
 fn model_i3_class_r13_b_legacy_strand_fabricates_ownership_seed_242() {
     assert_seed_clean_r13(242);
 }

@@ -680,6 +680,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.pause_unknown = eps.unknown;
     }
 
+    /// r30 round 14 (model R13-A): every producer-state read goes through here. A "producing" answer while this
+    /// journal's own acknowledged pause episode is open means someone else un-paused the producer (Leap's producer API
+    /// cannot say who): the episode is closed (`own_pause_released_externally`), so any later pause is someone else's
+    /// and is never resumed on this ceremony's authority. Narrows, does not close: an un-pause AND a re-pause entirely
+    /// between two reads of this agent are invisible (docs/RISK-REGISTER.md A-21; operating rule: never pause or resume
+    /// a producer by hand during a ceremony).
+    fn read_paused(&mut self) -> Result<bool, String> {
+        let r = self.ops.producer_paused();
+        if matches!(r, Ok(false)) && self.cfg.ceremony.mode == Mode::Producer && self.paused_by_us {
+            let episode = self.current_episode();
+            self.journal.evidence(self.state, json!({"own_pause_released_externally": true, "episode": episode,
+                "note": "the producer is producing although this ceremony's pause was open: someone else un-paused it; \
+                         any later pause is not this ceremony's"}))?;
+            self.push_pause_event(crate::journal::PauseEvent::Resume);
+        }
+        r
+    }
+
     /// r30 round 9 (review R9-F1/F2): a fresh producer-paused read, retried on ERRORS only (a definite answer is returned
     /// at once) every poll_ms for up to `window_ms`. Failed reads are journaled (at most about one per second, so a long
     /// outage does not flood the journal). Err = still unreadable at the end of the window.
@@ -688,7 +706,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let mut failures = 0u64;
         let mut last_journaled: Option<u64> = None;
         loop {
-            match self.ops.producer_paused() {
+            match self.read_paused() {
                 Ok(v) => {
                     if failures > 0 {
                         self.journal.evidence(self.state, json!({"producer_state_read_recovered": what, "failed_reads": failures}))?;
@@ -761,7 +779,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let read = if retry {
             self.read_paused_retrying(PAUSE_READ_RETRY_MS, "checking the source produces before reopening writes")
         } else {
-            self.ops.producer_paused()
+            self.read_paused()
         };
         Ok(match read {
             Ok(false) => {
@@ -1283,7 +1301,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             problems.extend(missing);
         }
-        match self.ops.producer_paused() {
+        match self.read_paused() {
             // api mode: this node does not produce; we only need producer_api
             // reachable for create_snapshot — its paused flag is irrelevant.
             Ok(paused) => {
@@ -2255,14 +2273,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.cfg.ceremony.mode != Mode::Producer {
             return Ok(true);
         }
-        if matches!(self.ops.producer_paused(), Ok(true)) {
+        if matches!(self.read_paused(), Ok(true)) {
             if self.state == State::Stranded {
                 // Record the confirmation: an UNSEALED strand paused by hand is reported sealed again.
                 self.journal.evidence(self.state, json!({"source_pause_enforced": true, "result": "already paused"}))?;
             }
             return Ok(true);
         }
-        let r = self.src_pause().and_then(|_| self.ops.producer_paused());
+        let r = match self.src_pause() {
+            Ok(()) => self.read_paused(),
+            Err(e) => Err(e),
+        };
         let ok = matches!(r, Ok(true));
         self.journal.evidence(self.state, json!({"source_pause_enforced": ok, "result": format!("{r:?}")}))?;
         Ok(ok)
@@ -2275,7 +2296,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.cfg.ceremony.mode != Mode::Producer || self.joining {
             return Ok(None);
         }
-        match self.ops.producer_paused() {
+        match self.read_paused() {
             Ok(true) => {}
             Ok(false) => return Ok(Some("the source producer is not paused".into())),
             Err(e) => return Ok(Some(format!("cannot confirm the source producer is paused ({e})"))),
@@ -2321,7 +2342,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // elsewhere reads now.
         let observed = match self.observed_paused.take() {
             Some(v) => Some(v),
-            None if self.cfg.ceremony.mode == Mode::Producer => self.ops.producer_paused().ok(),
+            None if self.cfg.ceremony.mode == Mode::Producer => self.read_paused().ok(),
             None => None,
         };
         let writes_kept_frozen = self.strand_intent;
@@ -2486,8 +2507,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // r30 round 13 (Codex R12-F1): a producer rollback that resumed, or that met a pause whose ownership is unknown,
         // is confirmed by a fresh "producing" read whatever hooks are configured: without it, a config with no on_abort
         // ended ABORTED + rollback_done with the producer still paused.
-        let must_confirm = perform && self.cfg.ceremony.mode == Mode::Producer && (resumed_now || self.pause_unknown);
-        let keep_frozen = if reopen_pending || must_confirm { self.writes_may_reopen(resumed_now)? } else { None };
+        // r30 round 14 (model F1-A): writes this journal froze (its on_freeze ran or started, even if it failed) are
+        // never left behind a rollback that reports completion while the producer is paused or unreadable, whatever
+        // hooks are configured: without an on_abort hook nothing reopens them, so a paused producer seals instead.
+        let froze_writes = perform && self.cfg.ceremony.mode == Mode::Producer && self.writes_closed_by_us;
+        let must_confirm = perform && self.cfg.ceremony.mode == Mode::Producer
+            && (resumed_now || self.pause_unknown || froze_writes);
+        let keep_frozen = if reopen_pending || must_confirm {
+            self.writes_may_reopen(resumed_now || froze_writes)?
+        } else {
+            None
+        };
         // A resume that answered ok while the producer stays paused seals (it did not take effect, or someone else paused
         // it since); a resume RPC that failed stays an INCOMPLETE rollback (exit 4), as before.
         let resume_ignored = rollback.get("source_producer_resume_error").and_then(|v| v.as_str())
@@ -2525,7 +2555,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 // `rollback` applies R2 again). The window cannot be closed completely: pause / resume by another
                 // process is not something this agent controls (docs/RISK-REGISTER.md A-20).
                 if self.cfg.ceremony.mode == Mode::Producer {
-                    let last = self.ops.producer_paused();
+                    let last = self.read_paused();
                     if !matches!(last, Ok(false)) {
                         let why = match &last { Ok(_) => "producer paused".to_string(), Err(e) => format!("producer state unknown ({e})") };
                         self.journal.evidence(State::Aborted, json!({"on_abort_withheld": why,
@@ -3027,6 +3057,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             } else {
                 if head != 0 {
                     late += 1;
+                    // r30 round 14 (R13-A): a late block while this ceremony's own pause holds may mean someone
+                    // un-paused the producer: read it (closes the episode if so).
+                    if self.paused_by_us {
+                        let _ = self.read_paused()?;
+                    }
                     // Journal the first few; a producer that never stops would
                     // otherwise write one line per poll until the deadline.
                     if late <= 10 {
@@ -3986,7 +4021,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if txs > 0 {
             return Err(format!("join refused: {txs} transaction(s) on the source after H {h}"));
         }
-        let paused = self.ops.producer_paused().map_err(|e| format!("join refused: producer API: {e}"))?;
+        let paused = self.read_paused().map_err(|e| format!("join refused: producer API: {e}"))?;
         Ok((bid, sid, members, info, paused_head, paused, ours))
     }
 

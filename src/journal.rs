@@ -615,6 +615,10 @@ impl Journal {
             if entry.data.get("resumed_production_for_snapshot").and_then(|v| v.as_bool()) == Some(true) {
                 out.pause_events.push(PauseEvent::Resume);
             }
+            // r30 round 14 (model R13-A): someone else un-paused this ceremony's own pause (a read saw it producing).
+            if entry.data.get("own_pause_released_externally").and_then(|v| v.as_bool()) == Some(true) {
+                out.pause_events.push(PauseEvent::Resume);
+            }
             if let Some(se) = entry.data.get("side_effect").and_then(|v| v.as_str()) {
                 match se {
                     "source_pause" => out.pause_events.push(PauseEvent::Pause {
