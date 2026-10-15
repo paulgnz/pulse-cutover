@@ -83,6 +83,8 @@ struct MockOps {
     /// If true, produce one extra block on the SECOND poll after pause (a
     /// late block arriving over p2p — quiescence must absorb + journal it).
     late_block: Cell<bool>,
+    /// The producer-paused read right after the late block fails once (transient).
+    late_block_read_fails: Cell<bool>,
     /// If true, the source keeps producing after the pause (a producer that
     /// ignored it): quiescence never passes and must time out.
     never_quiesce: Cell<bool>,
@@ -299,6 +301,7 @@ impl MockOps {
             target_polls: Cell::new(0),
             target_head: Cell::new(0),
             late_block: Cell::new(false),
+            late_block_read_fails: Cell::new(false),
             never_quiesce: Cell::new(false),
             paused_polls: Cell::new(0),
             burnoff_tx_per_block: Cell::new(0),
@@ -487,6 +490,9 @@ impl ChainOps for MockOps {
             }
             if polls == 2 && self.late_block.replace(false) {
                 self.head.set(self.head.get() + 1);
+                if self.late_block_read_fails.get() {
+                    self.paused_read_fail_count.set(1);
+                }
             }
         }
         Ok(self.info(self.head.get()))
@@ -8924,4 +8930,77 @@ fn r30r13_a_pause_between_the_reopen_check_and_the_reopen_withholds_on_abort() {
     assert!(e.iter().any(|v| v["data"]["on_abort_withheld"].is_string()), "the withheld reopen is journaled");
     let rec = pulse_cutover::journal::Journal::replay(&cfg.journal_path).unwrap();
     assert!(!rec.aborted_rollback_complete);
+}
+
+/// Final review M1: the `legacy_takeover` record (an older agent's pause/freeze ownership, fixed once) must be durable
+/// before this agent does anything. If its write fails (a full disk) and the run went on to strand over someone else's
+/// pause, the next run would re-derive ownership from that STRANDED state ("the older agent paused") and a plain
+/// rollback would resume the external pause. A command whose takeover record cannot be written refuses, unchanged.
+#[test]
+fn final_m1_a_failed_legacy_takeover_write_refuses_before_any_side_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r7_sched_config(dir.path(), "freeze-writes");
+    {
+        // An older agent (no undo tracking) armed and froze writes, and never paused the producer.
+        let (mut j, _) = open_journal(&cfg.journal_path);
+        j.transition(State::Armed, serde_json::json!({"mode": "Producer", "freeze_height": 120})).unwrap();
+        j.transition(State::Frozen, serde_json::json!({})).unwrap();
+    }
+    let before = journal_entries(&cfg).len();
+    // Someone else pauses the producer and its API is unreachable; this agent resumes the journal and its takeover
+    // write fails. (Without the refusal the run would strand on the unreadable producer, recording no pause of its
+    // own, and the next command would re-derive "the older agent paused" from that STRANDED state.)
+    let ops = MockOps::new(dir.path(), 125);
+    ops.schedule_ok.set(true);
+    ops.paused.set(true);
+    ops.paused_read_fails.set(true);
+    let (mut j, rec) = open_journal(&cfg.journal_path);
+    j.inject_write_failures(1);
+    let err = Machine::new(&cfg, &ops, j, rec).run().expect_err("a failed takeover write refuses the run");
+    assert!(err.contains("older agent") && err.contains("Nothing was changed"), "{err}");
+    assert_eq!(journal_entries(&cfg).len(), before, "no record written after the failed takeover write");
+    assert_eq!((ops.pauses.get(), ops.resumes.get()), (0, 0), "nothing touched");
+    assert!(ops.hooks.borrow().is_empty(), "no hook ran: {:?}", ops.hooks.borrow());
+    // The next command (a plain rollback) fixes the older agent's ownership from ITS records: it never paused, so the
+    // external pause is never resumed and writes are not reopened into the paused chain.
+    let ops2 = MockOps::new(dir.path(), 125);
+    ops2.paused.set(true);
+    let (j, rec) = open_journal(&cfg.journal_path);
+    let _ = Machine::new(&cfg, &ops2, j, rec).operator_rollback_opts(false, false);
+    assert_eq!(ops2.resumes.get(), 0, "someone else's pause is never resumed");
+    assert!(!ops2.hooks.borrow().iter().any(|h| h == "reopen-writes"), "writes not reopened into a paused chain");
+    let e = journal_entries(&cfg);
+    let t = e.iter().find(|v| v["data"]["legacy_takeover"].is_object()).expect("takeover record written");
+    assert_eq!(t["data"]["legacy_takeover"]["paused"], false);
+}
+
+/// Final review L1: during quiescence a late block while this ceremony's pause holds triggers a producer-paused read
+/// (R13-A narrowing). A transient read error there must not end the run mid-FROZEN (R9-F2): it is journaled and the
+/// ceremony completes.
+#[test]
+fn final_l1_an_unreadable_producer_during_quiescence_does_not_end_the_run_mid_frozen() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path(), 120);
+    let ops = MockOps::new(dir.path(), 110);
+    ops.late_block.set(true);
+    ops.late_block_read_fails.set(true);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("late_block_after_pause"));
+    assert!(text.contains("a late block while this ceremony's pause holds"), "the failed read is journaled");
+}
+
+/// Final review L3: a journal written by a NEWER agent (a record kind this agent does not know) is refused, never
+/// folded partially.
+#[test]
+fn final_l3_a_journal_with_an_unknown_record_kind_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    std::fs::write(&path, concat!(
+        r#"{"seq":0,"ts_ms":1,"ts":"t","kind":"transition","state":"ARMED","data":{"mode":"Producer"}}"#, "\n",
+        r#"{"seq":1,"ts_ms":2,"ts":"t","kind":"ownership","state":"ARMED","data":{}}"#, "\n",
+        r#"{"seq":2,"ts_ms":3,"ts":"t","kind":"evidence","state":"ARMED","data":{}}"#, "\n")).unwrap();
+    let err = pulse_cutover::journal::Journal::replay(&path).err().expect("refused");
+    assert!(err.contains("newer pulse-cutover") && err.contains("\"ownership\""), "{err}");
+    assert!(Journal::open(&path).is_err());
 }

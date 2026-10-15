@@ -55,6 +55,8 @@ pub struct Journal {
     path: PathBuf,
     file: File,
     seq: u64,
+    /// Test support: the next N writes fail as a full disk would (nothing is written).
+    fail_writes: u32,
     /// Held for the Journal's lifetime: an exclusive lock on `<journal>.lock`, so two ceremony
     /// processes can never drive the same journal (released when the Journal is dropped).
     _lock: File,
@@ -351,6 +353,7 @@ impl Journal {
                 path: path.to_path_buf(),
                 file,
                 seq,
+                fail_writes: 0,
                 _lock: lock,
             },
             recovered,
@@ -359,6 +362,12 @@ impl Journal {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Test support: make the next `n` writes fail (as ENOSPC would), writing nothing.
+    #[doc(hidden)]
+    pub fn inject_write_failures(&mut self, n: u32) {
+        self.fail_writes = n;
     }
 
     fn write(&mut self, kind: &str, state: &str, data: Value) -> Result<Entry, String> {
@@ -378,6 +387,10 @@ impl Journal {
             data,
         };
         let line = serde_json::to_string(&entry).map_err(|e| e.to_string())?;
+        if self.fail_writes > 0 {
+            self.fail_writes -= 1;
+            return Err("journal write: injected failure (No space left on device)".into());
+        }
         writeln!(self.file, "{line}").map_err(|e| format!("journal write: {e}"))?;
         self.file.sync_data().map_err(|e| format!("journal fsync: {e}"))?;
         self.seq += 1;
@@ -530,6 +543,17 @@ impl Journal {
                     ))
                 }
             };
+            // Fail closed on a journal from a NEWER agent: a record kind this agent does not know (or, below, a state it
+            // does not know) means it cannot fold the journal faithfully. Never run an older agent on a newer journal.
+            if !matches!(entry.kind.as_str(), "transition" | "evidence" | "error") {
+                return Err(format!(
+                    "journal line {} of {} has a record kind {:?} this agent does not know: the journal was written by a \
+                     newer pulse-cutover. Never run an older agent on a journal a newer one wrote: use that version",
+                    i + 1,
+                    path.display(),
+                    entry.kind
+                ));
+            }
             if entry.kind == "transition" {
                 let st: State = entry.state.parse()?;
                 if matches!(st, State::Ignited | State::Flipped | State::Live | State::Halted) {

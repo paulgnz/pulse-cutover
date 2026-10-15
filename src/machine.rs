@@ -123,6 +123,10 @@ pub struct Machine<'a, O: ChainOps> {
     pause_events: Vec<crate::journal::PauseEvent>,
     /// r30 round 9: an older agent's journal whose agent demonstrably paused (an open episode of ours before the log).
     legacy_paused: bool,
+    /// The older agent's freeze ownership (journaled with `legacy_paused` in the takeover record).
+    legacy_froze: bool,
+    /// An older agent's journal whose `legacy_takeover` record is not yet durable (see `ensure_legacy_takeover`).
+    legacy_takeover_pending: bool,
     /// r30 round 9: this journal ever paused the producer itself (any own episode, open or closed).
     ever_paused_by_us: bool,
     /// r30 round 10: own pause intents need their `source_pause_ack` to count as ours (journals armed by round 10+).
@@ -321,7 +325,7 @@ const EXTERNAL_PAUSE_HELD: &str = "the source producer was paused by someone els
     it and reopens writes (journaled), or `pulse-cutover join` follows a LIVE fleet";
 
 impl<'a, O: ChainOps> Machine<'a, O> {
-    pub fn new(cfg: &'a Config, ops: &'a O, mut journal: Journal, recovered: Recovered) -> Self {
+    pub fn new(cfg: &'a Config, ops: &'a O, journal: Journal, recovered: Recovered) -> Self {
         let resumed = recovered.state.is_some();
         let state = recovered.state.unwrap_or(State::Armed);
         // A resumed agent must assume any side effect it journaled as STARTED may have applied
@@ -353,17 +357,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     | State::Live | State::Halted | State::Stranded));
         // r30 round 14 (model R13-B): derive the older agent's ownership ONCE, from the journal as that agent left it,
         // and journal it, so a state this agent writes later (a strand over someone else's pause) never counts as the
-        // older agent's pause. A failed write only means the next run derives it again from the same records.
+        // older agent's pause. The record is written by `ensure_legacy_takeover`, the first thing every command does:
+        // a command whose takeover record cannot be made durable refuses before any side effect or other record
+        // (otherwise a later run could re-derive ownership from a strand this agent wrote).
         let (legacy_paused, legacy_froze) = match recovered.legacy_takeover {
             Some(t) if legacy_undo => t,
-            _ => {
-                if legacy_undo {
-                    let _ = journal.evidence(state, json!({"legacy_takeover": {"paused": derived_paused, "froze": derived_froze},
-                        "note": "an older agent's journal: its pause and freeze ownership is fixed here, once"}));
-                }
-                (derived_paused, derived_froze)
-            }
+            _ => (derived_paused, derived_froze),
         };
+        let legacy_takeover_pending = legacy_undo && recovered.legacy_takeover.is_none();
         // r30 round 7: an operator's forced release of an adopted external pause makes that pause ours to resume.
         let adopted_released = started("external_pause_release");
         // r30 round 9 (review R9-2): ownership is the LATEST open pause episode, never "some pause of ours ever".
@@ -426,6 +427,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             writes_closed_by_us,
             pause_events: recovered.pause_events.clone(),
             legacy_paused,
+            legacy_froze,
+            legacy_takeover_pending,
             ever_paused_by_us,
             acks_tracked,
             pause_unknown,
@@ -952,7 +955,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     }
 
     /// Drive the ceremony to a terminal state. Returns the terminal state.
+    /// The older agent's ownership (`legacy_paused`, `legacy_froze`) must be durable before this agent writes any
+    /// other record or touches anything: a failed write refuses the command (fail closed, nothing changed).
+    fn ensure_legacy_takeover(&mut self, command: &str) -> Result<(), String> {
+        if !self.legacy_takeover_pending {
+            return Ok(());
+        }
+        let rec = json!({"legacy_takeover": {"paused": self.legacy_paused, "froze": self.legacy_froze},
+            "note": "an older agent's journal: its pause and freeze ownership is fixed here, once"});
+        self.journal.evidence(self.state, rec).map_err(|e| format!(
+            "refusing to {command}: this journal was written by an older agent and the record fixing that agent's \
+             pause/freeze ownership could not be written ({e}). Nothing was changed. Fix the journal's disk (space, \
+             permissions) and run the command again. Journal: {}", self.journal.path().display()))?;
+        self.legacy_takeover_pending = false;
+        Ok(())
+    }
+
     pub fn run(&mut self) -> Result<State, String> {
+        self.ensure_legacy_takeover("run")?;
         // Defense in depth (main.rs checks too): a readiness-only config never drives anything.
         self.cfg.ensure_ceremony_profile()?;
         self.check_shadow_binding()?;
@@ -1772,6 +1792,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// resumed) only if the resume guard passes now, or with
     /// `force_stranded` (an operator's record of a fleet-wide decision, journaled).
     pub fn operator_rollback_opts(&mut self, force: bool, force_stranded: bool) -> Result<RollbackOutcome, String> {
+        self.ensure_legacy_takeover("roll back")?;
         self.check_shadow_binding()?;
         self.check_mainnet_binding()?;
         let mut notes: Vec<String> = vec![];
@@ -3072,8 +3093,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     late += 1;
                     // r30 round 14 (R13-A): a late block while this ceremony's own pause holds may mean someone
                     // un-paused the producer: read it (closes the episode if so).
+                    // This read only narrows A-21: an unreadable producer here must not end the run mid-FROZEN
+                    // (R9-F2). It is journaled and the run goes on; the fail-closed reads at the action points stay.
                     if self.paused_by_us {
-                        let _ = self.read_paused()?;
+                        if let Err(e) = self.read_paused() {
+                            if late <= 10 {
+                                self.journal.evidence(State::Frozen, json!({"producer_state_read_failed": e,
+                                    "during": "a late block while this ceremony's pause holds", "run_continues": true}))?;
+                            }
+                        }
                     }
                     // Journal the first few; a producer that never stops would
                     // otherwise write one line per poll until the deadline.
@@ -3795,6 +3823,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// joins only if the result (snapshot sha256, state fingerprints, migration genesis — all three required) equals
     /// the LIVE quorum's. A failed re-verification changes nothing on either chain.
     pub fn join_with(&mut self, event_id: &str, reverify: bool) -> Result<State, String> {
+        self.ensure_legacy_takeover("join")?;
         self.check_shadow_binding()?;
         self.check_mainnet_binding()?;
         if self.shadow_refused {
