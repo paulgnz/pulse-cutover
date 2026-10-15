@@ -35,7 +35,7 @@ jobs:
     # rc.29: the installers and the example manifest must pin exactly the release being published.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: installer pins match the tag
         run: |
           set -eu
@@ -57,7 +57,7 @@ jobs:
             # messense/rust-musl-cross:aarch64-musl, resolved 2026-10-12
             image: messense/rust-musl-cross@sha256:c9403b20663fca32f703b4201672120d8a634d5ebcaf95d013f0140382432a17
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build static ${{ matrix.target }}
         run: |
           docker run --rm -v "$PWD":/home/rust/src ${{ matrix.image }} \
@@ -76,7 +76,7 @@ jobs:
     needs: [pins, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
