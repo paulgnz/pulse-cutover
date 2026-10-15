@@ -26,7 +26,27 @@ case "$CMD" in
     ;;
   abort)
     echo "aborting: stopping the agent (the ratchet means nothing user-visible ran unless FLIPPED/LIVE printed)"
-    pkill -f 'pulse-cutover run' || echo "  (no running agent)"
+    # r30 round 13: SIGTERM first and WAIT for the agent to exit. It stops only at a safe point (never inside a pause or
+    # resume of the producer, which always reaches its journaled outcome), so the rollback below never finds this
+    # agent's own pause with "ownership unknown". SIGKILL only after the wait, loudly. The default wait (90 s) exceeds
+    # the agent's producer-read retry window (30 s) with margin, so a stop requested during a read outage still lands.
+    if pkill -TERM -f 'pulse-cutover run'; then
+      WAITED=0; STOP_WAIT=${PULSE_CUTOVER_STOP_WAIT:-90}
+      while pgrep -f 'pulse-cutover run' >/dev/null 2>&1 && [ "$WAITED" -lt "$STOP_WAIT" ]; do
+        sleep 1; WAITED=$((WAITED+1))
+      done
+      if pgrep -f 'pulse-cutover run' >/dev/null 2>&1; then
+        echo "  WARNING: the agent did not stop within ${STOP_WAIT}s of SIGTERM: killing it (SIGKILL). If it was inside a"
+        echo "  pause or resume of the producer, the rollback below may report that pause's ownership as unknown and ask"
+        echo "  for --force-stranded --i-understand after you check the producer."
+        pkill -KILL -f 'pulse-cutover run' || true
+        sleep 1
+      else
+        echo "  agent stopped (after ${WAITED}s)"
+      fi
+    else
+      echo "  (no running agent)"
+    fi
     # The decision is made by `pulse-cutover rollback`, which takes the journal's exclusive lock
     # (so it cannot race an agent that is still shutting down), kills a hook the stopped agent left
     # running, replays the journal, and rolls back ONLY when it positively shows ignition has not

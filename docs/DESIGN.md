@@ -6,7 +6,7 @@ ceremony is shaped the way it is: the adversarial review that changed the design
 **R-numbers** that appear in log messages, config comments and the README), the state machine,
 the config format, the failure and rollback table, and a sketch of a faster v2.
 
-It describes the code as of **v0.5.0-rc.29** (§3 and §5 carry the rc.21–rc.28 changes; rc.29's guard, authorization and
+It describes the code as of **v0.5.0-rc.30** (§3 and §5 carry the rc.21–rc.28 changes; rc.29's guard, authorization and
 relay changes are summarised in docs/OPERATOR-QUICKSTART.md §6 and ATOMICITY.md known limit 17; the
 review table in §2 was last re-checked at rc.11 and its "Today" column is dated that way). The
 first version of this design was written in August 2026, before the multi-producer rehearsal and
@@ -122,6 +122,71 @@ stateDiagram-v2
   `{subnet_id}` / … into the target RPC, ignite command and hooks, install the chain config,
   and only then `ignite_started`. Rehearsal-only overrides (compare allowlist, target chain_id
   change) are refused for mainnet and journaled wherever they act.
+- **Undo only what this journal did** (r30 rounds 6–8). Round 8 reduces it to two invariants, each checked at its
+  action point: **R1** a rollback resumes the producer only if this journal durably recorded that pause as its own
+  (`side_effect: source_pause`, written before the RPC; an old agent's journal only if it demonstrably reached its
+  pause step); **R2** writes this journal froze reopen (`on_abort`) only if a fresh read right before shows the
+  producer **producing**. Paused or unreadable: a performed rollback keeps writes frozen and seals (STRANDED,
+  `writes_kept_frozen`, `on_halt` pages; the intent is journaled first and completed by the next run after a crash).
+  A pause someone else made (found by a fresh read before this ceremony pauses, including during the snapshot wait)
+  is adopted for the cut as evidence only; it is never paused again, recorded as ours or resumed, except by an
+  operator's journaled release (`rollback --force-stranded --i-understand`), after which R2 still applies. The read and
+  the pause RPC are not atomic: a pause made between them is indistinguishable from ours (R2 still never reopens into
+  a paused chain).
+  **Round 9 makes both precise.** *Pause episodes*: every pause (ours, journaled before the RPC, or someone else's,
+  adopted as evidence), every journaled resume and every operator release carries an episode number; R1 resumes only
+  when the LATEST open episode is ours, so a resume journaled earlier closes its episode and never authorizes resuming a
+  later pause (review R9-2). *Journal segments*: a `join` that re-enters an ABORTED or STRANDED ceremony journals
+  `segment_start` before its first side effect (the re-freeze, a pause, or its commit); rollback steps, `rollback_done`
+  and a strand intent belong to one segment, so an earlier completed rollback never covers what the join did and an
+  earlier strand intent never re-strands a valid join (R9-1, R9-3; a STRANDED transition also satisfies the intent it
+  completes). With the fleet LIVE, rolling back after such a segment goes through the resume guard like any frozen
+  ceremony (`--force-stranded` records the operator's decision). R2's fresh read is retried on ERRORS for up to 30 s
+  after a resume of ours succeeded in this rollback (failed reads journaled about once a second), and so are the reads
+  that decide ownership at the start of FROZEN and confirm our pause; a definite "paused" still seals at once. An
+  operator rollback that ends STRANDED is reported as INCOMPLETE (exit 4), never as "rolled back" (R9-4); its forced
+  release is journaled only after its `rollback_requested` intent (R9-6).
+  **Round 10: a pause is ours only once acknowledged.** The randomized model checker (`tests/model.rs`) found that an
+  intent alone is not enough: killed after the `source_pause` intent and before the pause RPC, then someone else
+  pausing, a recovered run trusted the intent and resumed their pause. Journals armed from round 10 on (`pause_ack` on
+  the arming record) write a `source_pause_ack` once the RPC succeeded **and** a read (retried on errors) confirmed the
+  producer paused; an own episode counts as ours only with its ack. An intent without one is **ownership unknown**: R1
+  never resumes it; with the producer producing there is nothing to undo, and the ceremony simply pauses again in a new
+  episode; with the producer paused it is adopted as evidence (`pause_ownership_unknown: true`) and R2 keeps writes
+  frozen and seals. The cost is conservative: a kill between a successful pause RPC and its ack leaves that pause to
+  the operator (`rollback --force-stranded --i-understand`) instead of an automatic resume. Older journals keep their
+  intent-only rule.
+  **Round 11: a resume gives up ownership before its RPC** (the mirror of round 10, review R10-1). Every resume (a
+  rollback's, an operator's forced release, the `pause_at_h` recovery resume for the snapshot) first journals a
+  `side_effect: source_resume` intent: the episode becomes CLOSING and is no longer "ours". It closes when the resume's
+  outcome is journaled (`rollback_step: resume`, or `resumed_production_for_snapshot` after a confirming read). A failed
+  RPC is settled at once by a fresh read: producing = it happened (closed, `source_resume_applied_despite_error`);
+  paused or unreadable = ownership unknown (round 12, below). A closing episode that was never settled (a crash, a lost response) is **ownership unknown**:
+  never resumed again on this ceremony's own authority; with the producer producing there is nothing to undo and R2 may
+  reopen writes; with it paused (still ours, or someone else's pause after our resume took effect: the agent cannot
+  tell) a run adopts it with `pause_ownership_unknown`, and an abort or operator rollback keeps writes frozen (STRANDED,
+  or the operator rollback's refusal) until `--force-stranded --i-understand`. The `pause_at_h` recovery resume (R10-2)
+  now closes its episode, so the next pause needs a fresh intent and ack and a later pause by someone else is adopted,
+  never taken for ours. Journals written before round 11 contain no resume intents and are folded exactly as before.
+  **Round 13.** (a) A graceful stop: SIGTERM / SIGINT only set a flag, checked between states and inside the ARMED and
+  snapshot waits, never inside a pause or resume episode; the run journals `stopped_by_signal` and exits 6.
+  `cutover.sh abort` sends SIGTERM, waits (default 90 s since rc.30, longer than the 30 s producer-read retry window; `PULSE_CUTOVER_STOP_WAIT`) for the agent to exit and only
+  then runs `rollback`; SIGKILL only after the wait, loudly. So the common operator abort can no longer leave the
+  agent's own pause with "ownership unknown". (b) A resume whose RPC answers ok is confirmed by a (retried) read:
+  still paused or unreadable is ownership unknown, as after a failed RPC. A producer rollback that resumed, or met an
+  unknown pause, completes only after a confirming "producing" read, whatever hooks are configured (a resume that
+  answered ok but did not take effect seals: STRANDED). A failed read never bypasses the unknown-pause refusal of an
+  operator rollback. (c) Known limit, narrowed not closed: writes reopen (`on_abort`) after a fresh read made right
+  before the hook, after the ABORTED record; a pause made by another process in the remaining instant between that
+  read and the hook is not something this agent can prevent (RISK-REGISTER A-20).
+  **Round 12 (model checker classes R10-2 and R11-A).** A paused (or unreadable) read after ANY resume attempt, whether
+  the RPC answered or failed, is ownership unknown (`source_resume_outcome_unknown`), never "ours again": it cannot
+  tell "our resume did not apply" from "it applied and someone else paused the producer since". A run adopts that
+  pause for the cut; a rollback never resumes it on its own authority. An unknown pause on a producer is never left
+  behind a "rolled back" verdict either: a plain operator rollback refuses with nothing changed (also when no writes
+  would reopen), and `--force-stranded --i-understand` releases it. A release authorizes ONE resume, by the run that
+  journaled it: a release recovered from the journal (a forced rollback killed before its resume settled, or whose
+  resume did not take effect) authorizes nothing, and the next forced rollback journals its own.
 - **ABORTED** is reachable only before `create_chain` (upstream) or `ignite_started` is journaled. It resumes the source
   producer (producer mode, if `target.auto_rollback`), restarts the source and reverts flips
   (API mode, if they ran), runs `on_abort`, and moves the staged snapshot aside. The rollback
@@ -302,6 +367,20 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 | H does not finalize, or the scheduled file never appears | `snapshot_timeout_secs` | FROZEN | abort |
 | Snapshot not at H | exact-H check | FROZEN | abort (rehearsal flags journal and continue) |
 | Pause does not take effect; `quiesce_cmd` fails | producer API; hook | FROZEN | abort |
+| Producer found paused after this ceremony froze writes, not by this journal (an operator, a hook, a scheduler) | pause ownership check (r30 round 7) | FROZEN | adopted for the cut (journaled `adopted: true`), never re-paused or resumed; the cut continues |
+| A performed rollback would reopen writes this journal froze, but a fresh read shows the producer paused (someone else's pause, or ours still paused) or unreadable | reopen invariant R2 (r30 round 8) | FROZEN–VERIFIED | STRANDED (`writes_kept_frozen`): no `on_abort`, someone else's pause never resumed, `on_halt` pages; `rollback --force-stranded --i-understand` releases an external pause (journaled after its rollback intent), then R2 again; an operator rollback that ends here exits 4 (round 9). A read ERROR after our own resume is retried for up to 30 s first |
+| A `join` re-enters an ABORTED or STRANDED ceremony and dies (inside the re-freeze hook, after its own pause) | journal segment (r30 round 9) | ABORTED / STRANDED | `rollback` undoes what the join's segment did (reopens the re-frozen writes, resumes the join's own pause), never "already rolled back"; the resume guard applies (fleet LIVE: refused, or `--force-stranded`) |
+| The resumed agent cannot read the producer state at the start of FROZEN or right after its pause | bounded retry (r30 round 9) | FROZEN | retried for up to 30 s (journaled), then the run stops with the error (nothing changed) |
+| A resume of this ceremony's pause was started (`source_resume` intent) and its outcome never journaled (a crash, a lost response a read could not settle), then the producer is found paused | resume intent (r30 round 11) | FROZEN–VERIFIED / ABORTED | ownership unknown: never resumed on this ceremony's authority; adopted with `pause_ownership_unknown`; an abort keeps writes frozen (STRANDED), a plain operator rollback refuses; `--force-stranded --i-understand` releases it. Producer found producing instead: nothing to resume, R2 may reopen writes |
+| The resume RPC fails, or answers but the producer is still paused | resume settlement read (r30 rounds 11–12) | any rollback / FROZEN | a fresh read decides: producing = the resume happened (episode closed); paused or unreadable = ownership unknown (`source_resume_outcome_unknown`, never ours again): never resumed on this ceremony's authority; a plain operator rollback refuses (nothing changed); `--force-stranded --i-understand` releases it |
+| A forced rollback is killed after journaling `external_pause_release`, before its resume settled | release scoping (r30 round 12) | any rollback | the recovered release authorizes nothing (the pause is ownership unknown); a later forced rollback journals a new release |
+| `cutover.sh abort` / SIGTERM while the agent runs | stop flag (r30 round 13) | any | the agent stops at the next safe point (never inside a pause or resume), journals `stopped_by_signal`, exits 6; `cutover.sh` then runs `rollback`; SIGKILL only after a bounded wait |
+| A resume RPC answers ok but the producer stays paused | confirming read (r30 round 13) | rollback | ownership unknown; the rollback seals (STRANDED, on_halt pages) instead of recording `rollback_done` |
+| The producer is paused by someone else between the reopen check and `on_abort` | read right before the hook (r30 round 13) | rollback | `on_abort_withheld`: writes stay frozen, the rollback stays incomplete (exit 4); a pause in the remaining instant cannot be prevented (A-20) |
+| A rollback of a ceremony that froze writes (its on_freeze ran or started) finds the producer paused or unreadable, with or without an `on_abort` hook | confirming read (r30 round 14, model F1-A) | rollback | never `rollback_done` over a paused producer: STRANDED (`writes_kept_frozen`), on_halt pages; a refused ARM that never froze stays `nothing_to_undo` |
+| Someone else un-pauses this ceremony's acknowledged pause | every producer-state read, and a read on each late block during quiescence (r30 round 14, model R13-A) | any | `own_pause_released_externally`: the episode closes, any later pause is someone else's and is never resumed on this ceremony's authority. An un-pause AND re-pause between two reads cannot be seen (A-21; operating rule: no pause/resume by hand during a ceremony). A read ERROR on a late block during quiescence is journaled and the run continues (it never ends the run mid-FROZEN) |
+| This agent opens a journal written by an agent older than round 6 | `legacy_takeover` record (r30 round 14, model R13-B) | first open | the older agent's pause and freeze ownership is derived once, from the journal as that agent left it, and journaled as the first record of `run`, `rollback` or `join`; if that record cannot be written (e.g. a full disk) the command refuses with nothing changed; a strand this agent writes later is never read as the older agent's pause |
+| This agent opens a journal written by a NEWER agent (a record kind it does not know) | journal replay (rc.30) | any | refused on open, nothing folded or changed; operating rule: never run an older agent version on a journal a newer one wrote |
 | Head keeps moving after the pause | quiescence window | FROZEN | late blocks journaled; the window waits up to `quiescence_timeout_secs` (default 120), then ABORT (before ignition: `on_abort` reopens writes) |
 | Snapshot block id ≠ chain's block id at H (fork at the cut); chain_id changed | block lookup | FROZEN | abort |
 | Any transaction in H+1…pause, or an unreadable block, or an answer that is not that block with a `transactions` array | burn-off audit (fails closed) | FROZEN | abort |
@@ -424,3 +503,195 @@ and snapshot creation grows with state size. v2 would take both off the critical
   metalgo), which would also cut the ignite step (8.3–14.4 s in the single-node runs).
 
 None of this is scheduled.
+
+## 7. Readiness drill (r30, risk register D-7)
+
+**Purpose.** Rung 4 of the mainnet test ladder ([HOW-IT-WORKS.md](HOW-IT-WORKS.md#7-how-it-gets-proven-before-mainnet)):
+every producer proves, on the live chain and with no state or write impact on it, that its own infrastructure cuts exactly H and
+converts it to the same state as everyone else, and measures how long that takes. Nothing else can show this
+before a real event: rehearsals use rehearsal nodes, a drill uses each producer's real nodeos and hardware.
+
+**Shape.** A separate command, `pulse-cutover drill --config <ceremony.toml> --height H`, in its own module
+(`src/drill.rs`). It does not go through the state machine and never opens the ceremony journal for writing.
+
+1. Refuse unless the config uses the upstream backend with `compare_bin` and `snapshot.dir`, and (round 4) the
+   drill's own structural requirements hold: `[upstream] export_image` (a plain image reference),
+   `export_tools_dir` (an absolute real directory whose `export.sh` is a plain single-named file) and
+   `chain_state_db_size_mb` are set; `import_bin`, `compare_bin` and `fingerprint_bin` are absolute paths to
+   single-named regular files that are native executables (ELF, or Mach-O on macOS), not scripts, not links, not
+   writable by group or others; and `source.producer_api_url` has no query, fragment or credentials. Before creating anything, refuse when any path the drill writes
+   overlaps (after resolving symlinks) `snapshot.staged_path`, the journal, `upstream.work_dir` or `snapshot.dir`:
+   the whole drill root (each drill's work files, `latest.json` and its temp file, the cancel and lock files) and
+   the journal's lock file; and (round 3) refuse when any of those paths already exists as a symlink or a file with
+   other names (a hard link), since writing through it could overwrite a protected file. The drill never writes
+   through a link: its log is opened with `O_NOFOLLOW`, and `latest.json.tmp`, the cancel file and the copied evidence
+   are written as fresh inodes (any old name unlinked first, then `O_EXCL | O_NOFOLLOW`). Then take the ceremony's own exclusive journal lock (`<journal>.lock`) AND the drill
+   root's lock (`drill/drill.lock`, because configs that share a journal directory share `latest.json` whatever
+   their journal file names), and hold both for the whole drill, so a ceremony and a drill, or two drills, exclude
+   each other atomically. Refuse while the ceremony journal is in progress, sealed, unfinished or LIVE
+   (only no journal, an empty one or a finished ABORTED may run next to a drill), while another drill is RUNNING,
+   for H < head + 20, and for an H already drilled on this box (the
+   `drill/<H>` directory is claimed with an atomic create).
+2. `schedule_snapshot(H)` (the same producer-API call ARM makes), recording the producer API's
+   `snapshot_request_id` in the drill log and `latest.json` together with the producer API it was made on
+   (normalised) and its height: a producer-local id means nothing on another node (round 3). No freeze, no pause, no burn-off gate: the chain
+   keeps producing, and the blocks after H are recorded as information only.
+3. Wait for LIB ≥ H, pin H's block id, pick up `snapshot-<id of H>.bin`, hash it.
+4. Run the upstream pipeline (export → import → compare → fingerprint) in `<journal dir>/drill/<H>/work` in its
+   ARGUMENT-VECTOR mode (`upstream::run_pipeline_exec` with `PipelineExec::Argv`; the ceremony's `run_pipeline` is
+   unchanged and still runs its shell strings): the export is the fixed vector `docker run --rm --network none
+   -v <export dir>:/out -v <snapshot>:/in/cut.bin:ro -v <export_tools_dir>:/xce:ro --entrypoint bash <export_image>
+   /xce/export.sh --nodeos /usr/local/bin/nodeos --xpr-core /src/leap --snapshot /in/cut.bin --work-dir /out/export
+   --chain-state-db-size-mb <n> --timeout-seconds 7200 --deferred-sidecar /out/deferred-transactions.json`
+   (`upstream::drill_export_argv`), and the three tools run by argument vector with the pipeline's arguments. No
+   shell runs anywhere, and `upstream.export_cmd` is never used by a drill. The rehearsal compare allowlist and any
+   pinned `golden_state_root` are cleared: the drill reports the TRUE compare result. When the compare fails, the
+   drill still fingerprints the checkpoint (same tool and arguments, by vector), because comparing producers' state
+   is half of what it measures.
+5. Journal every step in `<journal dir>/drill/<H>/drill.jsonl` (`kind = "readiness_drill"` on every line), publish
+   `<journal dir>/drill/latest.json`, keep the compare report and checkpoint manifest, delete the multi-GB work
+   files unless `--keep-work`.
+
+**What it costs.** No state or write impact, but CPU, RAM (13.7 GB peak on mainnet state) and disk, and nodeos
+writes the snapshot at H synchronously: on a producing node that can cost blocks in its own round. Prefer a
+non-producing node with the same snapshot directory, or an H outside the producer's round. A drill that fails or
+is cancelled before H is final removes its pending request, by the request id it recorded and never by height (a
+ceremony may hold its own request at the same height): the guard refuses an unschedule by height outright and an
+unschedule of any id but the drill's own. Without a recorded id nothing is removed (recorded; the operator removes
+it by hand).
+
+**No shell, by construction (round 4).** Rounds 1–3 scanned the configured conversion commands and the wrapper
+scripts they named for references to hooks or stop/create/ignite commands; every review round found another way past
+the scan (quotes, `cd` and relative wrappers, `..` through a symlink, hard links, variables, `PATH`). The scanner is
+gone. A drill runs no configured text at all: the export is the fixed `docker run` vector above, built only from the
+validated `export_image`, `export_tools_dir` and `chain_state_db_size_mb`, and the three tools must be native
+executables run by argument vector. The guard refuses `run_long` / `run_long_cancellable` (shell) outright and lets
+`run_argv_cancellable` start only `docker` and the three validated tool paths. What remains trusted is what any
+operator trusts: the published sidecar image, the official `export.sh`, and the official tool binaries.
+
+**Pinned content, local daemon, no inherited environment (round 5).** A native-executable check alone still
+admitted `/bin/bash` as a "tool" (the import step would then run the export-produced log as shell). A drill now runs a
+program only when its content matches a configured pin: `import_bin_sha256`, `compare_bin_sha256`,
+`fingerprint_bin_sha256` and `docker_bin_sha256` (64 lowercase hex), checked at load and again by the guard right
+before each run, and the export image only by digest (`name@sha256:<64 hex>`; a tag can be moved). Docker is run by
+absolute path (`docker_bin`, never looked up through PATH) and always with `--host unix://<docker_socket>`
+(default `/var/run/docker.sock`, which must be a unix socket, not a link); the guard refuses a docker vector without
+it. Every argument-vector run gets a cleared environment (a fixed PATH, HOME and LC_ALL only), so no `DOCKER_HOST`,
+`DOCKER_CONTEXT`, `DOCKER_CONFIG` or `LD_PRELOAD` reaches it. Residual: a file could change between the guard's hash
+and the exec; each pinned file must be single-named and not writable by group or others (checked again at that
+moment), so only its owner could swap it, and the owner can already run anything (exec through the hashed file
+descriptor is not portable). The beacon reports the pins and their digest (`tools.tools_digest`); mission control
+calls producers in agreement only when they ran identical pinned tools on identical state.
+
+**The export container (round 5).** Killing the docker CLI does not stop the daemon-managed container. The drill
+names the container (`pulse-drill-<H>-<random>`, `--cidfile` in the drill directory) and records the name before it
+can exist (`export_container` in `latest.json`, `export_container_gone: false`). After the pipeline, whatever its
+outcome, and on every failure or cancel, it runs `docker kill` and `docker rm -f` on that name through the pinned CLI
+and the local socket, then `docker inspect` until the daemon answers "No such object" (any other answer is unknown,
+never gone). Until then `activity` reports the drill RUNNING whatever `latest.json` says (a ceremony's ARM keeps
+refusing), the drill ends FAILED-INCOMPLETE, and `--cancel` of a dead drill retries the stop and reports INCOMPLETE
+until the container is verified gone.
+
+**One producer, one lock (round 5).** Configs on the same producer but with different journal directories took
+different journal and drill-root locks and read different `latest.json` files. A third lock is keyed by the
+normalised `source.producer_api_url` and lives in nodeos's snapshot directory
+(`<snapshot.dir>/.pulse-cutover-producer-<16 hex>.lock`): the one resource a drill and a ceremony on one producer
+necessarily share, the same path for every process (a `/run` path would differ between root and non-root agents).
+Without a snapshot directory it falls back to the journal directory. A drill and `--cancel` hold it with the other two
+for their whole run; a ceremony takes it at ARM and holds it for its run (a fresh ARM, or one resumed while ARMED,
+refuses while it is held; after the freeze a busy lock is a loud warning, the cut continues). Lock order everywhere:
+journal lock, drill-root lock, producer lock; every acquisition is a bounded try-lock, so nothing can deadlock.
+
+**Process groups (round 4).** The drill's tools run in their own process group with a record written as a fresh
+inode (`O_CREAT | O_EXCL | O_NOFOLLOW`, exactly one name; an old name is unlinked first, never written through).
+A tool run ends only when `ps` positively shows its whole group gone: a group that survives the kill (self-cancel,
+timeout, or descendants still running after the tool exits), or whose state `ps` cannot report (missing, refused,
+non-zero, unparseable: "unknown" is never "stopped"), KEEPS its record and the run fails as INCOMPLETE. The drill
+then stays RUNNING (`stage = stop_incomplete`, work files kept) and `activity` reports it RUNNING whatever
+`latest.json` says while the recorded group is alive or unknown, so a ceremony's ARM keeps refusing until
+`pulse-cutover drill --cancel` has really stopped it. The ceremony's shell steps keep their behaviour, except that
+their process-group record is also written as a fresh inode (never through a symlink).
+
+**Both ways exclusive.** A fresh ceremony's ARM preflight refuses while `drill/latest.json` is RUNNING with a live
+drill process (same pid and start time) or a live pipeline process group; a RUNNING record with nothing alive is
+journaled as `readiness_drill_stale` and does not block. While a drill runs it also holds the journal lock, so
+`run` cannot even open the journal. `pulse-cutover drill --cancel` writes `drill/<H>/cancel` (the drill checks it
+while waiting for H and as the pipeline's cancel check, which stops the running tool), waits up to 60 s, then stops
+the pipeline's recorded process group (start-time checked, never pgid 0 or 1) and verifies it is gone. If the kill
+failed or the group is still alive, the cancel is INCOMPLETE: nothing is marked finished (the record stays RUNNING,
+so a ceremony's ARM keeps refusing) and the command exits non-zero. If no drill process is left, it takes the same
+two locks a drill takes (a ceremony or another drill holding them refuses the cancel), refuses next to a ceremony
+in progress, removes only the snapshot request id that drill recorded, and marks it FAILED (cancelled).
+
+Round 3: `--cancel` makes every check before writing anything (the output-path overlap and link checks; for a drill
+whose process is not alive, the two locks, the ceremony check, and the request's binding: it must have been made on
+this config's producer API, for this drill's H). A refused cancel writes nothing. An incomplete cancel KEEPS the
+pipeline's process-group record (it is removed only when the group is verified gone), so the drill keeps showing as
+RUNNING and a ceremony's ARM keeps refusing until the work is really gone. The request is removed only while it is
+still the single-block request at the recorded H on that node.
+
+**The ceremony holds the drill-root lock too** (round 3). Configs that share a journal directory share
+`drill/latest.json` but lock different journal files, so a drill under another journal name could start next to a
+ceremony (or be starting, not yet RUNNING in `latest.json`, when the ceremony's ARM checked). A ceremony's run takes
+`drill/drill.lock` before its drill check and holds it for the whole run: a fresh ARM refuses when it is held; a
+resumed ceremony is never refused for it mid-cut (it journals `readiness_drill_lock_busy` and continues). Lock order
+everywhere: the journal lock, then the drill-root lock (drill, `drill --cancel`, ceremony), so there is no cycle;
+every acquisition is a bounded try-lock.
+
+**Why it cannot change anything.** The drill never holds the raw `ChainOps`: every call goes through `DrillGuard`,
+which passes read-only calls, `schedule_snapshot` and the four validated programs by argument vector, and refuses (and records) every shell command and (and records) pause,
+resume, `create_snapshot`, ignite, hooks, orphan-hook kills, target reads and target binding. A drill that even
+tried one fails. It runs no hook, so no write freeze, flip, stop or chain creation can happen; it never reads or
+writes `snapshot.staged_path`; its pipeline uses its own work dir and its own process-group file, so a ceremony's
+orphan-hook cleanup and a drill cannot kill each other's processes.
+
+**Mainnet.** A drill is allowed on XPR mainnet without any override; the config is loaded with the normal rules, so
+rehearsal overrides stay refused for mainnet. A readiness-profile config (the one `beacon-install.sh` writes) can run
+a drill once it has `[upstream]` and `snapshot.dir`.
+
+**Reporting.** The beacon publishes `latest.json` as a top-level `drill` field (never inside `ceremony`). Its
+`fingerprints_digest` is computed exactly as a real VERIFIED record's (`{"upstream_state_root": root}`), so drills
+and ceremonies compare directly. Mission control validates the field (`projectDrill`), compares producers per drill
+height (`drillComparison`: same block at H, snapshot, state root, compare result, timings) and shows a separate
+READINESS DRILL panel. Drill data never feeds the fleet verdict, the agreement table, the creation-evidence log or
+any agent decision; an invalid `drill` field is dropped on its own (`drill_invalid`), never the whole report, and a
+DONE drill counts toward agreement only with a block id at H, a snapshot hash and a fingerprint digest. `status` prints the latest drill on its own line, labelled as not a ceremony, and `report`
+bundles `drill-latest.json`.
+
+**Exit codes.** 0 = evidence complete and the compare matched; 5 = evidence complete, the compare did not match;
+1 = the drill failed.
+
+**Not covered.** The finality wait it measures is the live chain's, not a frozen fleet's; the snapshot write is
+timed as "LIB ≥ H → file present". Peak memory is not measured by the agent (use the host's own monitoring). H is
+typed by each operator; a signed coordinator drill event is a possible follow-up.
+
+**A ceremony and a drill on one box** (rc.30 round 4). A fresh ceremony, or one resumed while still ARMED, refuses to
+arm while a drill holds the drill lock or is running. A ceremony resumed **after its freeze** is never refused: it
+stops the drill (cancel file, then a kill of the drill's recorded process group that keeps the record unless the group
+is proven gone), re-takes the lock and journals `readiness_drill_stopped_for_the_cut`, or a loud
+`readiness_drill_not_stopped` if it cannot confirm the drill stopped. A cut in progress is never stranded by a drill. The
+cancel file is written as a fresh inode inside the journal directory (whatever name sits there, a symlink or a hard
+link to the journal, is unlinked first, never truncated through; every directory on the way must be a real directory;
+round 5).
+
+**Round 6 (rc.30).** *Undo only what this journal did*: a source pause and a write freeze are journaled as side
+effects (`source_pause`, `write_freeze`) before they happen; a rollback resumes only a producer this journal paused,
+runs `on_abort` only after its own freeze, and moves a staged file aside only for a ceremony that could have staged
+it. A ceremony refused at ARM (a busy lock, a producer someone else paused) ends ABORTED with `nothing_to_undo` and
+touches nothing; a later `rollback` is a no-op. Journals from older agents (no `undo_tracking` on their arming
+record) keep the previous behaviour. The per-producer lock moved from nodeos's `snapshot.dir` into an agent-owned
+`lock_dir`, keyed on the canonical snapshot directory (producer API spellings collapse); only "held by another
+process" refuses an ARM. A drill writes a work marker beside that lock (`<lock>.work.json`, fresh inode) before its
+work starts and removes it only once its work is verified gone, so a ceremony in another journal directory still
+sees an export container or pipeline group that outlived the drill process: it refuses to ARM next to it, and after
+its freeze asks it to stop and warns. `loop` fails closed on a source that does not answer (unless
+`reset_when_source_down`, refused for mainnet) and holds the producer lock through `reset_cmd`.
+
+**Work markers belong to their drill** (rc.30 round 7). Every work marker names its drill (`drill_id`, also in that
+drill's `latest.json`) and the export container it starts. A drill removes only its own marker, while it still holds
+the journal, drill-root and producer locks, so a newer drill's marker can never be deleted by an older drill's
+cleanup. A marker whose drill never published and is not running is **unknown**, never "done": it blocks a fresh ARM
+on that producer from any journal directory. `pulse-cutover drill --clear-marker`, run with any config on the same
+producer, removes such an orphan only when the drill process, its pipeline group and its export container (asked
+through the pinned docker CLI on the local socket) are all proven gone, and records the removal; anything unknown
+refuses with nothing changed. `status` and the beacon show the marker before an event.

@@ -146,6 +146,11 @@ section{margin-top:26px}
 .fleet.STALLED{border-color:rgba(251,113,133,.45)}.fleet.STALLED b.v{color:var(--bad)}
 .fleet.SPLIT{border-color:var(--bad);background:rgba(251,113,133,.12);color:#fecdd3}.fleet.SPLIT b.v{color:var(--bad)}
 .fleet ul{margin:6px 0 0 18px;padding:0}
+/* readiness drills (r30): never a ceremony; a separate, neutral panel */
+.drills{margin:0 0 14px;padding:12px 16px;border-radius:14px;border:1px dashed var(--line);font-size:13px;line-height:1.55;color:var(--muted)}
+.drills b.v{font:700 12px var(--sans);letter-spacing:.8px;margin-right:8px}
+.drills .ok{color:var(--ok)}.drills .warn{color:var(--warn)}.drills .bad{color:var(--bad)}
+.drills ul{margin:6px 0 0 18px;padding:0}
 .checks{display:flex;gap:3px;margin-top:12px;height:6px}
 .checks i{flex:1;border-radius:3px;background:rgba(255,255,255,.07)}
 .checks i.ok{background:linear-gradient(90deg,#10b981,var(--ok))}.checks i.bad{background:var(--bad)}.checks i.todo{background:transparent;box-shadow:inset 0 0 0 1px rgba(251,191,36,.6)}
@@ -406,6 +411,7 @@ a.tilelink{color:inherit;text-decoration:none;display:block}
 <main class="wrap">
   <nav class="switch" id="switch" role="tablist" aria-label="Network"><span class="pill" id="pill"></span></nav>
   <div class="fleet" id="fleet" role="status" hidden></div>
+  <div class="drills" id="drills" hidden></div>
   <div id="v-page" hidden></div>
   <div id="v-overview">
 
@@ -687,6 +693,7 @@ const CHECKS = {
   metal_synced: ['setup', 'Metal node synced', 'the Metal P-Chain has finished bootstrapping'],
   metal_reachable: ['setup', 'Staking port open', 'peers can reach port 9651/tcp from the internet'],
   producer_api_private: ['setup', 'Producer API private', '/v1/producer/* (pause, resume, snapshots) does not answer from the internet'],
+  shadow: ['setup', 'SHADOW', 'shadow cutover: the full ceremony on a PRIVATE network from real mainnet state with the mainnet chain_id; never a real cut, and nothing may be signed on it with a real key'],
   rehearsal_overrides: ['setup', 'REHEARSAL', 'rehearsal only: this node runs a REHEARSAL ceremony (ceremony.rehearsal = true) or relaxes cutover gates (table-compare allowlist / target chain_id change); never a real cut'],
 };
 const kind = (c) => (CHECKS[c.name] || ['health'])[0];
@@ -735,6 +742,19 @@ function render() {
     const items = [...fv.alarms, ...(fv.warnings || []), ...(fv.verdict !== 'SPLIT' ? fv.not_live : [])];
     const html = `<b class="v">FLEET ${esc(fv.verdict)}</b>${esc(fv.event_id)} · ${what}${fv.detail ? ` · ${esc(fv.detail)}` : ''}${items.length ? `<ul>${items.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}`;
     fb.className = `fleet ${fv.verdict}`; fb.hidden = false; if (fb.dataset.sig !== html) { fb.innerHTML = html; fb.dataset.sig = html; }
+  }
+
+  // readiness drills (r30): the live chain snapshotted at an agreed H, no freeze; display only, never a ceremony
+  const db = $('drills'), dr = (net.drills || [])[0];
+  if (!dr) { db.hidden = true; db.innerHTML = ''; } else {
+    const sec = (ms) => (Number.isInteger(ms) ? `${(ms / 1000).toFixed(0)} s` : '–');
+    const verdict = dr.agree ? '<span class="ok">same state on every producer that finished</span>'
+      : dr.fingerprints_digest.length > 1 || dr.block_id_at_h.length > 1 ? '<span class="bad">producers DISAGREE</span>' : '<span class="warn">waiting for results</span>';
+    const cmp = dr.compare.map((g) => `${esc(g.value)} (${g.producers.length})`).join(', ') || '–';
+    const rows = dr.timings.map((t) => `<li>${esc(t.producer)}: conversion ${sec(t.conversion_total)} · export ${sec(t.export)} · import ${sec(t.import)} · compare ${sec(t.compare)} · finality ${sec(t.finality_wait)}</li>`);
+    const fails = dr.failed.map((f) => `<li class="bad">${esc(f.producer)} failed: ${esc(f.error || '')}</li>`);
+    const html = `<b class="v">READINESS DRILL</b>H ${esc(dr.h)} · not a cutover: nothing was frozen · ${dr.done}/${dr.producers} done${dr.running.length ? ` · running: ${esc(dr.running.join(', '))}` : ''} · ${verdict} · table compare: ${cmp}<ul>${[...fails, ...rows].join('')}</ul>`;
+    db.hidden = false; if (db.dataset.sig !== html) { db.innerHTML = html; db.dataset.sig = html; }
   }
 
   const c = net.chain || {}, s = net.summary;
@@ -977,7 +997,7 @@ const ICP = {
 const ic = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICP[n] || ICP.server}</svg>`;
 const CHECK_ICON = { source_api: 'globe', chain_id: 'key', producer_api: 'cpu', freeze_height: 'lock', freeze_lead_blocks: 'lock',
   staged_snapshot_absent: 'camera', disk_free: 'hdd', hook_on_freeze: 'lock', hook_post_ignite: 'zap', hook_on_live: 'arrow',
-  hook_on_abort: 'undo', validator_running: 'hex', metal_synced: 'hex', metal_reachable: 'radio', producer_api_private: 'lock', rehearsal_overrides: 'wrench',
+  hook_on_abort: 'undo', shadow: 'wrench', validator_running: 'hex', metal_synced: 'hex', metal_reachable: 'radio', producer_api_private: 'lock', rehearsal_overrides: 'wrench',
   target_live: 'activity' };
 const ROLE_ICON = { producer: 'cpu', history: 'db', api: 'globe', seed: 'link', query: 'db', full: 'globe' };
 const ROLE_NAME = { producer: 'Block producer node', history: 'History / Hyperion node', api: 'Public API node' };

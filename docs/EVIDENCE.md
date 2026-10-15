@@ -39,6 +39,8 @@ The agent has also changed since most of these runs. The main differences, noted
 | [Hyperion and bp mode](#hyperion-mode-and-bp-mode-2026-08-21-second-session) | 2026-08-21 | same | Tahoe (hyperion), local 1-node network (bp, loop) | hyperion, producer (`schedule_at_h`) | hyperion: 1 correct abort, 1 LIVE; bp: LIVE at exactly H; loop 22/22 |
 | [Multi-producer rehearsal](#multi-producer-rehearsal-5-bps-september-2026) | 2026-09-28/29 | Leap 5.0.3, 5 producers | private 5-validator Metal network | producer, 5 BPs | run 1 aborted on all 5; runs 2–6 LIVE on all 5 |
 | [Linux fault injection](#linux-fault-injection-rc9-and-rc10) | 2026-09-29/30 | stubbed nodeos | stubbed metalgo | producer and api | rc.9: 83/83 with a shim, critical BUG-1 found; rc.10: 49/49 with no shim |
+| [Upstream-stack fleet runs](#upstream-stack-fleet-runs-october-2026) | 2026-10-06 to 10-10 | XPR testnet state (rewritten test keys), 5-BP Leap 5.0.3 mesh, 21 scheduled names | upstream PulseVM v1.0.0, metalgo 1.14.2, private 5-validator Metal network | producer, 5 BPs, signed events, rc.22–rc.27 | 18 runs: happy paths, split (r4), stranding, join, partition, crash, schedule checks |
+| [Mainnet conversion](#mainnet-conversion-2026-10-13) | 2026-10-13 | a real XPR mainnet snapshot | none (conversion only) | the upstream pipeline, timed per stage | 9.6 min, 13.7 GB peak; compare fails on 3 tables |
 
 ---
 
@@ -400,6 +402,149 @@ through this suite.
 
 ---
 
+## Upstream-stack fleet runs (October 2026)
+
+**Setup.** Five BPs (4 vCPU, 8 GB each; Sydney, Singapore, Los Angeles, New Jersey, Frankfurt), each running a Leap
+5.0.3 producer of a private mesh restored from **XPR testnet state** (32,513 accounts; test keys rewritten so the
+fleet could sign; the 21 scheduled producer names spread round-robin over the five boxes) and a metalgo v1.14.2
+validator of a **private** 5-validator Metal network with **upstream PulseVM v1.0.0**. Every event was signed and
+relayed by mission control with a roster of all five. Rehearsal-only pieces on every run: the #106 CPU
+redenomination patch in the importer, the compare allowlist for `contract_index_double` and `global_property`
+(#109), the target chain_id change (#108), and **one shared producer key** (#107). No run used mainnet state, real
+per-BP keys or Tahoe.
+
+| Run | Agent | Scenario | Result |
+|---|---|---|---|
+| r1–r6 | rc.22 | happy paths, a partition, a crash at FROZEN and at IGNITED+2 s, mission control unreachable for 10–15 min | every BP cut exactly H, verified and agreed 5/5; identical dapp state at H on all 5 and against a reference nodeos (197 tables); but every healthy run ended with **LIVE and HALTED BPs on one chain** (each judged liveness alone on a slow WAN target: ~1.35 s per accepted block, 11–39 s gaps). **r4: a BP that lost the relay before its chain creation aborted and resumed the old chain while four peers had ignited: 33 writes landed after H.** Crash runs resumed from the journal; the partition healed with no divergence |
+| c1–c5 | rc.24 | happy path; r4 replayed; a broken compare; a forced resume (SPLIT control); a signed abort with one beacon silent | the relay-loss case now **strands** (0 writes after H, vs 33 in r4) and `join` brought the BP onto the LIVE chain; the forced resume latched a SPLIT alarm within ~4 s (7 writes landed before the manual fence); found F1–F6 (halt cascades, a BP that could not join, a silent member resuming) |
+| d1–d3 | rc.25 | c3a, c2 and c5 replayed | 4 LIVE with no halt cascade; relay-loss BP stranded and joined (5/5 LIVE); signed abort with a silent beacon: all 5 stranded, then a guarded rollback to ABORTED. 0 transactions after H on the old chain in all three |
+| e1 | rc.26 | a BP whose own compare failed | stranded, then `join --reverify` re-verified and joined the same chain: 5/5 LIVE, identical evidence on all five, 0 transactions after H |
+| g1, g1b, g2 | rc.27 | protocol-upgrade schedule equal / different on one BP; a halted target | equal schedule: 5/5 LIVE; different schedule: that BP never agreed and stranded, the other four LIVE; g2 found a false STALLED verdict (fixed in rc.28) |
+
+**Proves:** the exact-H cut, conversion and fleet gate on real testnet state with signed events; the failure paths
+added in rc.23–rc.27 (STRANDED, `join`, `--reverify`, degraded waiting, the SPLIT alarm) doing what they claim on
+real boxes; 0 transactions on the old chain after H in every run except r4 and the deliberate c4.
+
+**Does not prove:** fleet-wide all-or-nothing (r4 shows why it is needed; the fixes are local and read unsigned
+relay reports); anything with per-BP producer keys, the source chain_id kept for signing, or without the
+rehearsal patch and allowlist; mainnet state or a mainnet-sized validator set; rc.28 and rc.29 changes, which were
+tested in CI and review, not on the fleet.
+
+---
+
+## Model checking the ceremony state machine (2026-10-14)
+
+A seeded, randomized model checker (`tests/model.rs`; the `join` model is `r30r10_join_model_*` in `tests/machine.rs`)
+drives the real `Machine` against a world that knows who paused the producer and whether old-chain writes are open,
+with kills injected at random operations, external pauses and resumes, aborts, re-runs, plain and forced rollbacks,
+`unhalt` and `join`. Invariants are checked at every action: I1 no pause the agent made is left after a rollback; I2
+writes never reopen into a paused producer; I3 an external pause is never resumed without a journaled release; I4
+nothing resumes the old chain past the point of no return (creation, ignition, join); I5 the journal always replays;
+I6 every step terminates.
+
+On the code before round 10 it found two classes of I3 violation (an external pause resumed after an own pause was
+resumed and someone else paused again; and a kill between the pause intent and the pause RPC). Both are fixed (pause
+episodes in round 9, the pause acknowledgement in round 10) and kept as regression tests.
+
+| Run | Scenarios | Result |
+|---|---|---|
+| main model, seeds 1–20,000 | 20,000 (3,408 with a crash, 6,252 with an external pause, 513 forced releases) | 0 violations; ended LIVE 8,313, ABORTED 8,855, STRANDED 1,216, IGNITED 1,044, HALTED 533, other 39 |
+| join model, seeds 1–300 | 300 (from ABORTED and STRANDED, kills inside `join`) | 0 violations |
+
+**Proves:** the invariants hold over the generated interleavings on mocks. **Does not prove:** anything about real
+nodeos, metalgo or network behaviour; scenarios the generator does not produce (API and hyperion modes, shadow, the
+drill, mainnet `lock_dir`).
+
+### Round 11: the checker's reach widened (2026-10-15)
+
+A review of the checker itself found it weaker than its claims: I3 accepted any `external_pause_release` anywhere in
+the journal, the join model could not reach the join's own pause, I6 and I7 were not asserted, and no scenario used
+`schedule_at_h`. All four were fixed in the tests, and new faults were added: a resume that takes effect while its
+answer is lost, a kill right after a pause or a resume takes effect, and someone else pausing right after a resume.
+
+| Run | Scenarios | Result |
+|---|---|---|
+| main model, seeds 1–20,000 (7,819 `schedule_at_h`) | 20,000 (3,379 with a crash, 6,397 with an external pause, 1,124 forced releases, 241 lost resume answers, 227 kills right after a resume) | 76 violations of class R10-1 and 1 of class R11-A (below); no other violation |
+| join model, seeds 1–1,000 | 1,000 (934 reached a join segment, 146 the join's own pause intent, 99 its ack, 48 an unacknowledged intent) | 0 violations |
+
+The classes found on that run, all I3 (someone else's pause resumed) and all in the source, fixed in rounds 11 and 12:
+
+- **R10-1**: a resume that took effect but whose answer was lost, or after which the agent was killed before
+  journaling it, leaves the agent's pause episode open, so a later pause by someone else is resumed as the agent's.
+  Representative seeds 319, 675, 1959, 2067.
+- **R11-A**: a forced release whose resume was refused stays in force; after that party resumes and later pauses again,
+  a plain rollback resumes the new pause. Seed 13295.
+- A directed test reproduces review R10-2: production resumed for the snapshot (`pause_at_h` recovery) does not close
+  the agent's pause episode, so a pause made right after it is resumed by the abort.
+
+**After the fixes (round 12, same checker, every violation fatal):**
+
+| Run | Scenarios | Result |
+|---|---|---|
+| main model, seeds 1–20,000 (7,819 `schedule_at_h`) | 20,000 (3,376 with a crash, 6,362 with an external pause, 1,239 forced releases, 220 lost resume answers, 222 kills right after a resume, 922 ownership-unknown outcomes) | **0 violations**; ended LIVE 7,790, ABORTED 8,942, STRANDED 1,647, IGNITED 984, HALTED 500, other 137 |
+| join model, seeds 1–1,000 | 1,000 (934 segments, 146 join pause intents, 99 acks, 48 unacknowledged intents) | **0 violations** |
+
+## Mainnet conversion (2026-10-13)
+
+The upstream conversion pipeline, run once per stage exactly as the agent's upstream backend invokes it
+(`export.sh` in the Leap 5.0.3 sidecar image → `xpr_import_check` → `xpr_19_table_compare` →
+`xpr_state_fingerprint`; the v1.0.0 tool builds the 2026-10-06 fleet runs used), on one cloud host:
+6 vCPU (2.0 GHz Broadwell), 16 GB RAM. Two inputs on the same host:
+
+- **XPR mainnet**: the public BloxProd `latest-snapshot.bin` of 2026-10-13, 1,522,296,904 bytes, sha256
+  `6283db6418671cff…`, block 408,328,634, chain_id `384da888…` (checked from the export's sidecar).
+- **XPR testnet**: the snapshot the fleet rehearsals used, 184,796,064 bytes, block 408,461,570.
+
+| Stage | Mainnet | Peak RSS | Testnet |
+|---|---|---|---|
+| export (Leap → SHiP log + sidecar) | 168.9 s | 29 MB (the container's nodeos is not counted) | 19.6 s |
+| import (→ Arena checkpoint) | 191.6 s | 11.2 GB | 26.5 s |
+| 21-table compare | 140.4 s | 13.7 GB | 13.4 s |
+| state fingerprint | 71.6 s | 7.7 GB | 7.9 s |
+| **total** | **572.5 s** | | **67.4 s** |
+
+Mainnet sizes: SHiP log 605 MB, sidecar 245 MB, checkpoint 2.06 GB, 9.7 GB of work files per run.
+Imported: 885,878 accounts, 1,779,884 permissions, 479 code objects, 2,779,720 contract tables,
+7,606,833 contract rows, 1,713,856 / 160,921 / 825,725 / 104 index64 / index128 / index256 / index_double
+rows, 34 deferred transactions, 2,779 recent-transaction (dedupe) entries. Mainnet state root
+`42b0a70fa12998bd…`; testnet `ce8062296d3678d9…`.
+
+**Compare result.** Testnet: 19 of 21 tables equal; `contract_index_double` (arena side missing) and
+`global_property` (one row differs) fail, the two known v1.0.0 gaps the fleet rehearsals allow-listed.
+Mainnet: the same two plus **`generated_transaction`** (34 rows on the nodeos side, none read on the Arena
+side). The importer reports all 34 deferred transactions and all 104 `index_double` rows imported, so the
+likely cause was the compare tool's coverage (upstream #109). The testnet state has no deferred transactions, so
+no rehearsal exercised this table.
+
+**Diagnosis (same day).** The compare was rebuilt from upstream commit `298969ec` (its chaindb, database and snapshot
+crates are identical to the v1.0.0 release commit `4a43d8bb`) with two diagnostic switches, off by default:
+(1) frame all 19 Leap 5 SHiP tables (v1.0.0's serializer collects them but frames only 16, so
+`contract_index_double`, `contract_index_long_double` and `generated_transaction` never reach the compare), and
+(2) serialize `global_property` in Leap 5's full 157-byte shape (v1.0.0 drops the empty proposed-schedule envelope,
+`deferred_trx_expiration_window` and `max_transaction_delay`; the Arena checkpoint still holds those values). With
+both, **all 21 tables match nodeos on mainnet and on testnet**: `contract_index_double` (104 rows) sha256
+`860fee6b…`, `generated_transaction` (34 rows) `31e29136…`, `global_property` `fbfb5acb…`, equal on both sides.
+Without them the rebuilt tool fails exactly like the official binary. So the imported state is complete; the gap
+is serialization, and live SHiP after the cut shares the same serializer. Reported upstream on #109. Not covered: a snapshot taken while a
+producer-schedule change is pending (the compare would then fail, the safe direction).
+
+**Re-run on the released v1.0.0 (same day).** Tools built from the release tag (`4a43d8bb`): `xpr_import_check`
+`3d2879cb…`, `xpr_19_table_compare` `00cdaa59…`, `xpr_state_fingerprint` `b7e59222…`; released `pulsevm` binary
+`d8ba5d97…`. Mainnet: export 164.2 s, import 198.5 s, compare 147.6 s, fingerprint 72.8 s, **total 583.1 s (9.7 min)**,
+same peak memory; **state roots identical** to the first run (mainnet `42b0a70f…`, testnet `ce806229…`) and the same
+compare failures. The pre-release and released tools produce the same state.
+
+**Proves:** the official pipeline runs on full XPR mainnet state; its duration (about 9.6 minutes on this
+hardware, roughly linear in state size: 8.2× the snapshot, 8.5× the time); the conversion's peak memory (13.7 GB
+in one process, on a host where nothing else ran). The 32 GB per node that `doctor` now asks for on mainnet is a
+provisioning requirement with headroom for the producer's own nodeos and validator, not a measured minimum.
+
+**Does not prove:** that the converted state is correct (the gate fails); the time to write the snapshot at
+H on a mainnet producer, or the finality wait on mainnet; anything about ignition or the new chain; faster
+hardware's timings.
+
+---
+
 ## Findings R13–R23
 
 Found in the August rehearsals above. R1–R12 are in [DESIGN.md](DESIGN.md#2-adversarial-review-findings-that-shaped-the-design).
@@ -417,3 +562,34 @@ Found in the August rehearsals above. R1–R12 are in [DESIGN.md](DESIGN.md#2-ad
 | **R21** | hyperion-rs on an imported chain must index from cut + 1. `start_block = 0` asks SHiP for block 1, which the imported chain cannot serve, and the stream stays silent while `/v2/health` looks like a healthy idle chain. | The agent substitutes `{first_post_cut_block}` into `[hyperion].start_cmd`; `install.sh` ships a start script that sets `start_block`. |
 | **R22** | proton-cli ignores edits to `networks[].endpoints` in its config; only an `endpoints[]` override takes effect. A write proof meant for the rehearsal box landed on the real testnet. | Use the `endpoints` key and check with `proton chain:get` before signing. The misrouted transaction became the divergence control. |
 | **R23** | Public legacy Hyperion archives rate-limit: 429s to a 4 Hz probe (pre-flip `/v2` 93.3–93.5% vs 99.8–100% through the federator). Under 429s the federator could return HTTP 200 pages missing pre-cut rows (22 of 310 probes). | Federator hardening, after the recorded run: legacy health cached 5 s; partial answers flagged (`partial: true`, `total.relation: "gte"`, `source_errors`). A provider with its own old Elasticsearch avoids the dependency (same `LEGACY=` knob). |
+
+### Round 13: oracles matched to the rules (2026-10-15)
+
+The checker's own oracles were tightened to the code's exact rules (I3 run-local and consumed on every attempt; I7 also
+failing when a rollback completes over a paused producer in a ceremony that froze writes) and its generators widened
+(someone else un-pausing the agent's own pause, producer-API outages right after a resume, configs without `on_abort`,
+journals written by pre-round-6 agents, the operator-abort sequence). Run on the round-12 source:
+
+| Run | Scenarios | Result |
+|---|---|---|
+| main model, seeds 1–20,000 (7,138 `schedule_at_h`) | 20,000 (3,290 with a crash, 7,044 with an external pause, 845 external resumes of the agent's pause, 925 forced releases, 2,054 legacy journals, 4,073 without `on_abort`, 332 post-resume read outages) | 339 violations, all in three classes (below); no other violation |
+| join model, seeds 1–1,000 | 1,000 (934 segments, 146 join pause intents, 99 acks, 48 unacknowledged intents) | 0 violations |
+
+| Class | Seeds (of 20,000) | What happens | Owner |
+|---|---|---|---|
+| F1-A | 296 | in a config without `on_abort`, a rollback completes ABORTED over a paused producer: the producer-state confirmation only runs when a reopen hook is pending | source (round 13) |
+| R13-A | 22 | someone else un-pauses the agent's acknowledged pause and pauses again unseen; the agent later resumes that external pause as its own | source; only partly closable (the gap is invisible between two reads) |
+| R13-B | 21 | a pre-round-6 journal is stranded by this agent over someone else's pause; the legacy rule "STRANDED means the older agent paused" makes that pause look like ours and a plain rollback resumes it | source (round 13) |
+
+Each class has an `#[ignore]`d regression test in `tests/model.rs`; the default run fails on anything outside them.
+
+**Round 14 (2026-10-15).** F1-A, R13-A and R13-B are closed in the source, `OPEN_CLASSES` is empty and every class test
+runs by default. Strict run (`MODEL_STRICT=1`), 20,000 scenarios: **0 violations**: 3,340 crashes, 7,084 external
+pauses, 844 external un-pauses of the agent's own pause, 2,054 older-agent journals, 4,073 configs without `on_abort`,
+999 forced releases, 830 resume outcomes unknown, 7,138 `schedule_at_h`; final states LIVE 7,124, ABORTED 9,306,
+STRANDED 1,955, HALTED 446, and 1,169 scenarios whose last operator step (each scenario runs 2–5) left the journal in
+a non-terminal state, e.g. after a crash: IGNITED 940, FROZEN 187, VERIFIED 22, SNAPSHOTTED 17, ARMED 3. The R13-B seed counts
+were measured on different sources: 21 seeds on the round-12 source (round 13 table above); after round 14's first
+fix, 12 seeds of a second shape (seed 913) remained, closed by the `legacy_takeover` record. Join model, 1,000 scenarios: **0 violations** (933 segments, 146 join pause intents, 99
+acks, 48 unacknowledged). One residual is documented, not open: an un-pause and re-pause of the agent's pause entirely
+between two of its reads (risk A-21; `model_residual_r13_a…`, ignored, fails by design).

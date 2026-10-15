@@ -5,25 +5,12 @@
 //! the journal is both the audit record and the crash-resume source of truth.
 
 use std::{
-    fs::{
-        File,
-        OpenOptions,
-    },
-    io::{
-        BufRead,
-        BufReader,
-        Write,
-    },
-    path::{
-        Path,
-        PathBuf,
-    },
+    fs::{File, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
 };
 
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::state::State;
@@ -42,10 +29,21 @@ pub struct Entry {
     pub data: Value,
 }
 
+/// Why a lock could not be taken (r30 round 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockError {
+    /// Another process holds it: a live competitor.
+    Held(String),
+    /// Anything else (directory missing or unwritable, read-only mount): not evidence of a competitor.
+    Io(String),
+}
+
 pub struct Journal {
     path: PathBuf,
     file: File,
     seq: u64,
+    /// Test support: the next N writes fail as a full disk would (nothing is written).
+    fail_writes: u32,
     /// Held for the Journal's lifetime: an exclusive lock on `<journal>.lock`, so two ceremony
     /// processes can never drive the same journal (released when the Journal is dropped).
     _lock: File,
@@ -120,9 +118,206 @@ pub struct Recovered {
     /// rc.23: when the first post-ignition degraded symptom was seen (patience counts from there,
     /// across a crash and resume).
     pub degraded_since_ms: Option<u64>,
+    /// The `shadow` value of the ARMED (arming) record: Null for a real ceremony, the shadow identity for a shadow
+    /// (docs/DESIGN-shadow.md). None = no arming record yet. Journals from before shadow mode read as Null.
+    pub armed_shadow: Option<Value>,
+    /// r30 round 6: the arming record's `undo_tracking` flag. Some(true) = this journal records every source pause
+    /// (`side_effect: source_pause`) and write freeze (`side_effect: write_freeze`) before doing it, so a rollback
+    /// undoes only those. Some(false) = an arming record from an older agent (rollback keeps its old behaviour).
+    /// None = no arming record yet (nothing was done).
+    pub undo_tracking: Option<bool>,
+    /// r30 round 14 (model R13-B): the ownership an agent of round 14+ derived ONCE, the first time it opened an older
+    /// agent's journal (`legacy_takeover` evidence: `{paused, froze}`). Later runs use it instead of re-deriving it from
+    /// states this agent wrote itself (a strand this agent wrote over someone else's pause is not the older agent's).
+    pub legacy_takeover: Option<(bool, bool)>,
+    /// r30 round 10 (model checker, class B): the arming record's `pause_ack` flag. Some(true) = this journal writes a
+    /// `source_pause_ack` record once its own pause RPC succeeded and a read confirmed the producer paused, and an own
+    /// pause INTENT without its ack is ownership UNKNOWN (never resumed). Otherwise (older journals) an own intent
+    /// counts as ours, the previous behaviour.
+    pub pause_ack_tracking: Option<bool>,
+    /// Round-2 review: a shadow identity refusal was journaled (its first record). Sticky: from then on nothing may
+    /// resume the source or run on_abort on this journal, whatever records follow (a crash between the refusal's
+    /// records must not reopen a rollback that resumes a node which may be real).
+    pub shadow_refused: bool,
+    /// r30 round 8 (review R8-6): an abort decided to keep writes frozen and seal (STRANDED) because the producer was
+    /// paused (or unreadable) when writes would have reopened (`strand_intent`, or round 7's `external_pause_held`). A
+    /// crash before the STRANDED transition must not let a later run carry on: the next run completes the strand.
+    pub strand_intent: bool,
+    /// Round-2 review (D-10): the bindings a fresh XPR mainnet ARM authenticated (`mainnet_event_verified`), compared
+    /// offline with the config on every later run, join, rollback and unhalt (coord::mainnet_binding_problem).
+    pub mainnet_event_binding: Option<Value>,
+    /// r30 round 9 (review R9-2): every pause, resume and operator release, in journal order (pause EPISODES). A pause by
+    /// this ceremony (`side_effect: source_pause`, written before the RPC) or an adopted external one opens an episode;
+    /// a journaled resume (`rollback_step: resume`) closes the latest open one; an operator's `external_pause_release`
+    /// makes the latest open external episode ours. Never cleared: an old, completed resume can never authorize a later one.
+    pub pause_events: Vec<PauseEvent>,
+    /// r30 round 9 (review R9-3): writes this journal froze in its CURRENT segment (a `write_freeze` intent in it, or a
+    /// freeze carried over from the previous segment whose on_abort never reopened them).
+    pub writes_closed: bool,
+    /// r30 round 9 (review R9-1/R9-3): the journal segment (0 = the original ceremony). A `join` that re-enters an
+    /// ABORTED or STRANDED ceremony journals `segment_start` before its first side effect: undo bookkeeping
+    /// (rollback steps, rollback_done, strand intent) belongs to one segment only.
+    pub segment: u64,
+}
+
+/// r30 round 9: one entry of the pause-episode log (`Recovered::pause_events`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PauseEvent {
+    /// A pause: `ours` = this ceremony INTENDED it (intent before the RPC); false = someone else's, adopted as evidence.
+    Pause { ours: bool },
+    /// r30 round 10: this ceremony's pause RPC succeeded and a read confirmed the producer paused (`source_pause_ack`):
+    /// the latest open own intent becomes ours. Without it (a crash between the intent and the RPC, then someone else
+    /// pausing) the episode's ownership is UNKNOWN and nothing resumes it.
+    Ack,
+    /// A journaled resume (a rollback's `resume` step, or `resumed_production_for_snapshot`): closes the latest open
+    /// episode.
+    Resume,
+    /// The operator's journaled release of an external pause (`rollback --force-stranded --i-understand`).
+    /// r30 round 12 (model class R11-A): a release authorizes ONE resume, by the run that journaled it (`live`). A
+    /// release recovered from the journal (`live: false`, a forced rollback that died or whose resume did not settle)
+    /// authorizes nothing: the episode it named is ownership unknown, and a later forced rollback journals its own.
+    Release { live: bool },
+    /// r30 round 11 (review R10-1): this ceremony is ABOUT to resume its own pause (`side_effect: source_resume`, written
+    /// before the resume RPC). It gives up ownership at once: the episode is CLOSING. If the resume's outcome is never
+    /// journaled (a crash, or a lost response that a read could not settle), the episode stays closing = ownership
+    /// unknown, never resumed again on this ceremony's own authority (the producer may have resumed and someone else
+    /// paused it since).
+    ResumeIntent,
+}
+
+/// r30 round 9/10: the folded pause-episode log.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Episodes {
+    /// The latest open episode is this ceremony's own, confirmed pause (intent + ack, or legacy, or released).
+    pub ours: bool,
+    /// The latest open episode is someone else's (adopted) pause.
+    pub external: bool,
+    /// The latest open episode is an own pause INTENT without its ack (round 10), or an own pause whose resume was
+    /// started but never settled (round 11, closing): ownership unknown, never resumed.
+    pub unknown: bool,
+    /// This journal ever intended a pause of its own (open or closed, acked or not).
+    pub ever_ours: bool,
+}
+
+/// r30 round 9: fold the pause-episode log. `legacy_paused`: an older agent's journal whose agent demonstrably paused
+/// (an open episode of ours before every journaled event). `acks_tracked` (round 10): own intents need their
+/// `source_pause_ack` to count as ours; false for journals armed before round 10 (an intent counts as ours, as before).
+pub fn pause_episodes(events: &[PauseEvent], legacy_paused: bool, acks_tracked: bool) -> Episodes {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Owner {
+        Ours,
+        External,
+        Unknown,
+        /// r30 round 11: an own pause whose resume was started (intent journaled) and not settled.
+        Closing,
+    }
+    // (owner, open)
+    let mut eps: Vec<(Owner, bool)> = Vec::new();
+    if legacy_paused {
+        eps.push((Owner::Ours, true));
+    }
+    let mut ever_ours = legacy_paused;
+    for e in events {
+        match e {
+            PauseEvent::Pause { ours: true } => {
+                ever_ours = true;
+                eps.push((
+                    if acks_tracked {
+                        Owner::Unknown
+                    } else {
+                        Owner::Ours
+                    },
+                    true,
+                ));
+            }
+            PauseEvent::Pause { ours: false } => eps.push((Owner::External, true)),
+            PauseEvent::Ack => {
+                if let Some(ep) = eps.iter_mut().rev().find(|(_, open)| *open) {
+                    if ep.0 == Owner::Unknown {
+                        ep.0 = Owner::Ours;
+                    }
+                }
+            }
+            PauseEvent::Resume => {
+                if let Some(ep) = eps.iter_mut().rev().find(|(_, open)| *open) {
+                    ep.1 = false;
+                }
+            }
+            PauseEvent::Release { live } => {
+                let owner = if *live { Owner::Ours } else { Owner::Unknown };
+                match eps.iter_mut().rev().find(|(_, open)| *open) {
+                    Some(ep) => ep.0 = owner,
+                    None => eps.push((owner, true)),
+                }
+            }
+            PauseEvent::ResumeIntent => {
+                if let Some(ep) = eps.iter_mut().rev().find(|(_, open)| *open) {
+                    if ep.0 == Owner::Ours {
+                        ep.0 = Owner::Closing;
+                    }
+                }
+            }
+        }
+    }
+    let latest_open = eps.iter().rev().find(|(_, open)| *open).map(|(o, _)| *o);
+    Episodes {
+        ours: latest_open == Some(Owner::Ours),
+        external: latest_open == Some(Owner::External),
+        unknown: matches!(latest_open, Some(Owner::Unknown) | Some(Owner::Closing)),
+        ever_ours,
+    }
 }
 
 impl Journal {
+    /// The exclusive lock on `<journal>.lock`, held by a ceremony agent for its whole run and by a readiness
+    /// drill for its whole run (r30), so a ceremony and a drill (or two of either) on one journal are mutually
+    /// exclusive atomically. Creates the journal's directory if needed; never touches the journal itself.
+    pub fn lock(path: &Path) -> Result<File, String> {
+        Self::try_lock(path).map_err(|e| match e {
+            LockError::Held(m) | LockError::Io(m) => m,
+        })
+    }
+
+    /// r30 round 6: like `lock`, but tells "another process holds it" (`Held`, the only answer that means a live
+    /// competitor) apart from every other failure (`Io`: an unwritable or missing directory, a read-only mount), so
+    /// a hygiene lock that cannot be taken is reported rather than mistaken for a competitor.
+    pub fn try_lock(path: &Path) -> Result<File, LockError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    LockError::Io(format!("create lock dir {}: {e}", parent.display()))
+                })?;
+            }
+        }
+        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| LockError::Io(format!("open lock {}: {e}", lock_path.display())))?;
+        // A lock that is busy for a moment is not a second agent: a process that forked while this
+        // lock's previous holder had it open shares the lock until it execs (the fd is close-on-exec).
+        // Wait up to 2 s; a real concurrent agent holds the lock for the whole ceremony.
+        let mut busy = lock.try_lock();
+        for _ in 0..100 {
+            if !matches!(busy, Err(std::fs::TryLockError::WouldBlock)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            busy = lock.try_lock();
+        }
+        match busy {
+            Ok(()) => Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => Err(LockError::Held(format!(
+                "another pulse-cutover process holds {} — a ceremony (or a readiness drill) is already running on \
+                 this journal. Refusing to start a second one.",
+                lock_path.display()
+            ))),
+            Err(std::fs::TryLockError::Error(e)) => Err(LockError::Io(format!("lock {}: {e}", lock_path.display()))),
+        }
+    }
+
     pub fn open(path: &Path) -> Result<(Self, Recovered), String> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -130,36 +325,12 @@ impl Journal {
             }
         }
         // Exclusive lock FIRST: nothing below (tail repair, appends) may race another agent.
-        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|e| format!("open journal lock {}: {e}", lock_path.display()))?;
-        // A lock that is busy for a moment is not a second agent: a process that forked while this
-        // lock's previous holder had it open shares the lock until it execs (the fd is close-on-exec).
-        // Wait up to 2 s; a real concurrent agent holds the lock for the whole ceremony.
-        let mut busy = lock.try_lock();
-        for _ in 0..100 {
-            if !matches!(busy, Err(std::fs::TryLockError::WouldBlock)) { break; }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            busy = lock.try_lock();
-        }
-        match busy {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(format!(
-                    "another pulse-cutover process holds {} — a ceremony is already running on \
-                     this journal. Refusing to start a second one.",
-                    lock_path.display()
-                ))
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(format!("lock {}: {e}", lock_path.display()))
-            }
-        }
-        let torn = if path.exists() { Self::repair_torn_tail(path)? } else { false };
+        let lock = Self::lock(path)?;
+        let torn = if path.exists() {
+            Self::repair_torn_tail(path)?
+        } else {
+            false
+        };
         let recovered = if path.exists() {
             let mut r = Self::replay(path)?;
             r.torn_tail = torn;
@@ -184,6 +355,7 @@ impl Journal {
                 path: path.to_path_buf(),
                 file,
                 seq,
+                fail_writes: 0,
                 _lock: lock,
             },
             recovered,
@@ -192,6 +364,12 @@ impl Journal {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Test support: make the next `n` writes fail (as ENOSPC would), writing nothing.
+    #[doc(hidden)]
+    pub fn inject_write_failures(&mut self, n: u32) {
+        self.fail_writes = n;
     }
 
     fn write(&mut self, kind: &str, state: &str, data: Value) -> Result<Entry, String> {
@@ -211,8 +389,14 @@ impl Journal {
             data,
         };
         let line = serde_json::to_string(&entry).map_err(|e| e.to_string())?;
+        if self.fail_writes > 0 {
+            self.fail_writes -= 1;
+            return Err("journal write: injected failure (No space left on device)".into());
+        }
         writeln!(self.file, "{line}").map_err(|e| format!("journal write: {e}"))?;
-        self.file.sync_data().map_err(|e| format!("journal fsync: {e}"))?;
+        self.file
+            .sync_data()
+            .map_err(|e| format!("journal fsync: {e}"))?;
         self.seq += 1;
         Ok(entry)
     }
@@ -249,11 +433,13 @@ impl Journal {
     ///   newline, which is added;
     /// - a non-whitespace fragment that does not parse: torn, moved to `<journal>.torn-<ms>`
     ///   (fsynced, including its directory, BEFORE the journal is truncated).
+    ///
     /// The last LF-terminated record must parse: a complete record that does not is corruption,
     /// never silently dropped (that could roll recovery backward). Returns whether a torn tail
     /// was set aside.
     fn repair_torn_tail(path: &Path) -> Result<bool, String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("read journal {}: {e}", path.display()))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("read journal {}: {e}", path.display()))?;
         if bytes.is_empty() {
             return Ok(false);
         }
@@ -266,7 +452,11 @@ impl Journal {
             let complete = &bytes[..lf];
             let mut end = complete.len();
             loop {
-                let start = complete[..end].iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+                let start = complete[..end]
+                    .iter()
+                    .rposition(|b| *b == b'\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
                 let rec = &complete[start..end];
                 if rec.iter().all(is_ws) {
                     if start == 0 {
@@ -291,15 +481,22 @@ impl Journal {
         }
         if tail.iter().all(is_ws) {
             // Stray CR/blank bytes after the last LF: not a record. Trim so appends start clean.
-            let f = OpenOptions::new().write(true).open(path).map_err(|e| e.to_string())?;
-            f.set_len(tail_start as u64).map_err(|e| format!("trim journal tail: {e}"))?;
+            let f = OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|e| e.to_string())?;
+            f.set_len(tail_start as u64)
+                .map_err(|e| format!("trim journal tail: {e}"))?;
             f.sync_data().map_err(|e| e.to_string())?;
             return Ok(false);
         }
         let frag = tail.strip_suffix(b"\r").unwrap_or(tail);
         if serde_json::from_slice::<Entry>(frag).is_ok() {
             // Complete entry, only its newline missing: add it so the next append starts clean.
-            let mut f = OpenOptions::new().append(true).open(path).map_err(|e| e.to_string())?;
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(path)
+                .map_err(|e| e.to_string())?;
             f.write_all(b"\n").map_err(|e| e.to_string())?;
             f.sync_data().map_err(|e| e.to_string())?;
             return Ok(false);
@@ -307,20 +504,32 @@ impl Journal {
         let aside = PathBuf::from(format!(
             "{}.torn-{}",
             path.display(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
         ));
         {
             // The forensic copy (and its directory entry) must be durable BEFORE truncation.
             let mut f = File::create(&aside).map_err(|e| format!("save torn tail: {e}"))?;
-            f.write_all(tail).map_err(|e| format!("save torn tail: {e}"))?;
-            f.sync_all().map_err(|e| format!("fsync torn tail copy: {e}"))?;
-            let dir = aside.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            f.write_all(tail)
+                .map_err(|e| format!("save torn tail: {e}"))?;
+            f.sync_all()
+                .map_err(|e| format!("fsync torn tail copy: {e}"))?;
+            let dir = aside
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
             File::open(dir)
                 .and_then(|d| d.sync_all())
                 .map_err(|e| format!("fsync directory of torn tail copy {}: {e}", dir.display()))?;
         }
-        let f = OpenOptions::new().write(true).open(path).map_err(|e| e.to_string())?;
-        f.set_len(tail_start as u64).map_err(|e| format!("truncate torn tail: {e}"))?;
+        let f = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        f.set_len(tail_start as u64)
+            .map_err(|e| format!("truncate torn tail: {e}"))?;
         f.sync_data().map_err(|e| e.to_string())?;
         eprintln!(
             "journal: WARNING a partial last line (crash mid-write) was set aside to {} and \
@@ -342,8 +551,14 @@ impl Journal {
             .map_err(|e| e.to_string())?;
         // Only the bytes after the LAST LF can be a torn write (see repair_torn_tail): with
         // `lines()`, that fragment is the final element exactly when the file does not end in LF.
-        let ends_with_newline = std::fs::read(path).map(|b| b.last() == Some(&b'\n')).unwrap_or(true);
-        let tail_index = if ends_with_newline { None } else { lines.len().checked_sub(1) };
+        let ends_with_newline = std::fs::read(path)
+            .map(|b| b.last() == Some(&b'\n'))
+            .unwrap_or(true);
+        let tail_index = if ends_with_newline {
+            None
+        } else {
+            lines.len().checked_sub(1)
+        };
         for (i, line) in lines.iter().enumerate() {
             if line.trim().is_empty() {
                 continue;
@@ -351,26 +566,46 @@ impl Journal {
             let entry: Entry = match serde_json::from_str(line.trim_end_matches('\r')) {
                 Ok(e) => e,
                 Err(e) if Some(i) == tail_index => {
-                    eprintln!("journal: WARNING ignoring a partial last line (crash mid-write): {e}");
+                    eprintln!(
+                        "journal: WARNING ignoring a partial last line (crash mid-write): {e}"
+                    );
                     out.torn_tail = true;
                     continue;
                 }
                 Err(e) => {
                     return Err(format!(
-                        "corrupt journal line {} of {} (not the last line, so not a torn write): {e}",
-                        i + 1,
-                        path.display()
-                    ))
+                    "corrupt journal line {} of {} (not the last line, so not a torn write): {e}",
+                    i + 1,
+                    path.display()
+                ))
                 }
             };
+            // Fail closed on a journal from a NEWER agent: a record kind this agent does not know (or, below, a state it
+            // does not know) means it cannot fold the journal faithfully. Never run an older agent on a newer journal.
+            if !matches!(entry.kind.as_str(), "transition" | "evidence" | "error") {
+                return Err(format!(
+                    "journal line {} of {} has a record kind {:?} this agent does not know: the journal was written by a \
+                     newer pulse-cutover. Never run an older agent on a journal a newer one wrote: use that version",
+                    i + 1,
+                    path.display(),
+                    entry.kind
+                ));
+            }
             if entry.kind == "transition" {
                 let st: State = entry.state.parse()?;
-                if matches!(st, State::Ignited | State::Flipped | State::Live | State::Halted) {
+                if matches!(
+                    st,
+                    State::Ignited | State::Flipped | State::Live | State::Halted
+                ) {
                     out.reached_ignited = true;
                 }
                 if st == State::Halted {
                     out.unhalted = false;
-                    out.halted_from = entry.data.get("halted_from").and_then(|v| v.as_str()).and_then(|v| v.parse().ok());
+                    out.halted_from = entry
+                        .data
+                        .get("halted_from")
+                        .and_then(|v| v.as_str())
+                        .and_then(|v| v.parse().ok());
                 }
                 // Every ABORTED transition (re)opens the rollback; only a later `rollback_done` closes
                 // it. Leaving ABORTED (a new ceremony on this journal) forgets the episode's steps.
@@ -384,6 +619,29 @@ impl Journal {
                     out.rollback_steps_done.clear();
                 }
                 out.state = Some(st);
+                // The arming record (it carries "mode"; an unhalt returning to ARMED does not): bind the shadow identity.
+                if st == State::Armed
+                    && out.armed_shadow.is_none()
+                    && entry.data.get("mode").is_some()
+                {
+                    out.armed_shadow =
+                        Some(entry.data.get("shadow").cloned().unwrap_or(Value::Null));
+                }
+                if st == State::Armed
+                    && out.undo_tracking.is_none()
+                    && entry.data.get("mode").is_some()
+                {
+                    out.undo_tracking = Some(
+                        entry.data.get("undo_tracking").and_then(|v| v.as_bool()) == Some(true),
+                    );
+                }
+                if st == State::Armed
+                    && out.pause_ack_tracking.is_none()
+                    && entry.data.get("mode").is_some()
+                {
+                    out.pause_ack_tracking =
+                        Some(entry.data.get("pause_ack").and_then(|v| v.as_bool()) == Some(true));
+                }
                 if entry.state == State::Frozen.as_str() {
                     out.frozen_ts_ms = Some(entry.ts_ms);
                 }
@@ -392,17 +650,128 @@ impl Journal {
             // transition: that error is HALTED even if the process died before the transition.
             // (rc.7+ writes one HALTED transition carrying the reason.)
             if entry.kind == "error"
-                && entry.data.get("detail").and_then(|d| d.get("sealed")).and_then(|v| v.as_bool()) == Some(true)
+                && entry
+                    .data
+                    .get("detail")
+                    .and_then(|d| d.get("sealed"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
             {
-                out.halted_from = entry.state.parse().ok().filter(|s: &State| *s != State::Halted).or(out.halted_from);
+                out.halted_from = entry
+                    .state
+                    .parse()
+                    .ok()
+                    .filter(|s: &State| *s != State::Halted)
+                    .or(out.halted_from);
                 out.state = Some(State::Halted);
                 out.reached_ignited = true;
                 out.unhalted = false;
             }
-            if entry.data.get("snapshot_scheduled_at").and_then(|v| v.as_u64()).is_some() {
+            if entry.data.get("shadow_refused").and_then(|v| v.as_bool()) == Some(true)
+                || entry
+                    .data
+                    .get("detail")
+                    .and_then(|d| d.get("shadow_refused"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+            {
+                out.shadow_refused = true;
+            }
+            // r30 round 9 (review R9-1): a strand intent is satisfied by the STRANDED transition it caused (the transition
+            // itself carries `external_pause_held` as a display field and is not an intent).
+            if entry.kind != "transition"
+                && (entry.data.get("strand_intent").and_then(|v| v.as_bool()) == Some(true)
+                    || entry
+                        .data
+                        .get("external_pause_held")
+                        .and_then(|v| v.as_bool())
+                        == Some(true))
+            {
+                out.strand_intent = true;
+            }
+            if entry.kind == "transition" && entry.state == State::Stranded.as_str() {
+                out.strand_intent = false;
+            }
+            // r30 round 9 (review R9-3): a new segment (a join re-entering this ceremony) starts with no undo of its own
+            // done; writes the previous segment froze and never reopened stay ours to reopen.
+            if let Some(seg) = entry.data.get("segment_start").and_then(|v| v.as_u64()) {
+                let legacy_froze = out.undo_tracking == Some(false) && out.frozen_ts_ms.is_some();
+                let reopened = out.rollback_steps_done.iter().any(|x| x == "on_abort");
+                out.writes_closed = (out.writes_closed || legacy_froze) && !reopened;
+                out.rollback_steps_done.clear();
+                out.aborted_rollback_complete = false;
+                out.strand_intent = false;
+                out.segment = seg;
+            }
+            if let Some(b) = entry
+                .data
+                .get("mainnet_event_verified")
+                .filter(|b| b.is_object())
+            {
+                out.mainnet_event_binding = Some(b.clone());
+            }
+            if out.legacy_takeover.is_none() {
+                if let Some(t) = entry.data.get("legacy_takeover").filter(|t| t.is_object()) {
+                    out.legacy_takeover = Some((
+                        t.get("paused").and_then(|v| v.as_bool()) == Some(true),
+                        t.get("froze").and_then(|v| v.as_bool()) == Some(true),
+                    ));
+                }
+            }
+            if entry
+                .data
+                .get("snapshot_scheduled_at")
+                .and_then(|v| v.as_u64())
+                .is_some()
+            {
                 out.scheduled = true;
             }
+            if entry.data.get("source_pause_ack").is_some() {
+                out.pause_events.push(PauseEvent::Ack);
+            }
+            // r30 round 12: a resume attempt followed by a paused (or unreadable) read is never settled back to "ours"
+            // (`source_resume_outcome_unknown`): the episode stays closing = ownership unknown. A round-11
+            // `source_resume_cancelled` record is read the same way.
+            // r30 round 11 (review R10-2): the pause_at_h recovery resume closes its episode like a rollback's resume.
+            if entry
+                .data
+                .get("resumed_production_for_snapshot")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                out.pause_events.push(PauseEvent::Resume);
+            }
+            // r30 round 14 (model R13-A): someone else un-paused this ceremony's own pause (a read saw it producing).
+            if entry
+                .data
+                .get("own_pause_released_externally")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                out.pause_events.push(PauseEvent::Resume);
+            }
             if let Some(se) = entry.data.get("side_effect").and_then(|v| v.as_str()) {
+                match se {
+                    "source_pause" => out.pause_events.push(PauseEvent::Pause {
+                        ours: entry.data.get("adopted").and_then(|v| v.as_bool()) != Some(true),
+                    }),
+                    "external_pause_release" => {
+                        out.pause_events.push(PauseEvent::Release { live: false })
+                    }
+                    "source_resume" => out.pause_events.push(PauseEvent::ResumeIntent),
+                    "write_freeze" => out.writes_closed = true,
+                    _ => {}
+                }
+                // r30 round 7: a pause found after the freeze and ADOPTED for the cut (someone else paused the
+                // producer) is journaled as `side_effect: source_pause` with `adopted: true`; it is recovered as
+                // `source_pause_adopted`, never as this ceremony's own pause.
+                let se = if se == "source_pause"
+                    && entry.data.get("adopted").and_then(|v| v.as_bool()) == Some(true)
+                {
+                    "source_pause_adopted"
+                } else {
+                    se
+                };
                 if !out.side_effects.iter().any(|x| x == se) {
                     out.side_effects.push(se.to_string());
                 }
@@ -412,10 +781,20 @@ impl Journal {
                     out.reached_ignited = true;
                 }
             }
-            if entry.data.get("rollback_requested").and_then(|v| v.as_bool()) == Some(true) {
+            if entry
+                .data
+                .get("rollback_requested")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
                 out.rollback_pending = true;
             }
-            if entry.data.get("rollback_intent_cancelled").and_then(|v| v.as_bool()) == Some(true) {
+            if entry
+                .data
+                .get("rollback_intent_cancelled")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
                 out.rollback_pending = false;
             }
             if entry.data.get("rollback_incomplete").is_some() {
@@ -427,10 +806,13 @@ impl Journal {
                 out.rollback_steps_done.retain(|x| x != "on_abort");
             }
             if let Some(step) = entry.data.get("rollback_step").and_then(|v| v.as_str()) {
-                if entry.data.get("ok").and_then(|v| v.as_bool()) == Some(true)
-                    && !out.rollback_steps_done.iter().any(|x| x == step)
-                {
-                    out.rollback_steps_done.push(step.to_string());
+                if entry.data.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                    if step == "resume" {
+                        out.pause_events.push(PauseEvent::Resume);
+                    }
+                    if !out.rollback_steps_done.iter().any(|x| x == step) {
+                        out.rollback_steps_done.push(step.to_string());
+                    }
                 }
             }
             if entry.data.get("rollback_done").and_then(|v| v.as_bool()) == Some(true)
@@ -452,10 +834,16 @@ impl Journal {
             for (key, slot) in [
                 ("target_blockchain_id", &mut out.target_blockchain_id),
                 ("target_subnet_id", &mut out.target_subnet_id),
-                ("accepted_target_chain_id", &mut out.accepted_target_chain_id),
+                (
+                    "accepted_target_chain_id",
+                    &mut out.accepted_target_chain_id,
+                ),
                 ("boot_manifest_sha256", &mut out.boot_manifest_sha256),
                 ("boot_genesis_sha256", &mut out.boot_genesis_sha256),
-                ("boot_chain_config_sha256", &mut out.boot_chain_config_sha256),
+                (
+                    "boot_chain_config_sha256",
+                    &mut out.boot_chain_config_sha256,
+                ),
                 ("chain_id", &mut out.chain_id),
                 ("cut_block_id", &mut out.cut_block_id),
                 ("snapshot_file", &mut out.snapshot_file),

@@ -43,6 +43,15 @@ freeze_height = 12345
 # freeze_margin = 240        # rehearsal/loop only, with freeze_height = 0: H := LIB at ARM + margin
 # derive_h_at_arm = false    # rehearsal/loop only: explicit opt-in for freeze_height = 0 + freeze_margin
 # allow_inexact_cut = false  # rehearsal only: accept a snapshot that is not exactly H (journaled loudly)
+# lock_dir = "/var/lib/pulse-cutover/locks"   # agent-owned directory for the per-producer lock and drill work
+                             # markers (keyed on the canonical snapshot.dir). Absolute. Every agent, drill and loop on one
+                             # box must share it. Default: /var/lib/pulse-cutover/locks when writable, else locks/ beside
+                             # the journal directory. Nothing is ever written into nodeos's snapshot.dir. REQUIRED for
+                             # XPR mainnet where something new starts (await, loop, a drill, a fresh ARM); other commands
+                             # warn. install.sh writes it. Elsewhere the default is journaled as producer_lock_dir_default.
+# shadow = false             # SHADOW CUTOVER (docs/DESIGN-shadow.md): the full ceremony on a PRIVATE network from a
+                             # re-keyed copy of mainnet state, mainnet chain_id kept. Needs the [shadow] section below
+                             # and a private target.metal_network_id; checked at load, at ARM and before the freeze.
 # simulate_freeze = false    # api-mode rehearsal against a live chain that will not stop: proceed at LIB >= H
 # Pin the chain being migrated; the agent refuses a node serving anything
 # else. If omitted, the discovered chain_id is journaled and enforced from ARM.
@@ -170,7 +179,20 @@ auto_rollback = true                 # on abort BEFORE ignition: resume the sour
 # [upstream]
 # work_dir = "/root/cutover-rehearsal/upstream"   # REQUIRED. export/import scratch root
 # export_cmd = "docker run --rm ... export.sh --snapshot {snapshot} --work-dir {export_dir}/work ..."   # REQUIRED
-# import_bin = "/root/pulsevm/target/release/examples/xpr_import_check"          # REQUIRED
+# export_image = "leap-sidecar@sha256:<64 hex>" # READINESS DRILL only: the Leap 5.0.3 sidecar image BY DIGEST; a drill never
+                                                 # runs export_cmd (shell) but a fixed `docker run` argument vector
+# export_tools_dir = "/opt/xpr-chainbase-export" # READINESS DRILL only: absolute dir with the official export.sh
+                                                 # (a plain file), mounted read-only
+# chain_state_db_size_mb = 12288                 # READINESS DRILL only: export.sh --chain-state-db-size-mb
+# docker_bin = "/usr/bin/docker"                 # READINESS DRILL only: the docker CLI by absolute path (never PATH);
+                                                 # run with a cleared environment (no DOCKER_* variables)
+# docker_bin_sha256 = "<64 hex>"                 # READINESS DRILL only: its content pin (checked at load and per run)
+# docker_socket = "/var/run/docker.sock"         # READINESS DRILL only: the LOCAL daemon (`--host unix://<this>`)
+# import_bin_sha256 = "<64 hex>"                 # READINESS DRILL only: content pins of the three tools; a drill runs
+# compare_bin_sha256 = "<64 hex>"                #   a program only when sha256(file) equals its pin (r30 round 5:
+# fingerprint_bin_sha256 = "<64 hex>"            #   a native-executable check alone admitted /bin/bash)
+# import_bin = "/root/pulsevm/target/release/examples/xpr_import_check"          # REQUIRED (a drill: an absolute
+                                                 # native executable, not a script or link; same for the two below)
 # fingerprint_bin = "/root/pulsevm/target/release/examples/xpr_state_fingerprint"   # REQUIRED
 # compare_bin = "/root/pulsevm/target/release/examples/xpr_19_table_compare"    # the verification gate
                                                  # (the production profile requires it)
@@ -191,6 +213,9 @@ auto_rollback = true                 # on abort BEFORE ignition: resume the sour
 # reset_cmd = "/root/cutover-rehearsal/reset.sh"   # REQUIRED. returns both sides to a pre-ARM state (R12)
 # settle_secs = 10                                 # wait after reset before ARMing (default 0)
 # metrics_path = "/root/cutover-rehearsal/metrics.jsonl"   # REQUIRED. per-run metrics
+# reset_when_source_down = false                   # allow reset_cmd while the source does not answer (to start a
+                                                   # stopped node). Default: an unidentifiable source refuses the reset.
+                                                   # Refused for an XPR mainnet chain_id.
 
 # -----------------------------------------------------------------------------
 # [hooks] — shell commands at key moments. Producer mode's production profile
@@ -255,3 +280,14 @@ on_abort = "echo 'page the operator'"                    # on ABORT after rollba
 # instance_id = "<32-hex beacon.instance>"     #   else by producer account. Each member once.
 # [[coordination.roster]]
 # producer = "bp2"
+
+# -----------------------------------------------------------------------------
+# [shadow]                                      # only with [ceremony] shadow = true (docs/DESIGN-shadow.md)
+# label = "shadow-mainnet-408328634"            # REQUIRED. shown on every journal record, report and the board
+# producer_keys = ["PUB_K1_..."]                # REQUIRED. the re-keyed shadow source's signing keys; the source's
+                                                # active schedule must sign with these only (real mainnet never does)
+# i_understand_signatures_are_valid_on_mainnet = true   # REQUIRED. the shadow shares mainnet's signing domain:
+                                                # never sign on it with real keys, never expose it publicly
+# The identity proof (docs/DESIGN-shadow.md §3) also needs: target.rpc_url a metalgo /ext/ URL (the network is proven
+# on that metalgo), source.rpc_url == source.producer_api_url's node, [coordination]/[beacon] networks named "shadow*",
+# producer mode coordinated (signed event, roster, quorum >= 2), and outbound HTTPS to public XPR mainnet APIs.

@@ -22,7 +22,7 @@ Log in to the server that runs your **producer** nodeos. Download the installer 
 read it, then run it:
 
 ```bash
-V=v0.5.0-rc.29
+V=v0.5.0-rc.30
 curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 less beacon-install.sh          # you are about to run this as root: read it
 sudo bash beacon-install.sh
@@ -95,6 +95,17 @@ node tools/capture-static.mjs http://127.0.0.1:8888 /etc/pulse-cutover/static
 ```
 
 ## 6. During a ceremony: read the fleet verdict, not only your own state
+
+> [!IMPORTANT]
+> **XPR mainnet is cut only by a coordinated ceremony.** An agent whose source is XPR mainnet refuses a ceremony
+> config without a `[coordination]` section (at load, when `chain_id` is configured) and refuses to ARM (before
+> anything freezes) unless it runs the config `pulse-cutover await` derived from the signed event: `event_id` and
+> `event_hash` set and, in producer mode, the event's roster and a quorum of at least 2. API-mode nodes need the
+> signed event but no roster (they are not members of the producers' quorum). At that ARM the agent also re-fetches
+> the event from mission control and checks it is the signed payload it was derived from and that it names this
+> chain, this H, this roster and this quorum; if mission control does not answer, it does not ARM. Coordinators:
+> `coord.mjs event` requires `--chain-id` and `--h`. `pulse-cutover doctor` reports a
+> host whose memory or chain cannot be read instead of passing it.
 
 Each agent decides from its own observations, so one event can end with different states on different BPs (the
 5-BP rehearsal on the upstream stack ended every run with some BPs LIVE and some HALTED on the same new chain).
@@ -250,3 +261,71 @@ URLs locally. Fix, with producer and API on the same box: in your nginx server b
 `location ^~ /v1/producer { return 403; }`, and if nodeos also listens publicly on :8888, bind it to
 `http-server-address = 127.0.0.1:8889` and let nginx serve :8888 with the same rule (then point the beacon's
 `rpc_url` and `producer_api_url` at `http://127.0.0.1:8889`).
+
+**`producer_api_url` must point at the producing nodeos itself**, never at a load balancer, a proxy that fans out, or
+a replica. The agent pauses, resumes and reads the paused state through it; a read answered by another node can be
+stale. A stale "producing" read is safe (the agent fails closed) but strands the ceremony; a pause or resume sent to
+the wrong node does nothing to the producer.
+
+### One box, several configs: `lock_dir` (rc.30)
+
+A ceremony, a readiness drill (`pulse-cutover drill`) and a `loop` on the same producer exclude each other through a
+per-producer lock and a drill work marker in `[ceremony] lock_dir` (default `/var/lib/pulse-cutover/locks`, else
+`locks/` beside the journal directory), keyed on nodeos's canonical `snapshot.dir`. Nothing is written into nodeos's
+snapshot directory. If the agent, a drill or a loop on one box run as different users, set the same absolute
+`lock_dir` in every config, writable by all of them. Only "another process holds it" refuses an ARM (before
+anything changes); a `lock_dir` the agent cannot use is a journaled warning. A ceremony refused at ARM undoes
+nothing: it never resumes a producer it did not pause or reopens writes it did not close.
+
+**XPR mainnet requires an explicit `lock_dir`** (rc.30 rounds 7–8): the default depends on which user runs, so a root
+ceremony and a non-root drill could lock different directories. `install.sh` writes `lock_dir =
+"/var/lib/pulse-cutover/locks"` into generated configs. A mainnet config without one is refused only where something
+new would start (`await`, `loop`, a drill, and a fresh ARM); the beacon, `status`, `report`, `rollback`, `unhalt` and a
+resumed cut load it with a warning. Elsewhere the default is journaled (`producer_lock_dir_default`) and shown by
+`pulse-cutover status` and the beacon.
+
+### If someone else pauses the producer (rc.30 round 7)
+
+> **Operating rule: during a ceremony, never pause or resume the producer by hand. Let the agent do it** (or stop it
+> with `./cutover.sh abort` and let `rollback` decide). Leap's producer API does not record who paused a producer, so
+> an un-pause and a re-pause by hand between two of the agent's reads cannot be told apart from the agent's own pause,
+> and a later rollback would resume the second one (risk A-21). The agent narrows this (round 14: whenever it sees the
+> producer running while its own pause should hold, it gives that pause up and treats any later pause as someone
+> else's), but cannot close it.
+
+
+If you (or a hook, or a scheduler) pause the producer **after** the ceremony froze writes, the agent adopts that pause
+for the cut: it journals it (`side_effect: source_pause` with `adopted: true`), never pauses it again and never
+resumes it, and the cut carries on. If the ceremony then has to stop, it does **not** resume your pause and does
+**not** reopen writes into a paused chain (round 8: writes reopen only when a fresh read shows the producer producing,
+whoever paused it): it ends STRANDED (`writes_kept_frozen`) and pages `on_halt`. Release
+it deliberately with `pulse-cutover rollback --config <file> --force-stranded --i-understand` (resumes the producer and
+reopens writes, journaled as `external_pause_release`), or follow a LIVE fleet with `pulse-cutover join`. A producer
+already paused by someone else **before** the freeze is refused at ARM, with nothing touched.
+
+`rollback` exit codes: **0** rolled back (or already rolled back); **3** refused, nothing changed; **4** INCOMPLETE: a
+step failed, or (round 9) the rollback could not reopen writes because the producer was paused or unreadable, so the
+journal is now STRANDED with writes still frozen. Exit 4 never means "rolled back": check the producer by hand (who
+paused it? is it producing?), then run `rollback` again. A forced release (`--force-stranded --i-understand`) is
+journaled only after the rollback's own intent, so a crash between them leaves a pending rollback that `run` refuses
+to continue and a re-run of `rollback` finishes.
+
+Without an `on_abort` hook, a rollback reopens nothing itself, but it still reads the producer before it resumes or
+seals: if the producer API is unreachable for longer than the agent's 30 s read retry window at that moment, the
+rollback cannot tell who holds the pause and ends STRANDED (exit 4). This is intended (an unknown producer state is
+never treated as "producing"). Recovery: restore the producer API, check the producer by hand, then run
+`pulse-cutover rollback --config <file> --force-stranded --i-understand`.
+
+**Never run an older agent version on a journal written by a newer one.** A newer agent may journal facts an older
+one cannot read (ownership records, new states). From rc.30 the agent refuses a journal with a record kind or state
+it does not know; upgrade, never downgrade, mid-ceremony, and roll back with the same (or a newer) version that ran
+the cut.
+
+**Stopping the agent (round 13).** `./cutover.sh abort` now sends SIGTERM and **waits** (default 90 s, set
+`PULSE_CUTOVER_STOP_WAIT`; keep it above the agent's 30 s producer-read retry window) for the agent to exit before it runs `rollback`. The agent stops only at a safe point (never
+in the middle of pausing or resuming the producer), journals `stopped_by_signal` and exits **6**; `pulse-cutover run`
+resumes it, `rollback` rolls it back. Only if it has not exited after the wait does the script SIGKILL it, with a
+warning: then the rollback may report a pause of unknown ownership and ask for `--force-stranded --i-understand` after
+you check the producer. Do not pause or resume the producer by hand while a rollback runs: a rollback reopens writes
+only after reading "producing" right before it does, and withholds the reopen (exit 4) if the producer was paused in
+between (risk register A-20).

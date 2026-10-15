@@ -36,6 +36,9 @@ export function parseRoster(spec) {
 const HEX64 = /^[0-9a-f]{64}$/i;
 
 export function eventPayload(a, now = Date.now()) {
+  // D-10: every event binds the chain it cuts and its H (an XPR mainnet agent refuses an event that does not).
+  if (!HEX64.test(a['chain-id'] || '')) throw new Error('--chain-id must be the source chain_id (64 hex characters)');
+  if (!/^[1-9]\d{0,11}$/.test(String(a.h ?? ''))) throw new Error('--h must be a positive block number');
   const roster = parseRoster(a.roster);
   if (a.quorum !== undefined) {
     if (!roster) throw new Error('--quorum needs --roster (a quorum of whom?)');
@@ -47,7 +50,7 @@ export function eventPayload(a, now = Date.now()) {
   }
   if (a['metal-network-id'] !== undefined && !/^[1-9]\d{0,9}$/.test(String(a['metal-network-id']))) throw new Error('--metal-network-id must be a positive integer');
   return {
-    v: 1, type: 'event', network: a.net, event_id: a['event-id'] || `ev-${now.toString(36)}`, chain_id: a['chain-id'], h: +a.h,
+    v: 1, type: 'event', network: a.net, event_id: a['event-id'] || `ev-${now.toString(36)}`, chain_id: a['chain-id'].toLowerCase(), h: +a.h,
     freeze_lead_blocks: +(a.lead || 24), ...(a['cpu-scale'] === 'none' ? {} : { import_cpu_scale: +(a['cpu-scale'] || 143) }),
     ...(roster ? { roster } : {}),
     ...(a.quorum !== undefined ? { quorum: Number(a.quorum) } : {}),

@@ -12,17 +12,9 @@
 //! the full file list, so the operator can review before sharing.
 
 use std::collections::BTreeMap;
-use std::path::{
-    Path,
-    PathBuf,
-};
+use std::path::{Path, PathBuf};
 
-use crate::{
-    doctor,
-    ops::run_shell,
-    sanitize,
-    verify,
-};
+use crate::{doctor, ops::run_shell, sanitize, verify};
 
 pub struct ReportOptions {
     /// Ceremony config to mine for journal/work paths; default
@@ -60,8 +52,11 @@ impl Collected {
 
     fn add_cmd(&mut self, name: &str, cmd: &str) {
         match run_shell(cmd) {
+            // ungated: report bundle collects read-only diagnostics (ps/df/journalctl class)
             Ok(out) if !out.is_empty() => self.add(name, &out),
-            Ok(_) => self.notes.push(format!("{name}: empty output from `{cmd}`")),
+            Ok(_) => self
+                .notes
+                .push(format!("{name}: empty output from `{cmd}`")),
             Err(e) => self.notes.push(format!("{name}: {e}")),
         }
     }
@@ -112,11 +107,14 @@ pub fn run(opts: &ReportOptions) -> Result<(), String> {
         if let Ok(text) = std::fs::read_to_string(&config_path) {
             if let Ok(value) = text.parse::<toml::Value>() {
                 journal_path = toml_str(&value, &["journal_path"]).map(PathBuf::from);
-                work_dir = journal_path.as_ref().and_then(|j| j.parent().map(Path::to_path_buf));
+                work_dir = journal_path
+                    .as_ref()
+                    .and_then(|j| j.parent().map(Path::to_path_buf));
             }
         }
     } else {
-        c.notes.push(format!("no ceremony config at {}", config_path.display()));
+        c.notes
+            .push(format!("no ceremony config at {}", config_path.display()));
     }
     for manifest in ["/etc/pulse-cutover/ceremony.json", "ceremony.json"] {
         let p = Path::new(manifest);
@@ -160,6 +158,8 @@ pub fn run(opts: &ReportOptions) -> Result<(), String> {
             ("scan-contracts.txt", "scan-contracts.txt"),
             ("captured-roots.txt", "captured-roots.txt"),
             ("loop-metrics.jsonl", "loop-metrics.jsonl"),
+            // A readiness drill's latest result: its own file, never part of the ceremony journal.
+            ("drill-latest.json", "drill/latest.json"),
         ] {
             let p = work.join(file);
             if p.exists() {
@@ -236,10 +236,15 @@ pub fn run(opts: &ReportOptions) -> Result<(), String> {
     let out = opts.out.clone().unwrap_or_else(|| {
         PathBuf::from(format!(
             "pulse-cutover-report-{}-{stamp}.tar.gz",
-            if opts.paranoid { "host".into() } else { survey.hostname.replace('/', "-") }
+            if opts.paranoid {
+                "host".into()
+            } else {
+                survey.hostname.replace('/', "-")
+            }
         ))
     });
     run_shell(&format!(
+        // ungated: packs the report bundle into a local tarball, never touches the chain
         "tar -czf '{}' -C '{}' pulse-cutover-report",
         out.display(),
         staging_root.display()
@@ -255,7 +260,9 @@ pub fn run(opts: &ReportOptions) -> Result<(), String> {
     for f in &file_list {
         println!("  - {f}");
     }
-    println!("\nredactions applied (review before sharing — nothing listed leaves the box unredacted):");
+    println!(
+        "\nredactions applied (review before sharing — nothing listed leaves the box unredacted):"
+    );
     if total_by_kind.is_empty() {
         println!("  (none needed — no key/token/password-shaped content found)");
     } else {
@@ -287,7 +294,10 @@ mod tests {
 
     #[test]
     fn tail_keeps_last_n_lines() {
-        let text = (1..=10).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let text = (1..=10)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_eq!(tail(&text, 3), "8\n9\n10");
         assert_eq!(tail(&text, 100), text);
     }

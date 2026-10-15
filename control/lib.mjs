@@ -338,6 +338,23 @@ function targetView(t) {
     unread_for_ms: int(t.unread_for_ms, 'ceremony.target.unread_for_ms') };
 }
 
+const XPR_MAINNET_CHAIN_ID = '384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0';
+
+/**
+ * r30 shadow-fix: a SHADOW report (docs/DESIGN-shadow.md) lands only on a shadow board: one whose id starts with
+ * "shadow" and whose configured chain_id is NOT XPR mainnet (judged by the board's chain_id in networks.json, never by
+ * its name alone). Returns the refusal reason, or null.
+ */
+export function shadowBoardProblem(report, networks) {
+  if (!report || report.shadow == null) return null;
+  const n = (networks || []).find((x) => x && x.id === report.network);
+  if (!n) return 'a SHADOW report needs a configured shadow board';
+  if (typeof n.chain_id === 'string' && n.chain_id.toLowerCase() === XPR_MAINNET_CHAIN_ID)
+    return `board ${n.id} is configured with the XPR MAINNET chain_id: a SHADOW ceremony never reports there`;
+  if (!/^shadow/i.test(String(n.id))) return `board ${n.id} is not a shadow board (its id must start with "shadow")`;
+  return null;
+}
+
 /**
  * Validate a beacon report. Throws Bad (message = path: problem) on any violation of the declared types;
  * returns ONLY the allow-listed public projection (unknown fields are dropped, free text is redacted).
@@ -359,7 +376,15 @@ export function projectReport(r) {
     interval_secs: r.interval_secs === 0 ? null : Math.min(int(r.interval_secs, 'interval_secs', { min: 1, max: 3600 }) ?? 0, 200) || null,
     mode: str(r.mode, 'mode', { max: 16, nullable: true, re: /^[a-z]+$/ }),
     ready: bool(r.ready, 'ready', { nullable: false }),
+    // r30: SHADOW cutover label (docs/DESIGN-shadow.md); null outside a shadow.
+    shadow: r.shadow == null ? null : (isObj(r.shadow) && typeof r.shadow.label === 'string'
+      ? { label: redact(r.shadow.label, 64), metal_network_id: r.shadow.metal_network_id == null ? null
+          : int(r.shadow.metal_network_id, 'shadow.metal_network_id', { min: 0, max: 4294967295 }) }
+      : bad('shadow', 'must be null or {label, metal_network_id}')),
   };
+  // A shadow chain carries the mainnet chain_id: its evidence must never land on the mainnet board (the agent
+  // refuses such a config; the relay refuses the report too).
+  if (out.shadow && out.network === 'mainnet') bad('shadow', 'a SHADOW ceremony never reports on the mainnet network');
   if (!Array.isArray(r.checks)) bad('checks', 'must be an array');
   if (r.checks.length > 40) bad('checks', 'more than 40 entries');
   out.checks = r.checks.map((c, i) => {
@@ -424,6 +449,14 @@ export function projectReport(r) {
       target: targetView(ce.target),
     };
   }
+  // r30 review (d): drill telemetry is display-only. An invalid drill field drops the drill, never the report:
+  // otherwise one bad field would make a producer look silent and change fleet decisions.
+  try {
+    out.drill = projectDrill(r.drill);
+  } catch (e) {
+    out.drill = null;
+    out.drill_invalid = String(e?.message ?? e).slice(0, 200);
+  }
   const co = r.coord ?? null;
   if (co === null) out.coord = null;
   else {
@@ -452,6 +485,113 @@ export function projectReport(r) {
   return out;
 }
 export const isBad = (e) => e instanceof Bad;
+
+/**
+ * r30: a readiness drill's latest result (`pulse-cutover drill`): the live chain snapshotted at an agreed H with no
+ * freeze, converted, fingerprinted. Never a ceremony: it lives in its own field and never feeds the fleet verdict,
+ * the agreement table, the creation-evidence log or any agent decision.
+ */
+export function projectDrill(d) {
+  if (d === undefined || d === null) return null;
+  if (!isObj(d)) bad('drill', 'must be an object');
+  if (d.kind !== 'readiness_drill') bad('drill.kind', 'must be "readiness_drill"');
+  const hex = (v, p) => str(v, p, { max: 64, nullable: true, re: /^[0-9a-f]{16,64}$/ });
+  const tables = d.compare_failing_tables ?? [];
+  if (!Array.isArray(tables) || tables.length > 30) bad('drill.compare_failing_tables', 'must be an array of ≤ 30');
+  const timings = d.timings_ms ?? {};
+  if (!isObj(timings)) bad('drill.timings_ms', 'must be an object');
+  const tOut = {};
+  for (const [k, v] of Object.entries(timings).slice(0, 20)) {
+    if (!/^[a-z_]{1,32}$/.test(k) || RESERVED.has(k)) bad(`drill.timings_ms.${k}`, 'invalid key');
+    tOut[k] = int(v, `drill.timings_ms.${k}`, { max: 30 * 86400e3 });
+  }
+  return {
+    kind: 'readiness_drill',
+    h: int(d.h, 'drill.h', { nullable: false }),
+    state: d.state == null ? null : (['RUNNING', 'DONE', 'FAILED'].includes(d.state) ? d.state : bad('drill.state', 'must be RUNNING|DONE|FAILED')),
+    stage: str(d.stage, 'drill.stage', { max: 24, nullable: true, re: /^[a-z_]+$/ }),
+    block_id_at_h: hex(d.block_id_at_h, 'drill.block_id_at_h'),
+    snapshot_sha256: hex(d.snapshot_sha256, 'drill.snapshot_sha256'),
+    state_root: hex(d.state_root, 'drill.state_root'),
+    fingerprints_digest: hex(d.fingerprints_digest, 'drill.fingerprints_digest'),
+    compare: d.compare == null ? null : (['MATCH', 'MISMATCH'].includes(d.compare) ? d.compare : bad('drill.compare', 'must be MATCH|MISMATCH')),
+    compare_failing_tables: tables.map((t, i) => str(t, `drill.compare_failing_tables[${i}]`, { max: 48, re: /^[a-z0-9_]+$/ })),
+    timings_ms: tOut,
+    error: d.error == null ? null : (typeof d.error === 'string' && d.error.length <= 400 ? redact(d.error, 120) : bad('drill.error', 'must be a string ≤ 400')),
+    finished_ts_ms: int(d.finished_ts_ms, 'drill.finished_ts_ms'),
+    tools: projectDrillTools(d.tools),
+    work_marker: projectWorkMarker(d.work_marker),
+  };
+}
+
+/** r30 round 7: the producer's drill work marker (an orphan blocks a fresh ARM until `drill --clear-marker`). */
+function projectWorkMarker(w) {
+  if (w === undefined || w === null) return null;
+  if (!isObj(w)) bad('drill.work_marker', 'must be an object');
+  if (!['live', 'unknown', 'done'].includes(w.state)) bad('drill.work_marker.state', 'must be live|unknown|done');
+  return {
+    state: w.state,
+    h: int(w.h, 'drill.work_marker.h'),
+    drill_id: str(w.drill_id, 'drill.work_marker.drill_id', { max: 32, nullable: true, re: /^[0-9a-f]{32}$/ }),
+  };
+}
+
+/** r30 round 5: the content pins of the programs a drill ran (and their digest). Only known keys, 64 lowercase hex. */
+export const DRILL_TOOL_KEYS = ['docker_bin_sha256', 'import_bin_sha256', 'compare_bin_sha256', 'fingerprint_bin_sha256',
+  'export_image_digest', 'tools_digest'];
+function projectDrillTools(t) {
+  if (t === undefined || t === null) return null;
+  if (!isObj(t)) bad('drill.tools', 'must be an object');
+  const out = {};
+  for (const k of DRILL_TOOL_KEYS) {
+    if (t[k] == null) continue;
+    out[k] = str(t[k], `drill.tools.${k}`, { max: 64, re: /^[0-9a-f]{64}$/ });
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/**
+ * r30: compare the latest readiness drill of every producer, per drill height: which producers got the same block at
+ * H, snapshot, state root and compare result, and how long each took. Display only.
+ * `reports` = [{ producer, report }] (producer-role, newest per producer).
+ */
+export function drillComparison(reports) {
+  const byH = new Map();
+  for (const { producer, report } of reports) {
+    const d = report?.drill;
+    if (!d || !Number.isInteger(d.h)) continue;
+    if (!byH.has(d.h)) byH.set(d.h, []);
+    byH.get(d.h).push({ producer, d });
+  }
+  return [...byH.entries()].sort((a, b) => b[0] - a[0]).slice(0, 5).map(([h, rows]) => {
+    // r30 review (e): a DONE drill counts toward agreement only with complete evidence (block id at H, snapshot
+    // hash and fingerprint digest); one that lacks any is listed as incomplete and blocks `agree`.
+    // r30 round 5: and the content pins of the programs it ran (tools_digest): producers that ran different tools are
+    // not in agreement, whatever their state roots say.
+    const complete = (d) => d.state === 'DONE' && !!d.block_id_at_h && !!d.snapshot_sha256 && !!d.fingerprints_digest
+      && !!d.tools?.tools_digest;
+    const value = (d, key) => key === 'tools_digest' ? d.tools?.tools_digest : d[key];
+    const group = (key) => {
+      const g = {};
+      for (const { producer, d } of rows) if (complete(d)) (g[value(d, key)] ||= []).push(producer);
+      return Object.entries(g).map(([value, producers]) => ({ value, producers }));
+    };
+    const done = rows.filter((r) => r.d.state === 'DONE');
+    const incomplete = done.filter((r) => !complete(r.d)).map((r) => r.producer);
+    const roots = group('fingerprints_digest');
+    return {
+      h, producers: rows.length, done: done.length, incomplete,
+      running: rows.filter((r) => r.d.state === 'RUNNING').map((r) => r.producer),
+      failed: rows.filter((r) => r.d.state === 'FAILED').map((r) => ({ producer: r.producer, error: r.d.error })),
+      block_id_at_h: group('block_id_at_h'), snapshot_sha256: group('snapshot_sha256'), fingerprints_digest: roots,
+      compare: group('compare'), tools_digest: group('tools_digest'),
+      // Identical state from identical tools on every producer that finished, and at least two of them.
+      agree: done.length >= 2 && incomplete.length === 0 && roots.length === 1 && group('block_id_at_h').length === 1
+        && group('tools_digest').length === 1,
+      timings: rows.map((r) => ({ producer: r.producer, ...r.d.timings_ms })),
+    };
+  });
+}
 
 /** Heartbeat deadline for a report: 3 × its interval, never under 45 s, never over SILENT_CAP_SECS. */
 export const silentAfterMs = (report) => Math.min(Math.max(3 * (report?.interval_secs || 10), 45), SILENT_CAP_SECS) * 1000;

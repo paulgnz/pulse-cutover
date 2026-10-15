@@ -12,13 +12,14 @@ pulse-cutover moves a running Antelope chain (XPR Network) onto the PulseVM
 engine while keeping the **same public URL, the same chain_id and the same
 account state**. One binary drives the ceremony — freeze, snapshot, verify,
 ignite, flip — and records every step, with evidence, in a journal you can hand
-to anyone. Writes pause for the cut (71–114 s in the unattended rehearsals);
+to anyone. Writes pause for the cut: 71–114 s in the unattended rehearsals on a small
+chain, about 15 minutes for XPR mainnet (its state conversion alone measured 9.6 min, 2026-10-13);
 reads keep being served. A producer that aborts before ignition resumes its
 existing node; a fleet-wide rollback guarantee is **not yet implemented** (see
 the status box below).
 
 > [!IMPORTANT]
-> **Status (2026-10-13, v0.5.0-rc.29)**
+> **Status (2026-10-15, v0.5.0-rc.30)**
 > - **Proven in rehearsal** (September, 5 BPs on a private Metal network, fork plugin): same cut block, snapshot hash and
 >   fingerprints on every BP; zero transactions after H; a symmetric abort where every BP resumed the old chain.
 > - **Demonstrated on a sample**: state equality on 19 accounts / 5 contracts / 32 table scopes; a replay canary
@@ -28,6 +29,9 @@ the status box below).
 >   run ended with LIVE *and* HALTED BPs on one target chain, and in one run a BP resumed the old chain after its peers
 >   had ignited (33 writes landed after H). rc.23–rc.29 make the agents fleet-aware (STRANDED, `join`, degraded waits,
 >   a fleet verdict and creation-evidence log on mission control); they do not make the cut fleet-decided.
+> - **Mainnet conversion measured** (2026-10-13): the official v1.0.0 pipeline on a real XPR mainnet snapshot takes
+>   9.6 min and 13.7 GB RAM on a 6-vCPU host, and its table compare fails on 3 tables (upstream #109)
+>   ([EVIDENCE.md](docs/EVIDENCE.md#mainnet-conversion-2026-10-13)).
 > - **Not done yet**: fleet-wide all-or-nothing (no authority boundary; a partial abort can still split the network),
 >   exact H in API mode and on restart under a real freeze, per-validator producer keys, crash recovery on a fleet,
 >   validator registration/funding, and any run on Tahoe itself (the public Metal testnet) rather than a private
@@ -35,14 +39,16 @@ the status box below).
 
 > **Block producer? Connect your node in 2 minutes → [docs/OPERATOR-QUICKSTART.md](docs/OPERATOR-QUICKSTART.md) · set up your Metal validator and get your NodeID → [docs/METAL-QUICKSTART.md](docs/METAL-QUICKSTART.md)**
 > ```bash
-> V=v0.5.0-rc.29   # a release tag: the script's pins arrive with it (never main, never "latest")
+> V=v0.5.0-rc.30   # a release tag: the script's pins arrive with it (never main, never "latest")
 > curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 > less beacon-install.sh && sudo bash beacon-install.sh
 > ```
 > The running beacon only observes; installing it writes a binary, a readiness-only config, a token and a systemd
 > service (it never touches nodeos). It detects your network and account and prints one line to send us.
 
-**New here? → [docs/PROCESS.md](docs/PROCESS.md)**: the whole cutover, step by step, with diagrams: who does what, the timeline around the cut, every gate, what apps see, and how rollback works.
+**Start here → [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md)**: the whole cutover in plain terms, the measured mainnet numbers, what is proven and what is not, and how it gets proven before mainnet. Every known risk, its safeguard, evidence and owner: **[docs/RISK-REGISTER.md](docs/RISK-REGISTER.md)**.
+
+**In more detail → [docs/PROCESS.md](docs/PROCESS.md)**: the whole cutover, step by step, with diagrams: who does what, the timeline around the cut, every gate, what apps see, and how rollback works.
 
 **How atomic is the cut today? → [ATOMICITY.md](ATOMICITY.md)**: five properties, the gate or tool for each, the recorded evidence, and what is still open.
 
@@ -128,7 +134,7 @@ from a **release tag** (never `main`: the tag is what was reviewed and released,
 arrive with it), read it, try it with `--dry-run` first; it changes nothing:
 
 ```sh
-V=v0.5.0-rc.29
+V=v0.5.0-rc.30
 curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 less beacon-install.sh                  # you are about to run it as root: read it
 sudo bash beacon-install.sh --dry-run   # shows what it detected; changes nothing
@@ -149,7 +155,7 @@ mission control authenticates it. See [control/README.md](control/README.md).
 producing node**: compiling takes minutes of full CPU.
 
 ```sh
-V=v0.5.0-rc.29   # an exact release tag. Never "latest": GitHub's alias skips pre-releases and resolves to an old build
+V=v0.5.0-rc.30   # an exact release tag. Never "latest": GitHub's alias skips pre-releases and resolves to an old build
 curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/download/$V/pulse-cutover-x86_64-unknown-linux-musl
 curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/download/$V/sha256sums.txt
 sha256sum -c sha256sums.txt --ignore-missing
@@ -1075,7 +1081,7 @@ are ignored). The shape, abridged:
                 "staking_dir": "/var/lib/metalgo/staking", "post_live_probe_cmd": "…" },
   "flip":     { "public_host": "<public-ip-or-domain>", "edge": "auto" },
   "gateway":  { "mode": "edge" },
-  "artifacts": { "agent_release_tag": "v0.5.0-rc.29",      // or "agent": {"url", "sha256"}, which wins
+  "artifacts": { "agent_release_tag": "v0.5.0-rc.30",      // or "agent": {"url", "sha256"}, which wins
                  "plugin":    {"url": "…", "sha256": "…"},
                  "metalgo":   {"url": "…", "sha256": "…"},
                  "edge":      {"url": "…", "sha256": "…"},    // gateway.mode = edge
@@ -1362,7 +1368,7 @@ what testers get out of it.
 
 ## Status & caveats
 
-- Operator tooling v0.5.0-rc.29 (beacon, installers, mission control) — rehearsal-grade; both installers and
+- Operator tooling v0.5.0-rc.30 (beacon, installers, mission control) — rehearsal-grade; both installers and
   `install.sh` pin an exact released tag (bumped by each release; `latest` is refused).
   The September ceremonies ran the fork plugin (`v0.0.0-arena-mempoolfix.1`
   lineage, metalgo 1.13.5, plugin protocol 43); the 2026-10-06 fleet runs ran upstream

@@ -24,11 +24,17 @@ pub fn parse_public_k1(s: &str) -> Result<[u8; 33], String> {
     } else if let Some(r) = s.strip_prefix("EOS") {
         (r, b"")
     } else {
-        return Err(format!("{s:.16}… is not a K1 public key (PUB_K1_… or EOS…)"));
+        return Err(format!(
+            "{s:.16}… is not a K1 public key (PUB_K1_… or EOS…)"
+        ));
     };
-    let raw = bs58::decode(b58).into_vec().map_err(|e| format!("public key base58: {e}"))?;
+    let raw = bs58::decode(b58)
+        .into_vec()
+        .map_err(|e| format!("public key base58: {e}"))?;
     if raw.len() != 37 || ripemd_check(&raw[..33], suffix) != raw[33..] {
-        return Err(format!("{s:.16}… is not a valid K1 public key (length or checksum)"));
+        return Err(format!(
+            "{s:.16}… is not a valid K1 public key (length or checksum)"
+        ));
     }
     Ok(raw[..33].try_into().expect("33 bytes"))
 }
@@ -58,22 +64,29 @@ pub fn format_private_k1(secret: &[u8; 32]) -> String {
 /// the private key.
 pub fn public_of_private_k1(s: &str) -> Result<[u8; 33], String> {
     let secret: [u8; 32] = if let Some(r) = s.strip_prefix("PVT_K1_") {
-        let raw = bs58::decode(r).into_vec().map_err(|_| "private key is not valid base58".to_string())?;
+        let raw = bs58::decode(r)
+            .into_vec()
+            .map_err(|_| "private key is not valid base58".to_string())?;
         if raw.len() != 36 || ripemd_check(&raw[..32], b"K1") != raw[32..] {
             return Err("PVT_K1_ private key has a bad length or checksum".into());
         }
         raw[..32].try_into().expect("32 bytes")
     } else {
-        let raw = bs58::decode(s).into_vec().map_err(|_| "private key is not PVT_K1_… or a valid WIF".to_string())?;
+        let raw = bs58::decode(s)
+            .into_vec()
+            .map_err(|_| "private key is not PVT_K1_… or a valid WIF".to_string())?;
         let ok = raw.len() == 37
             && raw[0] == 0x80
             && sha2::Sha256::digest(sha2::Sha256::digest(&raw[..33]))[..4] == raw[33..];
         if !ok {
-            return Err("private key is not PVT_K1_… or a valid WIF (length, version or checksum)".into());
+            return Err(
+                "private key is not PVT_K1_… or a valid WIF (length, version or checksum)".into(),
+            );
         }
         raw[1..33].try_into().expect("32 bytes")
     };
-    let sk = SecretKey::from_byte_array(&secret).map_err(|_| "private key is not a valid secp256k1 secret".to_string())?;
+    let sk = SecretKey::from_byte_array(&secret)
+        .map_err(|_| "private key is not a valid secp256k1 secret".to_string())?;
     Ok(PublicKey::from_secret_key(&Secp256k1::signing_only(), &sk).serialize())
 }
 
@@ -88,17 +101,35 @@ fn registered_signers(row: &Value) -> (u64, Vec<(String, u64)>) {
         _ => None,
     };
     if let Some(a) = auth.filter(|a| a["keys"].is_array()) {
-        let keys = a["keys"].as_array().expect("checked").iter()
-            .filter_map(|k| Some((k["key"].as_str()?.to_string(), k["weight"].as_u64().unwrap_or(0))))
+        let keys = a["keys"]
+            .as_array()
+            .expect("checked")
+            .iter()
+            .filter_map(|k| {
+                Some((
+                    k["key"].as_str()?.to_string(),
+                    k["weight"].as_u64().unwrap_or(0),
+                ))
+            })
             .collect();
         return (a["threshold"].as_u64().unwrap_or(1), keys);
     }
-    (1, row["producer_key"].as_str().map(|k| vec![(k.to_string(), 1)]).unwrap_or_default())
+    (
+        1,
+        row["producer_key"]
+            .as_str()
+            .map(|k| vec![(k.to_string(), 1)])
+            .unwrap_or_default(),
+    )
 }
 
 /// Can `signing` alone produce for `producer` according to its source `eosio/producers` row?
 /// Ok(evidence) or Err(why the migrated chain would halt at the first re-election).
-pub fn check_registered_producer_key(row: Option<&Value>, producer: &str, signing: &[u8; 33]) -> Result<Value, String> {
+pub fn check_registered_producer_key(
+    row: Option<&Value>,
+    producer: &str,
+    signing: &[u8; 33],
+) -> Result<Value, String> {
     let ours = format_public_k1(signing);
     let row = row.ok_or_else(|| format!(
         "producer {producer} (this node's chain-config producer_name) is not registered in eosio/producers on the \
@@ -110,8 +141,17 @@ pub fn check_registered_producer_key(row: Option<&Value>, producer: &str, signin
              the cut drops it from the schedule and this node would stop producing"));
     }
     let (threshold, keys) = registered_signers(row);
-    let matches = keys.iter().any(|(k, w)| *w >= threshold && parse_public_k1(k).map(|p| &p == signing).unwrap_or(false));
-    let registered: Vec<String> = keys.iter().map(|(k, _)| parse_public_k1(k).map(|p| format_public_k1(&p)).unwrap_or_else(|_| k.clone())).collect();
+    let matches = keys.iter().any(|(k, w)| {
+        *w >= threshold && parse_public_k1(k).map(|p| &p == signing).unwrap_or(false)
+    });
+    let registered: Vec<String> = keys
+        .iter()
+        .map(|(k, _)| {
+            parse_public_k1(k)
+                .map(|p| format_public_k1(&p))
+                .unwrap_or_else(|_| k.clone())
+        })
+        .collect();
     if !matches {
         return Err(format!(
             "producer signing key mismatch: the target will sign as {producer} with {ours}, but eosio/producers \
@@ -121,7 +161,9 @@ pub fn check_registered_producer_key(row: Option<&Value>, producer: &str, signin
             if registered.is_empty() { "no key".to_string() } else { registered.join(", ") }
         ));
     }
-    Ok(json!({"producer": producer, "signing_key": ours, "registered": registered, "threshold": threshold, "result": "match"}))
+    Ok(
+        json!({"producer": producer, "signing_key": ours, "registered": registered, "threshold": threshold, "result": "match"}),
+    )
 }
 
 #[cfg(test)]
@@ -134,25 +176,37 @@ mod tests {
     fn key_formats_round_trip_and_derive() {
         let public = public_of_private_k1(&format_private_k1(&SECRET)).unwrap();
         assert_eq!(parse_public_k1(&format_public_k1(&public)).unwrap(), public);
-        assert_eq!(parse_public_k1(&format_legacy_public(&public)).unwrap(), public);
+        assert_eq!(
+            parse_public_k1(&format_legacy_public(&public)).unwrap(),
+            public
+        );
         // Derivation against a mathematical constant: secret 1 is the generator point G.
         let mut one = [0u8; 32];
         one[31] = 1;
         let g = public_of_private_k1(&format_private_k1(&one)).unwrap();
-        assert_eq!(hex::encode(g), "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+        assert_eq!(
+            hex::encode(g),
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        );
         // Legacy WIF (0x80 ‖ secret ‖ sha256d checksum) derives the same key.
         let mut wif = vec![0x80u8];
         wif.extend_from_slice(&SECRET);
         let check = sha2::Sha256::digest(sha2::Sha256::digest(&wif));
         wif.extend_from_slice(&check[..4]);
-        assert_eq!(public_of_private_k1(&bs58::encode(wif).into_string()).unwrap(), public);
+        assert_eq!(
+            public_of_private_k1(&bs58::encode(wif).into_string()).unwrap(),
+            public
+        );
         let mut bad = format_public_k1(&public);
         bad.pop();
         bad.push('1');
         assert!(parse_public_k1(&bad).is_err());
         assert!(parse_public_k1("PUB_K1_test").is_err());
         let e = public_of_private_k1("PVT_K1_notakey").unwrap_err();
-        assert!(!e.contains("notakey"), "errors never echo the private key: {e}");
+        assert!(
+            !e.contains("notakey"),
+            "errors never echo the private key: {e}"
+        );
     }
 
     #[test]
@@ -160,13 +214,25 @@ mod tests {
         let ours = public_of_private_k1(&format_private_k1(&SECRET)).unwrap();
         let other = public_of_private_k1(&format_private_k1(&[9u8; 32])).unwrap();
         let row = |key: &[u8; 33]| json!({"owner": "bp1", "is_active": 1, "producer_key": format_legacy_public(key)});
-        assert_eq!(check_registered_producer_key(Some(&row(&ours)), "bp1", &ours).unwrap()["result"], "match");
+        assert_eq!(
+            check_registered_producer_key(Some(&row(&ours)), "bp1", &ours).unwrap()["result"],
+            "match"
+        );
         let e = check_registered_producer_key(Some(&row(&other)), "bp1", &ours).unwrap_err();
-        assert!(e.contains("mismatch") && e.contains(&format_public_k1(&other)) && e.contains(&format_public_k1(&ours)), "{e}");
-        assert!(check_registered_producer_key(None, "bp1", &ours).unwrap_err().contains("not registered"));
+        assert!(
+            e.contains("mismatch")
+                && e.contains(&format_public_k1(&other))
+                && e.contains(&format_public_k1(&ours)),
+            "{e}"
+        );
+        assert!(check_registered_producer_key(None, "bp1", &ours)
+            .unwrap_err()
+            .contains("not registered"));
         let mut inactive = row(&ours);
         inactive["is_active"] = json!(0);
-        assert!(check_registered_producer_key(Some(&inactive), "bp1", &ours).unwrap_err().contains("NOT active"));
+        assert!(check_registered_producer_key(Some(&inactive), "bp1", &ours)
+            .unwrap_err()
+            .contains("NOT active"));
         // producer_authority wins over producer_key when present.
         let mut auth = row(&other);
         auth["producer_authority"] = json!(["block_signing_authority_v0", {"threshold": 1, "keys": [{"key": format_legacy_public(&ours), "weight": 1}]}]);

@@ -18,7 +18,7 @@ import { readFileSync, existsSync, watchFile, renameSync, mkdirSync, openSync, w
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isPublicIp, normIp, resolvePublic, limiter, safeRequest, probeProducerApi, safeJson, safeDecode, RE, UA, endpointId, endpointRef, reservedKey,
-  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, ceremonyFor, nextEvidence, EVIDENCE_MAX, STATE_RANK } from './lib.mjs';
+  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, ceremonyFor, nextEvidence, EVIDENCE_MAX, STATE_RANK, drillComparison, shadowBoardProblem } from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = +(process.env.PORT ?? 8787);
@@ -796,7 +796,10 @@ function status() {
           roster: roster(n).length,
           reporting: producers.filter((p) => p.reporting).length, ready: producers.filter((p) => p.ready).length,
           servers: serversAll, servers_reporting: serversLive, servers_ready: serversReady, servers_prepared: serversReady, servers_silent: serversAll - serversLive, servers_conflict: serversConflict, states },
-        producers, agreement: agreement(n), coordination: coordView(n), fleet: fleet(n), events: (events[n.id] || []).slice(0, 40) };
+        producers, agreement: agreement(n), coordination: coordView(n), fleet: fleet(n),
+        // r30: readiness drills, compared per drill height. Display only; never part of a ceremony decision.
+        drills: drillComparison(producers.map((p) => ({ producer: p.name, report: (p.beacons.find((b) => b.role !== 'api' && !b.silent) || p.beacons[0])?.report }))),
+        events: (events[n.id] || []).slice(0, 40) };
     }).sort((a, b) => a.priority - b.priority),
   };
 }
@@ -1054,6 +1057,7 @@ async function handle(req, res) {
     if (r.network !== bind.network || r.producer !== bind.producer)
       return send(res, 403, { error: `token is bound to ${bind.producer}@${bind.network}` });
     if (!netIds().includes(r.network)) return send(res, 404, { error: 'unknown network' });
+    { const why = shadowBoardProblem(r, cfg.networks); if (why) return send(res, 400, { error: `invalid report: shadow: ${why}` }); }
     const ts = Date.parse(r.ts), now = Date.now();
     if (ts > now + TS_FUTURE_MS) return send(res, 400, { error: 'report timestamp is in the future (check the server clock)' });
     if (ts < now - TS_PAST_MS) return send(res, 400, { error: 'report is too old' });

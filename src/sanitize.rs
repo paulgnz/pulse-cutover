@@ -121,7 +121,10 @@ fn apply_ip_rule(text: &str, rule: &Rule, tally: &mut BTreeMap<&'static str, usi
     if n > 0 {
         *tally.entry(rule.kind).or_default() += n;
     }
-    let mut out = rule.re.replace_all(&protected, rule.replacement).to_string();
+    let mut out = rule
+        .re
+        .replace_all(&protected, rule.replacement)
+        .to_string();
     for (i, k) in KEEP.iter().enumerate() {
         out = out.replace(&format!("\u{1}KEEP{i}\u{1}"), k);
     }
@@ -176,9 +179,8 @@ mod tests {
         let fake_k1 = "PVT_K1_2bfGi9rYsXQSXXTvJbDAPhHLQUojjaNLomdm3cEJ1XTzMqUt3V";
         let fake_r1 = "PVT_R1_vFqhewbYRHwSySmvGzCcXPfjEwFHfDcW6d9dDCONE9DZatt6u";
         let fake_wif = "5KQwrPbi5N4gyDKn3jVrtVXLPujQAKgPKoJRAY5og93cV1DsQwt";
-        let input = format!(
-            "producer_key = \"{fake_k1}\"\nlegacy: {fake_wif}\nother_key={fake_r1}\n"
-        );
+        let input =
+            format!("producer_key = \"{fake_k1}\"\nlegacy: {fake_wif}\nother_key={fake_r1}\n");
         let (out, tally) = sanitize(&input, false);
         assert!(!out.contains(fake_k1), "K1 key leaked:\n{out}");
         assert!(!out.contains(fake_r1), "R1 key leaked:\n{out}");
@@ -211,8 +213,14 @@ mod tests {
         let input = "curl -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig'\n\
                      authorization: Basic cGF1bDpodW50ZXIy\n";
         let (out, tally) = sanitize(input, false);
-        assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"), "bearer leaked:\n{out}");
-        assert!(!out.contains("cGF1bDpodW50ZXIy"), "basic auth leaked:\n{out}");
+        assert!(
+            !out.contains("eyJhbGciOiJIUzI1NiJ9"),
+            "bearer leaked:\n{out}"
+        );
+        assert!(
+            !out.contains("cGF1bDpodW50ZXIy"),
+            "basic auth leaked:\n{out}"
+        );
         assert!(tally["bearer-token"] >= 1);
         assert!(tally["authorization-header"] >= 1);
     }
@@ -260,7 +268,10 @@ mod tests {
         assert!(out.contains("127.0.0.1:8888"), "loopback must survive");
         assert!(out.contains("0.0.0.0:80"), "wildcard bind must survive");
         assert!(!out.contains("protonnz.com"), "hostname leaked:\n{out}");
-        assert!(out.contains("server.js"), "file names must survive paranoid mode");
+        assert!(
+            out.contains("server.js"),
+            "file names must survive paranoid mode"
+        );
         assert!(out.contains("config.toml"));
         assert!(tally["ip-address"] >= 1);
         assert!(tally["hostname"] >= 1);

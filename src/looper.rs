@@ -16,13 +16,7 @@ use std::io::Write as _;
 
 use serde_json::json;
 
-use crate::{
-    config::Config,
-    journal::Journal,
-    machine::Machine,
-    ops::ChainOps,
-    state::State,
-};
+use crate::{config::Config, journal::Journal, machine::Machine, ops::ChainOps, state::State};
 
 #[derive(Debug, Clone)]
 pub struct RunMetrics {
@@ -53,10 +47,8 @@ pub fn metrics_from_journal(path: &std::path::Path, run: u32) -> Result<RunMetri
             Some("transition") => {
                 transitions.push((v["state"].as_str().unwrap_or("?").to_string(), ts));
             }
-            Some("error") => {
-                if abort_reason.is_none() {
-                    abort_reason = v["data"]["message"].as_str().map(str::to_string);
-                }
+            Some("error") if abort_reason.is_none() => {
+                abort_reason = v["data"]["message"].as_str().map(str::to_string);
             }
             _ => {}
         }
@@ -143,7 +135,12 @@ pub fn run_loop<O: ChainOps>(cfg: &Config, ops: &O, runs: u32) -> Result<(), Str
 
     for run in 1..=runs {
         eprintln!("=== loop run {run}/{runs}: reset ===");
-        let reset = crate::ops::run_shell(&loop_cfg.reset_cmd);
+        // Round 5 (review R5-4): reset_cmd runs service commands on the source BEFORE any ceremony exists, so it is gated
+        // like every other source mutation: the chain must be known, never real XPR mainnet, a shadow's identity must be
+        // proven (parts 1-4) right before EVERY reset, and no ceremony or drill may be active on this box.
+        let locks = loop_gate(cfg, ops)?;
+        let reset = crate::ops::run_shell(&loop_cfg.reset_cmd); // ungated: loop_gate above, right before every reset
+        drop(locks); // the run's own Machine takes the per-run journal lock and the drill-root lock itself
         if let Err(e) = &reset {
             eprintln!("reset failed: {e} — recording and continuing");
             let m = RunMetrics {
@@ -202,6 +199,86 @@ pub fn run_loop<O: ChainOps>(cfg: &Config, ops: &O, runs: u32) -> Result<(), Str
     Ok(())
 }
 
+/// Every precondition for running `[loop] reset_cmd` (r30 round 5). Returns the locks to hold while it runs.
+///
+/// - `ceremony.chain_id` must be configured: the reset may stop or start the source, so the chain cannot be learned
+///   from a node that may be down; an unknown chain is refused.
+/// - XPR mainnet is refused unless the config is a shadow (`loop` is a rehearsal harness); a shadow must pass the full
+///   identity proof (parts 1-4, `shadow::identity_problems`) right now, before this reset.
+/// - A source that answers must report the configured chain (a real mainnet node under a testnet config is refused).
+/// - No ceremony (the base journal's lock) and no readiness drill (the drill-root lock, and the drill's activity record)
+///   may be active on this box.
+pub fn loop_gate<O: ChainOps>(
+    cfg: &Config,
+    ops: &O,
+) -> Result<(std::fs::File, std::fs::File, Option<std::fs::File>), String> {
+    let chain = cfg.ceremony.chain_id.as_deref().map(str::trim).filter(|c| !c.is_empty()).ok_or(
+        "loop refused: set ceremony.chain_id (the reset may stop or start the source, so the chain must be pinned in the \
+         config, not learned from a node that may be down)")?;
+    let mainnet = crate::config::is_xpr_mainnet(chain);
+    if mainnet && !cfg.is_shadow() {
+        return Err("loop refused: ceremony.chain_id is XPR MAINNET and this is not a shadow config (`loop` is a \
+                    rehearsal harness and never runs against mainnet)".into());
+    }
+    // Round 6 (review R6-3): fail closed. A source that does not answer cannot be identified, so the reset is refused,
+    // unless the config explicitly allows resetting a stopped node (never for a mainnet chain_id).
+    match ops.source_info() {
+        Ok(info) => {
+            if !info.chain_id.trim().eq_ignore_ascii_case(chain) {
+                return Err(format!(
+                    "loop refused: the source reports chain_id {} but the config pins {chain}",
+                    info.chain_id
+                ));
+            }
+            if crate::config::is_xpr_mainnet(&info.chain_id) && !cfg.is_shadow() {
+                return Err("loop refused: the source is XPR MAINNET".into());
+            }
+        }
+        Err(e) => {
+            let allowed = cfg
+                .r#loop
+                .as_ref()
+                .is_some_and(|l| l.reset_when_source_down)
+                && !mainnet;
+            if !allowed {
+                return Err(format!("loop refused: the source does not answer ({e}), so its chain cannot be checked before \
+                    reset_cmd (set [loop] reset_when_source_down = true to reset a stopped node; refused for mainnet)"));
+            }
+        }
+    }
+    if cfg.is_shadow() {
+        let problems = crate::shadow::identity_problems(cfg, ops);
+        if !problems.is_empty() {
+            return Err(format!(
+                "loop refused: SHADOW identity not proven before reset_cmd (nothing was run): {}",
+                problems.join("; ")
+            ));
+        }
+    }
+    let journal_lock = Journal::lock(&cfg.journal_path)
+        .map_err(|e| format!("loop refused: a ceremony holds this box's journal lock ({e})"))?;
+    let drill_lock = Journal::lock(&crate::drill::root_lock_base(cfg)).map_err(|e| {
+        format!("loop refused: a readiness drill or ceremony holds the drill lock ({e})")
+    })?;
+    // Round 6 (review R6-4): and the producer's lock (order: journal, drill root, producer), held through reset_cmd.
+    let producer_lock = match Journal::try_lock(&crate::drill::producer_lock_base(cfg)) {
+        Ok(f) => Some(f),
+        Err(crate::journal::LockError::Held(e)) => return Err(format!(
+            "loop refused: a ceremony or drill on this producer (possibly under another journal directory) holds its lock ({e})")),
+        Err(crate::journal::LockError::Io(e)) => {
+            eprintln!("WARNING: loop: cannot take this producer's lock ({e}); continuing without it");
+            None
+        }
+    };
+    if let Some(why) = crate::drill::ceremony_blocker(cfg) {
+        return Err(format!("loop refused: {why}"));
+    }
+    if let Some(why) = crate::drill::foreign_marker_blocker(cfg) {
+        return Err(format!("loop refused: {why}"));
+    }
+    Ok((journal_lock, drill_lock, producer_lock))
+}
+
 fn write_metrics(file: &mut std::fs::File, m: &RunMetrics) -> Result<(), String> {
     let phases: serde_json::Map<String, serde_json::Value> = m
         .phase_ms
@@ -226,15 +303,23 @@ fn write_metrics(file: &mut std::fs::File, m: &RunMetrics) -> Result<(), String>
 pub fn print_summary(all: &[RunMetrics]) {
     let live = all.iter().filter(|m| m.terminal == "LIVE").count();
     println!("\n================ LOOP SUMMARY ================");
-    println!("runs: {}   LIVE: {live}   non-LIVE: {}", all.len(), all.len() - live);
+    println!(
+        "runs: {}   LIVE: {live}   non-LIVE: {}",
+        all.len(),
+        all.len() - live
+    );
     for m in all {
         println!(
             "  run {:>3}: {:<12} gap={:>7}ms total={:>7}ms cut={} {}",
             m.run,
             m.terminal,
-            m.gap_ms.map(|g| g.to_string()).unwrap_or_else(|| "-".into()),
+            m.gap_ms
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| "-".into()),
             m.total_ms,
-            m.cut_height.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+            m.cut_height
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".into()),
             m.abort_reason.clone().unwrap_or_default(),
         );
     }

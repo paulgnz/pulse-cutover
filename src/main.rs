@@ -14,14 +14,7 @@
 use std::path::PathBuf;
 
 use pulse_cutover::{
-    config::Config,
-    doctor,
-    journal::Journal,
-    machine::Machine,
-    ops::HttpOps,
-    report,
-    scan,
-    state,
+    config::Config, doctor, journal::Journal, machine::Machine, ops::HttpOps, report, scan, state,
     verify,
 };
 
@@ -39,6 +32,9 @@ read-only, safe anywhere (including production):
   beacon          report readiness + ceremony evidence to mission control
   await           arm from a signed coordinator event (same H on every producer)
   verify          hash + dual-import fingerprint a snapshot (heavy but touches nothing)
+  drill           readiness drill: snapshot the LIVE chain at an agreed H (no freeze, no pause),
+                  convert it, report the evidence; never creates or ignites anything (heavy;
+                  --cancel stops a running one)
 
 mutating (normally driven by install.sh / cutover.sh):
   run             run the ceremony to LIVE (exit 0), ABORTED or HALTED (exit 1)
@@ -57,7 +53,8 @@ has started (journaled before the ignite command runs), a failure HALTS: nothing
 is rolled back and the journal is sealed until an operator runs `unhalt`. Most operators run ./cutover.sh instead, which
 wraps this with preflight checks and plain-language output.
 
-Exit codes: 0 = LIVE, 1 = did not reach LIVE (journal has the reason).
+Exit codes: 0 = LIVE, 1 = did not reach LIVE (journal has the reason), 4 = ABORTED with the rollback incomplete,
+6 = stopped by SIGTERM / SIGINT at a safe point (journaled `stopped_by_signal`; never inside a pause or resume).
 If the process dies, re-run the same command — it resumes from the journal.
 
 EXAMPLES
@@ -72,7 +69,12 @@ refused to continue or roll back on its own. After the coordinator has made the
 fleet-wide decision, this clears the seal: it journals who/when and returns the
 journal to the state it halted from, so the next `run` resumes from there (a
 resumed run with ignition started halts again unless the cause is fixed).
-It never resumes the source chain or reverts routing itself.";
+It never resumes the source chain or reverts routing itself.
+
+SHADOW journals: a shadow halted because its identity proof failed (shadow_refused) stays
+refused after unhalt: `run`, `rollback` and `join` touch nothing on it. Check by hand which
+chain the source belongs to (docs/DESIGN-shadow.md, manual recovery); a new shadow starts on a
+fresh journal.";
 
 const HELP_ROLLBACK: &str = "\
 pulse-cutover rollback --config ceremony.toml [--wait SECS] [--force-after-ignite] [--force-stranded --i-understand] [--no-journal-i-know]
@@ -239,6 +241,77 @@ EXAMPLES
   pulse-cutover report
   pulse-cutover report --paranoid --out /tmp/bundle.tar.gz";
 
+const HELP_DRILL: &str = "\
+pulse-cutover drill --config ceremony.toml --height H [--keep-work]
+pulse-cutover drill --config ceremony.toml --cancel
+pulse-cutover drill --config ceremony.toml --clear-marker
+
+A readiness drill with no state or write impact (rung 4 of the mainnet test ladder): every producer runs it with the SAME
+H, on the live chain, and mission control compares the results.
+
+It schedules nodeos's snapshot at exactly H (the ceremony's schedule_at_h call), waits while the chain
+keeps producing until H is final, picks up snapshot-<id of H>.bin, and runs the configured upstream
+pipeline on it (export -> import -> 21-table compare -> state fingerprint) in <journal dir>/drill/<H>/.
+It records each step's duration and publishes the result as <journal dir>/drill/latest.json, which the
+beacon reports as `drill` (never as the ceremony).
+
+It never: closes writes, pauses or resumes the producer, runs a hook, creates or ignites a chain, flips
+an edge, stops the source, or touches snapshot.staged_path or the ceremony journal. Every chain call goes
+through a guard that refuses all of those. The compare result is the TRUE result: a rehearsal allowlist
+and a pinned golden_state_root are ignored for a drill. Allowed on XPR mainnet (that is its purpose);
+rehearsal overrides in the config are still refused for mainnet at load, as always.
+
+No shell runs in a drill (r30 round 4). It never runs upstream.export_cmd: the export is a fixed
+`docker run --rm --network none` argument vector built from [upstream] export_image, export_tools_dir (holding
+export.sh) and chain_state_db_size_mb, with the snapshot and tools mounted read-only; import_bin, compare_bin and
+fingerprint_bin must be absolute paths to native executables (ELF or Mach-O; not scripts, not links, not hard
+links, not group/other-writable) and run by argument vector. The guard refuses every shell command and every
+program but those four. A tool whose process group cannot be verified gone (it survived the kill, or `ps` cannot
+tell) keeps its process-group record and ends the drill FAILED-INCOMPLETE: it stays RUNNING until --cancel stops it.
+
+Pinned (r30 round 5): every program a drill runs must match its sha256 pin ([upstream] import_bin_sha256,
+compare_bin_sha256, fingerprint_bin_sha256, docker_bin_sha256), checked at load and again right before each
+run; export_image must be pinned by digest (name@sha256:<64 hex>). Docker runs by absolute path (docker_bin)
+against the LOCAL daemon only (--host unix://<docker_socket>, default /var/run/docker.sock), with a cleared
+environment (no DOCKER_* variables). The export container is named and recorded before it exists; it is
+stopped and verified gone (docker kill / rm -f / inspect) after the export and on every failure or cancel,
+and until then the drill counts as running. A drill, --cancel and the ceremony also share one lock per
+producer (keyed by source.producer_api_url, in snapshot.dir), whatever their journal directories.
+
+Refused when: the config is not import_backend = \"upstream\" with compare_bin and snapshot.dir; export_image,
+export_tools_dir or chain_state_db_size_mb is missing or invalid, or a tool is not a plain native executable;
+source.producer_api_url carries a query, fragment or credentials; the ceremony journal is in progress, sealed,
+unfinished or LIVE, or its lock is held; another drill is running (the drill directory has its own lock too); any
+path the drill writes (the whole drill directory, latest.json, the journal lock) overlaps snapshot.staged_path, the
+journal, upstream.work_dir or snapshot.dir (symlinks resolved); H < head + 20; a drill at H already ran. The other
+way round, a fresh ceremony refuses to ARM while a drill is RUNNING.
+
+What it costs: CPU, RAM and disk (on XPR mainnet state the conversion took 9.6 min and 13.7 GB RAM,
+2026-10-13), and nodeos writes the snapshot at H synchronously, which on a producing node can cost blocks
+in its own round. Prefer a non-producing node with the same snapshot directory, or an H outside your
+production round. The multi-GB work files are deleted at the end (the evidence is kept) unless
+--keep-work. nodeos's snapshot file stays in snapshot.dir (yours to remove). A drill that fails or is
+cancelled before H is final removes its pending snapshot request by the request id it recorded (never by
+height: a ceremony may hold a request at the same height).
+
+--cancel: asks the running drill to stop (it checks while waiting for H and between and during pipeline
+steps), waits up to 60 s, then stops the pipeline tool's process group and checks it is gone (if not: a
+cancel INCOMPLETE, non-zero exit, the drill stays RUNNING and its process-group record is kept). If the
+drill process is gone it takes the drill's locks, refuses next to a ceremony in progress, removes only the
+recorded snapshot request (on the producer API it was made on, at its recorded H: run --cancel with the
+drill's own config) and marks the drill FAILED (cancelled). Every check runs before anything is written; a
+refused cancel writes nothing. A drill never writes through a symlink or a hard link.
+
+--clear-marker (r30 round 7): removes an orphaned drill work marker (its drill died, or the docker daemon was down
+when it ended), which otherwise blocks a fresh ARM on this producer, using ANY config on the same producer (same
+lock_dir and snapshot.dir). It takes the locks, refuses next to a ceremony in progress, and removes the marker only
+when the marker's drill process is not running, its pipeline process group has no members, and the pinned docker CLI
+on the local socket says the recorded export container does not exist; anything unknown refuses. Every marker names
+its drill (drill_id), and only that drill, or this command, removes it. `status` and the beacon show the marker.
+
+Exit codes: 0 = evidence complete and the compare matched; 5 = evidence complete, the compare did NOT
+match (the finding a drill exists to surface; the fingerprint is still reported); 1 = the drill failed.";
+
 const HELP_JOIN: &str = "\
 pulse-cutover join --config ceremony-<event>.toml --event <event_id> [--reverify]
 
@@ -282,6 +355,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "unhalt" => Some(HELP_UNHALT),
         "rollback" => Some(HELP_ROLLBACK),
         "join" => Some(HELP_JOIN),
+        "drill" => Some(HELP_DRILL),
         _ => None,
     }
 }
@@ -318,6 +392,11 @@ fn main() {
         }
         return;
     }
+    // r30 round 13: a ceremony stops on SIGTERM / SIGINT only at a safe point (never inside a pause or resume
+    // episode), journals `stopped_by_signal` and exits 6; `cutover.sh abort` waits for that before `rollback`.
+    if matches!(command, "run" | "join" | "loop") {
+        pulse_cutover::stop::install();
+    }
     let result = match command {
         "run" => cmd_run(&args),
         "loop" => cmd_loop(&args),
@@ -331,6 +410,7 @@ fn main() {
         "unhalt" => cmd_unhalt(&args),
         "rollback" => cmd_rollback(&args),
         "join" => cmd_join(&args),
+        "drill" => cmd_drill(&args),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -338,6 +418,9 @@ fn main() {
     };
     if let Err(e) = result {
         eprintln!("pulse-cutover: {e}");
+        if e.starts_with(pulse_cutover::stop::STOPPED) {
+            std::process::exit(pulse_cutover::stop::EXIT_STOPPED);
+        }
         std::process::exit(1);
     }
 }
@@ -478,19 +561,40 @@ fn cmd_join(args: &[String]) -> Result<(), String> {
     let cfg = load_config(args)?;
     cfg.ensure_ceremony_profile()?;
     let event = arg(args, "--event").ok_or("missing --event <event_id>")?;
-    let ignite_cmd = cfg.target.ignite_cmd.clone().unwrap_or_else(|| format!("systemctl restart {}", cfg.target.metalgo_unit));
-    let ops = HttpOps::new(&cfg.source.rpc_url, &cfg.source.producer_api_url, &cfg.target.rpc_url, &ignite_cmd,
-        cfg.source.snapshot_timeout_secs).with_hook_timeout(cfg.hooks.timeout_secs).with_pgid_file_for(&cfg.journal_path);
+    let ignite_cmd = cfg
+        .target
+        .ignite_cmd
+        .clone()
+        .unwrap_or_else(|| format!("systemctl restart {}", cfg.target.metalgo_unit));
+    let ops = HttpOps::new(
+        &cfg.source.rpc_url,
+        &cfg.source.producer_api_url,
+        &cfg.target.rpc_url,
+        &ignite_cmd,
+        cfg.source.snapshot_timeout_secs,
+    )
+    .with_hook_timeout(cfg.hooks.timeout_secs)
+    .with_pgid_file_for(&cfg.journal_path);
     let (journal, recovered) = Journal::open(&cfg.journal_path)?;
     let mut machine = Machine::new(&cfg, &ops, journal, recovered);
     let terminal = machine.join_with(&event, args.iter().any(|a| a == "--reverify"))?;
     println!("{terminal}");
-    if terminal == state::State::Live { Ok(()) } else { Err(format!("join ended in {terminal}; see {}", cfg.journal_path.display())) }
+    if terminal == state::State::Live {
+        Ok(())
+    } else {
+        Err(format!(
+            "join ended in {terminal}; see {}",
+            cfg.journal_path.display()
+        ))
+    }
 }
 
 fn cmd_loop(args: &[String]) -> Result<(), String> {
     let cfg = load_config(args)?;
     cfg.ensure_ceremony_profile()?;
+    if let Some(why) = cfg.mainnet_lock_dir_problem() {
+        return Err(why.into());
+    }
     cfg.ensure_h_known()?;
     let runs: u32 = arg(args, "--runs")
         .ok_or("missing --runs")?
@@ -525,31 +629,63 @@ fn cmd_await(args: &[String]) -> Result<(), String> {
     let path = PathBuf::from(arg(args, "--config").ok_or("--config <ceremony.toml> is required")?);
     let cfg = Config::load(&path)?;
     cfg.ensure_ceremony_profile()?;
+    // r30 round 8: a new mainnet event is never armed without an explicit lock_dir (checked again at ARM).
+    if let Some(why) = cfg.mainnet_lock_dir_problem() {
+        return Err(why.into());
+    }
     let code = pulse_cutover::coord::run_await(&cfg, &path)?;
     std::process::exit(code);
 }
 
 fn cmd_unhalt(args: &[String]) -> Result<(), String> {
     if !flag(args, "--i-understand") {
-        return Err("unhalt clears a SEALED ceremony (ignition may have started). Only after a \
+        return Err(
+            "unhalt clears a SEALED ceremony (ignition may have started). Only after a \
                     fleet-wide decision: re-run with --i-understand"
-            .into());
+                .into(),
+        );
     }
     let cfg = load_config(args)?;
     cfg.ensure_ceremony_profile()?;
     let (mut journal, recovered) = Journal::open(&cfg.journal_path)?;
     if recovered.state != Some(state::State::Halted) {
-        return Err(format!("journal state is {:?}, not HALTED: nothing to clear", recovered.state.map(|s| s.to_string())));
+        return Err(format!(
+            "journal state is {:?}, not HALTED: nothing to clear",
+            recovered.state.map(|s| s.to_string())
+        ));
+    }
+    if let Some(why) =
+        pulse_cutover::shadow::journal_mismatch(&cfg, recovered.armed_shadow.as_ref())
+    {
+        return Err(format!("unhalt refused: {why}. Nothing was changed."));
+    }
+    // Round-2 review (D-10): an XPR mainnet journal continues only with the event its fresh ARM authenticated.
+    if let Some(why) = pulse_cutover::coord::mainnet_binding_problem(
+        &cfg,
+        recovered.chain_id.as_deref(),
+        recovered.state,
+        recovered.mainnet_event_binding.as_ref(),
+    ) {
+        return Err(format!("unhalt refused: {why}"));
     }
     let back = recovered.halted_from.unwrap_or(state::State::Verified);
-    let who = std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "unknown".into());
-    journal.evidence(state::State::Halted, serde_json::json!({"unhalted_by": who, "returning_to": back.as_str()}))?;
+    let who = std::env::var("SUDO_USER")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "unknown".into());
+    journal.evidence(
+        state::State::Halted,
+        serde_json::json!({"unhalted_by": who, "returning_to": back.as_str()}),
+    )?;
     // Carry the established evidence forward on the transition, so nothing that reads "the
     // latest <state> record" (beacon summary, fleet gate) sees it as erased.
     let mut data = serde_json::json!({"unhalted": true, "by": who,
         "note": "seal cleared by operator; ignition-started is still recorded, so a failure halts again"});
-    for (k, v) in [("sha256", &recovered.sha256), ("chain_id", &recovered.chain_id), ("cut_block_id", &recovered.cut_block_id),
-                   ("snapshot_file", &recovered.snapshot_file)] {
+    for (k, v) in [
+        ("sha256", &recovered.sha256),
+        ("chain_id", &recovered.chain_id),
+        ("cut_block_id", &recovered.cut_block_id),
+        ("snapshot_file", &recovered.snapshot_file),
+    ] {
         if let Some(v) = v {
             data[k] = serde_json::json!(v);
         }
@@ -567,15 +703,22 @@ fn cmd_unhalt(args: &[String]) -> Result<(), String> {
 fn cmd_rollback(args: &[String]) -> Result<(), String> {
     let refuse = |msg: String| -> ! {
         eprintln!("pulse-cutover rollback: REFUSED — {msg}");
-        eprintln!("Nothing was changed: the source was NOT resumed and public routing was NOT reverted.");
+        eprintln!(
+            "Nothing was changed: the source was NOT resumed and public routing was NOT reverted."
+        );
         std::process::exit(3);
     };
     let incomplete = |failed: &[String]| -> ! {
-        eprintln!("pulse-cutover rollback: INCOMPLETE — {} step(s) failed:", failed.len());
+        eprintln!(
+            "pulse-cutover rollback: INCOMPLETE — {} step(s) failed:",
+            failed.len()
+        );
         for f in failed {
             eprintln!("  - {f}");
         }
-        eprintln!("The source may NOT be producing and routing may NOT be reverted: check by hand.");
+        eprintln!(
+            "The source may NOT be producing and routing may NOT be reverted: check by hand."
+        );
         std::process::exit(4);
     };
     // Every failure before any rollback action runs is a refusal (exit 3): nothing changed.
@@ -606,7 +749,10 @@ fn cmd_rollback(args: &[String]) -> Result<(), String> {
                  deleted, unreadable). If this box never ran a ceremony, re-run with --no-journal-i-know.",
                 cfg.journal_path.display()));
         }
-        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
         let mut p = cfg.journal_path.as_os_str().to_owned();
         p.push(format!(".rollback-{ms}.jsonl"));
         journal_path = std::path::PathBuf::from(p);
@@ -620,13 +766,25 @@ fn cmd_rollback(args: &[String]) -> Result<(), String> {
             Err(e) if e.contains("holds") && std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
-            Err(e) => refuse(format!("cannot take and read the journal to decide safely: {e}")),
+            Err(e) => refuse(format!(
+                "cannot take and read the journal to decide safely: {e}"
+            )),
         }
     };
-    let ignite_cmd = cfg.target.ignite_cmd.clone().unwrap_or_else(|| format!("systemctl restart {}", cfg.target.metalgo_unit));
-    let ops = HttpOps::new(&cfg.source.rpc_url, &cfg.source.producer_api_url, &cfg.target.rpc_url, &ignite_cmd,
-        cfg.source.snapshot_timeout_secs).with_hook_timeout(cfg.hooks.timeout_secs)
-        .with_pgid_file_for(&cfg.journal_path);
+    let ignite_cmd = cfg
+        .target
+        .ignite_cmd
+        .clone()
+        .unwrap_or_else(|| format!("systemctl restart {}", cfg.target.metalgo_unit));
+    let ops = HttpOps::new(
+        &cfg.source.rpc_url,
+        &cfg.source.producer_api_url,
+        &cfg.target.rpc_url,
+        &ignite_cmd,
+        cfg.source.snapshot_timeout_secs,
+    )
+    .with_hook_timeout(cfg.hooks.timeout_secs)
+    .with_pgid_file_for(&cfg.journal_path);
     let mut machine = Machine::new(&cfg, &ops, journal, recovered);
     let result = machine.operator_rollback_opts(force, flag(args, "--force-stranded"));
     drop(machine); // releases the journal lock
@@ -643,11 +801,21 @@ fn cmd_rollback(args: &[String]) -> Result<(), String> {
                 incomplete(&out.failed);
             }
             if out.already {
-                println!("already rolled back: journal {} (nothing done again)", cfg.journal_path.display());
+                println!(
+                    "already rolled back: journal {} (nothing done again)",
+                    cfg.journal_path.display()
+                );
             } else if audit_only {
-                println!("rolled back (no ceremony journal existed; audit record: {})", journal_path.display());
+                println!(
+                    "rolled back (no ceremony journal existed; audit record: {})",
+                    journal_path.display()
+                );
             } else {
-                println!("rolled back: journal now {} (see {})", out.state, cfg.journal_path.display());
+                println!(
+                    "rolled back: journal now {} (see {})",
+                    out.state,
+                    cfg.journal_path.display()
+                );
             }
             Ok(())
         }
@@ -662,8 +830,11 @@ fn cmd_rollback(args: &[String]) -> Result<(), String> {
 /// only way forward is to finish the rollback). Journaled with who and when.
 fn cancel_rollback_intent(cfg: &Config, understood: bool) -> Result<(), String> {
     if !understood {
-        return Err("--cancel-intent withdraws a recorded rollback so the ceremony may continue: pass \
-                    --i-understand to confirm".into());
+        return Err(
+            "--cancel-intent withdraws a recorded rollback so the ceremony may continue: pass \
+                    --i-understand to confirm"
+                .into(),
+        );
     }
     let (mut journal, rec) = Journal::open(&cfg.journal_path)
         .map_err(|e| format!("cannot take and read the journal: {e}"))?;
@@ -677,11 +848,99 @@ fn cancel_rollback_intent(cfg: &Config, understood: bool) -> Result<(), String> 
             rec.rollback_steps_done.join(", ")
         ));
     }
-    let by = std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "unknown".into());
+    let by = std::env::var("SUDO_USER")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "unknown".into());
     let st = rec.state.unwrap_or(state::State::Armed);
-    journal.evidence(st, serde_json::json!({"rollback_intent_cancelled": true, "cancelled_by": by}))?;
+    journal.evidence(
+        st,
+        serde_json::json!({"rollback_intent_cancelled": true, "cancelled_by": by}),
+    )?;
     println!("rollback intent cancelled (journaled, by {by}); `run` may continue from state {st}");
     Ok(())
+}
+
+fn cmd_drill(args: &[String]) -> Result<(), String> {
+    let cfg = load_config(args)?;
+    if flag(args, "--cancel") {
+        let ops = HttpOps::new(
+            &cfg.source.rpc_url,
+            &cfg.source.producer_api_url,
+            "",
+            "false",
+            cfg.source.snapshot_timeout_secs,
+        );
+        let msg = pulse_cutover::drill::cancel(&cfg, &ops, std::time::Duration::from_secs(60))?;
+        println!("{msg}");
+        return Ok(());
+    }
+    if flag(args, "--clear-marker") {
+        let ops = HttpOps::new(
+            &cfg.source.rpc_url,
+            &cfg.source.producer_api_url,
+            "",
+            "false",
+            cfg.source.snapshot_timeout_secs,
+        );
+        let msg = pulse_cutover::drill::clear_marker(&cfg, &ops)?;
+        println!("{msg}");
+        return Ok(());
+    }
+    let height: u64 = arg(args, "--height")
+        .ok_or("missing --height H (the agreed drill height, the same on every producer)")?
+        .parse()
+        .map_err(|e| format!("bad --height: {e}"))?;
+    // Never the ceremony's ignite command or hook process-group file: the drill has its own.
+    let pgid_for = pulse_cutover::drill::pgid_journal_for(&cfg, height);
+    let ops = HttpOps::new(
+        &cfg.source.rpc_url,
+        &cfg.source.producer_api_url,
+        "",
+        "false",
+        cfg.source.snapshot_timeout_secs,
+    )
+    .with_pgid_file_for(&pgid_for);
+    let opts = pulse_cutover::drill::DrillOptions {
+        height,
+        keep_work: flag(args, "--keep-work"),
+    };
+    let out = pulse_cutover::drill::run(&cfg, &ops, &opts)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out.view).unwrap_or_default()
+    );
+    if out.evidence_complete && !out.compare_match {
+        eprintln!(
+            "readiness drill DONE, but the 21-table compare did NOT match (tables: {}): a real ceremony would refuse \
+             to verify this state. The fingerprint above is still comparable across producers.",
+            out.view["compare_failing_tables"]
+        );
+        std::process::exit(5);
+    }
+    Ok(())
+}
+
+fn print_drill_status(cfg: &pulse_cutover::config::Config) {
+    if let Some(d) = pulse_cutover::drill::beacon_view(cfg) {
+        println!(
+            "drill (readiness drill, NOT a ceremony): H={} state={} compare={} fingerprints_digest={}",
+            d["h"], d["state"].as_str().unwrap_or("?"), d["compare"].as_str().unwrap_or("-"),
+            d["fingerprints_digest"].as_str().unwrap_or("-")
+        );
+        if let Some(w) = d.get("work_marker").filter(|w| !w.is_null()) {
+            println!(
+                "drill work marker on this producer: state={} H={} drill_id={}{}",
+                w["state"].as_str().unwrap_or("?"),
+                w["h"],
+                w["drill_id"].as_str().unwrap_or("-"),
+                if w["state"] == "unknown" {
+                    " (blocks a fresh ARM: `pulse-cutover drill --clear-marker` verifies its work gone and removes it)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
 }
 
 fn cmd_status(args: &[String]) -> Result<(), String> {
@@ -690,16 +949,44 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     if overrides.is_empty() {
         println!("rehearsal_overrides: none");
     } else {
-        println!("rehearsal_overrides: ACTIVE (REHEARSAL ONLY, never a real cut): {}", overrides.join("; "));
+        println!(
+            "rehearsal_overrides: ACTIVE (REHEARSAL ONLY, never a real cut): {}",
+            overrides.join("; ")
+        );
+    }
+    if cfg.is_shadow() {
+        let l = pulse_cutover::shadow::label(&cfg);
+        println!("ceremony: SHADOW {} on private Metal network {} (never a real cut; the chain keeps the source chain_id, \
+                  so never sign on it with a real key)", l["label"].as_str().unwrap_or(""), cfg.target.metal_network_id.unwrap_or(0));
     }
     if cfg.ceremony.rehearsal {
-        println!("ceremony: REHEARSAL (ceremony.rehearsal = true; never a real cut); relaxations: {}",
-            if cfg.production_problems().is_empty() { "none".to_string() } else { cfg.production_problems().join("; ") });
+        println!(
+            "ceremony: REHEARSAL (ceremony.rehearsal = true; never a real cut); relaxations: {}",
+            if cfg.production_problems().is_empty() {
+                "none".to_string()
+            } else {
+                cfg.production_problems().join("; ")
+            }
+        );
     } else if cfg.ceremony.profile == pulse_cutover::config::Profile::Ceremony {
         println!("ceremony: production profile met");
     }
+    print_drill_status(&cfg);
+    // r30 round 7: the effective lock directory (shared by every ceremony, drill and loop on this box).
+    println!(
+        "lock_dir: {} ({})",
+        pulse_cutover::drill::lock_dir(&cfg).display(),
+        if cfg.ceremony.lock_dir.is_some() {
+            "explicit"
+        } else {
+            "DEFAULT: set [ceremony] lock_dir so every user shares it"
+        }
+    );
     if !cfg.journal_path.exists() {
-        println!("no journal at {} — ceremony not started", cfg.journal_path.display());
+        println!(
+            "no journal at {} — ceremony not started",
+            cfg.journal_path.display()
+        );
         return Ok(());
     }
     let recovered = Journal::replay(&cfg.journal_path)?;
@@ -735,7 +1022,9 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     }
     // After LIVE: is the target still producing? (reporting only; never an action)
     let summary = pulse_cutover::beacon::journal_summary(&cfg.journal_path);
-    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(5)).build();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
     if let Some(c) = pulse_cutover::live_watch::check(&cfg, &summary, Some(&agent), false) {
         let detail = c["detail"].as_str().unwrap_or("");
         if c["ok"].as_bool() == Some(true) {
@@ -745,13 +1034,24 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         }
     }
     // cutover.sh reads this: once ignition may have started, a local rollback is refused.
-    println!("ignition_started: {}", if recovered.reached_ignited { "yes" } else { "no" });
+    println!(
+        "ignition_started: {}",
+        if recovered.reached_ignited {
+            "yes"
+        } else {
+            "no"
+        }
+    );
     // An operator rollback that started and did not finish blocks `run` until it is finished
     // (re-run `rollback`) or, if no step ran yet, cancelled (`rollback --cancel-intent`).
     let rollback = if recovered.rollback_pending {
         "pending (a rollback, the operator's or the agent's own abort, started and did not finish: re-run `pulse-cutover rollback`)"
     } else if recovered.state == Some(state::State::Aborted) {
-        if recovered.aborted_rollback_complete { "complete" } else { "INCOMPLETE (run `pulse-cutover rollback`)" }
+        if recovered.aborted_rollback_complete {
+            "complete"
+        } else {
+            "INCOMPLETE (run `pulse-cutover rollback`)"
+        }
     } else {
         "none"
     };
@@ -759,7 +1059,14 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         println!("stranded: yes (sealed: the source was NOT resumed; `pulse-cutover join` if the fleet went LIVE, \
                   `pulse-cutover rollback` (re-runs the resume guard) otherwise)");
     }
-    println!("rollback_pending: {}", if recovered.rollback_pending { "yes" } else { "no" });
+    println!(
+        "rollback_pending: {}",
+        if recovered.rollback_pending {
+            "yes"
+        } else {
+            "no"
+        }
+    );
     println!("rollback: {rollback}");
     Ok(())
 }

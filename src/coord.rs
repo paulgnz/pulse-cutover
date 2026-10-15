@@ -5,10 +5,10 @@
 //! - Messages are ed25519-signed by coordinator keys that each producer lists in its OWN config
 //!   (`[coordination] coordinator_keys`). Mission control only relays them; it cannot forge one.
 //! - Three message types, all for one `event_id`:
-//!     event  — "the cut will be at H on this chain with these parameters" (published ahead of time)
-//!     arm    — "go": the agent may start the ceremony for that event
-//!     abort  — "stop": honoured only before IGNITED (after that, falling back would drop
-//!              transactions already accepted by the new chain; that is a human decision)
+//!   - event — "the cut will be at H on this chain with these parameters" (published ahead of time)
+//!   - arm — "go": the agent may start the ceremony for that event
+//!   - abort — "stop": honoured only before IGNITED (after that, falling back would drop
+//!     transactions already accepted by the new chain; that is a human decision)
 //! - Every agent re-checks an event against its local config (chain_id, freeze lead, cpu scale)
 //!   and the live head (H must be at least `min_lead_blocks` ahead) before accepting it.
 //! - `auto_arm = false` (default): a signed arm ALSO needs a local confirmation file, so no remote
@@ -25,6 +25,9 @@
 //!   release_sha256  the PulseVM plugin build; rejected if `target.plugin_path` hashes differently
 //!                   or is not set (an unverifiable plugin refuses the event)
 //!   snapshot_sha256 the expected cut snapshot hash, once known (becomes snapshot.expected_sha256)
+//! XPR mainnet (RISK-REGISTER D-10): the event must name `chain_id` and `h`; at a fresh ARM the agent re-fetches
+//! it from the relay, re-verifies the signature and the payload hash, and requires it to bind this node's source
+//! chain, H, roster and quorum (`mainnet_event_problems`). Events without chain_id still load elsewhere.
 //! Arm binding: an arm must carry `event_hash` = sha256 of the accepted event's exact signed payload
 //! string (the relay enforces this too; the agent checks it itself in `check_arm`). An event is
 //! identified by id AND payload hash: a different body under the same id is validated from scratch.
@@ -43,70 +46,133 @@ use crate::config::Config;
 /// Verify one signed message against the allowed keys. Returns the parsed payload.
 pub fn verify(msg: &Value, allowed_keys: &[String]) -> Result<Value, String> {
     let payload = msg["payload"].as_str().ok_or("message has no payload")?;
-    let key_hex = msg["key"].as_str().ok_or("message has no key")?.to_lowercase();
+    let key_hex = msg["key"]
+        .as_str()
+        .ok_or("message has no key")?
+        .to_lowercase();
     if !allowed_keys.iter().any(|k| k.to_lowercase() == key_hex) {
-        return Err(format!("key {}… is not a configured coordinator key", &key_hex[..12.min(key_hex.len())]));
+        return Err(format!(
+            "key {}… is not a configured coordinator key",
+            &key_hex[..12.min(key_hex.len())]
+        ));
     }
-    let key: [u8; 32] = hex::decode(&key_hex).map_err(|e| e.to_string())?.try_into().map_err(|_| "key must be 32 bytes")?;
+    let key: [u8; 32] = hex::decode(&key_hex)
+        .map_err(|e| e.to_string())?
+        .try_into()
+        .map_err(|_| "key must be 32 bytes")?;
     let sig: [u8; 64] = hex::decode(msg["sig"].as_str().ok_or("message has no sig")?)
-        .map_err(|e| e.to_string())?.try_into().map_err(|_| "sig must be 64 bytes")?;
-    VerifyingKey::from_bytes(&key).map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?
+        .try_into()
+        .map_err(|_| "sig must be 64 bytes")?;
+    VerifyingKey::from_bytes(&key)
+        .map_err(|e| e.to_string())?
         .verify(payload.as_bytes(), &Signature::from_bytes(&sig))
         .map_err(|_| "signature does not verify".to_string())?;
     serde_json::from_str(payload).map_err(|e| format!("payload is not JSON: {e}"))
 }
 
 /// Check an `event` payload against this node's config and the live head.
-pub fn validate_event(ev: &Value, cfg: &Config, network: &str, head: Option<u64>, min_lead: u64) -> Result<u64, String> {
-    if ev["type"] != "event" { return Err("not an event message".into()); }
-    if ev["network"].as_str() != Some(network) { return Err(format!("event is for network {}, this node is on {network}", ev["network"])); }
+pub fn validate_event(
+    ev: &Value,
+    cfg: &Config,
+    network: &str,
+    head: Option<u64>,
+    min_lead: u64,
+) -> Result<u64, String> {
+    if ev["type"] != "event" {
+        return Err("not an event message".into());
+    }
+    if ev["network"].as_str() != Some(network) {
+        return Err(format!(
+            "event is for network {}, this node is on {network}",
+            ev["network"]
+        ));
+    }
     if let Some(want) = &cfg.ceremony.chain_id {
-        if ev["chain_id"].as_str() != Some(want.as_str()) { return Err("event chain_id differs from this node's config".into()); }
+        if ev["chain_id"].as_str() != Some(want.as_str()) {
+            return Err("event chain_id differs from this node's config".into());
+        }
     }
     let h = ev["h"].as_u64().ok_or("event has no H")?;
     if let Some(v) = ev["freeze_lead_blocks"].as_u64() {
-        if v != cfg.ceremony.freeze_lead_blocks { return Err(format!("event freeze_lead_blocks {v} ≠ local {}", cfg.ceremony.freeze_lead_blocks)); }
+        if v != cfg.ceremony.freeze_lead_blocks {
+            return Err(format!(
+                "event freeze_lead_blocks {v} ≠ local {}",
+                cfg.ceremony.freeze_lead_blocks
+            ));
+        }
     }
     // Compared whatever the backend: the field is part of the signed payload and producers must
     // agree on it (on the upstream backend it is inert; Config::warnings says so).
     if let Some(v) = ev["import_cpu_scale"].as_u64() {
-        if v != cfg.ceremony.import_cpu_scale { return Err(format!("event import_cpu_scale {v} ≠ local {}", cfg.ceremony.import_cpu_scale)); }
+        if v != cfg.ceremony.import_cpu_scale {
+            return Err(format!(
+                "event import_cpu_scale {v} ≠ local {}",
+                cfg.ceremony.import_cpu_scale
+            ));
+        }
     }
     if let Some(head) = head {
-        if h < head + min_lead { return Err(format!("H {h} is only {} blocks ahead of head {head} (minimum {min_lead})", h.saturating_sub(head))); }
+        if h < head + min_lead {
+            return Err(format!(
+                "H {h} is only {} blocks ahead of head {head} (minimum {min_lead})",
+                h.saturating_sub(head)
+            ));
+        }
     }
     // rc.23 review #8: a producer-mode event without a roster has no quorum to judge: the fleet gate would
     // count whoever reports, and the resume guard could never tell whether peers can commit without
     // this node. Refused (api / history nodes do not freeze a source, and may follow such an event).
-    let has_roster = ev.get("roster").and_then(|r| r.as_array()).is_some_and(|a| !a.is_empty());
+    let has_roster = ev
+        .get("roster")
+        .and_then(|r| r.as_array())
+        .is_some_and(|a| !a.is_empty());
     if cfg.ceremony.mode == crate::config::Mode::Producer && !has_roster {
         return Err("event has no roster: a producer-mode ceremony needs the event's signed roster and quorum \
                     (coord.mjs event --roster … --quorum N)".into());
     }
     if let Some(roster) = ev.get("roster").filter(|r| !r.is_null()) {
-        let members: Vec<crate::config::RosterMember> =
-            serde_json::from_value(roster.clone()).map_err(|e| format!("event roster is malformed: {e}"))?;
-        if members.is_empty() { return Err("event roster is empty".into()); }
+        let members: Vec<crate::config::RosterMember> = serde_json::from_value(roster.clone())
+            .map_err(|e| format!("event roster is malformed: {e}"))?;
+        if members.is_empty() {
+            return Err("event roster is empty".into());
+        }
         crate::config::check_roster(&members).map_err(|e| format!("event {e}"))?;
         if let Some(q) = ev["quorum"].as_u64() {
-            if q == 0 || q as usize > members.len() { return Err(format!("event quorum {q} is not within 1..={}", members.len())); }
+            if q == 0 || q as usize > members.len() {
+                return Err(format!(
+                    "event quorum {q} is not within 1..={}",
+                    members.len()
+                ));
+            }
         }
     }
     // The Metal network the target runs on (a private rehearsal network, or a public one): this node's
     // validator must be configured for the same one.
     if let Some(n) = ev.get("metal_network_id").filter(|v| !v.is_null()) {
         let n = n.as_u64().ok_or("event metal_network_id is not a number")?;
-        let local = cfg.target.expected_metal_network(cfg.ceremony.chain_id.as_deref().or(ev["chain_id"].as_str()));
+        let local = cfg
+            .target
+            .expected_metal_network(cfg.ceremony.chain_id.as_deref().or(ev["chain_id"].as_str()));
         if local != Some(n) {
-            return Err(format!("event metal_network_id {n} ≠ this node's {} (set target.metal_network_id)",
-                local.map(|l| l.to_string()).unwrap_or_else(|| "unknown".into())));
+            return Err(format!(
+                "event metal_network_id {n} ≠ this node's {} (set target.metal_network_id)",
+                local
+                    .map(|l| l.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            ));
         }
     }
     if let Some(want) = ev["release_sha256"].as_str() {
         if let Some(path) = &cfg.target.plugin_path {
-            let (got, _) = crate::verify::sha256_file(path).map_err(|e| format!("cannot hash plugin {}: {e}", path.display()))?;
+            let (got, _) = crate::verify::sha256_file(path)
+                .map_err(|e| format!("cannot hash plugin {}: {e}", path.display()))?;
             if !got.eq_ignore_ascii_case(want) {
-                return Err(format!("event release_sha256 {}… ≠ installed plugin {}…", &want[..12.min(want.len())], &got[..12]));
+                return Err(format!(
+                    "event release_sha256 {}… ≠ installed plugin {}…",
+                    &want[..12.min(want.len())],
+                    &got[..12]
+                ));
             }
         } else {
             return Err("event pins release_sha256 but this node has no target.plugin_path: the installed \
@@ -116,17 +182,100 @@ pub fn validate_event(ev: &Value, cfg: &Config, network: &str, head: Option<u64>
     Ok(h)
 }
 
+/// Round-2 review (D-10): what a fresh mainnet ARM authenticated, journaled as `mainnet_event_verified` BEFORE anything
+/// freezes, and compared OFFLINE with the config on every later run, join, rollback and unhalt. The roster is
+/// normalised (sorted producer|instance_id, instance ids lowercased) so its hash ignores order.
+pub fn mainnet_binding(cfg: &Config, chain_id: &str) -> Value {
+    use sha2::{Digest, Sha256};
+    let co = cfg.coordination.as_ref();
+    let mut roster: Vec<String> = co
+        .map(|c| {
+            c.roster
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}|{}",
+                        r.producer,
+                        r.instance_id.as_deref().unwrap_or("").to_lowercase()
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    roster.sort_unstable();
+    json!({
+        "event_id": co.and_then(|c| c.event_id.clone()),
+        "event_hash": co.and_then(|c| c.event_hash.as_ref().map(|h| h.to_lowercase())),
+        "network": co.map(|c| c.network.clone()),
+        "chain_id": chain_id.to_lowercase(),
+        "h": cfg.ceremony.freeze_height,
+        "roster_sha256": hex::encode(Sha256::digest(roster.join("\n").as_bytes())),
+        "roster_len": roster.len(),
+        "quorum": co.map(|c| c.fleet_quorum).unwrap_or(0),
+    })
+}
+
+/// Some(why) when a journal of an XPR MAINNET ceremony cannot be continued with this config: the fresh ARM's
+/// `mainnet_event_verified` binding is missing although the ceremony got past ARMED (a crash before the
+/// authentication must never let a resume skip it), or the config's event, chain, H, roster or quorum is not the one
+/// that was authenticated. Offline: no relay is needed. `state` = the journal's state (None: no journal yet).
+pub fn mainnet_binding_problem(
+    cfg: &Config,
+    journal_chain: Option<&str>,
+    state: Option<crate::state::State>,
+    binding: Option<&Value>,
+) -> Option<String> {
+    let chain = journal_chain.filter(|c| crate::config::is_xpr_mainnet(c))?;
+    // A coordinated shadow (producer mode) is bound like a real cut: its fresh ARM journals the same record, and a
+    // roster or quorum trimmed between a crash and the resume is refused for it too. Only an uncoordinated shadow
+    // (API mode, which never has a fleet gate) has nothing to compare.
+    if state.is_none() || (cfg.is_shadow() && cfg.coordination.is_none()) {
+        return None;
+    }
+    match binding {
+        None if state == Some(crate::state::State::Armed) => None, // still pre-freeze: the ARM preflight authenticates
+        None => Some("this XPR MAINNET journal has no `mainnet_event_verified` record (the signed event was never \
+                       authenticated before the freeze): refused. Nothing was changed; resolve it with the coordinator \
+                       by hand"
+            .into()),
+        Some(b) => {
+            let now = mainnet_binding(cfg, chain);
+            let fields = ["event_id", "event_hash", "network", "chain_id", "h", "roster_sha256", "quorum"];
+            let diff: Vec<String> = fields.iter()
+                .filter(|f| b.get(**f) != now.get(**f))
+                .map(|f| format!("{f}: authenticated {} vs config {}", b.get(*f).unwrap_or(&Value::Null), now[*f]))
+                .collect();
+            (!diff.is_empty()).then(|| format!(
+                "the config is not the XPR MAINNET event that was authenticated at ARM ({}): refused. Nothing was changed",
+                diff.join("; ")))
+        }
+    }
+}
+
 /// sha256 (hex) of a signed message's exact payload string: the relay's `event_hash`.
 pub fn payload_hash(msg: &Value) -> Option<String> {
     use sha2::{Digest, Sha256};
-    msg["payload"].as_str().map(|p| hex::encode(Sha256::digest(p.as_bytes())))
+    msg["payload"]
+        .as_str()
+        .map(|p| hex::encode(Sha256::digest(p.as_bytes())))
 }
 
 /// An (already signature-verified) arm payload applies to THIS accepted event.
-pub fn check_arm(arm: &Value, event_id: &str, network: &str, event_hash: &str) -> Result<(), String> {
-    if arm["type"] != "arm" { return Err("not an arm message".into()); }
-    if arm["event_id"].as_str() != Some(event_id) { return Err("arm is for another event".into()); }
-    if arm["network"].as_str() != Some(network) { return Err("arm is for another network".into()); }
+pub fn check_arm(
+    arm: &Value,
+    event_id: &str,
+    network: &str,
+    event_hash: &str,
+) -> Result<(), String> {
+    if arm["type"] != "arm" {
+        return Err("not an arm message".into());
+    }
+    if arm["event_id"].as_str() != Some(event_id) {
+        return Err("arm is for another event".into());
+    }
+    if arm["network"].as_str() != Some(network) {
+        return Err("arm is for another network".into());
+    }
     // The arm must name the exact event payload it authorizes (sha256 of the signed payload
     // string, as the relay computes it): an arm can never be replayed onto a different event body
     // published under the same id.
@@ -139,29 +288,164 @@ pub fn check_arm(arm: &Value, event_id: &str, network: &str, event_hash: &str) -
 
 /// True when `doc` (GET /api/coord/<network>) carries a valid signed abort for `event_id`.
 pub fn aborted(doc: &Value, keys: &[String], network: &str, event_id: &str) -> bool {
-    doc.get("abort").filter(|m| !m.is_null())
+    doc.get("abort")
+        .filter(|m| !m.is_null())
         .and_then(|m| verify(m, keys).ok())
-        .map(|p| p["type"] == "abort" && p["network"].as_str() == Some(network) && p["event_id"].as_str() == Some(event_id))
+        .map(|p| {
+            p["type"] == "abort"
+                && p["network"].as_str() == Some(network)
+                && p["event_id"].as_str() == Some(event_id)
+        })
         .unwrap_or(false)
 }
 
 /// rc.29: true when `doc` carries the signed `event` for `event_id` on `network` (and, when known, with exactly the
 /// payload `await` accepted). A relay answer without it (an empty store, a restore from backup, another network)
 /// says nothing about aborts: it is "unknown", never "no abort".
-pub fn carries_event(doc: &Value, keys: &[String], network: &str, event_id: &str, event_hash: Option<&str>) -> bool {
-    let Some(m) = doc.get("event").filter(|m| !m.is_null()) else { return false };
+pub fn carries_event(
+    doc: &Value,
+    keys: &[String],
+    network: &str,
+    event_id: &str,
+    event_hash: Option<&str>,
+) -> bool {
+    let Some(m) = doc.get("event").filter(|m| !m.is_null()) else {
+        return false;
+    };
     let Ok(p) = verify(m, keys) else { return false };
-    p["type"] == "event" && p["network"].as_str() == Some(network) && p["event_id"].as_str() == Some(event_id)
+    p["type"] == "event"
+        && p["network"].as_str() == Some(network)
+        && p["event_id"].as_str() == Some(event_id)
         && event_hash.is_none_or(|h| payload_hash(m).is_some_and(|x| x.eq_ignore_ascii_case(h)))
+}
+
+/// RISK-REGISTER D-10 (XPR mainnet, checked at a fresh ARM before anything freezes): the relay's answer `doc`
+/// must carry the signed event this config was derived from, and that signed payload must bind this ceremony.
+/// Checks, all fail-closed (an empty list means authenticated and bound):
+/// - the event verifies against `coordinator_keys` and sha256(payload) == `coordination.event_hash`;
+/// - type, network and event_id equal the config's;
+/// - `chain_id` is present and equals the source chain this node reports;
+/// - `h` is present and equals `ceremony.freeze_height`;
+/// - the signed roster equals the config's roster (producer + instance_id, as a set; both empty in api mode is
+///   fine), and when a roster is signed, its quorum (default: every member) equals `coordination.fleet_quorum`.
+///
+/// A relay that does not answer, or answers without our event, is NOT "no problem": the caller passes `None`.
+pub fn mainnet_event_problems(
+    doc: Option<&Value>,
+    cfg: &Config,
+    source_chain_id: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(co) = cfg.coordination.as_ref() else {
+        out.push("no [coordination] section: the signed event cannot be checked".into());
+        return out;
+    };
+    let (Some(event_id), Some(event_hash)) = (co.event_id.as_deref(), co.event_hash.as_deref())
+    else {
+        out.push("coordination.event_id / event_hash missing: run the config `pulse-cutover await` derived".into());
+        return out;
+    };
+    let Some(doc) = doc.filter(|d| d.is_object()) else {
+        out.push("the coordinator relay did not answer: the signed event cannot be authenticated (unknown is never yes)".into());
+        return out;
+    };
+    let Some(msg) = doc.get("event").filter(|m| !m.is_null()) else {
+        out.push(format!(
+            "the relay does not serve a signed event for {}: the event cannot be authenticated",
+            co.network
+        ));
+        return out;
+    };
+    let ev = match verify(msg, &co.coordinator_keys) {
+        Ok(ev) => ev,
+        Err(e) => {
+            out.push(format!(
+                "the relay's event does not verify against coordinator_keys: {e}"
+            ));
+            return out;
+        }
+    };
+    match payload_hash(msg) {
+        Some(h) if h.eq_ignore_ascii_case(event_hash) => {}
+        _ => {
+            out.push("the relay's signed event is not the payload this config was derived from (event_hash differs)".into());
+            return out;
+        }
+    }
+    if ev["type"] != "event" {
+        out.push("the signed message is not an event".into());
+    }
+    if ev["network"].as_str() != Some(co.network.as_str()) {
+        out.push(format!(
+            "the signed event's network {} is not coordination.network {}",
+            ev["network"], co.network
+        ));
+    }
+    if ev["event_id"].as_str() != Some(event_id) {
+        out.push(format!(
+            "the signed event's event_id {} is not coordination.event_id {event_id}",
+            ev["event_id"]
+        ));
+    }
+    match ev["chain_id"].as_str() {
+        Some(c) if c.eq_ignore_ascii_case(source_chain_id) => {}
+        Some(c) => out.push(format!(
+            "the signed event is for chain_id {c}, but this source is {source_chain_id}"
+        )),
+        None => out.push(
+            "the signed event names no chain_id: a mainnet event must bind the chain it cuts"
+                .into(),
+        ),
+    }
+    match ev["h"].as_u64() {
+        Some(h) if h == cfg.ceremony.freeze_height => {}
+        Some(h) => out.push(format!(
+            "the signed event's H {h} is not ceremony.freeze_height {}",
+            cfg.ceremony.freeze_height
+        )),
+        None => out.push("the signed event names no H".into()),
+    }
+    let norm = |m: &[crate::config::RosterMember]| -> std::collections::BTreeSet<(String, Option<String>)> {
+        m.iter().map(|r| (r.producer.clone(), r.instance_id.as_ref().map(|i| i.to_lowercase()))).collect()
+    };
+    let signed_roster: Vec<crate::config::RosterMember> =
+        match ev.get("roster").filter(|r| !r.is_null()) {
+            None => Vec::new(),
+            Some(r) => match serde_json::from_value(r.clone()) {
+                Ok(m) => m,
+                Err(e) => {
+                    out.push(format!("the signed event's roster is malformed: {e}"));
+                    return out;
+                }
+            },
+        };
+    if norm(&signed_roster) != norm(&co.roster) {
+        out.push("the signed event's roster differs from coordination.roster".into());
+    }
+    if !signed_roster.is_empty() {
+        let q = ev["quorum"].as_u64().unwrap_or(signed_roster.len() as u64);
+        if q as usize != co.fleet_quorum {
+            out.push(format!(
+                "the signed event's quorum {q} is not coordination.fleet_quorum {}",
+                co.fleet_quorum
+            ));
+        }
+    }
+    out
 }
 
 /// True when `doc` carries a valid signed `complete` for `event_id` (the coordinator closed an event that ran).
 /// `await` records it as a terminal tombstone: a completed event is never accepted or armed again, even by an
 /// agent whose journal directory never saw it run (a new run directory has no "ran" tombstone).
 pub fn completed(doc: &Value, keys: &[String], network: &str, event_id: &str) -> bool {
-    doc.get("complete").filter(|m| !m.is_null())
+    doc.get("complete")
+        .filter(|m| !m.is_null())
         .and_then(|m| verify(m, keys).ok())
-        .map(|p| p["type"] == "complete" && p["network"].as_str() == Some(network) && p["event_id"].as_str() == Some(event_id))
+        .map(|p| {
+            p["type"] == "complete"
+                && p["network"].as_str() == Some(network)
+                && p["event_id"].as_str() == Some(event_id)
+        })
         .unwrap_or(false)
 }
 
@@ -173,7 +457,10 @@ pub fn completed(doc: &Value, keys: &[String], network: &str, event_id: &str) ->
 // a standing abort.
 
 fn tombstone_file(cfg: &Config) -> PathBuf {
-    cfg.journal_path.parent().unwrap_or(Path::new(".")).join("coord-tombstones.json")
+    cfg.journal_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("coord-tombstones.json")
 }
 
 /// The tombstone recorded for `event_id`, if any.
@@ -208,7 +495,10 @@ pub fn record_tombstone(cfg: &Config, event_id: &str, kind: &str, reason: &str) 
     all.insert(event_id.to_string(), json!({"kind": kind, "at": chrono::Utc::now().to_rfc3339(), "reason": crate::beacon::sanitize_short(reason)}));
     let text = serde_json::to_string_pretty(&Value::Object(all)).unwrap_or_default();
     if let Err(e) = crate::secrets::write_file(&path, text.as_bytes(), false) {
-        eprintln!("await: ERROR: cannot record the {kind} decision for {event_id} in {}: {e}", path.display());
+        eprintln!(
+            "await: ERROR: cannot record the {kind} decision for {event_id} in {}: {e}",
+            path.display()
+        );
     }
 }
 
@@ -220,9 +510,15 @@ pub const MAX_ARM_AGE_MS: u64 = 15 * 60_000;
 /// An ARM's issued_at against `now_ms`: Ok, or why it cannot be acted on. A future-dated ARM is
 /// refused (saturating arithmetic used to accept it as fresh).
 pub fn arm_fresh(arm: &Value, now_ms: u64) -> Result<(), String> {
-    let t = arm["issued_at_ms"].as_u64().ok_or("arm carries no issued_at_ms")?;
+    let t = arm["issued_at_ms"]
+        .as_u64()
+        .ok_or("arm carries no issued_at_ms")?;
     if t > now_ms + MAX_ARM_FUTURE_MS {
-        return Err(format!("arm is dated {} s in the future (more than {} s of clock skew): refused", (t - now_ms) / 1000, MAX_ARM_FUTURE_MS / 1000));
+        return Err(format!(
+            "arm is dated {} s in the future (more than {} s of clock skew): refused",
+            (t - now_ms) / 1000,
+            MAX_ARM_FUTURE_MS / 1000
+        ));
     }
     if now_ms.saturating_sub(t) >= MAX_ARM_AGE_MS {
         return Err(format!("arm is older than {} min", MAX_ARM_AGE_MS / 60_000));
@@ -231,18 +527,28 @@ pub fn arm_fresh(arm: &Value, now_ms: u64) -> Result<(), String> {
 }
 
 fn state_file(cfg: &Config) -> PathBuf {
-    cfg.journal_path.parent().unwrap_or(Path::new(".")).join("coord-state.json")
+    cfg.journal_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("coord-state.json")
 }
 
 /// Coordination status the beacon reports (written by `await`).
 pub fn read_state(cfg: &Config) -> Value {
-    std::fs::read_to_string(state_file(cfg)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null)
+    std::fs::read_to_string(state_file(cfg))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null)
 }
 
 /// Write the coordination status the beacon reports. Err names the file and the OS error.
 pub fn try_write_state(cfg: &Config, v: &Value) -> Result<(), String> {
     let mut v = v.clone();
-    if let Some(r) = v.get("reason").and_then(|r| r.as_str()).map(crate::beacon::sanitize_short) {
+    if let Some(r) = v
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .map(crate::beacon::sanitize_short)
+    {
         v["reason"] = json!(r);
     }
     let path = state_file(cfg);
@@ -275,26 +581,41 @@ fn write_state(cfg: &Config, v: &Value) {
 
 /// Derived ceremony config for one event: H, event_id and the event's bindings (roster, quorum,
 /// expected snapshot hash) from the signed event. H derivation is switched OFF: H is the event's.
-pub fn derived_config(src: &Path, ev: &Value, event_hash: Option<&str>, out: &Path) -> Result<(), String> {
+pub fn derived_config(
+    src: &Path,
+    ev: &Value,
+    event_hash: Option<&str>,
+    out: &Path,
+) -> Result<(), String> {
     let h = ev["h"].as_u64().ok_or("event has no H")?;
     let event_id = ev["event_id"].as_str().ok_or("event has no event_id")?;
     let text = std::fs::read_to_string(src).map_err(|e| e.to_string())?;
     let mut doc: toml::Value = toml::from_str(&text).map_err(|e| e.to_string())?;
-    let cer = doc["ceremony"].as_table_mut().ok_or("config has no [ceremony]")?;
+    let cer = doc["ceremony"]
+        .as_table_mut()
+        .ok_or("config has no [ceremony]")?;
     cer.insert("freeze_height".into(), toml::Value::Integer(h as i64));
     cer.remove("derive_h_at_arm");
-    let co = doc["coordination"].as_table_mut().ok_or("config has no [coordination]")?;
+    let co = doc["coordination"]
+        .as_table_mut()
+        .ok_or("config has no [coordination]")?;
     co.insert("event_id".into(), toml::Value::String(event_id.into()));
     match event_hash {
-        Some(h) => { co.insert("event_hash".into(), toml::Value::String(h.into())); }
-        None => { co.remove("event_hash"); }
+        Some(h) => {
+            co.insert("event_hash".into(), toml::Value::String(h.into()));
+        }
+        None => {
+            co.remove("event_hash");
+        }
     }
     if let Some(roster) = ev.get("roster").filter(|r| r.is_array()) {
         let t: toml::Value = toml::Value::try_from(roster).map_err(|e| format!("roster: {e}"))?;
         co.insert("roster".into(), t);
         // The event decides the quorum; a local fleet_quorum is never inherited. No quorum in the
         // event means every roster member must agree.
-        let q = ev["quorum"].as_u64().unwrap_or(roster.as_array().map(|a| a.len()).unwrap_or(0) as u64);
+        let q = ev["quorum"]
+            .as_u64()
+            .unwrap_or(roster.as_array().map(|a| a.len()).unwrap_or(0) as u64);
         co.insert("fleet_quorum".into(), toml::Value::Integer(q as i64));
     }
     if let Some(sha) = ev["snapshot_sha256"].as_str() {
@@ -302,14 +623,22 @@ pub fn derived_config(src: &Path, ev: &Value, event_hash: Option<&str>, out: &Pa
             snap.insert("expected_sha256".into(), toml::Value::String(sha.into()));
         }
     }
-    std::fs::write(out, toml::to_string(&doc).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    std::fs::write(out, toml::to_string(&doc).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
 }
 
 /// `pulse-cutover await`: wait for a signed event + arm, then run the ceremony with that exact H.
 pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
-    let co = cfg.coordination.as_ref().ok_or("config has no [coordination] section")?;
-    if co.coordinator_keys.is_empty() { return Err("[coordination] coordinator_keys is empty: refusing to trust anyone".into()); }
-    let a = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
+    let co = cfg
+        .coordination
+        .as_ref()
+        .ok_or("config has no [coordination] section")?;
+    if co.coordinator_keys.is_empty() {
+        return Err("[coordination] coordinator_keys is empty: refusing to trust anyone".into());
+    }
+    let a = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .build();
     let base = co.url.trim_end_matches('/');
     // (event_id, H, sha256 of the event's signed payload): an event is identified by BOTH id and
     // body; a changed body under the same id is a different event and is validated again.
@@ -318,37 +647,84 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
     // The event id whose signed abort / tombstone was last recorded in the state file (written once).
     let mut aborted_seen: Option<String> = None;
     let mut last_note = String::new();
-    let note = |s: &str, last: &mut String| { if s != last { eprintln!("await: {s}"); *last = s.to_string(); } };
+    let note = |s: &str, last: &mut String| {
+        if s != last {
+            eprintln!("await: {s}");
+            *last = s.to_string();
+        }
+    };
     loop {
         let doc: Value = match a.get(&format!("{base}/api/coord/{}", co.network)).call() {
             Ok(r) => r.into_json().unwrap_or(Value::Null),
-            Err(e) => { note(&format!("mission control unreachable ({e}); retrying"), &mut last_note); std::thread::sleep(Duration::from_secs(3)); continue; }
+            Err(e) => {
+                note(
+                    &format!("mission control unreachable ({e}); retrying"),
+                    &mut last_note,
+                );
+                std::thread::sleep(Duration::from_secs(3));
+                continue;
+            }
         };
-        let head = a.post(&format!("{}/v1/chain/get_info", cfg.source.rpc_url.trim_end_matches('/'))).send_json(json!({}))
-            .ok().and_then(|r| r.into_json::<Value>().ok()).and_then(|v| v["head_block_num"].as_u64());
+        let head = a
+            .post(&format!(
+                "{}/v1/chain/get_info",
+                cfg.source.rpc_url.trim_end_matches('/')
+            ))
+            .send_json(json!({}))
+            .ok()
+            .and_then(|r| r.into_json::<Value>().ok())
+            .and_then(|v| v["head_block_num"].as_u64());
         // 1. event
-        match doc.get("event").filter(|m| !m.is_null()).map(|m| verify(m, &co.coordinator_keys)) {
+        match doc
+            .get("event")
+            .filter(|m| !m.is_null())
+            .map(|m| verify(m, &co.coordinator_keys))
+        {
             Some(Ok(ev)) => {
                 let id = ev["event_id"].as_str().unwrap_or("").to_string();
-                let hash = doc["event"].get("payload").and_then(|_| payload_hash(&doc["event"])).unwrap_or_default();
+                let hash = doc["event"]
+                    .get("payload")
+                    .and_then(|_| payload_hash(&doc["event"]))
+                    .unwrap_or_default();
                 let signed_abort = aborted(&doc, &co.coordinator_keys, &co.network, &id);
                 if signed_abort {
                     // Persisted at once: a relay that later omits the abort, or a restart, cannot
                     // resurrect the event.
-                    record_tombstone(cfg, &id, "aborted", "signed abort relayed by the coordinator");
-                } else if completed(&doc, &co.coordinator_keys, &co.network, &id) && tombstone(cfg, &id).is_none() {
+                    record_tombstone(
+                        cfg,
+                        &id,
+                        "aborted",
+                        "signed abort relayed by the coordinator",
+                    );
+                } else if completed(&doc, &co.coordinator_keys, &co.network, &id)
+                    && tombstone(cfg, &id).is_none()
+                {
                     // The coordinator closed this event (it ran): terminal here too, never accepted again.
-                    record_tombstone(cfg, &id, "completed", "signed complete relayed by the coordinator");
+                    record_tombstone(
+                        cfg,
+                        &id,
+                        "completed",
+                        "signed complete relayed by the coordinator",
+                    );
                 }
                 if let Some(t) = tombstone(cfg, &id).filter(|t| t["kind"] != "aborted") {
                     // Missed or already run on this node: terminal for this id.
                     if aborted_seen.as_deref() != Some(id.as_str()) {
-                        write_state(cfg, &json!({"event_id": id, "accepted": false, "armed": false, "terminal": t["kind"],
-                            "reason": format!("event {id} is terminal on this node ({})", t["kind"].as_str().unwrap_or("?")), "at": chrono::Utc::now().to_rfc3339()}));
+                        write_state(
+                            cfg,
+                            &json!({"event_id": id, "accepted": false, "armed": false, "terminal": t["kind"],
+                            "reason": format!("event {id} is terminal on this node ({})", t["kind"].as_str().unwrap_or("?")), "at": chrono::Utc::now().to_rfc3339()}),
+                        );
                         aborted_seen = Some(id.clone());
                     }
                     accepted = None;
-                    note(&format!("event {id} is terminal on this node ({}): waiting for a new event", t["kind"].as_str().unwrap_or("?")), &mut last_note);
+                    note(
+                        &format!(
+                            "event {id} is terminal on this node ({}): waiting for a new event",
+                            t["kind"].as_str().unwrap_or("?")
+                        ),
+                        &mut last_note,
+                    );
                 } else if signed_abort || is_tombstoned(cfg, &id) {
                     // A signed abort is final for its event id, whatever the event body (a new
                     // attempt is a new event id): never (re-)accept it. Without this the loop
@@ -357,23 +733,39 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
                     // abort accepted the aborted event.
                     if aborted_seen.as_deref() != Some(id.as_str()) {
                         let was_accepted = accepted.as_ref().is_some_and(|(x, _, _)| x == &id);
-                        write_state(cfg, &json!({"event_id": id, "accepted": was_accepted, "armed": false, "aborted": true,
-                            "at": chrono::Utc::now().to_rfc3339()}));
+                        write_state(
+                            cfg,
+                            &json!({"event_id": id, "accepted": was_accepted, "armed": false, "aborted": true,
+                            "at": chrono::Utc::now().to_rfc3339()}),
+                        );
                         aborted_seen = Some(id.clone());
                     }
                     accepted = None;
                     note(&format!("event {id} is aborted by the coordinator (signed); waiting for a new event"), &mut last_note);
-                } else if accepted.as_ref().map(|(x, _, hx)| x != &id || hx != &hash).unwrap_or(true) {
+                } else if accepted
+                    .as_ref()
+                    .map(|(x, _, hx)| x != &id || hx != &hash)
+                    .unwrap_or(true)
+                {
                     accepted = None;
                     match validate_event(&ev, cfg, &co.network, head, co.min_lead_blocks) {
                         Ok(h) => {
                             accepted = Some((id.clone(), h, hash.clone()));
                             accepted_ev = ev.clone();
-                            write_state(cfg, &json!({"event_id": id, "h": h, "accepted": true, "armed": false, "at": chrono::Utc::now().to_rfc3339()}));
-                            note(&format!("accepted event {id}: cut at H = {h}"), &mut last_note);
+                            write_state(
+                                cfg,
+                                &json!({"event_id": id, "h": h, "accepted": true, "armed": false, "at": chrono::Utc::now().to_rfc3339()}),
+                            );
+                            note(
+                                &format!("accepted event {id}: cut at H = {h}"),
+                                &mut last_note,
+                            );
                         }
                         Err(e) => {
-                            write_state(cfg, &json!({"event_id": id, "accepted": false, "reason": e}));
+                            write_state(
+                                cfg,
+                                &json!({"event_id": id, "accepted": false, "reason": e}),
+                            );
                             note(&format!("REJECTED event {id}: {e}"), &mut last_note);
                         }
                     }
@@ -383,7 +775,12 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
             None => note("no event published; waiting", &mut last_note),
         }
         // 2. arm (an aborted event never reaches here: step 1 dropped it)
-        if let (Some((id, h, ev_hash)), Some(Ok(arm))) = (&accepted, doc.get("arm").filter(|m| !m.is_null()).map(|m| verify(m, &co.coordinator_keys))) {
+        if let (Some((id, h, ev_hash)), Some(Ok(arm))) = (
+            &accepted,
+            doc.get("arm")
+                .filter(|m| !m.is_null())
+                .map(|m| verify(m, &co.coordinator_keys)),
+        ) {
             let bound = check_arm(&arm, id, &co.network, ev_hash);
             if let Err(e) = &bound {
                 if arm["event_id"].as_str() == Some(id.as_str()) {
@@ -392,18 +789,28 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
             }
             if bound.is_ok() {
                 let fresh = arm_fresh(&arm, chrono::Utc::now().timestamp_millis() as u64);
-                let confirm = cfg.journal_path.parent().unwrap_or(Path::new(".")).join(format!("confirm-{id}"));
+                let confirm = cfg
+                    .journal_path
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join(format!("confirm-{id}"));
                 let missed = head.is_some_and(|x| *h < x + co.min_lead_blocks / 2);
                 if let Err(why) = &fresh {
                     note(&format!("ignoring arm for {id}: {why}"), &mut last_note);
                 } else if is_tombstoned(cfg, id) {
-                    note(&format!("arm for {id} ignored: the event is aborted"), &mut last_note);
+                    note(
+                        &format!("arm for {id} ignored: the event is aborted"),
+                        &mut last_note,
+                    );
                 } else if missed {
                     // The window is gone for good (H too close to, or behind, the head): a terminal
                     // decision, recorded and reported, not a loop that re-reads the same ARM forever.
                     let why = format!("ARM for {id} missed its window: H {h} is too close to head {head:?} (needs {} blocks of lead)", co.min_lead_blocks / 2);
                     record_tombstone(cfg, id, "missed", &why);
-                    write_state(cfg, &json!({"event_id": id, "h": h, "accepted": true, "armed": false, "terminal": "missed", "reason": why, "at": chrono::Utc::now().to_rfc3339()}));
+                    write_state(
+                        cfg,
+                        &json!({"event_id": id, "h": h, "accepted": true, "armed": false, "terminal": "missed", "reason": why, "at": chrono::Utc::now().to_rfc3339()}),
+                    );
                     eprintln!("await: {why}. Not starting; this event is terminal on this node (publish a new event).");
                     return Ok(3);
                 } else if !co.auto_arm && !confirm.exists() {
@@ -411,15 +818,37 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
                 } else if head.is_none() {
                     note(&format!("ARM received for {id} but the source head is unknown; not starting yet"), &mut last_note);
                 } else {
-                    let derived = cfg.journal_path.parent().unwrap_or(Path::new(".")).join(format!("ceremony-{id}.toml"));
-                    derived_config(config_path, &accepted_ev, accepted.as_ref().map(|(_, _, hx)| hx.as_str()), &derived)?;
-                    write_state(cfg, &json!({"event_id": id, "h": h, "accepted": true, "armed": true, "at": chrono::Utc::now().to_rfc3339()}));
+                    let derived = cfg
+                        .journal_path
+                        .parent()
+                        .unwrap_or(Path::new("."))
+                        .join(format!("ceremony-{id}.toml"));
+                    derived_config(
+                        config_path,
+                        &accepted_ev,
+                        accepted.as_ref().map(|(_, _, hx)| hx.as_str()),
+                        &derived,
+                    )?;
+                    write_state(
+                        cfg,
+                        &json!({"event_id": id, "h": h, "accepted": true, "armed": true, "at": chrono::Utc::now().to_rfc3339()}),
+                    );
                     eprintln!("await: ARMED by signed coordinator message for {id}: running the ceremony at H = {h}");
                     // Recorded before the run starts: a restarted `await` never arms the same event
                     // again (the ceremony itself resumes from its journal with `run`).
-                    record_tombstone(cfg, id, "ran", "this node started the ceremony for this event");
-                    let status = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-                        .args(["run", "--config"]).arg(&derived).status().map_err(|e| e.to_string())?;
+                    record_tombstone(
+                        cfg,
+                        id,
+                        "ran",
+                        "this node started the ceremony for this event",
+                    );
+                    let status = std::process::Command::new(
+                        std::env::current_exe().map_err(|e| e.to_string())?,
+                    )
+                    .args(["run", "--config"])
+                    .arg(&derived)
+                    .status()
+                    .map_err(|e| e.to_string())?;
                     return Ok(status.code().unwrap_or(1));
                 }
             }
@@ -437,7 +866,10 @@ mod tests {
     /// payload. The vector is shared with control/test (control/test/fixtures/event-hash-vector.json).
     #[test]
     fn event_hash_matches_the_shared_control_vector() {
-        let v: Value = serde_json::from_str(include_str!("../control/test/fixtures/event-hash-vector.json")).unwrap();
+        let v: Value = serde_json::from_str(include_str!(
+            "../control/test/fixtures/event-hash-vector.json"
+        ))
+        .unwrap();
         let msg = serde_json::json!({ "payload": v["payload"].as_str().unwrap() });
         assert_eq!(payload_hash(&msg).as_deref(), v["event_hash"].as_str());
     }
@@ -452,7 +884,10 @@ mod tests {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let other = SigningKey::from_bytes(&[9u8; 32]);
         let keys = vec![hex::encode(sk.verifying_key().to_bytes())];
-        let m = signed(&sk, &json!({"type": "event", "network": "rehearsal", "event_id": "e1", "h": 100}));
+        let m = signed(
+            &sk,
+            &json!({"type": "event", "network": "rehearsal", "event_id": "e1", "h": 100}),
+        );
         assert_eq!(verify(&m, &keys).unwrap()["h"], 100);
         // wrong key
         assert!(verify(&signed(&other, &json!({"type": "event"})), &keys).is_err());
@@ -474,7 +909,10 @@ mod tests {
         derived_config(&src, &ev, None, &out).unwrap();
         let d: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(d["ceremony"]["freeze_height"].as_integer(), Some(900));
-        assert!(d["ceremony"].get("derive_h_at_arm").is_none(), "H must come from the event, not be derived");
+        assert!(
+            d["ceremony"].get("derive_h_at_arm").is_none(),
+            "H must come from the event, not be derived"
+        );
         assert_eq!(d["coordination"]["event_id"].as_str(), Some("e7"));
         assert_eq!(d["coordination"]["fleet_quorum"].as_integer(), Some(2));
         assert_eq!(d["coordination"]["roster"].as_array().unwrap().len(), 2);
@@ -486,13 +924,26 @@ mod tests {
         // Review #4: a correctly signed arm carrying the WRONG event_hash started the ceremony.
         let arm = |h: &str| json!({"type": "arm", "network": "testnet", "event_id": "e1", "event_hash": h});
         assert!(check_arm(&arm("aa"), "e1", "testnet", "aa").is_ok());
-        assert!(check_arm(&arm("bb"), "e1", "testnet", "aa").unwrap_err().contains("event_hash"));
-        assert!(check_arm(&json!({"type": "arm", "network": "testnet", "event_id": "e1"}), "e1", "testnet", "aa").is_err(),
-            "an arm without event_hash is not bound to any payload");
+        assert!(check_arm(&arm("bb"), "e1", "testnet", "aa")
+            .unwrap_err()
+            .contains("event_hash"));
+        assert!(
+            check_arm(
+                &json!({"type": "arm", "network": "testnet", "event_id": "e1"}),
+                "e1",
+                "testnet",
+                "aa"
+            )
+            .is_err(),
+            "an arm without event_hash is not bound to any payload"
+        );
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let ev = signed(&sk, &json!({"type": "event", "event_id": "e1"}));
         use sha2::{Digest, Sha256};
-        assert_eq!(payload_hash(&ev).unwrap(), hex::encode(Sha256::digest(ev["payload"].as_str().unwrap().as_bytes())));
+        assert_eq!(
+            payload_hash(&ev).unwrap(),
+            hex::encode(Sha256::digest(ev["payload"].as_str().unwrap().as_bytes()))
+        );
     }
 
     #[test]
@@ -505,7 +956,10 @@ mod tests {
              [snapshot]\nstaged_path = \"/s\"\n[target]\nmetalgo_unit = \"m\"\nrpc_url = \"http://m\"\n", dir.path().display())).unwrap();
         let cfg = Config::load(&cfg_path).unwrap();
         let err = try_write_state(&cfg, &json!({"event_id": "e1"})).unwrap_err();
-        assert!(err.contains("cannot write coordination state") && err.contains("coord-state.json"), "{err}");
+        assert!(
+            err.contains("cannot write coordination state") && err.contains("coord-state.json"),
+            "{err}"
+        );
         write_state(&cfg, &json!({"event_id": "e1"})); // logs, never panics
         std::fs::create_dir_all(dir.path().join("missing-dir")).unwrap();
         try_write_state(&cfg, &json!({"event_id": "e1"})).unwrap();
@@ -531,23 +985,40 @@ mod tests {
         let again = readiness_cfg(dir.path()); // a "restart": a fresh config, same directory
         assert!(is_tombstoned(&again, "e1"));
         record_tombstone(&again, "e1", "ran", "later");
-        assert_eq!(tombstone(&again, "e1").unwrap()["kind"], "aborted", "an abort is never overwritten");
+        assert_eq!(
+            tombstone(&again, "e1").unwrap()["kind"],
+            "aborted",
+            "an abort is never overwritten"
+        );
         record_tombstone(&again, "e2", "missed", "too late");
-        assert!(!is_tombstoned(&again, "e2"), "missed is terminal but not an abort");
+        assert!(
+            !is_tombstoned(&again, "e2"),
+            "missed is terminal but not an abort"
+        );
         assert_eq!(tombstone(&again, "e2").unwrap()["kind"], "missed");
         // A corrupt store is not overwritten (and an abort recorded there stays someone's problem to fix).
         std::fs::write(dir.path().join("coord-tombstones.json"), "{oops").unwrap();
         record_tombstone(&again, "e3", "ran", "x");
-        assert_eq!(std::fs::read_to_string(dir.path().join("coord-tombstones.json")).unwrap(), "{oops");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("coord-tombstones.json")).unwrap(),
+            "{oops"
+        );
     }
 
     #[test]
     fn arm_freshness_refuses_future_dated_and_stale_arms() {
         let now = 1_000_000_000_000u64;
         assert!(arm_fresh(&json!({"issued_at_ms": now - 1000}), now).is_ok());
-        assert!(arm_fresh(&json!({"issued_at_ms": now + 60_000}), now).is_ok(), "small clock skew");
-        assert!(arm_fresh(&json!({"issued_at_ms": now + 3_600_000}), now).unwrap_err().contains("future"));
-        assert!(arm_fresh(&json!({"issued_at_ms": now - 16 * 60_000}), now).unwrap_err().contains("older"));
+        assert!(
+            arm_fresh(&json!({"issued_at_ms": now + 60_000}), now).is_ok(),
+            "small clock skew"
+        );
+        assert!(arm_fresh(&json!({"issued_at_ms": now + 3_600_000}), now)
+            .unwrap_err()
+            .contains("future"));
+        assert!(arm_fresh(&json!({"issued_at_ms": now - 16 * 60_000}), now)
+            .unwrap_err()
+            .contains("older"));
         assert!(arm_fresh(&json!({}), now).is_err());
     }
 
@@ -571,9 +1042,17 @@ mod tests {
         assert!(completed(&doc, &keys, "rehearsal", "e1"));
         assert!(!completed(&doc, &keys, "rehearsal", "e2"));
         assert!(!completed(&doc, &keys, "mainnet", "e1"));
-        assert!(!completed(&json!({"complete": null}), &keys, "rehearsal", "e1"));
+        assert!(!completed(
+            &json!({"complete": null}),
+            &keys,
+            "rehearsal",
+            "e1"
+        ));
         let forged = json!({"complete": signed(&other, &json!({"type": "complete", "network": "rehearsal", "event_id": "e1"}))});
-        assert!(!completed(&forged, &keys, "rehearsal", "e1"), "only configured coordinator keys");
+        assert!(
+            !completed(&forged, &keys, "rehearsal", "e1"),
+            "only configured coordinator keys"
+        );
         // an abort is not a complete
         let ab = json!({"complete": signed(&sk, &json!({"type": "abort", "network": "rehearsal", "event_id": "e1"}))});
         assert!(!completed(&ab, &keys, "rehearsal", "e1"));

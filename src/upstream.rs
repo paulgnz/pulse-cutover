@@ -29,22 +29,12 @@
 
 use std::{
     collections::BTreeMap,
-    path::{
-        Path,
-        PathBuf,
-    },
+    path::{Path, PathBuf},
 };
 
-use serde_json::{
-    Value,
-    json,
-};
+use serde_json::{json, Value};
 
-use crate::{
-    config::Upstream,
-    ops::ChainOps,
-    verify,
-};
+use crate::{config::Upstream, ops::ChainOps, verify};
 
 #[derive(Debug, Clone)]
 pub struct UpstreamOutcome {
@@ -114,8 +104,7 @@ pub fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
 
 fn fresh_dir(path: &Path) -> Result<(), String> {
     if path.exists() {
-        std::fs::remove_dir_all(path)
-            .map_err(|e| format!("clear {}: {e}", path.display()))?;
+        std::fs::remove_dir_all(path).map_err(|e| format!("clear {}: {e}", path.display()))?;
     }
     std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))
 }
@@ -140,16 +129,23 @@ struct SidecarAccountSeq {
 /// that is not the cut's, no per-account rows, a zero global sequence, and recv_sequences that do
 /// not sum to global_action_sequence (every receipt bumps both once).
 pub fn check_sidecar(path: &Path, chain_id: &str, cut_block_id: &str) -> Result<Value, String> {
-    let f = std::fs::File::open(path).map_err(|e| format!("open sidecar {}: {e}", path.display()))?;
-    let sc: SidecarSeq = serde_json::from_reader(std::io::BufReader::new(f))
-        .map_err(|e| format!("sidecar {} is not valid JSON of the expected shape: {e}", path.display()))?;
+    let f =
+        std::fs::File::open(path).map_err(|e| format!("open sidecar {}: {e}", path.display()))?;
+    let sc: SidecarSeq = serde_json::from_reader(std::io::BufReader::new(f)).map_err(|e| {
+        format!(
+            "sidecar {} is not valid JSON of the expected shape: {e}",
+            path.display()
+        )
+    })?;
     let src = sc.source_chain_id.as_deref().ok_or(
         "sidecar has no source_chain_id: it predates full-state export, so per-account action \
          sequence counters would be missing or unchecked (history paging would reset at the cut). \
          Re-export with the current deferred-sidecar plugin",
     )?;
     if !chain_id.is_empty() && !src.eq_ignore_ascii_case(chain_id) {
-        return Err(format!("sidecar source_chain_id {src} is not this chain ({chain_id})"));
+        return Err(format!(
+            "sidecar source_chain_id {src} is not this chain ({chain_id})"
+        ));
     }
     if !sc.source_block_id.eq_ignore_ascii_case(cut_block_id) {
         return Err(format!(
@@ -158,14 +154,22 @@ pub fn check_sidecar(path: &Path, chain_id: &str, cut_block_id: &str) -> Result<
         ));
     }
     if sc.account_metadata.is_empty() {
-        return Err("sidecar has no account_metadata rows: every account's recv/auth/code/abi \
+        return Err(
+            "sidecar has no account_metadata rows: every account's recv/auth/code/abi \
                     sequence would restart at 0"
-            .into());
+                .into(),
+        );
     }
     if sc.global_action_sequence == 0 {
-        return Err("sidecar global_action_sequence is 0: the global action sequence would restart".into());
+        return Err(
+            "sidecar global_action_sequence is 0: the global action sequence would restart".into(),
+        );
     }
-    let sum_recv: u128 = sc.account_metadata.iter().map(|a| a.recv_sequence as u128).sum();
+    let sum_recv: u128 = sc
+        .account_metadata
+        .iter()
+        .map(|a| a.recv_sequence as u128)
+        .sum();
     // Every receipt bumps the global sequence once and exactly one receiver's recv_sequence once, so on a
     // chain that started at genesis these are equal. Proven exact on a real XPR testnet export (2026-10-01:
     // 1,983,236,481 both): a mismatch means counters were lost or altered, and history paging would break.
@@ -207,12 +211,163 @@ impl From<&str> for PipelineError {
 }
 
 /// One pipeline step's external command, cut short if `abort` fires while it runs.
-fn step<O: ChainOps>(ops: &O, cmd: &str, during: &'static str, abort: &mut impl FnMut(bool) -> bool)
-    -> Result<Result<String, String>, PipelineError> {
+fn step<O: ChainOps>(
+    ops: &O,
+    cmd: &str,
+    during: &'static str,
+    abort: &mut impl FnMut(bool) -> bool,
+) -> Result<Result<String, String>, PipelineError> {
     match ops.run_long_cancellable(cmd, &mut || abort(false)) {
         Ok(Some(out)) => Ok(Ok(out)),
         Ok(None) => Err(PipelineError::Aborted { during }),
         Err(e) => Ok(Err(e)),
+    }
+}
+
+/// How the pipeline runs its four external steps.
+///
+/// - [`PipelineExec::Shell`] (the ceremony, unchanged): `export_cmd` is the operator's shell template and the three
+///   tools run as quoted shell strings through `run_long_cancellable`.
+/// - [`PipelineExec::Argv`] (the readiness drill, r30 round 4): NOTHING runs through a shell. The export is a fixed
+///   `docker run` argument vector built from the explicit `[upstream] export_image` / `export_tools_dir` /
+///   `chain_state_db_size_mb` fields ([`drill_export_argv`]), and the tools run by argument vector
+///   (`run_argv_cancellable`), so no configured text can smuggle another command into a drill.
+#[derive(Debug, Clone)]
+pub enum PipelineExec {
+    Shell,
+    Argv(DrillExport),
+}
+
+/// The drill's export: the published Leap 5.0.3 sidecar image and the export tools directory, mounted read-only.
+#[derive(Debug, Clone)]
+pub struct DrillExport {
+    /// Pinned by digest (`name@sha256:<64 hex>`, r30 round 5).
+    pub image: String,
+    pub tools_dir: PathBuf,
+    pub chain_state_db_size_mb: u64,
+    /// The docker CLI by absolute path (pinned by sha256 in the drill; never looked up through PATH).
+    pub docker_bin: PathBuf,
+    /// The LOCAL daemon socket, passed explicitly as `--host unix://<socket>`.
+    pub docker_socket: PathBuf,
+    /// r30 round 5: the container's name, chosen before it is created and journaled first, so a cancel can stop the
+    /// container itself (killing the docker CLI does not stop a daemon-managed container).
+    pub container_name: String,
+    /// `--cidfile`: docker writes the container id there (it refuses an existing file).
+    pub cidfile: PathBuf,
+}
+
+/// `<docker_bin> --host unix://<socket>`: the start of every docker argument vector a drill runs.
+pub fn drill_docker_prefix(docker_bin: &Path, socket: &Path) -> Vec<String> {
+    vec![
+        docker_bin.display().to_string(),
+        "--host".into(),
+        format!("unix://{}", socket.display()),
+    ]
+}
+
+/// Inside the image: where the sidecar image keeps nodeos and the pinned Leap checkout (the published
+/// `leap-sidecar:5.0.3` layout export.sh's preflight checks).
+pub const DRILL_EXPORT_NODEOS: &str = "/usr/local/bin/nodeos";
+pub const DRILL_EXPORT_XPR_CORE: &str = "/src/leap";
+/// export.sh's own timeout for the export nodeos (seconds).
+pub const DRILL_EXPORT_TIMEOUT_SECS: u64 = 7200;
+
+/// The fixed `docker run` argument vector of a drill's export: no shell, no network, the snapshot and the tools
+/// mounted read-only, output only into the drill's fresh export directory. Err when a host path cannot be expressed
+/// in docker's `-v src:dst[:ro]` syntax unambiguously (a `:` or `,` in it, or a relative path).
+pub fn drill_export_argv(
+    ex: &DrillExport,
+    export_dir: &Path,
+    snapshot: &Path,
+) -> Result<Vec<String>, String> {
+    let mount = |p: &Path, what: &str| -> Result<String, String> {
+        let s = p.display().to_string();
+        if !p.is_absolute() || s.contains(':') || s.contains(',') || s.contains('\n') {
+            return Err(format!(
+                "{what} {s} cannot be mounted unambiguously (absolute, no ':' or ',')"
+            ));
+        }
+        Ok(s)
+    };
+    if !ex.docker_bin.is_absolute() || !ex.docker_socket.is_absolute() {
+        return Err("docker_bin and docker_socket must be absolute paths".into());
+    }
+    let name_ok = !ex.container_name.is_empty()
+        && ex.container_name.len() <= 64
+        && ex
+            .container_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !name_ok {
+        return Err(format!(
+            "container name {:?} is not a plain name",
+            ex.container_name
+        ));
+    }
+    let mut argv = drill_docker_prefix(&ex.docker_bin, &ex.docker_socket);
+    argv.extend([
+        "run".to_string(),
+        "--rm".into(),
+        "--name".into(),
+        ex.container_name.clone(),
+        "--cidfile".into(),
+        mount(&ex.cidfile, "cidfile")?,
+        "--network".into(),
+        "none".into(),
+    ]);
+    argv.extend(vec![
+        "-v".into(),
+        format!("{}:/out", mount(export_dir, "export dir")?),
+        "-v".into(),
+        format!("{}:/in/cut.bin:ro", mount(snapshot, "snapshot")?),
+        "-v".into(),
+        format!("{}:/xce:ro", mount(&ex.tools_dir, "export_tools_dir")?),
+        "--entrypoint".into(),
+        "bash".into(),
+        ex.image.clone(),
+        "/xce/export.sh".into(),
+        "--nodeos".into(),
+        DRILL_EXPORT_NODEOS.into(),
+        "--xpr-core".into(),
+        DRILL_EXPORT_XPR_CORE.into(),
+        "--snapshot".into(),
+        "/in/cut.bin".into(),
+        "--work-dir".into(),
+        "/out/export".into(),
+        "--chain-state-db-size-mb".into(),
+        ex.chain_state_db_size_mb.to_string(),
+        "--timeout-seconds".into(),
+        DRILL_EXPORT_TIMEOUT_SECS.to_string(),
+        "--deferred-sidecar".into(),
+        "/out/deferred-transactions.json".into(),
+    ]);
+    Ok(argv)
+}
+
+/// The ceremony's quoted shell form of a tool's argument vector: byte-for-byte what the pipeline always ran
+/// (`'<bin>' '<arg>' …`).
+fn quoted(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| format!("'{a}'"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Run one tool step in the given mode.
+fn tool_step<O: ChainOps>(
+    ops: &O,
+    exec: &PipelineExec,
+    argv: &[String],
+    during: &'static str,
+    abort: &mut impl FnMut(bool) -> bool,
+) -> Result<Result<String, String>, PipelineError> {
+    match exec {
+        PipelineExec::Shell => step(ops, &quoted(argv), during, abort),
+        PipelineExec::Argv(_) => match ops.run_argv_cancellable(argv, &mut || abort(false)) {
+            Ok(Some(out)) => Ok(Ok(out)),
+            Ok(None) => Err(PipelineError::Aborted { during }),
+            Err(e) => Ok(Err(e)),
+        },
     }
 }
 
@@ -233,11 +388,41 @@ pub fn run_pipeline<O: ChainOps>(
     cut_height: u64,
     cut_block_id: &str,
     chain_id: &str,
+    progress: impl FnMut(Value),
+    abort: impl FnMut(bool) -> bool,
+) -> Result<UpstreamOutcome, PipelineError> {
+    run_pipeline_exec(
+        up,
+        ops,
+        &PipelineExec::Shell,
+        snapshot,
+        snapshot_sha256,
+        cut_height,
+        cut_block_id,
+        chain_id,
+        progress,
+        abort,
+    )
+}
+
+/// [`run_pipeline`] with an explicit [`PipelineExec`]: `Shell` is the ceremony's path, `Argv` the drill's.
+#[allow(clippy::too_many_arguments)]
+pub fn run_pipeline_exec<O: ChainOps>(
+    up: &Upstream,
+    ops: &O,
+    exec: &PipelineExec,
+    snapshot: &Path,
+    snapshot_sha256: &str,
+    cut_height: u64,
+    cut_block_id: &str,
+    chain_id: &str,
     mut progress: impl FnMut(Value),
     mut abort: impl FnMut(bool) -> bool,
 ) -> Result<UpstreamOutcome, PipelineError> {
     if abort(true) {
-        return Err(PipelineError::Aborted { during: "before export" });
+        return Err(PipelineError::Aborted {
+            during: "before export",
+        });
     }
     std::fs::create_dir_all(&up.work_dir)
         .map_err(|e| format!("create upstream work_dir {}: {e}", up.work_dir.display()))?;
@@ -256,14 +441,27 @@ pub fn run_pipeline<O: ChainOps>(
         }
         None => {
             fresh_dir(&export_dir)?;
-            let cmd = up
-                .export_cmd
-                .replace("{snapshot}", &snapshot.display().to_string())
-                .replace("{export_dir}", &export_dir.display().to_string());
-            progress(json!({"upstream_export_cmd": cmd}));
-            let started = ops.now_ms();
-            let out = step(ops, &cmd, "export", &mut abort)?
-                .map_err(|e| format!("upstream export_cmd failed: {e}"))?;
+            let started;
+            let out = match exec {
+                PipelineExec::Shell => {
+                    let cmd = up
+                        .export_cmd
+                        .replace("{snapshot}", &snapshot.display().to_string())
+                        .replace("{export_dir}", &export_dir.display().to_string());
+                    progress(json!({"upstream_export_cmd": cmd}));
+                    started = ops.now_ms();
+                    step(ops, &cmd, "export", &mut abort)?
+                        .map_err(|e| format!("upstream export_cmd failed: {e}"))?
+                }
+                PipelineExec::Argv(ex) => {
+                    let argv = drill_export_argv(ex, &export_dir, snapshot)?;
+                    progress(json!({"upstream_export_argv": argv}));
+                    started = ops.now_ms();
+                    tool_step(ops, exec, &argv, "export", &mut abort)?.map_err(|e| {
+                        format!("export (docker, fixed argument vector) failed: {e}")
+                    })?
+                }
+            };
             let log = find_file(&export_dir, "chain_state_history.log").ok_or(
                 "export_cmd succeeded but no chain_state_history.log found under the export dir",
             )?;
@@ -311,7 +509,9 @@ pub fn run_pipeline<O: ChainOps>(
     }
     progress(json!({"upstream_export_manifest": manifest_env}));
     if abort(true) {
-        return Err(PipelineError::Aborted { during: "after export" });
+        return Err(PipelineError::Aborted {
+            during: "after export",
+        });
     }
 
     // ---- 2. xpr_import_check: SHiP log -> Arena checkpoint + manifest ----
@@ -321,15 +521,15 @@ pub fn run_pipeline<O: ChainOps>(
     let _ = std::fs::remove_file(&checkpoint_path);
     let _ = std::fs::remove_file(manifest_json_path(&checkpoint_path));
     let started = ops.now_ms();
-    let import_cmd = format!(
-        "'{}' '{}' '{}' '{}' '{}'",
-        up.import_bin.display(),
-        ship_log.display(),
-        arena_import.display(),
-        checkpoint_path.display(),
-        sidecar.display()
-    );
-    let import_out = step(ops, &import_cmd, "import", &mut abort)?
+    let import_argv: Vec<String> = [
+        up.import_bin.display().to_string(),
+        ship_log.display().to_string(),
+        arena_import.display().to_string(),
+        checkpoint_path.display().to_string(),
+        sidecar.display().to_string(),
+    ]
+    .into();
+    let import_out = tool_step(ops, exec, &import_argv, "import", &mut abort)?
         .map_err(|e| format!("xpr_import_check failed: {e}"))?;
     let checkpoint_manifest: Value = serde_json::from_str(
         &std::fs::read_to_string(manifest_json_path(&checkpoint_path))
@@ -374,7 +574,9 @@ pub fn run_pipeline<O: ChainOps>(
     }
 
     if abort(true) {
-        return Err(PipelineError::Aborted { during: "after import" });
+        return Err(PipelineError::Aborted {
+            during: "after import",
+        });
     }
 
     // ---- 3. xpr_19_table_compare: THE verification gate (when staged) ----
@@ -382,23 +584,25 @@ pub fn run_pipeline<O: ChainOps>(
         Some(bin) => {
             let arena_cmp = up.work_dir.join(format!("arena-compare-{cut_height}"));
             fresh_dir(&arena_cmp)?;
-            let report = up.work_dir.join(format!("compare-report-{cut_height}.json"));
+            let report = up
+                .work_dir
+                .join(format!("compare-report-{cut_height}.json"));
             let _ = std::fs::remove_file(&report);
             let started = ops.now_ms();
             // A non-zero exit (any nodeos-vs-Arena table difference) is a
             // verification FAILURE, unless (rehearsal only) every failing table it names is on
             // the explicit allowlist.
-            let compare_cmd = format!(
-                "'{}' '{}' '{}' '{}' '{}' '{}' '{}'",
-                bin.display(),
-                ship_log.display(),
-                checkpoint_path.display(),
-                arena_cmp.display(),
-                chain_id,
-                sidecar.display(),
-                report.display()
-            );
-            let res = step(ops, &compare_cmd, "table compare", &mut abort)?;
+            let compare_argv: Vec<String> = [
+                bin.display().to_string(),
+                ship_log.display().to_string(),
+                checkpoint_path.display().to_string(),
+                arena_cmp.display().to_string(),
+                chain_id.to_string(),
+                sidecar.display().to_string(),
+                report.display().to_string(),
+            ]
+            .into();
+            let res = tool_step(ops, exec, &compare_argv, "table compare", &mut abort)?;
             let wall = ops.now_ms().saturating_sub(started);
             match res {
                 Ok(out) => {
@@ -406,7 +610,9 @@ pub fn run_pipeline<O: ChainOps>(
                     // table (a tool that compared nothing, or a different tool, must not certify).
                     let missing = compare_missing_tables(&out, &[]);
                     if !missing.is_empty() {
-                        progress(json!({"upstream_19_table_compare": {"result": "INCOMPLETE", "missing_tables": missing, "output": out}}));
+                        progress(
+                            json!({"upstream_19_table_compare": {"result": "INCOMPLETE", "missing_tables": missing, "output": out}}),
+                        );
                         return Err(PipelineError::Failed(format!(
                             "xpr_19_table_compare exited 0 but did not report a matching line for every required table \
                              (missing: {}): not a verification",
@@ -441,8 +647,15 @@ pub fn run_pipeline<O: ChainOps>(
                         }
                     }
                     let missing = compare_missing_tables(&e, &failing);
-                    if !missing.is_empty() && !allow.is_empty() && not_allowed.is_empty() && !failing.is_empty() {
-                        not_allowed.push(format!("required table(s) not reported: {}", missing.join(", ")));
+                    if !missing.is_empty()
+                        && !allow.is_empty()
+                        && not_allowed.is_empty()
+                        && !failing.is_empty()
+                    {
+                        not_allowed.push(format!(
+                            "required table(s) not reported: {}",
+                            missing.join(", ")
+                        ));
                     }
                     if allow.is_empty() || failing.is_empty() || !not_allowed.is_empty() {
                         progress(json!({
@@ -459,7 +672,8 @@ pub fn run_pipeline<O: ChainOps>(
                         let why = if allow.is_empty() {
                             String::new()
                         } else if failing.is_empty() {
-                            " (the failure names no table, so the rehearsal allowlist cannot apply)".to_string()
+                            " (the failure names no table, so the rehearsal allowlist cannot apply)"
+                                .to_string()
                         } else {
                             format!(
                                 " (not on the rehearsal allowlist, or not the known difference: {})",
@@ -500,19 +714,21 @@ pub fn run_pipeline<O: ChainOps>(
     };
 
     if abort(true) {
-        return Err(PipelineError::Aborted { during: "after table compare" });
+        return Err(PipelineError::Aborted {
+            during: "after table compare",
+        });
     }
 
     // ---- 4. xpr_state_fingerprint: whole-state root (cross-node golden) ----
     let arena_fp = up.work_dir.join(format!("arena-fingerprint-{cut_height}"));
     fresh_dir(&arena_fp)?;
-    let fp_cmd = format!(
-        "'{}' '{}' '{}'",
-        up.fingerprint_bin.display(),
-        checkpoint_path.display(),
-        arena_fp.display()
-    );
-    let fp_out = step(ops, &fp_cmd, "state fingerprint", &mut abort)?
+    let fp_argv: Vec<String> = [
+        up.fingerprint_bin.display().to_string(),
+        checkpoint_path.display().to_string(),
+        arena_fp.display().to_string(),
+    ]
+    .into();
+    let fp_out = tool_step(ops, exec, &fp_argv, "state fingerprint", &mut abort)?
         .map_err(|e| format!("xpr_state_fingerprint failed: {e}"))?;
     let (state_root, fingerprint_tables) = verify::parse_upstream_report(&fp_out);
     progress(json!({
@@ -525,7 +741,9 @@ pub fn run_pipeline<O: ChainOps>(
         }
     }));
     // A whole-state commitment is part of the evidence (and what the fleet gate compares).
-    let root_ok = state_root.as_deref().is_some_and(|r| r.len() >= 16 && r.chars().all(|c| c.is_ascii_hexdigit()) && r.chars().any(|c| c != '0'));
+    let root_ok = state_root.as_deref().is_some_and(|r| {
+        r.len() >= 16 && r.chars().all(|c| c.is_ascii_hexdigit()) && r.chars().any(|c| c != '0')
+    });
     if !root_ok {
         return Err(PipelineError::Failed(format!(
             "xpr_state_fingerprint printed no usable state_root ({state_root:?}): VERIFIED requires a non-empty whole-state commitment"
@@ -542,9 +760,11 @@ pub fn run_pipeline<O: ChainOps>(
                 )));
             }
             None => {
-                return Err("golden_state_root configured but xpr_state_fingerprint printed \
+                return Err(
+                    "golden_state_root configured but xpr_state_fingerprint printed \
                             no state_root"
-                    .into());
+                        .into(),
+                );
             }
         }
     }
@@ -593,10 +813,25 @@ pub fn compare_failing_tables(output: &str) -> Vec<String> {
 /// Every table `xpr_19_table_compare` (PulseVM v1.0.0) reports. A passing comparison must print a
 /// matching `table <name>: rows=… sha256=…` line for each (a newer tool may print more).
 pub const REQUIRED_COMPARE_TABLES: &[&str] = &[
-    "account", "account_metadata", "code", "contract_table", "contract_row", "contract_index64",
-    "contract_index128", "contract_index256", "contract_index_double", "global_property", "protocol_state",
-    "permission", "permission_link", "resource_limits", "resource_usage", "resource_limits_state",
-    "resource_limits_config", "transaction", "dynamic_global_property",
+    "account",
+    "account_metadata",
+    "code",
+    "contract_table",
+    "contract_row",
+    "contract_index64",
+    "contract_index128",
+    "contract_index256",
+    "contract_index_double",
+    "global_property",
+    "protocol_state",
+    "permission",
+    "permission_link",
+    "resource_limits",
+    "resource_usage",
+    "resource_limits_state",
+    "resource_limits_config",
+    "transaction",
+    "dynamic_global_property",
 ];
 
 /// Tables whose v1.0.0 compare failure has a KNOWN, recognisable signature (the SHiP serializer
@@ -647,7 +882,8 @@ impl ProtocolSchedule {
             protocol_version: u32,
             activation_height: u32,
         }
-        let root: Root = serde_json::from_slice(bytes).map_err(|e| format!("protocol upgrade schedule: {e}"))?;
+        let root: Root =
+            serde_json::from_slice(bytes).map_err(|e| format!("protocol upgrade schedule: {e}"))?;
         if root.protocol_upgrades.len() > 1024 {
             return Err("protocol upgrade schedule: more than 1,024 entries".into());
         }
@@ -655,12 +891,20 @@ impl ProtocolSchedule {
         for (i, e) in root.protocol_upgrades.iter().enumerate() {
             let (ver, height) = (e.protocol_version, e.activation_height);
             if height <= 1 {
-                return Err(format!("protocol_upgrades[{i}]: activation height {height} (0 and 1 are rejected)"));
+                return Err(format!(
+                    "protocol_upgrades[{i}]: activation height {height} (0 and 1 are rejected)"
+                ));
             }
             match entries.last() {
-                None if ver <= 1 => return Err(format!("protocol_upgrades[0]: first protocol version {ver} must be > 1")),
+                None if ver <= 1 => {
+                    return Err(format!(
+                        "protocol_upgrades[0]: first protocol version {ver} must be > 1"
+                    ))
+                }
                 Some((pv, ph)) if ver <= *pv || height <= *ph => {
-                    return Err(format!("protocol_upgrades[{i}]: versions and heights must strictly increase"))
+                    return Err(format!(
+                        "protocol_upgrades[{i}]: versions and heights must strictly increase"
+                    ))
                 }
                 _ => {}
             }
@@ -672,8 +916,10 @@ impl ProtocolSchedule {
     pub fn load(path: Option<&Path>) -> Result<Self, String> {
         match path {
             None => Ok(Self::empty()),
-            Some(p) => Self::parse(&std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?)
-                .map_err(|e| format!("{}: {e}", p.display())),
+            Some(p) => {
+                Self::parse(&std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?)
+                    .map_err(|e| format!("{}: {e}", p.display()))
+            }
         }
     }
 
@@ -711,7 +957,11 @@ pub fn compare_missing_tables(output: &str, failing: &[String]) -> Vec<String> {
         .filter(|t| {
             // As in compare_failing_tables: a failed command's first stdout line shares a line with
             // the error prefix.
-            let re = regex::Regex::new(&format!(r"(?m)(?:^|[\s:])table {}: rows=", regex::escape(t))).expect("regex");
+            let re = regex::Regex::new(&format!(
+                r"(?m)(?:^|[\s:])table {}: rows=",
+                regex::escape(t)
+            ))
+            .expect("regex");
             !re.is_match(output)
         })
         .map(|t| t.to_string())
@@ -733,7 +983,9 @@ pub fn known_compare_difference(table: &str, output: &str) -> Result<String, Str
         regex::escape(table)
     ))
     .expect("regex");
-    let c = re.captures(output).ok_or("no nodeos=/arena= report line for it")?;
+    let c = re
+        .captures(output)
+        .ok_or("no nodeos=/arena= report line for it")?;
     let rows = |i: usize| c.get(i).and_then(|m| m.as_str().parse::<u64>().ok());
     let (nodeos_none, arena_none) = (&c[1] == "None", &c[3] == "None");
     match table {
@@ -774,6 +1026,18 @@ pub fn ignite_pending_reasons() -> Vec<&'static str> {
         "same-chain-id cutover: PulseVM must enforce TAPOS (block-summary ring seeded \
          at the cut, checked at admission and block application) so transactions \
          signed on a leftover source chain cannot replay onto the target",
+        "imported accounts must be billed CPU in the units their limits are in (#106: \
+         PulseVM v1.0.0 bills metering points against microsecond limits, so accounts run \
+         out of CPU within seconds of the cut)",
+        "every producer must sign with its own registered key (#107: the migrated system \
+         contract re-elects producers at the first onblock and a node whose key differs \
+         stops producing; rehearsals shared one key)",
+        "a fleet-wide commit point: the target must not produce or admit transactions until \
+         a fleet-signed COMMIT exists (#113, sealed start; docs/DESIGN-authority-boundary.md), \
+         or a partial abort can leave two writable chains",
+        "a producer election must not be able to halt the chain (#122: the migrated system contract \
+         keeps electing the schedule; one that leaves out every validator's producer means nobody \
+         can build again, and kickbp, unregprod or a vote change can trigger it)",
     ]
 }
 
@@ -808,13 +1072,18 @@ fn varuint32(out: &mut Vec<u8>, mut n: u64) {
 }
 
 fn hex_field(v: &Value, k: &str) -> Result<Vec<u8>, String> {
-    let s = v.get(k).and_then(|x| x.as_str()).ok_or_else(|| format!("block JSON missing {k}"))?;
+    let s = v
+        .get(k)
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| format!("block JSON missing {k}"))?;
     hex::decode(s).map_err(|e| format!("block {k} is not hex: {e}"))
 }
 
 fn u64_field(v: &Value, k: &str) -> Result<u64, String> {
     let f = v.get(k).ok_or_else(|| format!("block JSON missing {k}"))?;
-    f.as_u64().or_else(|| f.as_str().and_then(|s| s.parse().ok())).ok_or_else(|| format!("block {k} is not a number: {f}"))
+    f.as_u64()
+        .or_else(|| f.as_str().and_then(|s| s.parse().ok()))
+        .ok_or_else(|| format!("block {k} is not a number: {f}"))
 }
 
 fn bytes_field(out: &mut Vec<u8>, b: &[u8]) {
@@ -832,7 +1101,10 @@ pub fn name_to_u64(s: &str) -> Result<u64, String> {
             b'a'..=b'z' => Ok((c - b'a') as u64 + 6),
             b'1'..=b'5' => Ok((c - b'1') as u64 + 1),
             b'.' => Ok(0),
-            _ => Err(format!("name {s:?} has an invalid character {:?}", c as char)),
+            _ => Err(format!(
+                "name {s:?} has an invalid character {:?}",
+                c as char
+            )),
         }
     };
     let mut v = 0u64;
@@ -855,10 +1127,21 @@ pub fn block_timestamp_slot(ts: &str) -> Result<u32, String> {
     let bad = || format!("block timestamp {ts:?} is not YYYY-MM-DDTHH:MM:SS[.mmm]");
     let ts = ts.trim_end_matches('Z');
     let (date, time) = ts.split_once('T').ok_or_else(bad)?;
-    let d: Vec<i64> = date.split('-').map(|x| x.parse().map_err(|_| bad())).collect::<Result<_, _>>()?;
+    let d: Vec<i64> = date
+        .split('-')
+        .map(|x| x.parse().map_err(|_| bad()))
+        .collect::<Result<_, _>>()?;
     let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
-    let t: Vec<i64> = hms.split(':').map(|x| x.parse().map_err(|_| bad())).collect::<Result<_, _>>()?;
-    if d.len() != 3 || t.len() != 3 || frac.is_empty() || frac.len() > 3 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+    let t: Vec<i64> = hms
+        .split(':')
+        .map(|x| x.parse().map_err(|_| bad()))
+        .collect::<Result<_, _>>()?;
+    if d.len() != 3
+        || t.len() != 3
+        || frac.is_empty()
+        || frac.len() > 3
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+    {
         return Err(bad());
     }
     let ms_frac: i64 = format!("{frac:0<3}").parse().map_err(|_| bad())?;
@@ -872,7 +1155,9 @@ pub fn block_timestamp_slot(ts: &str) -> Result<u32, String> {
     let ms = ((days * 24 + t[0]) * 60 + t[1]) * 60_000 + t[2] * 1000 + ms_frac;
     let since = ms - 946_684_800_000;
     if since < 0 || since % 500 != 0 {
-        return Err(format!("block timestamp {ts:?} is not on a 500 ms slot after 2000-01-01"));
+        return Err(format!(
+            "block timestamp {ts:?} is not on a 500 ms slot after 2000-01-01"
+        ));
     }
     u32::try_from(since / 500).map_err(|_| bad())
 }
@@ -886,11 +1171,18 @@ pub fn pack_signature(sig: &str) -> Result<Vec<u8>, String> {
     } else if let Some(r) = sig.strip_prefix("SIG_R1_") {
         (1u8, "R1", r)
     } else {
-        return Err(format!("unsupported signature {sig:?} (only SIG_K1_ / SIG_R1_)"));
+        return Err(format!(
+            "unsupported signature {sig:?} (only SIG_K1_ / SIG_R1_)"
+        ));
     };
-    let raw = bs58::decode(b58).into_vec().map_err(|e| format!("signature base58: {e}"))?;
+    let raw = bs58::decode(b58)
+        .into_vec()
+        .map_err(|e| format!("signature base58: {e}"))?;
     if raw.len() != 69 {
-        return Err(format!("signature decodes to {} bytes, expected 69", raw.len()));
+        return Err(format!(
+            "signature decodes to {} bytes, expected 69",
+            raw.len()
+        ));
     }
     let mut h = ripemd::Ripemd160::new();
     h.update(&raw[..65]);
@@ -914,12 +1206,24 @@ fn pack_extensions(out: &mut Vec<u8>, v: Option<&Value>, what: &str) -> Result<(
     for e in exts {
         let (t, data) = match &e {
             Value::Array(p) if p.len() == 2 => (p[0].as_u64(), p[1].as_str()),
-            Value::Object(o) => (o.get("type").and_then(|x| x.as_u64()), o.get("data").and_then(|x| x.as_str())),
+            Value::Object(o) => (
+                o.get("type").and_then(|x| x.as_u64()),
+                o.get("data").and_then(|x| x.as_str()),
+            ),
             _ => (None, None),
         };
-        let (t, data) = t.zip(data).ok_or_else(|| format!("block {what} entry {e} is not [type, hex]"))?;
-        out.extend_from_slice(&u16::try_from(t).map_err(|_| format!("{what} type {t} > u16"))?.to_le_bytes());
-        bytes_field(out, &hex::decode(data).map_err(|e| format!("{what} data: {e}"))?);
+        let (t, data) = t
+            .zip(data)
+            .ok_or_else(|| format!("block {what} entry {e} is not [type, hex]"))?;
+        out.extend_from_slice(
+            &u16::try_from(t)
+                .map_err(|_| format!("{what} type {t} > u16"))?
+                .to_le_bytes(),
+        );
+        bytes_field(
+            out,
+            &hex::decode(data).map_err(|e| format!("{what} data: {e}"))?,
+        );
     }
     Ok(())
 }
@@ -930,32 +1234,62 @@ fn pack_extensions(out: &mut Vec<u8>, v: Option<&Value>, what: &str) -> Result<(
 pub fn pack_signed_block(block: &Value) -> Result<PackedBlock, String> {
     use sha2::Digest as _;
     let mut out = Vec::new();
-    let ts = block.get("timestamp").and_then(|x| x.as_str()).ok_or("block JSON missing timestamp")?;
+    let ts = block
+        .get("timestamp")
+        .and_then(|x| x.as_str())
+        .ok_or("block JSON missing timestamp")?;
     out.extend_from_slice(&block_timestamp_slot(ts)?.to_le_bytes());
-    let producer = block.get("producer").and_then(|x| x.as_str()).ok_or("block JSON missing producer")?;
+    let producer = block
+        .get("producer")
+        .and_then(|x| x.as_str())
+        .ok_or("block JSON missing producer")?;
     out.extend_from_slice(&name_to_u64(producer)?.to_le_bytes());
-    out.extend_from_slice(&u16::try_from(u64_field(block, "confirmed")?).map_err(|_| "confirmed > u16")?.to_le_bytes());
+    out.extend_from_slice(
+        &u16::try_from(u64_field(block, "confirmed")?)
+            .map_err(|_| "confirmed > u16")?
+            .to_le_bytes(),
+    );
     let previous = hex_field(block, "previous")?;
-    for (k, b) in [("previous", &previous), ("transaction_mroot", &hex_field(block, "transaction_mroot")?), ("action_mroot", &hex_field(block, "action_mroot")?)] {
+    for (k, b) in [
+        ("previous", &previous),
+        ("transaction_mroot", &hex_field(block, "transaction_mroot")?),
+        ("action_mroot", &hex_field(block, "action_mroot")?),
+    ] {
         if b.len() != 32 {
             return Err(format!("block {k} is {} bytes, expected 32", b.len()));
         }
         out.extend_from_slice(b);
     }
-    out.extend_from_slice(&u32::try_from(u64_field(block, "schedule_version")?).map_err(|_| "schedule_version > u32")?.to_le_bytes());
+    out.extend_from_slice(
+        &u32::try_from(u64_field(block, "schedule_version")?)
+            .map_err(|_| "schedule_version > u32")?
+            .to_le_bytes(),
+    );
     match block.get("new_producers") {
         None | Some(Value::Null) => out.push(0),
         Some(_) => {
-            return Err("the cut block carries a producer schedule change (new_producers): not supported \
+            return Err(
+                "the cut block carries a producer schedule change (new_producers): not supported \
                         as a migration anchor — choose a cut without a schedule change"
-                .into())
+                    .into(),
+            )
         }
     }
-    pack_extensions(&mut out, block.get("header_extensions"), "header_extensions")?;
+    pack_extensions(
+        &mut out,
+        block.get("header_extensions"),
+        "header_extensions",
+    )?;
     let header_len = out.len();
-    let sig = block.get("producer_signature").and_then(|x| x.as_str()).ok_or("block JSON missing producer_signature")?;
+    let sig = block
+        .get("producer_signature")
+        .and_then(|x| x.as_str())
+        .ok_or("block JSON missing producer_signature")?;
     out.extend_from_slice(&pack_signature(sig)?);
-    let txs = block.get("transactions").and_then(|x| x.as_array()).ok_or("block JSON missing transactions[] (need the full block with receipts)")?;
+    let txs = block
+        .get("transactions")
+        .and_then(|x| x.as_array())
+        .ok_or("block JSON missing transactions[] (need the full block with receipts)")?;
     varuint32(&mut out, txs.len() as u64);
     for (i, t) in txs.iter().enumerate() {
         let status = match t.get("status").and_then(|x| x.as_str()) {
@@ -967,7 +1301,11 @@ pub fn pack_signed_block(block: &Value) -> Result<PackedBlock, String> {
             other => return Err(format!("receipt {i}: unknown status {other:?}")),
         };
         out.push(status);
-        out.extend_from_slice(&u32::try_from(u64_field(t, "cpu_usage_us")?).map_err(|_| "cpu_usage_us > u32")?.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(u64_field(t, "cpu_usage_us")?)
+                .map_err(|_| "cpu_usage_us > u32")?
+                .to_le_bytes(),
+        );
         varuint32(&mut out, u64_field(t, "net_usage_words")?);
         match t.get("trx") {
             Some(Value::String(id)) => {
@@ -980,10 +1318,16 @@ pub fn pack_signed_block(block: &Value) -> Result<PackedBlock, String> {
             }
             Some(trx @ Value::Object(_)) => {
                 out.push(1);
-                let sigs = trx.get("signatures").and_then(|x| x.as_array()).ok_or_else(|| format!("receipt {i}: no signatures"))?;
+                let sigs = trx
+                    .get("signatures")
+                    .and_then(|x| x.as_array())
+                    .ok_or_else(|| format!("receipt {i}: no signatures"))?;
                 varuint32(&mut out, sigs.len() as u64);
                 for s in sigs {
-                    out.extend_from_slice(&pack_signature(s.as_str().ok_or_else(|| format!("receipt {i}: signature not a string"))?)?);
+                    out.extend_from_slice(&pack_signature(
+                        s.as_str()
+                            .ok_or_else(|| format!("receipt {i}: signature not a string"))?,
+                    )?);
                 }
                 let comp = match trx.get("compression").and_then(|x| x.as_str()) {
                     Some("none") | None => 0u8,
@@ -991,15 +1335,22 @@ pub fn pack_signed_block(block: &Value) -> Result<PackedBlock, String> {
                     Some(o) => return Err(format!("receipt {i}: unknown compression {o:?}")),
                 };
                 out.push(comp);
-                let cfd = hex::decode(trx.get("packed_context_free_data").and_then(|x| x.as_str()).unwrap_or(""))
-                    .map_err(|e| format!("receipt {i}: packed_context_free_data: {e}"))?;
+                let cfd = hex::decode(
+                    trx.get("packed_context_free_data")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or(""),
+                )
+                .map_err(|e| format!("receipt {i}: packed_context_free_data: {e}"))?;
                 bytes_field(&mut out, &cfd);
-                let packed = hex_field(trx, "packed_trx").map_err(|e| format!("receipt {i}: {e}"))?;
+                let packed =
+                    hex_field(trx, "packed_trx").map_err(|e| format!("receipt {i}: {e}"))?;
                 if comp == 0 {
                     if let Some(want) = trx.get("id").and_then(|x| x.as_str()) {
                         let got = hex::encode(sha2::Sha256::digest(&packed));
                         if !got.eq_ignore_ascii_case(want) {
-                            return Err(format!("receipt {i}: sha256(packed_trx) {got} != transaction id {want}"));
+                            return Err(format!(
+                                "receipt {i}: sha256(packed_trx) {got} != transaction id {want}"
+                            ));
                         }
                     }
                 }
@@ -1010,10 +1361,17 @@ pub fn pack_signed_block(block: &Value) -> Result<PackedBlock, String> {
     }
     pack_extensions(&mut out, block.get("block_extensions"), "block_extensions")?;
     let prev_num = u32::from_be_bytes(previous[..4].try_into().expect("32 bytes"));
-    let block_num = prev_num.checked_add(1).ok_or("previous block number overflows")?;
+    let block_num = prev_num
+        .checked_add(1)
+        .ok_or("previous block number overflows")?;
     let mut digest: [u8; 32] = sha2::Sha256::digest(&out[..header_len]).into();
     digest[..4].copy_from_slice(&block_num.to_be_bytes());
-    Ok(PackedBlock { bytes: out, id: hex::encode(digest), block_num, receipts: txs.len() })
+    Ok(PackedBlock {
+        bytes: out,
+        id: hex::encode(digest),
+        block_num,
+        receipts: txs.len(),
+    })
 }
 
 /// The three files a PulseVM v1.0.0 node boots a migrated chain from, written into the
@@ -1034,14 +1392,18 @@ pub struct BootArtifacts {
 pub fn boot_paths(up: &Upstream, cut_height: u64) -> (PathBuf, PathBuf, PathBuf) {
     (
         up.work_dir.join(format!("boot-{cut_height}.manifest.json")),
-        up.work_dir.join(format!("migration-genesis-{cut_height}.json")),
+        up.work_dir
+            .join(format!("migration-genesis-{cut_height}.json")),
         up.work_dir.join(format!("chain-config-{cut_height}.json")),
     )
 }
 
 fn read_json_object(path: &Path, what: &str) -> Result<serde_json::Map<String, Value>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("read {what} {}: {e}", path.display()))?;
-    match serde_json::from_str::<Value>(&text).map_err(|e| format!("{what} {} is not JSON: {e}", path.display()))? {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {what} {}: {e}", path.display()))?;
+    match serde_json::from_str::<Value>(&text)
+        .map_err(|e| format!("{what} {} is not JSON: {e}", path.display()))?
+    {
         Value::Object(m) => Ok(m),
         _ => Err(format!("{what} {} is not a JSON object", path.display())),
     }
@@ -1067,7 +1429,8 @@ pub fn build_boot_artifacts(
     cut_block_id: &str,
     chain_id: &str,
 ) -> Result<BootArtifacts, String> {
-    let packed = pack_signed_block(source_block).map_err(|e| format!("cannot pack the source cut block: {e}"))?;
+    let packed = pack_signed_block(source_block)
+        .map_err(|e| format!("cannot pack the source cut block: {e}"))?;
     if packed.block_num as u64 != cut_height || !packed.id.eq_ignore_ascii_case(cut_block_id) {
         return Err(format!(
             "the packed source block is not the cut: computed id {} (block {}) != cut block id {cut_block_id} \
@@ -1076,10 +1439,14 @@ pub fn build_boot_artifacts(
         ));
     }
     let mut manifest = outcome.checkpoint_manifest.clone();
-    let m = manifest.as_object_mut().ok_or("checkpoint manifest is not a JSON object")?;
+    let m = manifest
+        .as_object_mut()
+        .ok_or("checkpoint manifest is not a JSON object")?;
     if let Some(src) = m.get("source_chain_id").and_then(|v| v.as_str()) {
         if !chain_id.is_empty() && !src.eq_ignore_ascii_case(chain_id) {
-            return Err(format!("checkpoint manifest source_chain_id {src} is not this chain ({chain_id})"));
+            return Err(format!(
+                "checkpoint manifest source_chain_id {src} is not this chain ({chain_id})"
+            ));
         }
     }
     m.insert("source_block".into(), json!(hex::encode(&packed.bytes)));
@@ -1091,14 +1458,23 @@ pub fn build_boot_artifacts(
     }
     let manifest_sha256 = write_json(&manifest_path, &manifest, false)?;
 
-    let base = up.genesis_base.as_ref().ok_or("upstream.genesis_base is not set")?;
+    let base = up
+        .genesis_base
+        .as_ref()
+        .ok_or("upstream.genesis_base is not set")?;
     let mut genesis = read_json_object(base, "upstream.genesis_base")?;
     for k in ["initial_timestamp", "initial_key", "initial_configuration"] {
         if !genesis.contains_key(k) {
-            return Err(format!("upstream.genesis_base {} has no {k}", base.display()));
+            return Err(format!(
+                "upstream.genesis_base {} has no {k}",
+                base.display()
+            ));
         }
     }
-    genesis.insert("migration_checkpoint_sha256".into(), json!(outcome.checkpoint_sha256));
+    genesis.insert(
+        "migration_checkpoint_sha256".into(),
+        json!(outcome.checkpoint_sha256),
+    );
     let genesis = Value::Object(genesis);
     if crate::secrets::has_private_key(&genesis) {
         return Err(format!(
@@ -1113,8 +1489,14 @@ pub fn build_boot_artifacts(
         Some(p) => read_json_object(p, "upstream.chain_config_base")?,
         None => serde_json::Map::new(),
     };
-    cc.insert("migration_checkpoint".into(), json!(outcome.checkpoint_path.display().to_string()));
-    cc.insert("migration_manifest".into(), json!(manifest_path.display().to_string()));
+    cc.insert(
+        "migration_checkpoint".into(),
+        json!(outcome.checkpoint_path.display().to_string()),
+    );
+    cc.insert(
+        "migration_manifest".into(),
+        json!(manifest_path.display().to_string()),
+    );
     // Per-node: chain_config_base usually carries this node's producer_key. Written 0600 from
     // creation, only into a directory nobody else can write (secrets::write_file).
     let cc = Value::Object(cc);
@@ -1134,7 +1516,9 @@ pub fn build_boot_artifacts(
 /// `BLOCKCHAIN_ID=<id>` (and optionally `SUBNET_ID=<id>`) from create_chain_cmd output; the last
 /// occurrence wins. Ids are Metal CB58 strings.
 pub fn parse_create_chain_output(out: &str) -> Result<(String, Option<String>), String> {
-    let re = regex::Regex::new(r"(?m)^\s*(BLOCKCHAIN_ID|SUBNET_ID)=([1-9A-HJ-NP-Za-km-z]{32,64})\s*$").expect("static regex");
+    let re =
+        regex::Regex::new(r"(?m)^\s*(BLOCKCHAIN_ID|SUBNET_ID)=([1-9A-HJ-NP-Za-km-z]{32,64})\s*$")
+            .expect("static regex");
     let (mut bid, mut sid) = (None, None);
     for c in re.captures_iter(out) {
         match &c[1] {
@@ -1155,14 +1539,32 @@ mod tests {
     #[test]
     fn protocol_schedule_hash_matches_pulsevm_and_rules_match_its_validator() {
         // PulseVM docs/protocol-features.md §7: the example hash is of §4's two-entry schedule.
-        let two = ProtocolSchedule::parse(br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":1000000},
-            {"protocol_version":3,"activation_height":1500000}]}"#).unwrap();
-        assert_eq!(two.hash, "e73c3b500964300ce82280695d0608e80d9b50602531b560e9ec33e04e09e914");
+        let two = ProtocolSchedule::parse(
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":1000000},
+            {"protocol_version":3,"activation_height":1500000}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            two.hash,
+            "e73c3b500964300ce82280695d0608e80d9b50602531b560e9ec33e04e09e914"
+        );
         assert_eq!(two.max_version(), 3);
-        let s = ProtocolSchedule::parse(br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":1000000}]}"#).unwrap();
-        assert_eq!((s.max_version(), ProtocolSchedule::parse(b"  ").unwrap()), (2, ProtocolSchedule::empty()));
-        assert_eq!(ProtocolSchedule::parse(b"{}").unwrap(), ProtocolSchedule::empty());
-        assert_eq!(ProtocolSchedule::parse(br#"{"protocol_upgrades":[]}"#).unwrap(), ProtocolSchedule::empty());
+        let s = ProtocolSchedule::parse(
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":1000000}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (s.max_version(), ProtocolSchedule::parse(b"  ").unwrap()),
+            (2, ProtocolSchedule::empty())
+        );
+        assert_eq!(
+            ProtocolSchedule::parse(b"{}").unwrap(),
+            ProtocolSchedule::empty()
+        );
+        assert_eq!(
+            ProtocolSchedule::parse(br#"{"protocol_upgrades":[]}"#).unwrap(),
+            ProtocolSchedule::empty()
+        );
         for bad in [
             &br#"{"protocol_upgrades":[{"protocol_version":2,"activation_heigth":1000000}]}"#[..],
             br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":1}]}"#,
@@ -1183,10 +1585,21 @@ mod tests {
         assert!(ProtocolSchedule::parse(br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":10},{"protocol_version":5,"activation_height":20}]}"#).is_ok());
         // Against the cut: anything at or before H + margin is refused.
         assert!(s.check_against_cut(800_000, 100_000).is_ok());
-        assert!(s.check_against_cut(900_000, 100_000).unwrap_err().contains("within 100000 blocks"));
-        assert!(s.check_against_cut(2_000_000, 0).is_err(), "an activation before the cut is refused");
-        assert!(ProtocolSchedule::empty().check_against_cut(1, 1_000_000).is_ok());
-        assert_eq!(ProtocolSchedule::parse(s.to_json().to_string().as_bytes()).unwrap(), s);
+        assert!(s
+            .check_against_cut(900_000, 100_000)
+            .unwrap_err()
+            .contains("within 100000 blocks"));
+        assert!(
+            s.check_against_cut(2_000_000, 0).is_err(),
+            "an activation before the cut is refused"
+        );
+        assert!(ProtocolSchedule::empty()
+            .check_against_cut(1, 1_000_000)
+            .is_ok());
+        assert_eq!(
+            ProtocolSchedule::parse(s.to_json().to_string().as_bytes()).unwrap(),
+            s
+        );
     }
 
     #[test]
@@ -1198,7 +1611,10 @@ mod tests {
              # comment\n\
              CHAIN_STATE_HISTORY_LOG=chain_state_history.log\n",
         );
-        assert_eq!(env["XPR_CORE_REVISION"], "d133c6413ce8ce2e96096a0513ec25b4a8dbe837");
+        assert_eq!(
+            env["XPR_CORE_REVISION"],
+            "d133c6413ce8ce2e96096a0513ec25b4a8dbe837"
+        );
         assert_eq!(
             env["INPUT_SNAPSHOT_SHA256"],
             "d2e3e6071edfa93ec4777aeb817ff63c76ae40a76ec6e1ca755f252c54b026d7"
@@ -1227,7 +1643,14 @@ mod tests {
     fn ignite_pending_reasons_name_only_the_mainnet_gaps() {
         let reasons = ignite_pending_reasons().join(" ");
         assert!(reasons.contains("chain_id") && reasons.contains("TAPOS"));
-        assert_eq!(ignite_pending_reasons().len(), 2);
+        // RISK-REGISTER blockers B-1 (#106), B-2 (#107) and A-1 (#113) are refusals too.
+        assert!(
+            reasons.contains("#106")
+                && reasons.contains("#107")
+                && reasons.contains("#113")
+                && reasons.contains("#122")
+        );
+        assert_eq!(ignite_pending_reasons().len(), 6);
     }
 
     /// The stage-2 rig's real cut block (XPR testnet 408461570, 6 receipts) and the anchor the
@@ -1235,27 +1658,51 @@ mod tests {
     /// reproduce it byte for byte, and its computed id must be the cut block id.
     #[test]
     fn full_source_block_reproduces_the_rig_anchor_exactly() {
-        let block: Value = serde_json::from_str(include_str!("../tests/fixtures/xpr-testnet-block-408461570.json")).unwrap();
-        let want: Value = serde_json::from_str(include_str!("../tests/fixtures/boot-manifest-408461570.json")).unwrap();
+        let block: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/xpr-testnet-block-408461570.json"
+        ))
+        .unwrap();
+        let want: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/boot-manifest-408461570.json"
+        ))
+        .unwrap();
         let p = pack_signed_block(&block).unwrap();
-        assert_eq!(p.id, "1858a10265a2714f8d77797b02b164ca83e1d73f3776576e9f055cda4d979fed");
+        assert_eq!(
+            p.id,
+            "1858a10265a2714f8d77797b02b164ca83e1d73f3776576e9f055cda4d979fed"
+        );
         assert_eq!(p.block_num, 408461570);
         assert_eq!(p.receipts, 6);
-        assert_eq!(hex::encode(&p.bytes), want["source_block"].as_str().unwrap());
+        assert_eq!(
+            hex::encode(&p.bytes),
+            want["source_block"].as_str().unwrap()
+        );
     }
 
     #[test]
     fn tampered_block_json_changes_the_id_or_fails() {
-        let block: Value = serde_json::from_str(include_str!("../tests/fixtures/xpr-testnet-block-408461570.json")).unwrap();
+        let block: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/xpr-testnet-block-408461570.json"
+        ))
+        .unwrap();
         let mut b = block.clone();
         b["action_mroot"] = json!("00".repeat(32));
-        assert_ne!(pack_signed_block(&b).unwrap().id, pack_signed_block(&block).unwrap().id);
+        assert_ne!(
+            pack_signed_block(&b).unwrap().id,
+            pack_signed_block(&block).unwrap().id
+        );
         let mut b = block.clone();
         b["transactions"][0]["trx"]["packed_trx"] = json!("00");
-        assert!(pack_signed_block(&b).unwrap_err().contains("sha256(packed_trx)"));
+        assert!(pack_signed_block(&b)
+            .unwrap_err()
+            .contains("sha256(packed_trx)"));
         let mut b = block.clone();
         let sig = b["producer_signature"].as_str().unwrap().to_string();
-        b["producer_signature"] = json!(format!("{}{}", &sig[..sig.len() - 1], if sig.ends_with('6') { '7' } else { '6' }));
+        b["producer_signature"] = json!(format!(
+            "{}{}",
+            &sig[..sig.len() - 1],
+            if sig.ends_with('6') { '7' } else { '6' }
+        ));
         assert!(pack_signed_block(&b).is_err());
         let mut b = block;
         b.as_object_mut().unwrap().remove("transactions");
@@ -1269,17 +1716,27 @@ mod tests {
         assert!(name_to_u64("EOSIO").is_err());
         assert_eq!(block_timestamp_slot("2000-01-01T00:00:00.000").unwrap(), 0);
         assert_eq!(block_timestamp_slot("2000-01-01T00:00:00.500").unwrap(), 1);
-        assert_eq!(block_timestamp_slot("2026-09-30T00:00:01.000").unwrap(), 0x649e1b02);
+        assert_eq!(
+            block_timestamp_slot("2026-09-30T00:00:01.000").unwrap(),
+            0x649e1b02
+        );
         assert!(block_timestamp_slot("2026-09-30T00:00:01.250").is_err());
     }
 
     #[test]
     fn compare_output_names_exactly_the_failing_tables() {
-        let out = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compare-v1.0.0-408461570.log")).unwrap();
-        assert_eq!(compare_failing_tables(&out), vec!["contract_index_double", "global_property"]);
+        let out = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/compare-v1.0.0-408461570.log"
+        ))
+        .unwrap();
+        assert_eq!(
+            compare_failing_tables(&out),
+            vec!["contract_index_double", "global_property"]
+        );
         // As the failed command reports it: "`cmd` exited ...: <stderr> <stdout>" — the first
         // stdout line shares a line with the prefix.
-        let wrapped = format!("`x` exited exit status: 1:  table permission: nodeos=1 arena=2\ntable account: rows=1 sha256=aa");
+        let wrapped = "`x` exited exit status: 1:  table permission: nodeos=1 arena=2\ntable account: rows=1 sha256=aa".to_string();
         assert_eq!(compare_failing_tables(&wrapped), vec!["permission"]);
         assert!(compare_failing_tables("21-table nodeos/Arena comparison FAILED").is_empty());
     }
@@ -1287,18 +1744,41 @@ mod tests {
     /// The real v1.0.0 failure (stage-2 cut) matches the known signatures; anything else does not.
     #[test]
     fn known_compare_differences_match_only_their_signature() {
-        let out = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compare-v1.0.0-408461570.log")).unwrap();
+        let out = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/compare-v1.0.0-408461570.log"
+        ))
+        .unwrap();
         assert!(known_compare_difference("contract_index_double", &out).is_ok());
-        assert!(known_compare_difference("global_property", &out).unwrap().contains("157"));
+        assert!(known_compare_difference("global_property", &out)
+            .unwrap()
+            .contains("157"));
         let failing = compare_failing_tables(&out);
-        assert!(compare_missing_tables(&out, &failing).is_empty(), "every other required table matched");
-        assert_eq!(compare_missing_tables(&out, &[]), vec!["contract_index_double", "global_property"]);
+        assert!(
+            compare_missing_tables(&out, &failing).is_empty(),
+            "every other required table matched"
+        );
+        assert_eq!(
+            compare_missing_tables(&out, &[]),
+            vec!["contract_index_double", "global_property"]
+        );
         // contract_index_double present on both sides with different rows: a real mismatch.
-        let both = out.replace("arena=None", "arena=Some(TableReport { rows: 133, sha256: \"00\" })");
+        let both = out.replace(
+            "arena=None",
+            "arena=Some(TableReport { rows: 133, sha256: \"00\" })",
+        );
         assert!(known_compare_difference("contract_index_double", &both).is_err());
         // global_property with a different size gap, or more rows: a different defect.
-        assert!(known_compare_difference("global_property", &out.replace("bytes=143", "bytes=140")).is_err());
-        assert!(known_compare_difference("global_property", &out.replacen("rows: 1,", "rows: 2,", 1)).is_err());
+        assert!(known_compare_difference(
+            "global_property",
+            &out.replace("bytes=143", "bytes=140")
+        )
+        .is_err());
+        assert!(known_compare_difference(
+            "global_property",
+            &out.replacen("rows: 1,", "rows: 2,", 1)
+        )
+        .is_err());
         assert!(known_compare_difference("permission", &out).is_err());
     }
 
@@ -1309,7 +1789,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(b, "2YXVy2NWHZJphNuvWry8So8TpQodhSb7ZVJPxhwhtKS6Z6JjpV");
-        assert_eq!(s.as_deref(), Some("2qFyanyVDk2LKrUsUdh3JjtYJYZGqUg9y9QAvMaWdQZZGaLiXY"));
+        assert_eq!(
+            s.as_deref(),
+            Some("2qFyanyVDk2LKrUsUdh3JjtYJYZGqUg9y9QAvMaWdQZZGaLiXY")
+        );
         assert!(parse_create_chain_output("ok").is_err());
         assert!(parse_create_chain_output("BLOCKCHAIN_ID=0OIl").is_err());
     }

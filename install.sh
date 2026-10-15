@@ -26,7 +26,7 @@ set -euo pipefail
 # `artifacts.agent_release_tag`. Bumped by the release process together with tools/beacon-install.sh
 # (VERSION_DEFAULT); the two must agree (tools/test/run.sh checks). Never "latest": GitHub's
 # "latest release" alias skips pre-releases, so it resolved to a six-week-old v0.4.0 for every rc.
-AGENT_RELEASE_DEFAULT="v0.5.0-rc.29"
+AGENT_RELEASE_DEFAULT="v0.5.0-rc.30"
 
 MODE=""
 MANIFEST=""
@@ -1182,6 +1182,8 @@ PRESCAN=$(mget_opt '.snapshot.prescan_path')
   [ -n "$FM" ] && { echo "freeze_margin = $FM"; echo "derive_h_at_arm = true   # rehearsal: H derived at arm"; }
   [ "$SIM" = "true" ] && echo 'simulate_freeze = true'
   echo "chain_id = \"$CHAIN_ID\""
+  # r30: one lock directory for every agent, drill and loop on this box (XPR mainnet requires it to be explicit).
+  echo "lock_dir = \"$(mget_opt '.ceremony.lock_dir' | grep . || echo /var/lib/pulse-cutover/locks)\""
   echo "import_cpu_scale = $CPU_SCALE"
   # Producer mode: where to write the history boundary for a federating router (manifest .ceremony.boundary_path).
   BPATH=$(mget_opt '.ceremony.boundary_path'); [ -n "$BPATH" ] && echo "boundary_path = \"$BPATH\""
