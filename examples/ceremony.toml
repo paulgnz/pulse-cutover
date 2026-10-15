@@ -270,6 +270,9 @@ on_abort = "echo 'page the operator'"                    # on ABORT after rollba
                                                # (doubles, at most 120; default 10)
 # fleet_stall_secs = 300                       # while degraded, the fleet's highest target head must move at least
                                                # this often or the ceremony halts (default 300)
+# early_abort = false                         # rc.31: stop early (never freeze) once the quorum is provably
+#                                             #   unreachable. OFF by default; `await` takes it from the SIGNED
+#                                             #   event (coord.mjs event --early-abort yes) so the fleet agrees
 # Written by `await` into the DERIVED config from the signed event (never typed in):
 # event_id = "..."                             # the event this ceremony belongs to (enables signed aborts)
 # event_hash = "..."                           # sha256 of the accepted event's exact signed payload (rc.29): before

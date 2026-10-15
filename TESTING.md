@@ -39,7 +39,20 @@ journal never strands again; I7 a rollback that provably finished leaves writes 
 `tests/machine.rs` does the same for `join` on the upstream backend, including the join's own pause windows (the run
 asserts it reached them).
 
-CI runs 300 + 60 scenarios. Long runs: `MODEL_SCENARIOS=20000 cargo test --test model -- --nocapture`,
+Since rc.31 a share of the coordinated scenarios also have a roster (this node plus one peer, quorum 2) whose peer
+can make a durable exit (ABORTED without ever verifying) at a random relay read, so the early abort on an unreachable
+quorum runs under the same crash, pause and resume faults (`r31_early_abort` in the run's stats). A separate fleet model, `fleet_model_never_splits_on_an_early_abort` (`FLEET_MODEL_SCENARIOS`, default 100),
+runs TWO acting agents and a scripted third member (q = 2 < N = 3) on one simulated relay, including the review-M1
+sequence (members exit, one agent stops on the unreachable quorum, the exited members re-run on fresh journals under the
+same event) and foreign-H / older-beacon exits; oracle I8: an early abort never coexists with any member's ignition. A third,
+`interleaved_fleet_model_never_splits_after_a_member_was_counted` (`IFLEET_MODEL_SCENARIOS`, default 60), runs two agents
+in threads that yield at every relay read to a seeded scheduler (reproducible per seed), with lagging and dark beacons
+and members that exit (forged, or crash + fresh journal) after a peer's gate counted them; oracle I9: an agent that
+stopped on an unreachable quorum and kept or resumed its old chain never coexists with an ignition (I9), and no agent
+that froze reopens its old chain while the other ignites (I9b). Round 4 adds N = 5 / q = 4, members exiting at different
+reads, relay restarts on lost or older state as they exit (`IFLEET_WIPE=1` forces it), and finality lag for one agent;
+the sequential model adds a relay restart on lost state before an exited member re-ARMs (`FLEET_WIPE=1`). The models
+run with the early abort ON. CI runs 300 + 60 scenarios. Long runs: `MODEL_SCENARIOS=20000 cargo test --test model -- --nocapture`,
 `JOIN_MODEL_SCENARIOS=1000 cargo test --test machine r30r10_join_model -- --nocapture`; replay one with
 `MODEL_SEED=<seed>` / `JOIN_MODEL_SEED=<seed>`. The classes found earlier (A, B, R10-1, R10-2, R11-A) are fixed and
 kept as regression tests in `tests/model.rs`.

@@ -2293,3 +2293,131 @@ fn r7_clear_marker_removes_an_orphan_only_when_its_work_is_proven_gone() {
         .unwrap()
         .contains("no drill work marker"));
 }
+
+/// The chain the recorded v1.0.0 compare log comes from (rc.31 round 3: the matcher checks the configured chain_id).
+const TESTNET_CHAIN: &str = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd";
+
+/// A testnet drill config with its own lock_dir (the shared default would race other tests' marker checks).
+fn testnet_drill_config(dir: &Path) -> Config {
+    let d = dir.display().to_string();
+    drill_config_edit(dir, TESTNET_CHAIN, "", |t| {
+        t.replacen(
+            "[ceremony]\n",
+            &format!("[ceremony]\nlock_dir = \"{d}/locks\"\n"),
+            1,
+        )
+    })
+    .unwrap()
+}
+
+/// rc.31 (fleet run: every drill exited 5 on the two known v1.0.0 compare gaps, like a real mismatch): a compare that
+/// fails ONLY on those gaps, each with exactly its recorded signature and every other table matching, is classified
+/// `known_gaps_only` (still MISMATCH); the same tables failing any other way stay a real mismatch.
+#[test]
+fn drill_tells_the_known_v1_gaps_from_a_real_mismatch() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/compare-v1.0.0-408461570.log"
+    );
+    let run = |body: String, h: u64| {
+        let dir = tempfile::tempdir().unwrap();
+        stage_tools(dir.path(), false);
+        script(&dir.path().join("bin/compare.run"), &body);
+        let cfg = testnet_drill_config(dir.path());
+        let chain = LiveChain::new(dir.path(), TESTNET_CHAIN, h - 40);
+        drill::run(
+            &cfg,
+            &chain,
+            &DrillOptions {
+                height: h,
+                keep_work: false,
+            },
+        )
+        .unwrap()
+    };
+    // Exactly the recorded v1.0.0 output: known gaps only.
+    let out = run(format!("#!/bin/sh\ncat '{fixture}'\nexit 1\n"), 540);
+    assert!(
+        !out.compare_match && out.compare_known_gaps_only,
+        "{}",
+        out.view
+    );
+    assert_eq!(out.view["compare"], "MISMATCH", "never reported as a match");
+    assert_eq!(out.view["compare_class"], "known_gaps_only");
+    assert_eq!(out.view["compare_known_gaps"].as_array().unwrap().len(), 2);
+    // global_property with another size difference: a real mismatch.
+    let out = run(
+        format!("#!/bin/sh\nsed 's/bytes=143/bytes=150/' '{fixture}'\nexit 1\n"),
+        540,
+    );
+    assert!(!out.compare_known_gaps_only, "{}", out.view);
+    assert_eq!(out.view["compare_class"], "mismatch");
+    // A third table failing as well: a real mismatch.
+    let out = run(
+        format!("#!/bin/sh\nsed 's/^table permission: rows=66214 sha256=.*/table permission: nodeos=Some(TableReport {{ rows: 2 }}) arena=None/' '{fixture}'\nexit 1\n"),
+        540,
+    );
+    assert!(!out.compare_known_gaps_only, "{}", out.view);
+    // The same rows on a box configured for ANOTHER chain (round 3: the configured chain_id is checked): a real mismatch.
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), false);
+    script(
+        &dir.path().join("bin/compare.run"),
+        &format!("#!/bin/sh\ncat '{fixture}'\nexit 1\n"),
+    );
+    let cfg = drill_config(dir.path(), MAINNET, "").unwrap();
+    let chain = LiveChain::new(dir.path(), MAINNET, 500);
+    let out = drill::run(
+        &cfg,
+        &chain,
+        &DrillOptions {
+            height: 540,
+            keep_work: false,
+        },
+    )
+    .unwrap();
+    assert!(!out.compare_known_gaps_only, "{}", out.view);
+    // The staged partial failure (a table line missing): a real mismatch.
+    let dir = tempfile::tempdir().unwrap();
+    stage_tools(dir.path(), false);
+    let cfg = testnet_drill_config(dir.path());
+    let chain = LiveChain::new(dir.path(), TESTNET_CHAIN, 500);
+    let out = drill::run(
+        &cfg,
+        &chain,
+        &DrillOptions {
+            height: 540,
+            keep_work: false,
+        },
+    )
+    .unwrap();
+    assert!(!out.compare_known_gaps_only);
+    assert_eq!(out.view["compare_class"], "mismatch");
+}
+
+#[test]
+fn known_gaps_classifier_needs_every_table_and_its_signature() {
+    let out = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/compare-v1.0.0-408461570.log"
+    ))
+    .unwrap();
+    let both = vec![
+        "contract_index_double".to_string(),
+        "global_property".to_string(),
+    ];
+    assert!(drill::known_gaps_only(&both, &out, TESTNET_CHAIN).is_some());
+    assert!(
+        drill::known_gaps_only(&[], &out, TESTNET_CHAIN).is_none(),
+        "nothing failing is not a gap"
+    );
+    assert!(
+        drill::known_gaps_only(&both, "", TESTNET_CHAIN).is_none(),
+        "no output"
+    );
+    // Naming only one of two failing tables leaves the other unaccounted: the classifier reports it missing.
+    assert!(drill::known_gaps_only(&both[..1], &out, TESTNET_CHAIN).is_none());
+    let mut other = both.clone();
+    other.push("permission".into());
+    assert!(drill::known_gaps_only(&other, &out, TESTNET_CHAIN).is_none());
+}

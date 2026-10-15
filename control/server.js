@@ -13,12 +13,12 @@
 // MC_OFFLINE=1 disables all outbound polling (tests). PORT=0 picks a free port (printed on start).
 import http from 'node:http';
 import net from 'node:net';
-import { createHash, createPublicKey, verify as edVerify, timingSafeEqual } from 'node:crypto';
+import { createHash, createPublicKey, verify as edVerify, timingSafeEqual, randomBytes } from 'node:crypto';
 import { readFileSync, existsSync, watchFile, renameSync, mkdirSync, openSync, writeSync, fsyncSync, closeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isPublicIp, normIp, resolvePublic, limiter, safeRequest, probeProducerApi, safeJson, safeDecode, RE, UA, endpointId, endpointRef, reservedKey,
-  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, ceremonyFor, nextEvidence, EVIDENCE_MAX, STATE_RANK, drillComparison, shadowBoardProblem } from './lib.mjs';
+  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, ceremonyFor, pastCreate, nextEvidence, EVIDENCE_MAX, STATE_RANK, drillComparison, shadowBoardProblem } from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = +(process.env.PORT ?? 8787);
@@ -389,6 +389,14 @@ function validCoordEntry(k, v) {
     if (!l || typeof l !== 'object' || typeof l.event_id !== 'string' || !Array.isArray(l.alarms)) throw new Error(`${k}.split_latch: invalid`);
     out.split_latch = { event_id: l.event_id, alarms: l.alarms.map((a) => String(a).slice(0, 400)).slice(0, 10), at: String(l.at || '') };
   }
+  // rc.31 round 4 (review MEDIUM-1): the per-event marks anchor {event_id, state_id, gen, lost}: which server-state file
+  // (state_id) and generation the current event's marks were last written at, and a sticky `lost` once a start found
+  // the server state missing, replaced or older than that.
+  if (v.marks !== undefined && v.marks !== null) {
+    const m = v.marks;
+    if (!m || typeof m !== 'object' || typeof m.event_id !== 'string' || typeof m.state_id !== 'string' || !Number.isSafeInteger(m.gen)) throw new Error(`${k}.marks: invalid`);
+    out.marks = { event_id: m.event_id, state_id: m.state_id, gen: m.gen, lost: m.lost === true };
+  }
   if (v.history !== undefined && !Array.isArray(v.history)) throw new Error(`${k}.history: not an array`);
   out.history = (v.history || []).map((h, i) => { if (!h || typeof h !== 'object' || typeof h.event_id !== 'string') throw new Error(`${k}.history[${i}]: invalid`); return h; });
   if (v.used !== undefined && (!v.used || typeof v.used !== 'object' || Array.isArray(v.used))) throw new Error(`${k}.used: not an object`);
@@ -447,6 +455,10 @@ const lastTs = dict();
 // rc.29: watermarks older than the freshness window are dropped; the highest dropped one stays as a floor (persisted as
 // `ts_floor`), so a report replayed after a backward step of the relay's clock is still refused.
 let tsFloor = 0;
+// rc.31 round 4 (review MEDIUM-1): the server-state file's identity and a generation that every successful write raises.
+// A restore from an older copy, or a lost file, is detected against the coord file's per-event marks anchor.
+let serverStateId = null;
+let serverGen = 0;
 // Per network, per producer, PER EVENT ID: the highest ceremony stage reported for that event (rc.23 review #2).
 // Only ever raised; a report for another event id never touches it (a token holder bouncing its event id cannot
 // reset it), and replacing a silent instance never lowers it, so an agent's resume guard still sees a member that
@@ -467,6 +479,10 @@ function loadServerState() {
     let j; try { j = JSON.parse(readFileSync(STATE_FILE, 'utf8')); } catch (e) { throw new Error(`not JSON (${e.message})`); }
     if (!j || typeof j !== 'object' || j.v !== 1 || typeof j.lastTs !== 'object' || typeof j.nodes !== 'object' || !j.lastTs || !j.nodes) throw new Error('bad shape');
     if (j.ts_floor !== undefined && !Number.isFinite(j.ts_floor)) throw new Error('ts_floor');
+    if (j.gen !== undefined && !Number.isSafeInteger(j.gen)) throw new Error('gen');
+    if (j.state_id !== undefined && (typeof j.state_id !== 'string' || !/^[0-9a-f]{32}$/.test(j.state_id))) throw new Error('state_id');
+    serverGen = j.gen ?? 0;
+    serverStateId = j.state_id ?? null;
     tsFloor = j.ts_floor || 0;
     for (const [k, v] of Object.entries(j.lastTs)) {
       if (!KEY_RE.test(k) || !Number.isFinite(v)) throw new Error(`lastTs.${k.slice(0, 20)}`);
@@ -499,6 +515,12 @@ function loadServerState() {
               state: typeof x.state === 'string' ? x.state.slice(0, 16) : null, at: Number.isFinite(x.at) ? x.at : 0 };
             if (Number.isInteger(x.rank) && x.rank >= 0 && x.rank <= MAX_RANK) mark.rank = x.rank;
             if (height(x.src_first) && height(x.src_max) && x.src_max >= x.src_first) { mark.src_first = x.src_first; mark.src_max = x.src_max; }
+            // rc.31: the durable exit mark and the re-entry flag (never lowered; only loaded in their exact shape).
+            if (x.exited && typeof x.exited === 'object' && ['ABORTED', 'STRANDED'].includes(x.exited.state)) mark.exited = { state: x.exited.state, at: Number.isFinite(x.exited.at) ? x.exited.at : 0 };
+            if (x.reentered === true) mark.reentered = true;
+            if (x.exit_seen && typeof x.exit_seen === 'object' && ['ABORTED', 'STRANDED'].includes(x.exit_seen.state)) mark.exit_seen = { state: x.exit_seen.state, at: Number.isFinite(x.exit_seen.at) ? x.exit_seen.at : 0 };
+            // rc.31 round 3: sticky "this member verified"; only an explicit false loads as false (unknown = absent).
+            if (typeof x.verified_seen === 'boolean') mark.verified_seen = x.verified_seen;
             // rc.27 foreign_past records migrate into the rc.28 creation-evidence log (kept, never dropped); only on the
             // first rc.28 start (no evidence log in the file yet).
             const fl = j.evidence !== undefined ? [] : Array.isArray(x.foreign_past) ? x.foreign_past : x.foreign_past && typeof x.foreign_past === 'object' ? [x.foreign_past] : [];
@@ -565,6 +587,23 @@ function loadServerState() {
 }
 try { loadServerState(); }
 catch (e) { console.error(`servers: ${STATE_FILE} is unreadable or corrupt (${e.message}). Refusing to start: fix or restore it (deleting it forgets replay protection and identity conflicts).`); process.exit(3); }
+// A state file without an identity (new, or written before rc.31 round 4) gets one; it is written with the next save.
+serverStateId ||= randomBytes(16).toString('hex');
+// rc.31 round 4: a coordinated event whose marks were anchored on another server-state file, or on a later generation
+// than the one loaded (a lost or restored state file), has LOST marks: sticky, served as marks_complete:false, so no
+// agent can prove a member out of reach (and resume guards refuse) for that event.
+{
+  const next = clone(coord);
+  let changed = false;
+  for (const [netId, c] of Object.entries(next)) {
+    const a = c?.marks;
+    if (a && !a.lost && (a.state_id !== serverStateId || a.gen > serverGen)) {
+      a.lost = true; changed = true;
+      console.error(`coord: ${netId} event ${a.event_id}: server state ${a.state_id !== serverStateId ? 'replaced or lost' : `older (gen ${serverGen} < ${a.gen})`}; its marks are now INCOMPLETE for good`);
+    }
+  }
+  if (changed && !commitCoord(next)) { console.error('coord: could not record lost marks; refusing to start'); process.exit(3); }
+}
 /** The whole server state with `override` = [netId, producer, byKey] swapped in (not yet live), as a plain object. */
 function serverSnapshot(override, lastOverride, emOverride, evOverride) {
   const em = JSON.parse(JSON.stringify(eventMax));
@@ -627,7 +666,8 @@ const signedEvent = (netId, evId) => !!coord[netId]?.used && own(coord[netId].us
 // never overwrite recorded evidence.
 function commitServers(override, lastOverride, emOverride, evOverride) {
   if (stateUncertain) { console.error('servers: state uncertain after a failed write; restart mission control to reload it'); return false; }
-  try { atomicWrite(STATE_FILE, serverSnapshot(override, lastOverride, emOverride, evOverride)); return true; }
+  const gen = serverGen + 1;
+  try { atomicWrite(STATE_FILE, { ...serverSnapshot(override, lastOverride, emOverride, evOverride), gen, state_id: serverStateId }); serverGen = gen; return true; }
   catch (e) {
     if (e.afterRename) stateUncertain = true;
     console.error(`servers: persist failed (${e.message}); change NOT accepted${e.afterRename ? '; it may be on disk: every API refused until restart' : ''}`);
@@ -717,10 +757,8 @@ function agreement(n) {
 // One verdict per network for the current (or last) coordinated event, from the roster's producer-role reports:
 // LIVE / DEGRADED / SPLIT (red alarm) / ABORTED / PENDING. See fleetVerdict in lib.mjs. A change is logged.
 const lastVerdict = dict();
-function fleet(n) {
-  const c = coord[n.id];
-  const ev = c?.event ? JSON.parse(c.event.payload) : null;
-  if (!ev) return null;
+/** The pure fleet verdict for one event (no latching, no log): what `fleet` and the abort check (rc.31) both judge. */
+function fleetVerdictFor(n, ev) {
   const now = Date.now();
   const byProducer = dict();
   for (const p of Object.keys(nodes[n.id] || {})) {
@@ -729,7 +767,28 @@ function fleet(n) {
   }
   const marks = dict();
   for (const [p, m] of Object.entries(eventMax[n.id] || {})) if (m[ev.event_id]) marks[p] = m[ev.event_id];
-  const v = fleetVerdict(ev, byProducer, marks, evidence[n.id] || {});
+  const a = coord[n.id]?.marks;
+  const marksComplete = !(a && a.event_id === ev.event_id && (a.lost || a.state_id !== serverStateId || a.gen > serverGen));
+  return fleetVerdict(ev, byProducer, marks, evidence[n.id] || {}, { marksComplete });
+}
+const lastQuorumAlarm = dict();
+function fleet(n) {
+  const c = coord[n.id];
+  const ev = c?.event ? JSON.parse(c.event.payload) : null;
+  if (!ev) return null;
+  const v = fleetVerdictFor(n, ev);
+  // rc.31 (review fix 4): log the QUORUM UNREACHABLE alarm once per event when it first appears.
+  if (v.quorum_unreachable && lastQuorumAlarm[n.id] !== ev.event_id) {
+    lastQuorumAlarm[n.id] = ev.event_id;
+    pushEvent(n.id, 'fleet', v.warnings.find((w) => w.startsWith('ALARM QUORUM UNREACHABLE')) || 'ALARM QUORUM UNREACHABLE');
+  }
+  // rc.31: a signed abort refused (or accepted only with an explicit acknowledgement) because members were already
+  // past chain creation stays visible on the event as a warning.
+  for (const h of (c.history || []).filter((x) => x.event_id === ev.event_id && (x.type === 'abort_refused' || x.after_creation === true))) {
+    v.warnings.unshift(h.type === 'abort_refused'
+      ? `ALARM: a signed abort was REFUSED at ${h.at} and NOT relayed (no member received this veto): ${h.reason}; agents never honour an abort after ignition: use join / operator-halt, then complete`
+      : `ALARM: a signed abort was relayed although members showed signs of chain creation (${h.at}): ${h.reason}`);
+  }
   // A SPLIT is LATCHED per event (review #6): it stays red until an operator clears it on the mission-control
   // host (POST /api/admin/clear-split?net=…), even if the reports that showed it change or go silent.
   const latch = c.split_latch && c.split_latch.event_id === ev.event_id ? c.split_latch : null;
@@ -765,8 +824,17 @@ function status() {
       const geo = n.geo || {};
       let serversAll = 0, serversLive = 0, serversReady = 0, serversConflict = 0; const states = {};
       const producers = names.map((name) => {
+        // rc.31 round 4 (review MEDIUM-2): a member the relay marked as having exited the current event (or that re-entered
+        // it) has every later report for that event served as an identity CONFLICT, which every agent version's fleet gate
+        // refuses to count (rc.22+ gates skip conflict:true reports) and every resume guard treats as unknown.
+        // Round 5: only for an event whose signed payload turns the early abort on (otherwise rc.30 behaviour), and never
+        // for a legitimate join after a LIVE quorum (LOW-1).
+        const curMark = currentEv?.early_abort === true ? eventMax[n.id]?.[name]?.[currentEv.event_id] : null;
+        const exitConflict = (s) => !!curMark?.exited && s.report.coord?.event_id === currentEv.event_id
+          && !['ABORTED', 'STRANDED'].includes(s.report.ceremony?.state) && s.report.ceremony?.joined !== true;
         const beacons = servers(n.id, name).map((s) => ({ node: s.label, sid: s.sid, role: s.report.role || null, age_ms: reportAge(s, now),
-          silent: isSilent(s, now), conflict: !!s.conflict, stages: stages(s, now), report: s.report }))
+          silent: isSilent(s, now), conflict: !!s.conflict || exitConflict(s), ...(exitConflict(s) ? { exit_reentry: true } : {}),
+          stages: stages(s, now), report: s.report }))
           .sort((x, y) => (x.role === 'producer' ? -1 : 0) - (y.role === 'producer' ? -1 : 0));
         for (const b of beacons) {
           serversAll++; if (b.conflict) serversConflict++;
@@ -797,6 +865,14 @@ function status() {
           reporting: producers.filter((p) => p.reporting).length, ready: producers.filter((p) => p.ready).length,
           servers: serversAll, servers_reporting: serversLive, servers_ready: serversReady, servers_prepared: serversReady, servers_silent: serversAll - serversLive, servers_conflict: serversConflict, states },
         producers, agreement: agreement(n), coordination: coordView(n), fleet: fleet(n),
+        // rc.31 round 4 (review MEDIUM-1): whether the current event's marks are complete on this relay (the agents need
+        // `complete: true` and a non-decreasing (state_id, generation) to prove anyone out of reach).
+        marks_state: currentEv ? (() => {
+          const a = coord[n.id]?.marks;
+          const anchored = a && a.event_id === currentEv.event_id ? a : null;
+          return { event_id: currentEv.event_id, state_id: serverStateId, generation: serverGen,
+            complete: !anchored || (!anchored.lost && anchored.state_id === serverStateId && anchored.gen <= serverGen) };
+        })() : null,
         // r30: readiness drills, compared per drill height. Display only; never part of a ceremony decision.
         drills: drillComparison(producers.map((p) => ({ producer: p.name, report: (p.beacons.find((b) => b.role !== 'api' && !b.silent) || p.beacons[0])?.report }))),
         events: (events[n.id] || []).slice(0, 40) };
@@ -977,7 +1053,38 @@ async function handle(req, res) {
       if (c.abort) return send(res, 409, { error: 'event already aborted' });
       if (c.complete && p.type !== 'complete') return send(res, 409, { error: 'event already complete' });
       if (own(c, p.type) && c[p.type]) return send(res, 200, { ok: true, type: p.type, event_id: p.event_id, unchanged: true });
-      c[p.type] = msg; c.history.push({ type: p.type, event_id: p.event_id, at });
+      // rc.31 (fleet run h2: an abort landed after the event was 5/5 LIVE, was accepted, and the verdict stayed LIVE
+      // with no alarm). An abort is also the VETO every agent checks before creating and igniting, so it is refused
+      // only when the fleet has demonstrably gone forward: verdict LIVE / STALLED, or at least `quorum` roster members'
+      // FRESH reports for this event past chain creation (review M2: one member's buggy or spoofed create_started, an
+      // unretired creation-evidence entry of an earlier event at the same H, or one without an H must not block a
+      // legitimate veto). Any lesser past-creation sign: the abort is accepted and ALARMED. A refusal can be overridden
+      // by a signed acknowledgement (`acknowledge_past_creation`, coord.mjs --after-creation yes). Every case is
+      // recorded in the event's history.
+      let afterCreation = null;
+      if (p.type === 'abort') {
+        const v = fleetVerdictFor(n, cur);
+        const past = (v?.members || []).filter((m) => m.past_create);
+        const rosterNames = Array.isArray(cur.roster) && cur.roster.length ? cur.roster.map((m) => m.producer) : Object.keys(nodes[n.id] || {});
+        const q = Number.isInteger(cur.quorum) && cur.quorum > 0 ? cur.quorum : rosterNames.length;
+        const nowMs = Date.now();
+        const freshPast = rosterNames.filter((pr) => servers(n.id, pr).some((x) => (x.report.role || 'producer') === 'producer' && !x.conflict
+          && !isSilent(x, nowMs) && x.report.coord?.event_id === p.event_id && pastCreate(ceremonyFor(x.report, cur))));
+        const forward = ['LIVE', 'STALLED'].includes(v?.verdict) || (q > 0 && freshPast.length >= q);
+        const reason = `verdict ${v?.verdict}; fresh reports past chain creation: ${freshPast.join(', ') || 'none'} (quorum ${q}); any sign of creation: ${past.map((m) => `${m.producer} (${m.state || 'past creation'})`).join(', ') || 'none'}`.slice(0, 400);
+        if (forward && p.acknowledge_past_creation !== true) {
+          const rec = clone(coord);
+          const rc = rec[n.id]; rc.history ||= [];
+          rc.history.push({ type: 'abort_refused', event_id: p.event_id, at, reason });
+          rc.history = rc.history.slice(-100);
+          commitCoord(rec);
+          pushEvent(n.id, 'coordinator', `ALARM: signed abort for ${p.event_id} REFUSED, the fleet already went forward (${reason}). This veto was NOT relayed: no member has received it`);
+          return send(res, 409, { error: `event ${p.event_id} already went forward (${reason}): the abort is REFUSED and NOT relayed, so it is a veto no member has received (members before creation or ignition will proceed). Agents never honour an abort after their own ignition; resolve with join / operator-halt and close the event with complete. To relay the abort anyway, sign it with acknowledge_past_creation (coord.mjs --after-creation yes)`, verdict: v?.verdict, past_create: freshPast });
+        }
+        if (forward || past.length) afterCreation = reason;
+      }
+      c[p.type] = msg; c.history.push({ type: p.type, event_id: p.event_id, at, ...(afterCreation ? { after_creation: true, reason: afterCreation } : {}) });
+      if (afterCreation) pushEvent(n.id, 'coordinator', `ALARM: signed abort for ${p.event_id} relayed although members show signs of chain creation${p.acknowledge_past_creation === true ? ' (acknowledged by the signer)' : ''}: ${afterCreation}`);
       note = p.type === 'arm' ? `ARMED event ${p.event_id}` : p.type === 'complete' ? `event ${p.event_id} COMPLETE (closed; a new event may be published)` : `ABORTED event ${p.event_id}`;
     }
     if (!commitCoord(next)) return send(res, 503, { error: 'could not persist the message; nothing was relayed, retry' });
@@ -1090,7 +1197,7 @@ async function handle(req, res) {
     recomputeConflicts(byKey, tokenHash);
     const conflict = byKey[key].conflict;
     // The per-event high-water mark (only raised; a new event id starts over).
-    let em = null;
+    let em = null, exitNote = null;
     const evId = r.coord?.event_id;
     // Movement arming is judged with this report's own rank included (the other members' marks as stored) and
     // the current coordinated event's roster when this report is for it.
@@ -1109,9 +1216,19 @@ async function handle(req, res) {
       for (const p of Object.keys(nodes[r.network] || {})) {
         if (servers(r.network, p).some((x) => (x.report.role || 'producer') === 'producer' && !x.conflict && x.report.coord?.event_id === evId && !isSilent(x, now))) fresh.add(p);
       }
-      const nm = nextEventMark(cur, ce, Number.isSafeInteger(r.source?.head) ? r.source.head : null, movementArmed(evFor, marks, fresh), now);
+      // rc.31 round 3: a creation-evidence observation for this producer and event (or an unattributed one, or an
+      // overflowed log) means it may have verified: it can never get an exit mark.
+      const log = evidence[r.network]?.[r.producer];
+      const logged = !!log && (log.overflow === true || (log.obs || []).some((o) => o.event_id === evId || o.event_id == null));
+      const nm = nextEventMark(cur, ce, Number.isSafeInteger(r.source?.head) ? r.source.head : null, movementArmed(evFor, marks, fresh), now,
+        Number.isInteger(evFor.h) ? evFor.h : null, { role: r.role || 'producer', logged, exitMarks: evFor.early_abort === true });
       if (nm) {
         em = trimMarks(Object.assign(dict(), mine, { [evId]: nm }), r.network, evId);
+        // rc.31 (review M1): a member that ended the event without verifying and reports again in another state is
+        // re-entering an event it exited (e.g. a fresh journal under the same event id). The exit mark stays (agents
+        // never count it at a gate again); the operator is alarmed.
+        if (nm.exited && !cur?.exited) exitNote = `exited event ${evId} without verifying (${nm.exited.state}): durable exit mark set; a new attempt needs a new event id`;
+        if (nm.reentered && !cur?.reentered) exitNote = `ALARM: re-entered event ${evId} (${ce?.state}) after exiting it without verifying: rc.31 agents never count this member for ${evId} again; a new attempt needs a new event id`;
       }
     }
     // rc.28: every accepted past-creation report is an observation in the producer's creation-evidence log.
@@ -1125,6 +1242,18 @@ async function handle(req, res) {
     }
     (nodes[r.network] ||= dict())[r.producer] = byKey;
     if (em) (eventMax[r.network] ||= dict())[r.producer] = em;
+    // rc.31 round 4: anchor the current event's marks on this server-state file and generation (coord file). Written
+    // after the server state: a crash in between leaves an older anchor, which never reads as lost.
+    if (em && evNow && evNow.event_id === evId) {
+      const a = coord[r.network]?.marks;
+      if (!a || a.event_id !== evId || a.state_id !== serverStateId || a.gen < serverGen) {
+        const next = clone(coord);
+        const lost = !!a && a.event_id === evId && (a.lost || a.state_id !== serverStateId);
+        next[r.network].marks = { event_id: evId, state_id: serverStateId, gen: serverGen, lost };
+        if (!commitCoord(next)) console.error('coord: could not anchor the event marks (the anchor stays older; never unsafe)');
+      }
+    }
+    if (exitNote) pushEvent(r.network, r.producer, exitNote);
     lastTs[key] = ts;
     for (const [k, v] of Object.entries(lastTs)) if (v < now - TS_PAST_MS) { tsFloor = Math.max(tsFloor, v); delete lastTs[k]; }
     const label = servers(r.network, r.producer).find((s) => s.key === key)?.label || r.node;

@@ -177,6 +177,21 @@ struct World {
     legacy_froze: Cell<bool>,
     /// Signed coordinator abort is served from this tick on (0 = never; coordinated configs only).
     coord_abort_tick: Cell<u64>,
+    /// rc.31: the event has a roster (this node bp1 + bp2, quorum 2) and the relay mirrors this node's own beacon
+    /// report for both members; from relay read `quorum_out_tick` on (0 = never) bp2 shows a durable exit (ABORTED without ever
+    /// verifying), which makes the quorum provably unreachable.
+    roster_mode: Cell<bool>,
+    /// rc.31 review L4: this agent is one of two acting agents of a simulated fleet (shared relay).
+    fleet: RefCell<Option<std::rc::Rc<FleetSim>>>,
+    /// Round 4: extra finality lag (the interleaved model makes one agent's wait for H longer than the other's).
+    lib_lag: Cell<u64>,
+    /// rc.31 round 3: this agent is agent N of the interleaved fleet model (a shared relay with a turn scheduler).
+    ifleet: RefCell<Option<(std::sync::Arc<IFleet>, usize)>>,
+    quorum_out_tick: Cell<u64>,
+    /// rc.31: before its exit bp2 is still in FROZEN (never agrees at the gate), so the gate waits.
+    bp2_lags: Cell<bool>,
+    status_reads: Cell<u64>,
+    bp2_seen_verified: Cell<bool>,
     now: Cell<u64>,
     // --- observations ---
     violations: RefCell<Vec<String>>,
@@ -232,6 +247,14 @@ impl World {
             resume_fails: Cell::new(0),
             resume_ignored: Cell::new(0),
             coord_abort_tick: Cell::new(0),
+            roster_mode: Cell::new(false),
+            fleet: RefCell::new(None),
+            lib_lag: Cell::new(0),
+            ifleet: RefCell::new(None),
+            quorum_out_tick: Cell::new(0),
+            bp2_lags: Cell::new(false),
+            status_reads: Cell::new(0),
+            bp2_seen_verified: Cell::new(false),
             now: Cell::new(1_000_000),
             violations: RefCell::new(Vec::new()),
             trace: RefCell::new(Vec::new()),
@@ -322,7 +345,7 @@ impl World {
     /// The scheduler writes the snapshot of H once H is final (LIB = head - 1 in this model).
     fn scheduler_tick(&self) {
         let h = self.scheduled_h.get();
-        if h == 0 || self.head.get().saturating_sub(1) < h {
+        if h == 0 || self.head.get().saturating_sub(1 + self.lib_lag.get()) < h {
             return;
         }
         let file = self
@@ -349,7 +372,7 @@ impl World {
             head_block_num: head,
             head_block_id: self.block_id(head),
             head_block_time: "2024-01-01T00:00:00.000".into(),
-            last_irreversible_block_num: head.saturating_sub(1),
+            last_irreversible_block_num: head.saturating_sub(1 + self.lib_lag.get()),
         }
     }
 }
@@ -363,7 +386,10 @@ fn mock_signed(payload: serde_json::Value) -> serde_json::Value {
 }
 
 fn mock_event() -> serde_json::Value {
-    mock_signed(serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1"}))
+    // rc.31 round 5: the signed event turns the early abort on (configs that set `early_abort` are bound to it).
+    mock_signed(
+        serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "early_abort": true}),
+    )
 }
 
 impl ChainOps for World {
@@ -608,6 +634,55 @@ impl ChainOps for World {
             return Ok(Some(serde_json::json!({"event": mock_event()})));
         }
         if url.ends_with("/api/status") {
+            if let Some(f) = self.fleet.borrow().as_ref() {
+                return Ok(Some(f.doc()));
+            }
+            if let Some((f, me)) = self.ifleet.borrow().as_ref() {
+                return Ok(Some(f.read(*me)));
+            }
+            if self.roster_mode.get() {
+                // This node's own beacon, as its beacon would report it (the journal summary), and bp2 mirroring it
+                // (it agrees at the gate) until its durable exit.
+                let mine = serde_json::json!({"coord": {"event_id": "e1"},
+                    "ceremony": pulse_cutover::beacon::journal_summary(&self.journal)});
+                // Counted in relay reads (the gate waits without polling the source, so source ticks stand still).
+                self.status_reads.set(self.status_reads.get() + 1);
+                let t = self.quorum_out_tick.get();
+                let bp2 = if t > 0 && self.status_reads.get() >= t {
+                    serde_json::json!({"coord": {"event_id": "e1"}, "ceremony": {"state": "ABORTED", "evidence": {"h": H, "agent_version": env!("CARGO_PKG_VERSION"), "early_abort": true},
+                        "transitions": [{"state": "ARMED", "ts": "t"}, {"state": "ABORTED", "ts": "t"}]}})
+                } else if self.bp2_lags.get() {
+                    serde_json::json!({"coord": {"event_id": "e1"}, "ceremony": {"state": "FROZEN", "evidence": {"h": H, "agent_version": env!("CARGO_PKG_VERSION"), "early_abort": true},
+                        "transitions": [{"state": "ARMED", "ts": "t"}, {"state": "FROZEN", "ts": "t"}]}})
+                } else {
+                    mine.clone()
+                };
+                // Round 3: a relay that ever saw bp2 (mirroring this node) VERIFIED keeps verified_seen and never marks it.
+                if matches!(
+                    bp2["ceremony"]["state"].as_str(),
+                    Some("VERIFIED" | "IGNITED" | "FLIPPED" | "LIVE" | "HALTED")
+                ) {
+                    self.bp2_seen_verified.set(true);
+                }
+                let seen = self.bp2_seen_verified.get();
+                // rc.31 review M1: an rc.31 relay holds the durable exit mark once bp2 exited without verifying.
+                let bp2_mark = if t > 0 && self.status_reads.get() >= t && !seen {
+                    serde_json::json!({"e1": {"past_create": false, "rank": 2, "verified_seen": false,
+                        "exited": {"state": "ABORTED", "at": 1}}})
+                } else {
+                    serde_json::json!({"e1": {"past_create": false, "rank": if seen { 4 } else { 2 }, "verified_seen": seen}})
+                };
+                let mut mine = mine;
+                mine["agent_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+                let mut bp2 = bp2;
+                bp2["agent_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+                return Ok(Some(
+                    serde_json::json!({"networks": [{"id": "rehearsal", "producers": [
+                    {"name": "bp1", "beacons": [{"age_ms": 1000, "report": mine}]},
+                    {"name": "bp2", "event_max": bp2_mark, "beacons": [{"age_ms": 1000, "report": bp2}]}],
+                    "marks_state": {"event_id": "e1", "state_id": "s1", "generation": self.status_reads.get(), "complete": true}}]}),
+                ));
+            }
             return Ok(Some(
                 serde_json::json!({"networks": [{"id": "rehearsal", "producers": []}]}),
             ));
@@ -716,6 +791,822 @@ on_live = "flip-gateway"
     let path = dir.join("ceremony.toml");
     std::fs::write(&path, text).unwrap();
     Config::load(&path).unwrap_or_else(|e| panic!("model config does not load: {e}"))
+}
+
+/// rc.31: the model's coordinated config with a roster (bp1 = this node, bp2), quorum 2 and a beacon identity.
+fn model_add_roster(dir: &Path) -> Config {
+    let path = dir.join("ceremony.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap().replace(
+        "fleet_quorum = 0",
+        "fleet_quorum = 2\nreport_max_age_secs = 60\nearly_abort = true",
+    );
+    for p in ["bp1", "bp2"] {
+        text += &format!("\n[[coordination.roster]]\nproducer = \"{p}\"\n");
+    }
+    std::fs::write(dir.join("beacon.token"), "tok\n").unwrap();
+    text += &format!("\n[beacon]\nurl = \"https://mc.example/api/report\"\nproducer = \"bp1\"\nnetwork = \"rehearsal\"\ntoken_file = \"{}/beacon.token\"\n", dir.display());
+    std::fs::write(&path, text).unwrap();
+    Config::load(&path).unwrap_or_else(|e| panic!("model roster config does not load: {e}"))
+}
+
+// ------------------------------------------------------------- fleet model (rc.31 review L4) --
+//
+// Two ACTING agents (bp1 = A, bp2 = B, each with its own chain view, journal and config) and one scripted member (bp3)
+// of one event, roster N = 3, quorum q = 2 < N, sharing one simulated relay. The relay serves each agent's journal
+// summary as its beacon report, bp3's scripted report and (an rc.31 relay) the durable per-event exit mark, computed
+// as the relay computes it and never lowered. Runs are whole runs in a random order, with crashes and re-runs.
+// Review M1 is the generator's core: B refuses ARM (a failing freeze hook) and exits; bp3 exits; A may stop on the
+// unreachable quorum; then B's operator fixes the config and re-runs on a FRESH journal under the same event while
+// bp3 re-arms. Stale / foreign / older-beacon exits are generated too. Oracle I8 (the split rc.31 must never cause):
+// an agent that stopped on "fleet quorum unreachable" never coexists with a member that started chain creation or
+// ignition for the event (the other agent, or bp3 re-armed and following B onto its chain).
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Bp3 {
+    /// In the ceremony, mirroring the reading agent's own report (it agrees at every gate).
+    In,
+    /// Exited without verifying: honest (the relay marks it), for another H, or from an older beacon (no transitions).
+    Out(OutKind),
+    /// Re-armed under the same event after exiting (a fresh journal), mirroring the reader again.
+    ReArmed,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum OutKind {
+    Honest,
+    ForeignH,
+    NoTransitions,
+}
+
+struct FleetSim {
+    a_journal: PathBuf,
+    b_journal: PathBuf,
+    bp3: Cell<Bp3>,
+    /// The relay's exit-mark memory (an rc.31 relay): producer -> (exited, re-entered).
+    marks: RefCell<std::collections::BTreeMap<String, (bool, bool)>>,
+    /// Round 3: producer -> (verified_seen, high-water rank).
+    verified: RefCell<std::collections::BTreeMap<String, (bool, u64)>>,
+    relay_marks: bool,
+    /// Review: the relay restarted on lost state before the re-run (marks gone; reported incomplete).
+    lost: Cell<bool>,
+    /// The agent currently running (its own report is what bp3 mirrors).
+    reader: Cell<u8>,
+    reads: Cell<u64>,
+    bp3_out_at: Cell<u64>,
+}
+
+impl FleetSim {
+    fn summary(path: &Path) -> Option<serde_json::Value> {
+        path.exists()
+            .then(|| pulse_cutover::beacon::journal_summary(path))
+    }
+
+    /// The relay's rule (control/lib.mjs `exitWithoutVerify`) on a beacon ceremony summary.
+    fn exits_without_verify(c: &serde_json::Value) -> bool {
+        let countable = ["VERIFIED", "IGNITED", "FLIPPED", "LIVE", "HALTED"];
+        matches!(c["state"].as_str(), Some("ABORTED" | "STRANDED"))
+            && c["evidence"]["h"].as_u64() == Some(H)
+            && c["create_started"].as_bool() != Some(true)
+            && c["ignition_started"].as_bool() != Some(true)
+            && c["joined"].as_bool() != Some(true)
+            && c["forced_rollback"].as_bool() != Some(true)
+            && c["transitions"].as_array().is_some_and(|t| {
+                !t.is_empty()
+                    && !t
+                        .iter()
+                        .any(|x| x["state"].as_str().is_some_and(|s| countable.contains(&s)))
+            })
+            && c["evidence"]["snapshot_sha256"].is_null()
+            && c["evidence"]["fingerprints_digest"].is_null()
+            && c["aborting"].as_bool() != Some(true)
+            && c["rollback_pending"].as_bool() != Some(true)
+    }
+
+    fn observe(&self, producer: &str, c: &serde_json::Value) {
+        if !self.relay_marks {
+            return;
+        }
+        // Round 3: the relay's sticky verified_seen (any VERIFIED-or-later sign) and high-water rank.
+        let countable = ["VERIFIED", "IGNITED", "FLIPPED", "LIVE", "HALTED"];
+        let st = c["state"].as_str().unwrap_or("");
+        let seen_now = countable.contains(&st)
+            || !c["evidence"]["snapshot_sha256"].is_null()
+            || !c["evidence"]["fingerprints_digest"].is_null()
+            || c["transitions"].as_array().is_some_and(|t| {
+                t.iter()
+                    .any(|x| countable.contains(&x["state"].as_str().unwrap_or("")))
+            });
+        {
+            let mut v = self.verified.borrow_mut();
+            let e = v.entry(producer.to_string()).or_insert((false, 0));
+            e.0 |= seen_now;
+            e.1 = e.1.max(rank_of(st));
+        }
+        let seen = self.verified.borrow()[producer].0;
+        let mut m = self.marks.borrow_mut();
+        let e = m.entry(producer.to_string()).or_insert((false, false));
+        if e.0 && !matches!(c["state"].as_str(), Some("ABORTED" | "STRANDED")) {
+            e.1 = true;
+        }
+        if !seen && Self::exits_without_verify(c) {
+            e.0 = true;
+        }
+    }
+
+    fn doc(&self) -> serde_json::Value {
+        let n = self.reads.get() + 1;
+        self.reads.set(n);
+        let t = self.bp3_out_at.get();
+        if t > 0 && n >= t && self.bp3.get() == Bp3::In {
+            self.bp3.set(Bp3::Out(OutKind::Honest));
+        }
+        let a = Self::summary(&self.a_journal);
+        let b = Self::summary(&self.b_journal);
+        let reader = if self.reader.get() == 0 { &a } else { &b };
+        let bp3 = match self.bp3.get() {
+            Bp3::In | Bp3::ReArmed => reader
+                .clone()
+                .unwrap_or(serde_json::json!({"state": "ARMED", "evidence": {"h": H, "agent_version": env!("CARGO_PKG_VERSION"), "early_abort": true}})),
+            Bp3::Out(k) => {
+                let h = if k == OutKind::ForeignH { H + 1 } else { H };
+                let mut c = serde_json::json!({"state": "ABORTED", "evidence": {"h": h, "agent_version": env!("CARGO_PKG_VERSION"), "early_abort": true},
+                    "transitions": [{"state": "ARMED", "ts": "t"}, {"state": "ABORTED", "ts": "t"}]});
+                if k == OutKind::NoTransitions {
+                    c.as_object_mut().unwrap().remove("transitions");
+                }
+                c
+            }
+        };
+        let mut producers = vec![];
+        for (name, c) in [("bp1", a.clone()), ("bp2", b.clone()), ("bp3", Some(bp3))] {
+            let Some(c) = c else { continue };
+            self.observe(name, &c);
+            let (ex, re) = self
+                .marks
+                .borrow()
+                .get(name)
+                .copied()
+                .unwrap_or((false, false));
+            let (vs, rank) = self
+                .verified
+                .borrow()
+                .get(name)
+                .copied()
+                .unwrap_or((false, 0));
+            let mark = if self.relay_marks {
+                serde_json::json!({"e1": {"past_create": false, "rank": rank, "verified_seen": vs,
+                    "exited": if ex { serde_json::json!({"state": "ABORTED", "at": 1}) } else { serde_json::Value::Null },
+                    "reentered": re}})
+            } else {
+                serde_json::Value::Null
+            };
+            producers.push(serde_json::json!({"name": name, "event_max": mark,
+                "beacons": [{"age_ms": 1000, "report": {"coord": {"event_id": "e1"},
+                    "agent_version": env!("CARGO_PKG_VERSION"), "ceremony": c}}]}));
+        }
+        // Round 4: an rc.31 relay whose marks are complete (this sim never loses state; the interleaved one does).
+        let marks_state = if self.relay_marks {
+            serde_json::json!({"event_id": "e1", "state_id": if self.lost.get() { "s2" } else { "s1" },
+                "generation": n, "complete": !self.lost.get() || std::env::var("R31_DISABLE_FIX_A").is_ok()})
+        } else {
+            serde_json::Value::Null
+        };
+        serde_json::json!({"networks": [{"id": "rehearsal", "producers": producers, "marks_state": marks_state}]})
+    }
+}
+
+/// One fleet agent's config: roster bp1..bp3, quorum 2, its own beacon identity.
+fn fleet_agent_config(dir: &Path, producer: &str, fail_freeze: bool) -> Config {
+    model_config_full(dir, true, fail_freeze, false, false);
+    let path = dir.join("ceremony.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap().replace(
+        "fleet_quorum = 0",
+        "fleet_quorum = 2\nreport_max_age_secs = 60\nearly_abort = true",
+    );
+    for p in ["bp1", "bp2", "bp3"] {
+        text += &format!("\n[[coordination.roster]]\nproducer = \"{p}\"\n");
+    }
+    std::fs::write(dir.join("beacon.token"), format!("tok-{producer}\n")).unwrap();
+    text += &format!("\n[beacon]\nurl = \"https://mc.example/api/report\"\nproducer = \"{producer}\"\nnetwork = \"rehearsal\"\ntoken_file = \"{}/beacon.token\"\n", dir.display());
+    std::fs::write(&path, text).unwrap();
+    Config::load(&path).unwrap_or_else(|e| panic!("fleet config does not load: {e}"))
+}
+
+fn fleet_run(cfg: &Config, world: &World, sim: &FleetSim, who: u8, label: &str) {
+    sim.reader.set(who);
+    let mut r = step_run(cfg, world);
+    if matches!(r, StepResult::Crashed) {
+        world.note(format!("{label}: crashed; re-run"));
+        r = step_run(cfg, world);
+    }
+    world.note(format!("{label}: {r:?}"));
+}
+
+/// Returns (violations, trace).
+fn fleet_scenario(seed: u64) -> (Vec<String>, Vec<String>) {
+    let mut rng = Rng::new(seed ^ 0x00F1_EE70_0031_5EED);
+    let da = tempfile::tempdir().unwrap();
+    let db = tempfile::tempdir().unwrap();
+    let relay_marks = !rng.chance(15);
+    let sim = std::rc::Rc::new(FleetSim {
+        a_journal: da.path().join("journal.jsonl"),
+        b_journal: db.path().join("journal.jsonl"),
+        bp3: Cell::new(Bp3::In),
+        marks: RefCell::new(Default::default()),
+        verified: RefCell::new(Default::default()),
+        relay_marks,
+        lost: Cell::new(false),
+        reader: Cell::new(0),
+        reads: Cell::new(0),
+        bp3_out_at: Cell::new(0),
+    });
+    let wa = World::new(da.path());
+    let wb = World::new(db.path());
+    *wa.fleet.borrow_mut() = Some(sim.clone());
+    *wb.fleet.borrow_mut() = Some(sim.clone());
+    let b_refuses = rng.chance(70);
+    match rng.below(4) {
+        0 => {}
+        1 => sim.bp3.set(Bp3::Out(OutKind::Honest)),
+        2 => sim.bp3.set(Bp3::Out(if rng.chance(50) {
+            OutKind::ForeignH
+        } else {
+            OutKind::NoTransitions
+        })),
+        _ => sim.bp3_out_at.set(1 + rng.below(8)),
+    }
+    if rng.chance(40) {
+        wa.crash_at.set(1 + rng.below(200));
+    }
+    if rng.chance(30) {
+        wb.crash_at.set(1 + rng.below(200));
+    }
+    let b_first = rng.chance(70);
+    let rerun_b = rng.chance(80);
+    let bp3_rearms = rng.chance(80);
+    let head = format!(
+        "fleet seed {seed}: relay_marks={relay_marks} b_refuses={b_refuses} bp3={:?} bp3_out_at={} b_first={b_first} \
+         rerun_b={rerun_b} bp3_rearms={bp3_rearms}",
+        sim.bp3.get(),
+        sim.bp3_out_at.get()
+    );
+    let cfg_a = fleet_agent_config(da.path(), "bp1", false);
+    let cfg_b1 = fleet_agent_config(db.path(), "bp2", b_refuses);
+    if b_first {
+        fleet_run(&cfg_b1, &wb, &sim, 1, "B (first)");
+        fleet_run(&cfg_a, &wa, &sim, 0, "A");
+    } else {
+        fleet_run(&cfg_a, &wa, &sim, 0, "A");
+        fleet_run(&cfg_b1, &wb, &sim, 1, "B (first)");
+    }
+    let wipe_before_rerun = std::env::var("FLEET_WIPE").is_ok() || rng.chance(40);
+    if rerun_b {
+        // Review: the relay restarts on LOST state first (every mark gone), in some scenarios.
+        if wipe_before_rerun {
+            sim.marks.borrow_mut().clear();
+            sim.verified.borrow_mut().clear();
+            sim.lost.set(true);
+        }
+        // The operator fixes B's config and re-runs it on a FRESH journal under the same event (review M1).
+        let _ = std::fs::rename(&sim.b_journal, db.path().join("journal.old.jsonl"));
+        let wb2 = World::new(db.path());
+        *wb2.fleet.borrow_mut() = Some(sim.clone());
+        if bp3_rearms && matches!(sim.bp3.get(), Bp3::Out(_)) {
+            sim.bp3.set(Bp3::ReArmed);
+        }
+        let cfg_b2 = fleet_agent_config(db.path(), "bp2", false);
+        fleet_run(&cfg_b2, &wb2, &sim, 1, "B (fresh journal)");
+        for l in wb2.trace.borrow().iter() {
+            wb.note(l.clone());
+        }
+    }
+    let ja = std::fs::read_to_string(&sim.a_journal).unwrap_or_default();
+    let jb = std::fs::read_to_string(&sim.b_journal).unwrap_or_default()
+        + &std::fs::read_to_string(db.path().join("journal.old.jsonl")).unwrap_or_default();
+    let ignited = |j: &str| {
+        j.contains("\"side_effect\":\"ignite_started\"")
+            || j.contains("\"side_effect\":\"create_chain\"")
+    };
+    let early = |j: &str| j.contains("fleet quorum unreachable");
+    let (a_ignited, b_ignited) = (ignited(&ja), ignited(&jb));
+    let mut v = vec![];
+    if early(&ja) && b_ignited {
+        v.push(
+            "I8: A stopped on an unreachable quorum while B (with bp3) went on to ignite the event"
+                .to_string(),
+        );
+    }
+    if early(&jb) && a_ignited {
+        v.push("I8: B stopped on an unreachable quorum while A ignited the event".to_string());
+    }
+    let mut t = vec![head];
+    t.extend(wa.trace.borrow().iter().map(|l| format!("A| {l}")));
+    t.extend(wb.trace.borrow().iter().map(|l| format!("B| {l}")));
+    t.push(format!(
+        "TAGS early_a={} early_b={} a_ignited={a_ignited} b_ignited={b_ignited} b_refused_rearm={}",
+        early(&ja),
+        early(&jb),
+        jb.contains("already exited event e1")
+    ));
+    (v, t)
+}
+
+/// rc.31 review L4: the fleet model (two acting agents, q < N, a re-arm after an exit, stale and foreign data).
+/// FLEET_MODEL_SCENARIOS (default 100), or one FLEET_MODEL_SEED.
+#[test]
+fn fleet_model_never_splits_on_an_early_abort() {
+    quiet_panics();
+    let (start, count) = match std::env::var("FLEET_MODEL_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(s) => (s, 1),
+        None => (
+            1,
+            std::env::var("FLEET_MODEL_SCENARIOS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100),
+        ),
+    };
+    let mut bad = vec![];
+    let mut stats: std::collections::BTreeMap<String, u64> = Default::default();
+    for seed in start..start + count {
+        let (v, t) = fleet_scenario(seed);
+        if let Some(tags) = t.last().and_then(|l| l.strip_prefix("TAGS ")) {
+            for tag in tags.split(' ') {
+                *stats.entry(tag.to_string()).or_default() += 1;
+            }
+        }
+        if !v.is_empty() {
+            bad.push((seed, v, t));
+        }
+    }
+    eprintln!("FLEET MODEL over {count} scenarios: {stats:?}");
+    assert!(
+        bad.is_empty(),
+        "{} of {count} fleet scenarios split:{}",
+        bad.len(),
+        report(&bad)
+    );
+}
+
+// ------------------------------------------------ interleaved fleet model (rc.31 rounds 3-4, HIGH-1, MEDIUM-1) --
+//
+// Two acting agents, A (bp1) and B (bp2), run in their own threads, but only ONE runs at a time: every relay read is a
+// yield point where a seeded scheduler picks who continues, so gate reads interleave with the other agent's steps and
+// a seed replays exactly. Scripted members C (bp3), X (bp4) and Y (bp5) mirror the reading agent (so B's gate can count
+// them VERIFIED); X and Y exit at their own (different) reads after that, with a never-verified ABORTED (a forged report,
+// or a crash + fresh journal + abort). Beacons lag, and a beacon that just showed VERIFIED may go dark for a while.
+// Round 4 (review MEDIUM-1): in some scenarios the relay restarts on LOST state the moment X and Y have both exited (the
+// reviewer's mutation): reports and marks are gone, so the exits are seen fresh. The relay mirrors control/lib.mjs and
+// server.js: exit marks, sticky verified_seen, rank, and the marks state (state id, generation, complete).
+// Roster N = 5, quorum q = 4. Oracle I9: an agent that stopped on "fleet quorum unreachable" and then never froze or
+// resumed its source must not coexist with any agent that started ignition (the HIGH-1 split).
+
+use std::sync::{Arc, Condvar, Mutex};
+
+/// Mutation switches for the "fixes disabled" demonstrations (relay side; the agent side needs a patched scratch copy).
+fn r31_fix1_disabled() -> bool {
+    std::env::var("R31_DISABLE_FIX1").is_ok()
+}
+fn r31_fix_a_disabled() -> bool {
+    std::env::var("R31_DISABLE_FIX_A").is_ok()
+}
+
+#[derive(Default, Clone)]
+struct IMark {
+    exited: bool,
+    reentered: bool,
+    verified_seen: bool,
+    rank: u64,
+}
+
+/// An older copy of the relay's state: (agents' reports, marks, generation).
+type RelayBackup = (
+    [Option<serde_json::Value>; 2],
+    std::collections::BTreeMap<String, IMark>,
+    u64,
+);
+
+struct IFleetState {
+    turn: usize,
+    alive: [bool; 2],
+    rng: Rng,
+    reads: u64,
+    /// The relay's current copy of each agent's beacon report (lagging).
+    reports: [Option<serde_json::Value>; 2],
+    /// X, Y: the read from which each shows its exit (0 = never), and whether it has.
+    exit_at: [u64; 2],
+    exited: [bool; 2],
+    marks: std::collections::BTreeMap<String, IMark>,
+    journals: [PathBuf; 2],
+    darkened: [bool; 2],
+    dark_until: [u64; 2],
+    /// Round 4: restart on lost state once X and Y have both exited; the relay's state id, generation, lost flag.
+    wipe: bool,
+    wiped: bool,
+    state_id: u64,
+    gen: u64,
+    lost: bool,
+    /// "Counted at a peer's gate, then marked": X and Y exit a few reads after B's report first shows VERIFIED.
+    after_b_verified: bool,
+    /// Restore from an older backup (taken at `backup_at`) instead of starting empty.
+    restore: bool,
+    backup_at: u64,
+    backup: Option<RelayBackup>,
+}
+
+struct IFleet {
+    s: Mutex<IFleetState>,
+    cv: Condvar,
+}
+
+fn rank_of(state: &str) -> u64 {
+    match state {
+        "ARMED" => 1,
+        "FROZEN" => 2,
+        "SNAPSHOTTED" => 3,
+        "VERIFIED" | "STRANDED" => 4,
+        "IGNITED" | "HALTED" => 5,
+        "FLIPPED" => 6,
+        "LIVE" => 7,
+        _ => 0,
+    }
+}
+
+impl IFleet {
+    fn wait_turn(&self, me: usize) {
+        let mut g = self.s.lock().unwrap();
+        while g.turn != me {
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+
+    /// Hand the baton to a seeded choice among the agents still running (possibly `me` again).
+    fn pass(&self, g: &mut IFleetState) {
+        let alive: Vec<usize> = (0..2).filter(|i| g.alive[*i]).collect();
+        if alive.is_empty() {
+            return;
+        }
+        g.turn = alive[g.rng.below(alive.len() as u64) as usize];
+        self.cv.notify_all();
+    }
+
+    fn finish(&self, me: usize) {
+        let mut g = self.s.lock().unwrap();
+        g.alive[me] = false;
+        self.pass(&mut g);
+    }
+
+    fn observe(g: &mut IFleetState, name: &str, c: &serde_json::Value) {
+        let fix1 = !r31_fix1_disabled();
+        let m = g.marks.entry(name.to_string()).or_default();
+        m.rank = m.rank.max(rank_of(c["state"].as_str().unwrap_or("")));
+        let countable = ["VERIFIED", "IGNITED", "FLIPPED", "LIVE", "HALTED"];
+        let verified_sign = countable.contains(&c["state"].as_str().unwrap_or(""))
+            || c["create_started"].as_bool() == Some(true)
+            || c["ignition_started"].as_bool() == Some(true)
+            || !c["evidence"]["snapshot_sha256"].is_null()
+            || !c["evidence"]["fingerprints_digest"].is_null()
+            || c["transitions"].as_array().is_some_and(|t| {
+                t.iter()
+                    .any(|x| countable.contains(&x["state"].as_str().unwrap_or("")))
+            });
+        if verified_sign {
+            m.verified_seen = true;
+        }
+        if m.exited && !matches!(c["state"].as_str(), Some("ABORTED" | "STRANDED")) {
+            m.reentered = true;
+        }
+        if (!fix1 || !m.verified_seen) && FleetSim::exits_without_verify(c) {
+            m.exited = true;
+        }
+    }
+
+    /// One relay read by agent `me`: a yield point. Returns the status document.
+    fn read(&self, me: usize) -> serde_json::Value {
+        let doc = {
+            let mut g = self.s.lock().unwrap();
+            g.reads += 1;
+            g.gen += 1;
+            if g.after_b_verified
+                && g.exit_at == [0, 0]
+                && g.reports[1]
+                    .as_ref()
+                    .is_some_and(|r| r["state"].as_str() == Some("VERIFIED"))
+            {
+                let r = g.reads;
+                g.exit_at = [r + 1 + g.rng.below(6), r + 1 + g.rng.below(12)];
+            }
+            for k in 0..2 {
+                if g.exit_at[k] > 0 && g.reads >= g.exit_at[k] {
+                    g.exited[k] = true;
+                }
+            }
+            // The older backup: taken at `backup_at`, or (counted-then-marked scenarios) the last state before B's
+            // report first shows VERIFIED, so it holds B's earlier report and no VERIFIED mark for X and Y.
+            let b_pre = g.reports[1].as_ref().is_some_and(|r| {
+                matches!(
+                    r["state"].as_str(),
+                    Some("ARMED" | "FROZEN" | "SNAPSHOTTED")
+                )
+            });
+            if g.restore
+                && ((g.after_b_verified && b_pre && !g.exited[0])
+                    || (!g.after_b_verified && g.backup.is_none() && g.reads >= g.backup_at))
+            {
+                g.backup = Some((g.reports.clone(), g.marks.clone(), g.gen));
+            }
+            if g.wipe && !g.wiped && g.exited[0] && g.exited[1] {
+                // The reviewer's mutation: the relay restarts on lost state (or on an older backup) as X and Y exit.
+                g.wiped = true;
+                match g.backup.take().filter(|_| g.restore) {
+                    Some((reports, marks, gen)) => {
+                        g.reports = reports;
+                        g.marks = marks;
+                        if !r31_fix_a_disabled() {
+                            g.lost = true;
+                            g.gen = gen;
+                        }
+                    }
+                    None => {
+                        g.marks.clear();
+                        g.reports = [None, None];
+                        if !r31_fix_a_disabled() {
+                            g.lost = true;
+                            g.state_id += 1;
+                            g.gen = 1;
+                        }
+                    }
+                }
+            }
+            // Beacon lag: another agent's report reaches the relay only at some reads. A beacon that just showed
+            // VERIFIED may go dark for a while (starved by the relay's per-token rate limit): its last, still fresh,
+            // VERIFIED report stays up while that agent goes on to create and ignite (review HIGH-1).
+            for i in 0..2 {
+                let verified_now = g.reports[i]
+                    .as_ref()
+                    .is_some_and(|r| r["state"].as_str() == Some("VERIFIED"));
+                if verified_now && !g.darkened[i] {
+                    g.darkened[i] = true;
+                    let pct = if g.after_b_verified { 90 } else { 60 };
+                    if g.rng.chance(pct) {
+                        g.dark_until[i] = g.reads + 1 + g.rng.below(80);
+                    }
+                }
+                if g.reads < g.dark_until[i] {
+                    continue;
+                }
+                if i == me || g.reports[i].is_none() || g.rng.chance(50) {
+                    let p = g.journals[i].clone();
+                    if p.exists() {
+                        g.reports[i] = Some(pulse_cutover::beacon::journal_summary(&p));
+                    }
+                }
+            }
+            let reader = g.reports[me].clone().unwrap_or(serde_json::json!({"state": "ARMED", "evidence": {"h": H, "agent_version": env!("CARGO_PKG_VERSION"), "early_abort": true}}));
+            let exit = serde_json::json!({"state": "ABORTED", "evidence": {"h": H, "agent_version": env!("CARGO_PKG_VERSION"), "early_abort": true},
+                "transitions": [{"state": "ARMED", "ts": "t"}, {"state": "ABORTED", "ts": "t"}]});
+            let entries: Vec<(&str, Option<serde_json::Value>)> = vec![
+                ("bp1", g.reports[0].clone()),
+                ("bp2", g.reports[1].clone()),
+                ("bp3", Some(reader.clone())),
+                (
+                    "bp4",
+                    Some(if g.exited[0] {
+                        exit.clone()
+                    } else {
+                        reader.clone()
+                    }),
+                ),
+                ("bp5", Some(if g.exited[1] { exit } else { reader })),
+            ];
+            let mut producers = vec![];
+            for (name, c) in entries {
+                let Some(c) = c else { continue };
+                Self::observe(&mut g, name, &c);
+                let m = g.marks.get(name).unwrap();
+                let mark = serde_json::json!({"e1": {"past_create": false, "rank": m.rank,
+                    "verified_seen": if r31_fix1_disabled() { false } else { m.verified_seen },
+                    "exited": if m.exited { serde_json::json!({"state": "ABORTED", "at": 1}) } else { serde_json::Value::Null },
+                    "reentered": m.reentered}});
+                producers.push(serde_json::json!({"name": name, "event_max": mark,
+                    "beacons": [{"age_ms": 1000, "report": {"coord": {"event_id": "e1"},
+                        "agent_version": env!("CARGO_PKG_VERSION"), "ceremony": c}}]}));
+            }
+            let marks_state = serde_json::json!({"event_id": "e1", "state_id": format!("s{}", g.state_id),
+                "generation": g.gen, "complete": !g.lost});
+            self.pass(&mut g);
+            serde_json::json!({"networks": [{"id": "rehearsal", "producers": producers, "marks_state": marks_state}]})
+        };
+        self.wait_turn(me);
+        doc
+    }
+}
+
+/// Returns (violations, trace).
+fn ifleet_scenario(seed: u64) -> (Vec<String>, Vec<String>) {
+    let mut rng = Rng::new(seed ^ 0x0031_0003_0031_BEEF);
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    // X and Y exit at different reads (or one of them never).
+    let after_b_verified = rng.chance(70);
+    let exit_at = if after_b_verified {
+        [0, 0]
+    } else {
+        [
+            1 + rng.below(12),
+            if rng.chance(85) { 1 + rng.below(20) } else { 0 },
+        ]
+    };
+    let sched = [rng.chance(80), rng.chance(50)];
+    let lag = [rng.below(40), 0];
+    let crash = [
+        if rng.chance(25) {
+            1 + rng.below(200)
+        } else {
+            0
+        },
+        if rng.chance(25) {
+            1 + rng.below(200)
+        } else {
+            0
+        },
+    ];
+    let wipe = std::env::var("IFLEET_WIPE").is_ok() || rng.chance(50);
+    let restore = rng.chance(60);
+    let fleet = Arc::new(IFleet {
+        s: Mutex::new(IFleetState {
+            turn: 0,
+            alive: [true, true],
+            rng: Rng::new(seed ^ 0x5C4E_D00E_u64.wrapping_mul(3)),
+            reads: 0,
+            reports: [None, None],
+            exit_at,
+            exited: [false, false],
+            marks: Default::default(),
+            journals: [
+                dirs[0].path().join("journal.jsonl"),
+                dirs[1].path().join("journal.jsonl"),
+            ],
+            darkened: [false, false],
+            dark_until: [0, 0],
+            wipe,
+            wiped: false,
+            state_id: 1,
+            gen: 0,
+            lost: false,
+            restore,
+            after_b_verified,
+            backup_at: 1 + rng.below(exit_at[0].max(6)),
+            backup: None,
+        }),
+        cv: Condvar::new(),
+    });
+    let head = format!(
+        "ifleet seed {seed}: exit_at={exit_at:?} scheduled={sched:?} crash={crash:?} wipe={wipe} restore={restore} after_b_verified={after_b_verified}"
+    );
+    let mut handles = vec![];
+    for (i, d) in dirs.iter().enumerate() {
+        let f = fleet.clone();
+        let dir = d.path().to_path_buf();
+        let (sch, cr, lg) = (sched[i], crash[i], lag[i]);
+        handles.push(std::thread::spawn(move || {
+            f.wait_turn(i);
+            let cfg = ifleet_agent_config(&dir, if i == 0 { "bp1" } else { "bp2" }, sch);
+            let world = World::new(&dir);
+            *world.ifleet.borrow_mut() = Some((f.clone(), i));
+            world.scheduler.set(sch);
+            world.crash_at.set(cr);
+            world.lib_lag.set(lg);
+            let mut r = step_run(&cfg, &world);
+            if matches!(r, StepResult::Crashed) {
+                r = step_run(&cfg, &world);
+            }
+            world.note(format!("run: {r:?}"));
+            let trace = world.trace.borrow().clone();
+            f.finish(i);
+            trace
+        }));
+    }
+    let traces: Vec<Vec<String>> = handles
+        .into_iter()
+        .map(|h| h.join().unwrap_or_else(|_| vec!["thread panicked".into()]))
+        .collect();
+    let wiped = fleet.s.lock().unwrap().wiped;
+    let j: Vec<String> = (0..2)
+        .map(|i| std::fs::read_to_string(dirs[i].path().join("journal.jsonl")).unwrap_or_default())
+        .collect();
+    let ignited = |j: &str| {
+        j.contains("\"side_effect\":\"ignite_started\"")
+            || j.contains("\"side_effect\":\"create_chain\"")
+    };
+    let early = |j: &str| j.contains("fleet quorum unreachable");
+    let froze = |j: &str| j.contains("\"kind\":\"transition\",\"state\":\"FROZEN\"");
+    // The old chain is open again: this ceremony's pause resumed, or its frozen writes reopened (on_abort).
+    let resumed = |j: &str| {
+        j.contains("\"ok\":true,\"rollback_step\":\"resume\"")
+            || j.contains("\"ok\":true,\"rollback_step\":\"on_abort\"")
+    };
+    let mut v = vec![];
+    for (a, b) in [(0, 1), (1, 0)] {
+        if early(&j[a]) && (!froze(&j[a]) || resumed(&j[a])) && ignited(&j[b]) {
+            v.push(format!(
+                "I9: agent {a} stopped on an unreachable quorum and its old chain kept or resumed production while agent {b} ignited"
+            ));
+        } else if froze(&j[a]) && resumed(&j[a]) && ignited(&j[b]) {
+            // Round 4: the wider split, whatever the abort's reason (a relay restored mid-event fooled the resume guard).
+            v.push(format!(
+                "I9b: agent {a} froze, then reopened its old chain while agent {b} ignited"
+            ));
+        }
+    }
+    let mut t = vec![head];
+    for (i, tr) in traces.iter().enumerate() {
+        t.extend(tr.iter().map(|l| format!("{i}| {l}")));
+    }
+    let early_vs_ignited = (early(&j[0]) && ignited(&j[1])) || (early(&j[1]) && ignited(&j[0]));
+    let early_kept_old = (0..2).any(|a| early(&j[a]) && (!froze(&j[a]) || resumed(&j[a])));
+    t.push(format!(
+        "TAGS early_vs_ignited={early_vs_ignited} early_kept_old_chain={early_kept_old} early={} ignited={} both_verified={} wiped={wiped}",
+        early(&j[0]) || early(&j[1]),
+        ignited(&j[0]) || ignited(&j[1]),
+        j.iter().all(|x| x.contains("\"state\":\"VERIFIED\""))
+    ));
+    (v, t)
+}
+
+/// One interleaved agent's config: roster bp1..bp5, quorum 4, its own beacon identity and producer lock.
+fn ifleet_agent_config(dir: &Path, producer: &str, scheduled: bool) -> Config {
+    model_config_full(dir, true, false, scheduled, false);
+    let path = dir.join("ceremony.toml");
+    let mut text = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace(
+            "fleet_quorum = 0",
+            "fleet_quorum = 4\nreport_max_age_secs = 60\nearly_abort = true",
+        )
+        // Slower polling (mock clock): the 10 s quorum-poll rate limit then allows reads during the waits.
+        .replace("poll_ms = 1\n", "poll_ms = 2000\n")
+        .replace(
+            "quiescence_timeout_secs = 5\n",
+            "quiescence_timeout_secs = 120\n",
+        )
+        .replace("quorum_timeout_secs = 10\n", "quorum_timeout_secs = 300\n")
+        .replace("fleet_timeout_secs = 5\n", "fleet_timeout_secs = 120\n")
+        // Each agent its own producer lock (both run in one process against the same mock producer API URL).
+        .replacen(
+            "[ceremony]\n",
+            &format!("[ceremony]\nlock_dir = \"{}/locks\"\n", dir.display()),
+            1,
+        );
+    for p in ["bp1", "bp2", "bp3", "bp4", "bp5"] {
+        text += &format!("\n[[coordination.roster]]\nproducer = \"{p}\"\n");
+    }
+    std::fs::write(dir.join("beacon.token"), format!("tok-{producer}\n")).unwrap();
+    text += &format!("\n[beacon]\nurl = \"https://mc.example/api/report\"\nproducer = \"{producer}\"\nnetwork = \"rehearsal\"\ntoken_file = \"{}/beacon.token\"\n", dir.display());
+    std::fs::write(&path, text).unwrap();
+    Config::load(&path).unwrap_or_else(|e| panic!("ifleet config does not load: {e}"))
+}
+
+/// rc.31 rounds 3-4: the interleaved fleet model. IFLEET_MODEL_SCENARIOS (default 60), or IFLEET_MODEL_SEED;
+/// IFLEET_WIPE=1 makes every scenario restart the relay on lost state as X and Y exit.
+#[test]
+fn interleaved_fleet_model_never_splits_after_a_member_was_counted() {
+    quiet_panics();
+    let (start, count) = match std::env::var("IFLEET_MODEL_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(s) => (s, 1),
+        None => (
+            1,
+            std::env::var("IFLEET_MODEL_SCENARIOS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(60),
+        ),
+    };
+    let mut bad = vec![];
+    let mut stats: std::collections::BTreeMap<String, u64> = Default::default();
+    for seed in start..start + count {
+        let (v, t) = ifleet_scenario(seed);
+        if let Some(tags) = t.last().and_then(|l| l.strip_prefix("TAGS ")) {
+            for tag in tags.split(' ') {
+                *stats.entry(tag.to_string()).or_default() += 1;
+            }
+        }
+        if !v.is_empty() {
+            bad.push((seed, v, t));
+        }
+    }
+    eprintln!("IFLEET MODEL over {count} scenarios: {stats:?}");
+    assert!(
+        bad.is_empty(),
+        "{} of {count} interleaved scenarios split:{}",
+        bad.len(),
+        report(&bad)
+    );
 }
 
 // --------------------------------------------------------------- driving --
@@ -1011,6 +1902,23 @@ fn scenario_full(seed: u64, r11: bool, r13: bool) -> (Vec<String>, Vec<String>) 
     if coordinated && rng.chance(35) {
         world.coord_abort_tick.set(1 + rng.below(40));
     }
+    // rc.31 draws come from a fourth stream (earlier seeds keep their draws).
+    let mut rng4 = Rng::new(seed ^ 0x0031_0031_EA51_AB07);
+    let cfg = if coordinated && rng4.chance(45) {
+        world.roster_mode.set(true);
+        if rng4.chance(75) {
+            world.quorum_out_tick.set(1 + rng4.below(5));
+        }
+        world.bp2_lags.set(rng4.chance(50));
+        world.note(format!(
+            "faults(r31): roster q=2, quorum_out@{} bp2_lags={}",
+            world.quorum_out_tick.get(),
+            world.bp2_lags.get()
+        ));
+        model_add_roster(dir.path())
+    } else {
+        cfg
+    };
     if rng.chance(60) {
         world.crash_at.set(1 + rng.below(250));
     }
@@ -1158,6 +2066,8 @@ fn scenario_full(seed: u64, r11: bool, r13: bool) -> (Vec<String>, Vec<String>) 
         ),
         ("read_outage_after_resume", "outage right after the resume"),
         ("resume_outcome_unknown", "source_resume_outcome_unknown"),
+        ("r31_early_abort", "fleet quorum unreachable"),
+        ("r31_early_abort_deferred", "\"early_abort\":\"deferred\""),
     ] {
         let hay = format!("{j}\n{}", world.trace.borrow().join("\n"));
         if hay.contains(needle) {

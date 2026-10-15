@@ -152,6 +152,11 @@ pub struct Coordination {
     /// the fleet counts as stalled too (and the ceremony halts).
     #[serde(default = "default_fleet_stall")]
     pub fleet_stall_secs: u64,
+    /// rc.31: stop waiting early (and never freeze) once the fleet's quorum is provably unreachable. OFF by default:
+    /// with it off the ceremony waits for the fleet timeout exactly as rc.30 did. Set by `await` from the SIGNED event
+    /// (`early_abort: true`) so the whole fleet runs one setting; a hand-written config must match on every member.
+    #[serde(default)]
+    pub early_abort: bool,
 }
 
 fn default_degraded_patience() -> u64 {

@@ -6,7 +6,7 @@ ceremony is shaped the way it is: the adversarial review that changed the design
 **R-numbers** that appear in log messages, config comments and the README), the state machine,
 the config format, the failure and rollback table, and a sketch of a faster v2.
 
-It describes the code as of **v0.5.0-rc.30** (§3 and §5 carry the rc.21–rc.28 changes; rc.29's guard, authorization and
+It describes the code as of **v0.5.0-rc.31** (§3 and §5 carry the rc.21–rc.28 changes; rc.29's guard, authorization and
 relay changes are summarised in docs/OPERATOR-QUICKSTART.md §6 and ATOMICITY.md known limit 17; the
 review table in §2 was last re-checked at rc.11 and its "Today" column is dated that way). The
 first version of this design was written in August 2026, before the multi-producer rehearsal and
@@ -224,6 +224,74 @@ stateDiagram-v2
   (fleet run c5) the guard also requires this node's OWN fresh, non-conflicted report for the event on the
   relay: under a signed abort a silent member used to resume while the visible ones stranded (they could not
   account for it). A roster without a `[beacon]`, or a beacon producer outside the roster, is a config warning.
+- **Early abort when the quorum is provably unreachable** (rc.31, fleet runs h4/h5). **OFF by default.** It runs only
+  when `[coordination] early_abort = true`, which `await` takes from the SIGNED event (`coord.mjs event --early-abort
+  yes`; absent = off), so the whole fleet runs one setting. Round 5 (review MEDIUM-2): the setting is bound to the signed
+  event: the agent turns it on at ARM only when its config says so AND the relay's signed event (verified with the
+  configured keys and the accepted payload hash) says so, journals the result in its ARMED record (reported as ceremony
+  evidence), refuses the ARM when the config asks for it but the relay does not answer, and runs it off (journaled)
+  when the signed event says off; on XPR mainnet the binding check refuses any mismatch; a proof needs every roster
+  member's ARMED evidence to say `early_abort: true`.
+  **Flag off = rc.30 behaviour, plus the QUORUM UNREACHABLE alarm and stricter resume guards.** The relay sets exit
+  marks, the re-entry alarm and the `conflict: true` projection ONLY for an event whose signed payload has
+  `early_abort: true` (otherwise it only remembers `exit_seen` for its own alarm), and the agent's ARM refusals over exit
+  marks and tombstones run only with the flag on, so an h5-style refuse → fix → re-ARM under the same event is counted
+  at every gate as in rc.30 (`rc31_flag_off_a_refused_then_fixed_member_is_counted_as_in_rc30`, `control/test/rc31`).
+  Remaining differences with the flag off, all in the stricter direction: the resume guard can STRAND where rc.30
+  resumed: when this agent remembers a peer as VERIFIED-or-later (it stays "in the ceremony"), when the relay reports
+  its marks incomplete or they went backwards (lost or restored relay state), or when at least `quorum` members may
+  have verified under a signed abort; and the relay refuses an abort once the fleet demonstrably went forward (409).
+  `rc31_flag_off_never_takes_an_early_abort_path` proves no early-abort path runs.
+  **What mission control does either way** (review fix 4): when its own view proves the quorum unreachable (the
+  rule below, on its marks), it raises "ALARM QUORUM UNREACHABLE: sign an abort" with the exact `coord.mjs abort`
+  command. **Operating rule:** a signed abort is the safe way to end such an event (authenticated and final on every
+  agent); any early abort is followed by a signed abort for the event.
+  *With the flag on*, a coordinated producer that is **not yet VERIFIED itself** reads the relay while it waits: in the
+  ARMED wait (every 10 s, and once more right before `on_freeze`), in the FROZEN wait for H to finalize (a fresh look on
+  entering it, then every 10 s) and during the upstream verification. Once VERIFIED there is no early abort (a peer's gate
+  may have counted it). `fleet::quorum_unreachable_with` returns a proof only when: the relay serves the event's
+  `marks_state` with `complete: true` and its state id / generation have not gone backwards against what this agent
+  journaled; every roster member's ceremony was RUN by an agent ≥ 0.5.0-rc.31 (the `agent_version` the runner writes
+  into its ARMED record, reported as ceremony evidence; missing = no proof); this node's own fresh report is visible; no
+  other member is known past creation; and at least `N − q + 1` other members are durably out: the relay's exit mark
+  for the member and event, not re-entered, `verified_seen: false` explicitly and a high-water rank below VERIFIED (or
+  STRANDED's own rank with a STRANDED exit), every report for it fresh, unconflicted, this H, ABORTED or STRANDED, never
+  VERIFIED, and **this agent never saw it VERIFIED-or-later** (its journaled `peers_seen_verified`).
+  *The relay's marks* (`control/lib.mjs`, `server.js`): `verified_seen` is sticky (any sign the member verified); an exit
+  mark is set only by a `producer`-role report ending ABORTED / STRANDED without verifying and never while
+  `verified_seen` is true. The server state carries a state id and a generation raised by every write; the coord file
+  anchors the current event's marks on (state id, generation); a start on a lost, replaced or older server state marks
+  the event's marks **lost** (sticky in the coord file) and serves `marks_state.complete: false`. Rules: (1) no rc.31 gate
+  counts a marked member for that event again; the agent journals every mark it sees (`exit_marks_seen`, from every relay
+  read: ARMED and FROZEN polls and the gate) and keeps excluding those members if the relay later forgets them; (2) a
+  marked member that reports any other state is a re-entry: ALARM, and its later reports for the event are served with
+  `conflict: true`, which every agent's gate since v0.5.0-rc.7 skips (rc.30: `src/machine.rs` `fleet_gate`,
+  `reports_of`: `!conflict && fresh && !failing health`), so this holds for older agents too; (3) with the flag on, a
+  fresh ARM refuses when this box's **local exit tombstone** says it already ended the event (written beside the beacon
+  token, outside every run directory, fsynced, before any exit or early abort is reported; no tombstone, no early abort),
+  when the relay's marks are incomplete or not served, and when the relay does not answer; the relay's exit mark for
+  this producer refuses an ARM in any case. A new attempt needs a NEW event id.
+  *Agent memory* (round 4): the agent journals peers it ever saw VERIFIED-or-later, the relay's marks state, and a
+  regression (`relay_marks_regressed`); a remembered peer is never out and stays in the ceremony for the resume guard;
+  a regressed or incomplete relay view proves nothing, and the resume guard refuses on it.
+  *Why that is safe* (under the trust model: token-authenticated, unsigned reports and a relay that can lose state but
+  says so): a member counted out never reached VERIFIED as far as the relay or this agent ever saw, so no peer's gate
+  counted it; its exit stays permanent at every gate (marks, conflicts, journaled marks, local tombstones), so at most
+  `N − out < q` members can ever be counted; a relay restart on lost or older state is detected (coord anchor, agent
+  journal) and disables proofs and resumes for the event. After the freeze the early abort only decides WHEN: `abort()`
+  and the resume guard are unchanged, and a guard refusal defers it. Defence in depth: the guard counts members that may
+  have verified (relay mark or agent memory) as in the ceremony and, under a signed abort, refuses when at least `q` may
+  have verified.
+  *Residuals* (why D-13 is PARTIAL): marks are relay state from unsigned reports (D-1, D-2): a forged exit report sent
+  before a member's first VERIFIED reaches the relay can mark it (a liveness cost; the mark also keeps it out of every
+  gate); a relay that loses BOTH its server state and its coord file loses the anchor and the event itself (agents then
+  fall back to their journals and local tombstones); the version gate trusts each member's reported runner version; the
+  models run agents sequentially or interleaved at relay reads only (`fleet_model_never_splits_on_an_early_abort`,
+  `interleaved_fleet_model_never_splits_after_a_member_was_counted`), and the interleaved one is not fully deterministic
+  (some agent waits use wall-clock time). Measured: with the round-4 fixes (a)–(c) disabled and the relay losing or
+  restoring state as members exit, the interleaved model splits 8 / 1,000; with them on 0 / 1,000. With the review fixes
+  1 and 2 disabled and the relay losing state before an exited member re-ARMs, the sequential model splits 34 / 300;
+  with them on 0 / 300. Risk register D-13.
 - **Join** (rc.23). `pulse-cutover join --event <id>` lets a STRANDED or ABORTED producer (upstream backend,
   producer mode) track and ignite the chain a LIVE quorum of the roster runs (a unique group: two groups with a
   quorum are a split), without creating one. From ABORTED it first re-runs `on_freeze` (on_abort reopened writes)
@@ -394,6 +462,8 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 | Upstream, producer mode: the signing key (chain config `producer_key` = genesis `initial_key`) is not what `eosio/producers` registers for `producer_name`, or that producer is unregistered / inactive | producer key check | ARMED, VERIFIED | abort |
 | Upstream: a boot artifact missing or changed since VERIFIED | re-hash | VERIFIED | abort |
 | Fleet does not agree before `fleet_timeout_secs` | fleet gate | VERIFIED | abort (rc.23, coordinated: only if the resume guard passes; else STRANDED) |
+| Enough roster members carry the relay's durable exit mark (ended the event without ever verifying) that fewer than `quorum` can still be counted (rc.31) | ARMED wait, right before `on_freeze`, FROZEN finality wait, upstream verification, fleet gate | ARMED–VERIFIED | abort at once (before the freeze: nothing frozen); after it only through the resume guard; guard would refuse: keep waiting (`early_abort: deferred`) |
+| This producer already exited the event without verifying (relay exit mark), e.g. a re-run on a fresh journal under the same event id (rc.31) | preflight (fresh ARM) | — | refused: a new attempt needs a new event id |
 | Any abort after FROZEN in a coordinated producer ceremony, when the event has no roster, the relay does not answer, a roster member is missing, stale, conflicted or ever reported past chain creation, or at least `quorum` other members are still in the ceremony (no signed abort) | resume guard (rc.23, checked twice around the abort intent) | FROZEN–VERIFIED | STRANDED: source stays paused, writes frozen, `on_halt`; `join` or `rollback` (re-checked / `--force-stranded`) |
 | — `create_chain` journaled (upstream) — | | | |
 | Upstream: `create_chain_cmd` fails or prints no `BLOCKCHAIN_ID=`; a previous run started it without journaling an id; the chain config cannot be installed; a signed abort after creation | create_chain | VERIFIED | halt (a chain may exist and be starting: fleet decision) |
@@ -659,7 +729,29 @@ DONE drill counts toward agreement only with a block id at H, a snapshot hash an
 bundles `drill-latest.json`.
 
 **Exit codes.** 0 = evidence complete and the compare matched; 5 = evidence complete, the compare did not match;
-1 = the drill failed.
+7 = evidence complete, the compare did not match ONLY on the known PulseVM v1.0.0 gaps; 1 = the drill failed.
+
+**Known gaps vs a real mismatch** (rc.31; the rc.30 fleet drills all exited 5 on the two known v1.0.0 gaps, which a
+service manager shows as a failure exactly like a real mismatch). A drill never applies the rehearsal allowlist and
+never reports a mismatch as a match: `compare` stays `MISMATCH`. It adds `compare_class`: `match`, `mismatch`, or
+`known_gaps_only` when every failing table is in `upstream::KNOWN_COMPARE_DIFFERENCES` (contract_index_double,
+global_property) AND its failure equals that table's recorded signature (`known_compare_difference`: Arena has no
+contract_index_double while nodeos has rows; global_property one row each side, Arena exactly 14 bytes shorter) AND
+every other required table matched. Anything else, the same tables failing in another way included, is `mismatch`
+(exit 5). Since rc.31 review L3 the global_property signature is judged on the row bytes, only inside that table's
+section of the output: with the 14 bytes v1.0.0 omits removed (6 after the first byte, 8 at Arena offset 54) the
+printed rows must be equal over at least 70 bytes (the chain parameters and the chain_id prefix), so another chain or
+other parameters with the same size never match; the ceremony's rehearsal allowlist uses the same matcher. Round 3: the
+omitted spans are pinned to their recorded values (6 zero bytes; `58 02 00 00 80 53 3b 00`), and the chain_id in the
+Arena row is compared with the configured source chain_id. **Unchecked with v1.0.0's tool:** it prints only the first
+96 bytes of each row, so Arena bytes 96–142 (the last 2 bytes of the chain_id and the 45-byte tail) and nodeos bytes
+96–156 are not compared. Round 4 (review LOW-1): when a compare tool prints WHOLE rows, the matcher compares the whole
+rows after the transformation, the full 32-byte chain_id, and binds both rows to the printed table digests (sha256 over
+the tool's framing); v1.0.0 cannot, so its signature says "of 143: the tool prints 96 per row"; rehearsal-only (the allowlist is refused for XPR mainnet, and a drill's class never
+turns a mismatch into a match). The
+signatures are those of the v1.0.0 tools; a fixed upstream compare stops producing them, and the class
+disappears by itself. Operators who want a service to treat 7 as success can say so in their unit
+(`SuccessExitStatus=7`); the agent does not.
 
 **Not covered.** The finality wait it measures is the live chain's, not a frozen fleet's; the snapshot write is
 timed as "LIB ≥ H → file present". Peak memory is not measured by the agent (use the host's own monitoring). H is

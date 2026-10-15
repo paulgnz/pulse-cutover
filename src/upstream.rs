@@ -641,7 +641,7 @@ pub fn run_pipeline_exec<O: ChainOps>(
                             not_allowed.push(t.clone());
                             continue;
                         }
-                        match known_compare_difference(t, &e) {
+                        match known_compare_difference(t, &e, chain_id) {
                             Ok(sig) => known.push((t.clone(), sig)),
                             Err(why) => not_allowed.push(format!("{t} ({why})")),
                         }
@@ -977,7 +977,11 @@ pub fn compare_missing_tables(output: &str, failing: &[String]) -> Vec<String> {
 ///   shorter on the Arena side (157 vs 143 on v1.0.0: the proposed-schedule envelope and the
 ///   trailing configuration fields the declared ABI has and the serializer omits). Any other row
 ///   count or size difference is a different defect.
-pub fn known_compare_difference(table: &str, output: &str) -> Result<String, String> {
+pub fn known_compare_difference(
+    table: &str,
+    output: &str,
+    chain_id: &str,
+) -> Result<String, String> {
     let re = regex::Regex::new(&format!(
         r"table {}: nodeos=(Some\(TableReport \{{ rows: (\d+)[^)]*\)|None) arena=(Some\(TableReport \{{ rows: (\d+)[^)]*\)|None)",
         regex::escape(table)
@@ -1000,19 +1004,161 @@ pub fn known_compare_difference(table: &str, output: &str) -> Result<String, Str
             if nodeos_none || arena_none || rows(2) != Some(1) || rows(4) != Some(1) {
                 return Err("not the known difference: expected one row on each side".into());
             }
-            let size = |side: &str| {
-                regex::Regex::new(&format!(r"(?m)^\s*{side} present=true bytes=(\d+)"))
-                    .expect("regex")
-                    .captures(output)
-                    .and_then(|c| c[1].parse::<u64>().ok())
-            };
-            match (size("nodeos"), size("arena")) {
-                (Some(n), Some(a)) if n == a + 14 => Ok(format!("known: global_property row {n} bytes on nodeos, {a} on Arena (the 14 bytes v1.0.0 omits)")),
-                (n, a) => Err(format!("not the known difference: row sizes nodeos {n:?} / arena {a:?} (expected Arena exactly 14 bytes shorter)")),
-            }
+            global_property_known_difference(output, chain_id)
         }
         other => Err(format!("{other} has no known difference")),
     }
+}
+
+/// Where PulseVM v1.0.0's Arena serialization of the `global_property` row omits bytes that nodeos writes (rc.31 review
+/// L3, measured on the recorded v1.0.0 compare log): 6 bytes right after the first byte, and 8 more bytes 54 bytes into
+/// what remains (in front of the configuration's tail and the chain_id). 6 + 8 = the 14-byte size difference.
+const GP_OMIT_FIRST: (usize, usize) = (1, 6);
+const GP_OMIT_SECOND: (usize, usize) = (54, 8);
+/// The compared prefix must reach this far into the Arena row: past the chain parameters and into the chain_id
+/// (which starts at Arena byte 66), so a different chain or different parameters can never match.
+const GP_MIN_COMPARED: usize = 70;
+/// Round 3 (review L3): the omitted spans are PINNED to the values v1.0.0's nodeos rows carry (recorded log), not just
+/// dropped: 6 zero bytes, then `58 02 00 00 80 53 3b 00`.
+const GP_OMITTED_FIRST: [u8; 6] = [0, 0, 0, 0, 0, 0];
+const GP_OMITTED_SECOND: [u8; 8] = [0x58, 0x02, 0x00, 0x00, 0x80, 0x53, 0x3b, 0x00];
+/// Where the chain_id starts in the Arena row.
+const GP_ARENA_CHAIN_ID_AT: usize = 66;
+
+/// rc.31 review L3: the global_property known difference, judged on the BYTES, not only the size. Only the
+/// `table global_property: first differing row` section of the output is read (never another table's lines). Both rows
+/// must be present with nodeos exactly 14 bytes longer, and the printed nodeos row with the two known omissions removed
+/// must equal the printed Arena row over at least `GP_MIN_COMPARED` bytes (chain parameters and the chain_id prefix).
+/// Missing hex, a size difference other than 14 or any other differing byte is a real mismatch. Used by the drill's
+/// `known_gaps_only` class and by the ceremony's rehearsal allowlist alike.
+fn global_property_known_difference(output: &str, chain_id: &str) -> Result<String, String> {
+    let mut section = String::new();
+    let mut inside = false;
+    for line in output.lines() {
+        if line.starts_with("table ") {
+            inside = line.starts_with("table global_property: first differing row");
+            continue;
+        }
+        if inside {
+            section.push_str(line);
+            section.push('\n');
+        }
+    }
+    if section.is_empty() {
+        return Err(
+            "not the known difference: no global_property row section in the output".into(),
+        );
+    }
+    let side = |name: &str| -> Option<(u64, Vec<u8>)> {
+        let c = regex::Regex::new(&format!(
+            r"(?m)^\s*{name} present=true bytes=(\d+) hex=([0-9a-fA-F]+)"
+        ))
+        .expect("regex")
+        .captures(&section)?;
+        let hex = &c[2];
+        let even = &hex[..hex.len() - hex.len() % 2];
+        Some((c[1].parse().ok()?, hex::decode(even).ok()?))
+    };
+    let (Some((n, nb)), Some((a, ab))) = (side("nodeos"), side("arena")) else {
+        return Err("not the known difference: the global_property section lacks a row size and hex for both sides".into());
+    };
+    if n != a + 14 {
+        return Err(format!("not the known difference: row sizes nodeos {n} / arena {a} (expected Arena exactly 14 bytes shorter)"));
+    }
+    let (o1, l1) = GP_OMIT_FIRST;
+    let (o2, l2) = GP_OMIT_SECOND;
+    if nb.len() < o1 + l1 {
+        return Err(
+            "not the known difference: the printed nodeos row is too short to compare".into(),
+        );
+    }
+    if nb[o1..o1 + l1] != GP_OMITTED_FIRST {
+        return Err(
+            "not the known difference: the first omitted span is not the recorded v1.0.0 value"
+                .into(),
+        );
+    }
+    let mut stripped: Vec<u8> = nb[..o1].iter().chain(&nb[o1 + l1..]).copied().collect();
+    if stripped.get(o2..o2 + l2) != Some(&GP_OMITTED_SECOND[..]) {
+        return Err(
+            "not the known difference: the second omitted span is not the recorded v1.0.0 value"
+                .into(),
+        );
+    }
+    if stripped.len() >= o2 + l2 {
+        stripped.drain(o2..o2 + l2);
+    } else {
+        return Err(
+            "not the known difference: the printed nodeos row is too short to compare".into(),
+        );
+    }
+    let len = stripped.len().min(ab.len());
+    if len < GP_MIN_COMPARED {
+        return Err(format!("not the known difference: only {len} comparable bytes printed (need {GP_MIN_COMPARED}, through the chain_id prefix)"));
+    }
+    // The chain_id against the configured source chain_id, as far as the tool prints it (the rest is unchecked: DESIGN).
+    let want = hex::decode(chain_id.trim())
+        .map_err(|_| "not the known difference: the configured chain_id is not hex".to_string())?;
+    let seen = &ab[GP_ARENA_CHAIN_ID_AT.min(ab.len())..];
+    let k = seen.len().min(want.len());
+    if k == 0 || seen[..k] != want[..k] {
+        return Err("not the known difference: the global_property row's chain_id is not the configured source chain_id".into());
+    }
+    if stripped[..len] != ab[..len] {
+        let at = (0..len).find(|i| stripped[*i] != ab[*i]).unwrap_or(0);
+        return Err(format!("not the known difference: with the 14 known bytes removed the rows still differ at Arena byte {at}"));
+    }
+    // Round 4 (review LOW-1): when the tool prints WHOLE rows (no `...`, the decoded length equals `bytes=`), the whole
+    // row is checked: equal after the transformation (so the full chain_id and the configuration tail are compared), the
+    // full 32-byte chain_id equals the configured one, and each row hashes to its side's printed table digest (the
+    // tool's framing: present byte, uvarint length, payload), so the printed rows are the rows the digests cover.
+    let full = nb.len() as u64 == n && ab.len() as u64 == a;
+    if full {
+        if stripped != ab {
+            return Err(
+                "not the known difference: the whole rows differ beyond the 14 known bytes".into(),
+            );
+        }
+        if ab.get(GP_ARENA_CHAIN_ID_AT..GP_ARENA_CHAIN_ID_AT + 32) != Some(&want[..]) {
+            return Err("not the known difference: the row's full chain_id is not the configured source chain_id".into());
+        }
+        let digest = |row: &[u8]| {
+            let mut h = <sha2::Sha256 as sha2::Digest>::new();
+            sha2::Digest::update(&mut h, [1u8]);
+            let mut l = row.len() as u64;
+            loop {
+                let mut b = (l as u8) & 0x7f;
+                l >>= 7;
+                if l != 0 {
+                    b |= 0x80;
+                }
+                sha2::Digest::update(&mut h, [b]);
+                if l == 0 {
+                    break;
+                }
+            }
+            sha2::Digest::update(&mut h, row);
+            hex::encode(sha2::Digest::finalize(h))
+        };
+        let re = regex::Regex::new(
+            r#"table global_property: nodeos=Some\(TableReport \{ rows: 1, sha256: "([0-9a-f]{64})" \}\) arena=Some\(TableReport \{ rows: 1, sha256: "([0-9a-f]{64})" \}\)"#,
+        )
+        .expect("regex");
+        let Some(c) = re.captures(output) else {
+            return Err(
+                "not the known difference: whole rows printed but no table digests to bind them to"
+                    .into(),
+            );
+        };
+        if digest(&nb) != c[1] || digest(&ab) != c[2] {
+            return Err(
+                "not the known difference: the printed rows do not hash to the table digests"
+                    .into(),
+            );
+        }
+        return Ok(format!("known: global_property row {n} bytes on nodeos, {a} on Arena; whole rows equal once the 14 bytes v1.0.0 omits are removed, chain_id and digests verified"));
+    }
+    Ok(format!("known: global_property row {n} bytes on nodeos, {a} on Arena; equal over {len} printed bytes (of {a}: the tool prints 96 per row) once the 14 bytes v1.0.0 omits are removed"))
 }
 
 /// What still stands between an upstream ignition and a SAME-CHAIN-ID MAINNET cutover. Kept as
@@ -1743,16 +1889,142 @@ mod tests {
 
     /// The real v1.0.0 failure (stage-2 cut) matches the known signatures; anything else does not.
     #[test]
+    fn global_property_known_difference_compares_bytes_in_its_own_section() {
+        let out = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/compare-v1.0.0-408461570.log"
+        ))
+        .unwrap();
+        const TESTNET: &str = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd";
+        assert!(known_compare_difference("global_property", &out, TESTNET).is_ok());
+        // Another configured chain: refused even though the two rows agree with each other.
+        assert!(known_compare_difference("global_property", &out, &"ab".repeat(32)).is_err());
+        // An omitted span with other content (same size): refused.
+        let other_span = out.replacen("hex=0100000000000001", "hex=0100000000000101", 1);
+        assert_ne!(other_span, out);
+        assert!(known_compare_difference("global_property", &other_span, TESTNET).is_err());
+        let other_span2 = out.replacen("5802000080533b00", "5802000080533b01", 1);
+        assert!(known_compare_difference("global_property", &other_span2, TESTNET).is_err());
+        // Another chain (the chain_id prefix differs on the Arena side), same sizes: a real mismatch.
+        let other_chain = out.replace(
+            "000071ee83bcf52142d61019d95f9cc5427ba6a0",
+            "000071ee83bcf52142d61019d95f9cc5427ca6a0",
+        );
+        assert_ne!(other_chain, out);
+        assert!(known_compare_difference("global_property", &other_chain, TESTNET).is_err());
+        // A chain parameter differs (Arena side), same sizes: a real mismatch.
+        let other_param = out.replacen(
+            "arena present=true bytes=143 hex=01010000100000000000e803",
+            "arena present=true bytes=143 hex=01010000100000000000e903",
+            1,
+        );
+        assert_ne!(other_param, out);
+        assert!(known_compare_difference("global_property", &other_param, TESTNET).is_err());
+        // The sizes alone (no hex) are no longer enough.
+        let no_hex = regex::Regex::new(r" hex=[0-9a-f]+\.\.\.")
+            .unwrap()
+            .replace_all(&out, "")
+            .to_string();
+        assert!(known_compare_difference("global_property", &no_hex, TESTNET).is_err());
+        // Row lines under ANOTHER table's section are never read as global_property's.
+        let moved = out.replace(
+            "table global_property: first differing row index 0",
+            "table permission: first differing row index 0",
+        );
+        assert!(known_compare_difference("global_property", &moved, TESTNET).is_err());
+    }
+
+    #[test]
+    fn global_property_whole_rows_are_checked_when_printed_in_full() {
+        const CHAIN: &str = "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd";
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/compare-v1.0.0-408461570.log"
+        ))
+        .unwrap();
+        let re =
+            regex::Regex::new(r"(?m)^\s*(nodeos|arena) present=true bytes=\d+ hex=([0-9a-f]+)")
+                .unwrap();
+        let prefix = |side: &str| {
+            hex::decode(&re.captures_iter(&fixture).find(|c| &c[1] == side).unwrap()[2]).unwrap()
+        };
+        // Whole rows built from the recorded prefixes: Arena = its 96 printed bytes + the chain_id's last 2 bytes + a
+        // 45-byte tail; nodeos = the same with the two known spans put back.
+        let tail: Vec<u8> = (0..45u8).collect();
+        let chain = hex::decode(CHAIN).unwrap();
+        let mut arena = prefix("arena");
+        arena.extend_from_slice(&chain[30..]);
+        arena.extend_from_slice(&tail);
+        assert_eq!(arena.len(), 143);
+        let mut nodeos = vec![arena[0]];
+        nodeos.extend_from_slice(&GP_OMITTED_FIRST);
+        nodeos.extend_from_slice(&arena[1..54]);
+        nodeos.extend_from_slice(&GP_OMITTED_SECOND);
+        nodeos.extend_from_slice(&arena[54..]);
+        assert_eq!(nodeos.len(), 157);
+        assert_eq!(&nodeos[..96], &prefix("nodeos")[..]);
+        let framed = |row: &[u8]| {
+            let mut v = vec![1u8, row.len() as u8 & 0x7f | 0x80, (row.len() >> 7) as u8];
+            if row.len() < 128 {
+                v = vec![1u8, row.len() as u8];
+            }
+            v.extend_from_slice(row);
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&v))
+        };
+        let out = |n: &[u8], a: &[u8], dn: &str, da: &str| {
+            format!("table global_property: nodeos=Some(TableReport {{ rows: 1, sha256: \"{dn}\" }}) arena=Some(TableReport {{ rows: 1, sha256: \"{da}\" }})\n\
+                     table global_property: first differing row index 0\n  nodeos present=true bytes={} hex={}\n  arena present=true bytes={} hex={}\n",
+                n.len(), hex::encode(n), a.len(), hex::encode(a))
+        };
+        let good = out(&nodeos, &arena, &framed(&nodeos), &framed(&arena));
+        assert!(global_property_known_difference(&good, CHAIN)
+            .unwrap()
+            .contains("whole rows"));
+        // A different config tail on the Arena side (same size): refused (the prefix check alone could not see it).
+        let mut bad_tail = arena.clone();
+        bad_tail[140] ^= 1;
+        assert!(global_property_known_difference(
+            &out(&nodeos, &bad_tail, &framed(&nodeos), &framed(&bad_tail)),
+            CHAIN
+        )
+        .is_err());
+        // The last 2 chain_id bytes differ on both sides: refused against the configured chain.
+        let (mut n2, mut a2) = (nodeos.clone(), arena.clone());
+        a2[97] ^= 1;
+        n2[111] ^= 1;
+        assert!(global_property_known_difference(
+            &out(&n2, &a2, &framed(&n2), &framed(&a2)),
+            CHAIN
+        )
+        .is_err());
+        // Rows that do not hash to the printed digests: refused.
+        assert!(global_property_known_difference(
+            &out(&nodeos, &arena, &framed(&arena), &framed(&nodeos)),
+            CHAIN
+        )
+        .is_err());
+    }
+
+    #[test]
     fn known_compare_differences_match_only_their_signature() {
         let out = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/compare-v1.0.0-408461570.log"
         ))
         .unwrap();
-        assert!(known_compare_difference("contract_index_double", &out).is_ok());
-        assert!(known_compare_difference("global_property", &out)
-            .unwrap()
-            .contains("157"));
+        assert!(known_compare_difference(
+            "contract_index_double",
+            &out,
+            "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
+        )
+        .is_ok());
+        assert!(known_compare_difference(
+            "global_property",
+            &out,
+            "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
+        )
+        .unwrap()
+        .contains("157 bytes"));
         let failing = compare_failing_tables(&out);
         assert!(
             compare_missing_tables(&out, &failing).is_empty(),
@@ -1767,19 +2039,31 @@ mod tests {
             "arena=None",
             "arena=Some(TableReport { rows: 133, sha256: \"00\" })",
         );
-        assert!(known_compare_difference("contract_index_double", &both).is_err());
+        assert!(known_compare_difference(
+            "contract_index_double",
+            &both,
+            "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
+        )
+        .is_err());
         // global_property with a different size gap, or more rows: a different defect.
         assert!(known_compare_difference(
             "global_property",
-            &out.replace("bytes=143", "bytes=140")
+            &out.replace("bytes=143", "bytes=140"),
+            "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
         )
         .is_err());
         assert!(known_compare_difference(
             "global_property",
-            &out.replacen("rows: 1,", "rows: 2,", 1)
+            &out.replacen("rows: 1,", "rows: 2,", 1),
+            "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
         )
         .is_err());
-        assert!(known_compare_difference("permission", &out).is_err());
+        assert!(known_compare_difference(
+            "permission",
+            &out,
+            "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
+        )
+        .is_err());
     }
 
     #[test]

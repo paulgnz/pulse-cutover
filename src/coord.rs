@@ -212,6 +212,8 @@ pub fn mainnet_binding(cfg: &Config, chain_id: &str) -> Value {
         "roster_sha256": hex::encode(Sha256::digest(roster.join("\n").as_bytes())),
         "roster_len": roster.len(),
         "quorum": co.map(|c| c.fleet_quorum).unwrap_or(0),
+        // rc.31 round 5 (review MEDIUM-2): the early-abort setting is part of what the signed event binds.
+        "early_abort": co.map(|c| c.early_abort).unwrap_or(false),
     })
 }
 
@@ -240,9 +242,14 @@ pub fn mainnet_binding_problem(
             .into()),
         Some(b) => {
             let now = mainnet_binding(cfg, chain);
-            let fields = ["event_id", "event_hash", "network", "chain_id", "h", "roster_sha256", "quorum"];
+            let fields = ["event_id", "event_hash", "network", "chain_id", "h", "roster_sha256", "quorum", "early_abort"];
+            // A binding journaled before rc.31 has no early_abort: it was off.
+            let off = json!(false);
+            let get = |v: &Value, f: &str| -> Value {
+                v.get(f).cloned().unwrap_or_else(|| if f == "early_abort" { off.clone() } else { Value::Null })
+            };
             let diff: Vec<String> = fields.iter()
-                .filter(|f| b.get(**f) != now.get(**f))
+                .filter(|f| get(b, f) != get(&now, f))
                 .map(|f| format!("{f}: authenticated {} vs config {}", b.get(*f).unwrap_or(&Value::Null), now[*f]))
                 .collect();
             (!diff.is_empty()).then(|| format!(
@@ -431,7 +438,38 @@ pub fn mainnet_event_problems(
             ));
         }
     }
+    // rc.31 round 5 (review MEDIUM-2): the early abort is the signed event's decision.
+    let signed_early = ev["early_abort"].as_bool() == Some(true);
+    if signed_early != co.early_abort {
+        out.push(format!(
+            "coordination.early_abort = {} but the signed event says {signed_early}",
+            co.early_abort
+        ));
+    }
     out
+}
+
+/// rc.31 round 5 (review MEDIUM-2): does the relay's signed event for this ceremony (verified against the configured
+/// keys and, when known, the accepted payload hash) turn the early abort on? Unknown (no answer, no event) = false.
+pub fn signed_early_abort(doc: &Value, cfg: &Config) -> bool {
+    let Some(co) = cfg.coordination.as_ref() else {
+        return false;
+    };
+    let Some(event_id) = co.event_id.as_deref() else {
+        return false;
+    };
+    if !carries_event(
+        doc,
+        &co.coordinator_keys,
+        &co.network,
+        event_id,
+        co.event_hash.as_deref(),
+    ) {
+        return false;
+    }
+    verify(&doc["event"], &co.coordinator_keys)
+        .ok()
+        .is_some_and(|p| p["early_abort"].as_bool() == Some(true))
 }
 
 /// True when `doc` carries a valid signed `complete` for `event_id` (the coordinator closed an event that ran).
@@ -468,6 +506,56 @@ pub fn tombstone(cfg: &Config, event_id: &str) -> Option<Value> {
     let t = std::fs::read_to_string(tombstone_file(cfg)).ok()?;
     let v: Value = serde_json::from_str(&t).ok()?;
     v.get(event_id).cloned().filter(|x| !x.is_null())
+}
+
+/// rc.31 (review): where this box records that it ENDED an event without verifying (separate from the signed-abort
+/// tombstones): beside the beacon token (installed outside every run directory), else the box's lock directory.
+pub fn exit_tombstone_path(cfg: &Config, event_id: &str) -> PathBuf {
+    let dir = cfg
+        .beacon
+        .as_ref()
+        .and_then(|b| b.token_file.as_ref())
+        .and_then(|t| t.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| crate::drill::lock_dir(cfg));
+    let safe: String = event_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    dir.join(format!("event-exit-{safe}.json"))
+}
+
+/// The local exit tombstone for `event_id`, if this box wrote one.
+pub fn exit_tombstone(cfg: &Config, event_id: &str) -> Option<Value> {
+    let t = std::fs::read_to_string(exit_tombstone_path(cfg, event_id)).ok()?;
+    let v: Value =
+        serde_json::from_str(&t).unwrap_or(json!({"reason": "unreadable tombstone (still final)"}));
+    Some(v)
+}
+
+/// Write the local exit tombstone (fsynced) for `event_id`. Never removed by the agent.
+pub fn record_exit_tombstone(cfg: &Config, event_id: &str, reason: &str) -> Result<(), String> {
+    let path = exit_tombstone_path(cfg, event_id);
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("create {}: {e}", d.display()))?;
+    }
+    let body = json!({"event_id": event_id, "kind": "exited_without_verifying", "reason": reason,
+        "journal": cfg.journal_path.display().to_string()})
+    .to_string();
+    let mut f =
+        std::fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    std::io::Write::write_all(&mut f, body.as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    f.sync_all()
+        .map_err(|e| format!("fsync {}: {e}", path.display()))
 }
 
 /// An `aborted` tombstone: a signed abort for this id was seen on this node.
@@ -618,6 +706,11 @@ pub fn derived_config(
             .unwrap_or(roster.as_array().map(|a| a.len()).unwrap_or(0) as u64);
         co.insert("fleet_quorum".into(), toml::Value::Integer(q as i64));
     }
+    // rc.31: the early abort is the signed event's decision (one setting for the whole fleet); absent = off.
+    co.insert(
+        "early_abort".into(),
+        toml::Value::Boolean(ev["early_abort"].as_bool() == Some(true)),
+    );
     if let Some(sha) = ev["snapshot_sha256"].as_str() {
         if let Some(snap) = doc.get_mut("snapshot").and_then(|v| v.as_table_mut()) {
             snap.insert("expected_sha256".into(), toml::Value::String(sha.into()));

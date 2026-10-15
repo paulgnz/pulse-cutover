@@ -130,7 +130,8 @@ test('rc.28: an older event\'s ordinary creation evidence is not trimmed by newe
   assert.equal((await send('bpa', 'ev-1', { state: 'LIVE', ignition_started: true, evidence: { h: CUT }, target: tgt('TargetChainBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB') })).status, 200);
   assert.equal((await send('bpa', 'ev-1', { state: 'ABORTED', evidence: { h: CUT } })).status, 200);
   // Close ev-1, then 22 newer signed events with ordinary reports.
-  assert.equal((await fetch(`${base}/api/coord/testnet`, { method: 'POST', body: JSON.stringify(signed({ type: 'abort', network: 'testnet', event_id: 'ev-1' })) })).status, 200);
+  // rc.31: this event has creation evidence, so closing it with an abort needs the signer's explicit acknowledgement.
+  assert.equal((await fetch(`${base}/api/coord/testnet`, { method: 'POST', body: JSON.stringify(signed({ type: 'abort', network: 'testnet', event_id: 'ev-1', acknowledge_past_creation: true })) })).status, 200);
   for (let i = 0; i < 22; i++) {
     assert.equal((await EVPOST(base, { event_id: `ev-n${i}`, h: CUT + i + 1 })).status, 200);
     assert.equal((await send('bpa', `ev-n${i}`, { state: 'ABORTED', evidence: { h: CUT + i + 1 } })).status, 200);
@@ -196,7 +197,8 @@ test('rc.28 verification: rc.27 agents see the whole blocking set under the CURR
   assert.equal((await EVPOST(base, { event_id: 'ev-0', h: CUT })).status, 200);
   const send = reporter(base, Date.now() - 150e3);
   assert.equal((await send('bpa', 'ev-0', { state: 'LIVE', ignition_started: true, evidence: { h: CUT } })).status, 200);
-  assert.equal((await fetch(`${base}/api/coord/testnet`, { method: 'POST', body: JSON.stringify(signed({ type: 'abort', network: 'testnet', event_id: 'ev-0' })) })).status, 200);
+  // rc.31: this event has creation evidence, so closing it with an abort needs the signer's explicit acknowledgement.
+  assert.equal((await fetch(`${base}/api/coord/testnet`, { method: 'POST', body: JSON.stringify(signed({ type: 'abort', network: 'testnet', event_id: 'ev-0', acknowledge_past_creation: true })) })).status, 200);
   assert.equal((await EVPOST(base, { event_id: 'ev-1', h: CUT })).status, 200);
   const r = await fetch(`${base}/api/report`, { method: 'POST', headers: { authorization: `Bearer ${TOK.bpb}` },
     body: JSON.stringify({ ...fixture(), producer: 'bpb', network: 'testnet', role: 'producer', instance_id: 'b'.repeat(32), ts: new Date(Date.now() - 1000).toISOString(),
