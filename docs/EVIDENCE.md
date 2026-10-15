@@ -587,6 +587,9 @@ Each class has an `#[ignore]`d regression test in `tests/model.rs`; the default 
 runs by default. Strict run (`MODEL_STRICT=1`), 20,000 scenarios: **0 violations**: 3,340 crashes, 7,084 external
 pauses, 844 external un-pauses of the agent's own pause, 2,054 older-agent journals, 4,073 configs without `on_abort`,
 999 forced releases, 830 resume outcomes unknown, 7,138 `schedule_at_h`; final states LIVE 7,124, ABORTED 9,306,
-STRANDED 1,955, HALTED 446. Join model, 1,000 scenarios: **0 violations** (933 segments, 146 join pause intents, 99
+STRANDED 1,955, HALTED 446, and 1,169 scenarios whose last operator step (each scenario runs 2–5) left the journal in
+a non-terminal state, e.g. after a crash: IGNITED 940, FROZEN 187, VERIFIED 22, SNAPSHOTTED 17, ARMED 3. The R13-B seed counts
+were measured on different sources: 21 seeds on the round-12 source (round 13 table above); after round 14's first
+fix, 12 seeds of a second shape (seed 913) remained, closed by the `legacy_takeover` record. Join model, 1,000 scenarios: **0 violations** (933 segments, 146 join pause intents, 99
 acks, 48 unacknowledged). One residual is documented, not open: an un-pause and re-pause of the agent's pause entirely
 between two of its reads (risk A-21; `model_residual_r13_a…`, ignored, fails by design).
