@@ -1328,16 +1328,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     "rehearsal_overrides": self.cfg.rehearsal_overrides(),
                     "rehearsal": self.cfg.ceremony.rehearsal,
                     "production_profile": if self.cfg.ceremony.rehearsal { json!(self.cfg.production_problems()) } else { json!("met") },
-                    "shadow": crate::shadow::identity(&self.cfg),
+                    "shadow": crate::shadow::identity(self.cfg),
                 }),
             )?;
             if self.cfg.is_shadow() {
-                self.journal.evidence(State::Armed, json!({"SHADOW": crate::shadow::label(&self.cfg),
+                self.journal.evidence(State::Armed, json!({"SHADOW": crate::shadow::label(self.cfg),
                     "note": "SHADOW cutover on a private network (docs/DESIGN-shadow.md): not a cutover; the chain carries the \
                              source chain_id, so never sign on it with a real key"}))?;
                 eprintln!(
                     "WARNING: SHADOW ceremony ({}): not a cutover",
-                    crate::shadow::label(&self.cfg)["label"]
+                    crate::shadow::label(self.cfg)["label"]
                         .as_str()
                         .unwrap_or("")
                 );
@@ -1452,7 +1452,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     )?;
                 }
             } else if !resumed {
-                let eff = crate::drill::lock_dir(&self.cfg);
+                let eff = crate::drill::lock_dir(self.cfg);
                 eprintln!("WARNING: [ceremony] lock_dir is not set: using the default {} (agents, drills and loops on \
                            this box running as other users may use another directory and not exclude each other; set \
                            lock_dir explicitly)", eff.display());
@@ -1461,7 +1461,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
         if self.drill_root_lock.is_none() {
-            match Journal::lock(&crate::drill::root_lock_base(&self.cfg)) {
+            match Journal::lock(&crate::drill::root_lock_base(self.cfg)) {
                 Ok(f) => self.drill_root_lock = Some(f),
                 Err(e) if pre_freeze => problems.push(format!(
                     "a readiness drill holds this directory's drill lock (it is starting or running): {e}. Wait for \
@@ -1476,7 +1476,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // Round 6: only "held by another process" refuses (and only before the freeze, touching nothing: see
             // rollback_steps). Any other failure (an unwritable or missing lock_dir) is journaled: this lock is drill
             // hygiene; the fleet gate, not this lock, protects the cut.
-            match Journal::try_lock(&crate::drill::producer_lock_base(&self.cfg)) {
+            match Journal::try_lock(&crate::drill::producer_lock_base(self.cfg)) {
                 Ok(f) => self.producer_lock = Some(f),
                 Err(crate::journal::LockError::Held(e)) if pre_freeze => problems.push(format!(
                     "another pulse-cutover process holds this producer's lock (a readiness drill or loop on the same \
@@ -1486,9 +1486,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 Err(crate::journal::LockError::Held(_)) => {} // past the freeze: reported by stop_drill_for_the_cut below
                 Err(crate::journal::LockError::Io(e)) => {
                     eprintln!("WARNING: cannot take this producer's lock in {} ({e}); continuing without it",
-                              crate::drill::lock_dir(&self.cfg).display());
+                              crate::drill::lock_dir(self.cfg).display());
                     self.journal.evidence(self.state, json!({"producer_lock_unavailable": e,
-                        "lock_dir": crate::drill::lock_dir(&self.cfg),
+                        "lock_dir": crate::drill::lock_dir(self.cfg),
                         "note": "the producer lock could not be taken for a reason other than another holder; the ceremony continues"}))?;
                 }
             }
@@ -1496,17 +1496,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // Round 6 (review R6-5): a drill under ANOTHER journal directory on this producer whose work survived its
         // process (an export container or pipeline group not verified gone) is named by the producer's work marker.
         if pre_freeze {
-            if let Some(why) = crate::drill::foreign_marker_blocker(&self.cfg) {
+            if let Some(why) = crate::drill::foreign_marker_blocker(self.cfg) {
                 problems.push(why);
             }
-        } else if let Some(why) = crate::drill::foreign_marker_blocker(&self.cfg) {
+        } else if let Some(why) = crate::drill::foreign_marker_blocker(self.cfg) {
             self.stop_foreign_drill_work(&why)?;
         }
         // A readiness drill running on this box would compete for CPU, RAM and disk in the cut window
         // (docs/DESIGN.md §7): before the freeze the ceremony refuses to ARM next to one; a stale record is only reported.
-        match crate::drill::activity(&self.cfg) {
+        match crate::drill::activity(self.cfg) {
             crate::drill::DrillActivity::Running { .. } if pre_freeze => {
-                problems.extend(crate::drill::ceremony_blocker(&self.cfg));
+                problems.extend(crate::drill::ceremony_blocker(self.cfg));
             }
             crate::drill::DrillActivity::Stale { h: dh } if pre_freeze => {
                 self.journal.evidence(self.state, json!({"readiness_drill_stale": {"h": dh,
@@ -1542,7 +1542,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // SHADOW (docs/DESIGN-shadow.md): before anything freezes, prove the target is the configured private
         // network and the source signs only with shadow keys (a shadow config on a real mainnet node refuses here).
         if self.cfg.is_shadow() && pre_verify {
-            let ip = crate::shadow::identity_problems(&self.cfg, self.ops);
+            let ip = crate::shadow::identity_problems(self.cfg, self.ops);
             self.shadow_proven = ip.is_empty();
             for p in ip {
                 problems.push(format!("SHADOW identity: {p}"));
@@ -1570,7 +1570,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 let url = format!("{}/api/coord/{}", co.url.trim_end_matches('/'), co.network);
                 let doc = self.ops.get_json(&url).ok().flatten();
                 let mut bound =
-                    crate::coord::mainnet_event_problems(doc.as_ref(), &self.cfg, &info.chain_id);
+                    crate::coord::mainnet_event_problems(doc.as_ref(), self.cfg, &info.chain_id);
                 // Round-3 review: the authenticated H must be the H this journal executes (recovered on a resume).
                 if let Some(h) = self
                     .resolved_h
@@ -1819,7 +1819,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let mainnet = self.cfg.mainnet_refusals_apply(self.chain_id.as_deref());
         let problems = self.cfg.production_problems();
         if self.cfg.is_shadow() {
-            let shadow_problems = crate::shadow::identity_problems(&self.cfg, self.ops);
+            let shadow_problems = crate::shadow::identity_problems(self.cfg, self.ops);
             if !shadow_problems.is_empty() {
                 self.shadow_refuse(
                     "SHADOW identity not verified before the freeze",
@@ -2116,7 +2116,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 // per producer, only with a fresh, non-conflicted agreeing report.
                 producers
                     .iter()
-                    .filter(|p| reports_of(p).iter().any(|r| agrees(r)))
+                    .filter(|p| reports_of(p).iter().any(&agrees))
                     .count()
             } else {
                 // Roster gate: only the event's required members.
@@ -5165,7 +5165,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // through here). Only this run's positive proof lets a shadow past the mainnet ignite refusal.
         self.shadow_verified = false;
         if self.cfg.is_shadow() {
-            let problems = crate::shadow::identity_problems(&self.cfg, self.ops);
+            let problems = crate::shadow::identity_problems(self.cfg, self.ops);
             if !problems.is_empty() {
                 // shadow_refuse() halts instead when chain creation or ignition already started.
                 self.shadow_refuse(
@@ -5376,7 +5376,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         };
         if self.cfg.is_shadow() {
-            let problems = crate::shadow::target_network_problems(&self.cfg, self.ops);
+            let problems = crate::shadow::target_network_problems(self.cfg, self.ops);
             if !problems.is_empty() {
                 self.shadow_refuse("SHADOW: after ignition the target metalgo is not the configured private network", json!({"problems": problems}))?;
                 return Ok(());

@@ -1842,7 +1842,8 @@ fn r5_a_drill_runs_only_pinned_content_never_a_host_shell() {
     };
     let regular = dir.path().join("not-a-socket");
     std::fs::write(&regular, "x").unwrap();
-    let cases: Vec<(Box<dyn Fn(String) -> String>, &str)> = vec![
+    type Edit = Box<dyn Fn(String) -> String>;
+    let cases: Vec<(Edit, &str)> = vec![
         (
             Box::new(move |t: String| set_toml(&t, "import_bin", bash)),
             "not its pin",

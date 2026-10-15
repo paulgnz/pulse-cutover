@@ -426,8 +426,7 @@ pub fn parse_nginx_dump(dump: &str) -> WebInfo {
                     }
                     "location" => {
                         let path = words
-                            .filter(|t| !matches!(*t, "=" | "~" | "~*" | "^~"))
-                            .next()
+                            .find(|t| !matches!(*t, "=" | "~" | "~*" | "^~"))
                             .unwrap_or("/")
                             .to_string();
                         stack.push(Ctx::Location(path));
@@ -781,10 +780,10 @@ pub fn classify_parent_chain(chain: &[String]) -> Option<String> {
         None => Some(
             "orphaned (nohup/setsid — parent is init; started by a script that has exited)".into(),
         ),
-        Some(shell) if matches!(shell, "bash" | "sh" | "dash" | "zsh" | "ksh") => {
+        Some("bash" | "sh" | "dash" | "zsh" | "ksh") => {
             Some(format!("shell script ({})", chain[0]))
         }
-        Some(other) if matches!(other, "sudo" | "su" | "sshd" | "login") => {
+        Some("sudo" | "su" | "sshd" | "login") => {
             Some(format!("interactive session ({})", chain[0]))
         }
         Some(_) => Some(format!("under `{}`", chain[0])),
@@ -1041,14 +1040,12 @@ pub fn compute_verdicts(r: &DoctorReport) -> BTreeMap<String, Verdict> {
         }
 
         // hyperion extras.
-        if mode == "hyperion" {
-            if !r.docker_present && !r.elasticsearch.detected {
-                needs.push(
-                    "docker (for the Elasticsearch container) — or a running Elasticsearch \
+        if mode == "hyperion" && !r.docker_present && !r.elasticsearch.detected {
+            needs.push(
+                "docker (for the Elasticsearch container) — or a running Elasticsearch \
                      on :9200"
-                        .into(),
-                );
-            }
+                    .into(),
+            );
         }
 
         // Port conflicts: a port the ceremony must bind, held by a foreign process.
@@ -1376,10 +1373,10 @@ fn survey_nodeos(r: &mut DoctorReport) {
                         .to_string();
                     // Only units that actually START it (ExecStart mentions it).
                     let execs = sh(&format!("grep -sE '^ExecStart' {f}")).unwrap_or_default();
-                    if execs.contains("nodeos") || execs.contains("docker") {
-                        if !n.systemd_units.contains(&unit) {
-                            n.systemd_units.push(unit);
-                        }
+                    if (execs.contains("nodeos") || execs.contains("docker"))
+                        && !n.systemd_units.contains(&unit)
+                    {
+                        n.systemd_units.push(unit);
                     }
                 }
             }

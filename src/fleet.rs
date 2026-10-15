@@ -490,7 +490,7 @@ fn unique_best<K: Clone, V: Clone>(
     q: usize,
 ) -> Option<(K, Vec<String>, V, bool)> {
     let mut g = groups;
-    g.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    g.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
     let second = g.get(1).map(|x| x.1.len()).unwrap_or(0);
     g.into_iter().next().map(|(k, m, v)| (k, m, v, second < q))
 }
@@ -641,10 +641,8 @@ pub fn join_view(
     if q == 0 {
         return Err("the event has no roster or quorum: there is no fleet decision to join".into());
     }
-    let mut groups: std::collections::BTreeMap<
-        (String, String),
-        (Vec<String>, Option<String>, Vec<String>),
-    > = Default::default();
+    type Group = (Vec<String>, Option<String>, Vec<String>);
+    let mut groups: std::collections::BTreeMap<(String, String), Group> = Default::default();
     for m in members(status, co) {
         let Some(r) = m.report else { continue };
         let c = &r["ceremony"];

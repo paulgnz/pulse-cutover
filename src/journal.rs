@@ -433,6 +433,7 @@ impl Journal {
     ///   newline, which is added;
     /// - a non-whitespace fragment that does not parse: torn, moved to `<journal>.torn-<ms>`
     ///   (fsynced, including its directory, BEFORE the journal is truncated).
+    ///
     /// The last LF-terminated record must parse: a complete record that does not is corruption,
     /// never silently dropped (that could roll recovery backward). Returns whether a torn tail
     /// was set aside.

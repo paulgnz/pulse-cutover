@@ -548,7 +548,7 @@ pub struct Snapshot {
 ///   chain_state_history.log) -> import_bin (xpr_import_check: SHiP ->
 ///   Arena checkpoint + manifest) -> compare_bin (xpr_19_table_compare:
 ///   wire-level nodeos-vs-Arena 19-table comparison, THE verification gate)
-///   + fingerprint_bin (xpr_state_fingerprint: whole-state root, journaled,
+///   plus fingerprint_bin (xpr_state_fingerprint: whole-state root, journaled,
 ///   golden-comparable across nodes).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

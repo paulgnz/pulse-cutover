@@ -353,14 +353,13 @@ fn probe(cfg: &Config, vars: &[(String, String)]) -> Option<(bool, String)> {
 fn probe_reason(out: &str) -> &str {
     out.lines()
         .map(str::trim)
-        .filter(|l| {
+        .rfind(|l| {
             !l.is_empty()
                 && !l.contains("ExperimentalWarning")
                 && !l.contains("--trace-warnings")
                 && !l.starts_with("(node:")
                 && !l.starts_with("(Use `node")
         })
-        .last()
         .unwrap_or(out)
 }
 

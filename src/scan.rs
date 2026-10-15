@@ -62,38 +62,35 @@ pub fn wasm_env_imports(wasm: &[u8]) -> Result<(BTreeSet<String>, BTreeSet<Strin
     let mut env = BTreeSet::new();
     let mut non_env = BTreeSet::new();
     for payload in Parser::new(0).parse_all(wasm) {
-        match payload.map_err(|e| e.to_string())? {
-            Payload::ImportSection(reader) => {
-                let mut record = |module: &str, name: &str, is_func: bool| {
-                    if !is_func {
-                        return; // only function imports can be called/stubbed
-                    }
-                    if module == "env" {
-                        env.insert(name.to_string());
-                    } else {
-                        non_env.insert(format!("{module}::{name}"));
-                    }
-                };
-                let is_func = |ty: &TypeRef| matches!(ty, TypeRef::Func(_) | TypeRef::FuncExact(_));
-                for group in reader {
-                    match group.map_err(|e| e.to_string())? {
-                        Imports::Single(_, imp) => record(imp.module, imp.name, is_func(&imp.ty)),
-                        Imports::Compact1 { module, items } => {
-                            for item in items {
-                                let item = item.map_err(|e| e.to_string())?;
-                                record(module, item.name, is_func(&item.ty));
-                            }
+        if let Payload::ImportSection(reader) = payload.map_err(|e| e.to_string())? {
+            let mut record = |module: &str, name: &str, is_func: bool| {
+                if !is_func {
+                    return; // only function imports can be called/stubbed
+                }
+                if module == "env" {
+                    env.insert(name.to_string());
+                } else {
+                    non_env.insert(format!("{module}::{name}"));
+                }
+            };
+            let is_func = |ty: &TypeRef| matches!(ty, TypeRef::Func(_) | TypeRef::FuncExact(_));
+            for group in reader {
+                match group.map_err(|e| e.to_string())? {
+                    Imports::Single(_, imp) => record(imp.module, imp.name, is_func(&imp.ty)),
+                    Imports::Compact1 { module, items } => {
+                        for item in items {
+                            let item = item.map_err(|e| e.to_string())?;
+                            record(module, item.name, is_func(&item.ty));
                         }
-                        Imports::Compact2 { module, ty, names } => {
-                            let f = is_func(&ty);
-                            for name in names {
-                                record(module, name.map_err(|e| e.to_string())?, f);
-                            }
+                    }
+                    Imports::Compact2 { module, ty, names } => {
+                        let f = is_func(&ty);
+                        for name in names {
+                            record(module, name.map_err(|e| e.to_string())?, f);
                         }
                     }
                 }
             }
-            _ => {}
         }
     }
     Ok((env, non_env))

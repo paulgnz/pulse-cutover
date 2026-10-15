@@ -166,7 +166,8 @@ fn staking_reachable(cfg: &Config, b: &Budget) -> Option<bool> {
 /// Last producer-API exposure verdict from mission control: it probes this server's IP (:8888, :80 and the
 /// producer's bp.json endpoints that resolve to it) with the read-only /v1/producer/paused. Asked at most
 /// every 10 minutes; `None` until the first answer. (open endpoints, endpoints checked)
-static EXPOSURE: Mutex<Option<(Instant, Option<(Vec<String>, u64)>)>> = Mutex::new(None);
+type ExposureCache = Option<(Instant, Option<(Vec<String>, u64)>)>;
+static EXPOSURE: Mutex<ExposureCache> = Mutex::new(None);
 
 fn producer_api_exposure(cfg: &Config, b: &Budget) -> Option<(Vec<String>, u64)> {
     let bc = cfg.beacon.as_ref()?;

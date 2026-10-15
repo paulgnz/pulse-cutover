@@ -1736,7 +1736,7 @@ mod tests {
         );
         // As the failed command reports it: "`cmd` exited ...: <stderr> <stdout>" — the first
         // stdout line shares a line with the prefix.
-        let wrapped = format!("`x` exited exit status: 1:  table permission: nodeos=1 arena=2\ntable account: rows=1 sha256=aa");
+        let wrapped = "`x` exited exit status: 1:  table permission: nodeos=1 arena=2\ntable account: rows=1 sha256=aa".to_string();
         assert_eq!(compare_failing_tables(&wrapped), vec!["permission"]);
         assert!(compare_failing_tables("21-table nodeos/Arena comparison FAILED").is_empty());
     }

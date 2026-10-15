@@ -1246,8 +1246,7 @@ fn happy_path_reaches_live_with_full_evidence() {
     let live: serde_json::Value = text
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
-        .filter(|v: &serde_json::Value| v["state"] == "LIVE" && v["kind"] == "transition")
-        .next_back()
+        .rfind(|v: &serde_json::Value| v["state"] == "LIVE" && v["kind"] == "transition")
         .unwrap();
     assert!(live["data"]["cut_height"].as_u64().unwrap() >= 120);
     assert!(live["data"]["write_gap_ms_wallclock"].as_u64().unwrap() > 0);
@@ -1466,12 +1465,10 @@ fn verify_snapshot_is_deterministic_and_tamper_evident() {
     bytes[n / 2] ^= 0xFF;
     let tampered = dir.path().join("tampered.bin");
     std::fs::write(&tampered, bytes).unwrap();
-    match verify::verify_snapshot(&tampered, 1) {
-        Ok(t) => {
-            assert_ne!(t.sha256, a.sha256);
-            assert_ne!(t.roots, a.roots);
-        }
-        Err(_) => {} // structural corruption fails the parse — also detected
+    // Structural corruption fails the parse (Err): also detected.
+    if let Ok(t) = verify::verify_snapshot(&tampered, 1) {
+        assert_ne!(t.sha256, a.sha256);
+        assert_ne!(t.roots, a.roots);
     }
 }
 
@@ -1533,8 +1530,7 @@ fn api_mode_flips_before_stopping_source_and_reads_never_gap() {
     let live: serde_json::Value = text
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
-        .filter(|v: &serde_json::Value| v["state"] == "LIVE" && v["kind"] == "transition")
-        .next_back()
+        .rfind(|v: &serde_json::Value| v["state"] == "LIVE" && v["kind"] == "transition")
         .unwrap();
     assert!(
         live["data"]["public_health"]["consecutive_ok_polls"]
@@ -3891,9 +3887,8 @@ fn r3_roster_with_zero_quorum_is_a_config_error() {
     .unwrap();
     let text =
         base.replace("event_id = \"e1\"\n", "") + "\n[[coordination.roster]]\nproducer = \"bp1\"\n";
-    let err = load_toml(dir.path(), "zero.toml", &text)
-        .err()
-        .expect("roster + quorum 0 must not load");
+    let err =
+        load_toml(dir.path(), "zero.toml", &text).expect_err("roster + quorum 0 must not load");
     assert!(err.contains("fleet_quorum"), "{err}");
     let over = base.replace("fleet_quorum = 0", "fleet_quorum = 3")
         + "\n[[coordination.roster]]\nproducer = \"bp1\"\n";
@@ -7720,8 +7715,7 @@ fn beacon_reports_a_config_short_of_the_production_profile_instead_of_refusing_i
         .replace("rehearsal = true", "rehearsal = false");
     std::fs::write(&path, &text).unwrap();
     let strict = Config::load(&path)
-        .err()
-        .expect("the test fixture must fall short of the production profile");
+        .expect_err("the test fixture must fall short of the production profile");
     assert!(strict.contains("PRODUCTION PROFILE"), "{strict}");
     let cfg = Config::load_for_report(&path).expect("the beacon loads it for reporting");
     let report = pulse_cutover::beacon::build_report(&cfg, "protonnz", "testnet");
@@ -10798,9 +10792,7 @@ fn rust_code_mask(text: &str) -> String {
                 continue;
             }
             out.push('r');
-            for _ in 0..hashes {
-                out.push('#');
-            }
+            out.extend(std::iter::repeat_n('#', hashes));
             out.push('"');
             j += 1;
             loop {
@@ -10809,9 +10801,7 @@ fn rust_code_mask(text: &str) -> String {
                 }
                 if c[j] == '"' && (0..hashes).all(|k| c.get(j + 1 + k) == Some(&'#')) {
                     out.push('"');
-                    for _ in 0..hashes {
-                        out.push('#');
-                    }
+                    out.extend(std::iter::repeat_n('#', hashes));
                     j += 1 + hashes;
                     break;
                 }
@@ -11023,9 +11013,9 @@ fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
     let raw = m
         .lines()
         .filter(|l| {
-            (l.contains("self.ops.pause()")
+            l.contains("self.ops.pause()")
                 || l.contains("self.ops.resume()")
-                || l.contains("self.ops.run_hook("))
+                || l.contains("self.ops.run_hook(")
         })
         .count();
     assert_eq!(raw, 5, "exactly the three gate bodies and the two on_halt pages call pause/resume/run_hook directly");
@@ -13535,9 +13525,7 @@ fn final_l3_a_journal_with_an_unknown_record_kind_is_refused() {
         r#"{"seq":0,"ts_ms":1,"ts":"t","kind":"transition","state":"ARMED","data":{"mode":"Producer"}}"#, "\n",
         r#"{"seq":1,"ts_ms":2,"ts":"t","kind":"ownership","state":"ARMED","data":{}}"#, "\n",
         r#"{"seq":2,"ts_ms":3,"ts":"t","kind":"evidence","state":"ARMED","data":{}}"#, "\n")).unwrap();
-    let err = pulse_cutover::journal::Journal::replay(&path)
-        .err()
-        .expect("refused");
+    let err = pulse_cutover::journal::Journal::replay(&path).expect_err("refused");
     assert!(
         err.contains("newer pulse-cutover") && err.contains("\"ownership\""),
         "{err}"

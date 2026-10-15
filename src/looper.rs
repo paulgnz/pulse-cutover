@@ -47,10 +47,8 @@ pub fn metrics_from_journal(path: &std::path::Path, run: u32) -> Result<RunMetri
             Some("transition") => {
                 transitions.push((v["state"].as_str().unwrap_or("?").to_string(), ts));
             }
-            Some("error") => {
-                if abort_reason.is_none() {
-                    abort_reason = v["data"]["message"].as_str().map(str::to_string);
-                }
+            Some("error") if abort_reason.is_none() => {
+                abort_reason = v["data"]["message"].as_str().map(str::to_string);
             }
             _ => {}
         }

@@ -5,10 +5,10 @@
 //! - Messages are ed25519-signed by coordinator keys that each producer lists in its OWN config
 //!   (`[coordination] coordinator_keys`). Mission control only relays them; it cannot forge one.
 //! - Three message types, all for one `event_id`:
-//!     event  — "the cut will be at H on this chain with these parameters" (published ahead of time)
-//!     arm    — "go": the agent may start the ceremony for that event
-//!     abort  — "stop": honoured only before IGNITED (after that, falling back would drop
-//!              transactions already accepted by the new chain; that is a human decision)
+//!   - event — "the cut will be at H on this chain with these parameters" (published ahead of time)
+//!   - arm — "go": the agent may start the ceremony for that event
+//!   - abort — "stop": honoured only before IGNITED (after that, falling back would drop
+//!     transactions already accepted by the new chain; that is a human decision)
 //! - Every agent re-checks an event against its local config (chain_id, freeze lead, cpu scale)
 //!   and the live head (H must be at least `min_lead_blocks` ahead) before accepting it.
 //! - `auto_arm = false` (default): a signed arm ALSO needs a local confirmation file, so no remote
@@ -328,6 +328,7 @@ pub fn carries_event(
 /// - `h` is present and equals `ceremony.freeze_height`;
 /// - the signed roster equals the config's roster (producer + instance_id, as a set; both empty in api mode is
 ///   fine), and when a roster is signed, its quorum (default: every member) equals `coordination.fleet_quorum`.
+///
 /// A relay that does not answer, or answers without our event, is NOT "no problem": the caller passes `None`.
 pub fn mainnet_event_problems(
     doc: Option<&Value>,

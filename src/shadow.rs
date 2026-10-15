@@ -10,6 +10,7 @@
 //!     none of the declared keys is in mainnet's producer schedule, and mainnet's block at the source's LIB is
 //!     not the source's block (or mainnet has not reached that height). A real mainnet node can pass 2 only by
 //!     declaring the real keys, which 3 refuses; it can never pass the block-id half of 3.
+//!
 //! It runs at ARM, before the freeze, right before chain creation / ignition (the result gates the mainnet
 //! bypass), and after ignition (target network only). The journal binds the shadow identity at ARM
 //! (`identity`), so a config flipped to or from shadow later is refused on run, join, rollback and unhalt.
@@ -80,7 +81,7 @@ pub fn check_config(cfg: &Config) -> Result<(), String> {
         .ceremony
         .chain_id
         .as_deref()
-        .map_or(true, |c| c.trim().is_empty())
+        .is_none_or(|c| c.trim().is_empty())
     {
         problems.push(
             "ceremony.chain_id must be set in a shadow ceremony (the chain it imitates)".into(),
