@@ -29,7 +29,7 @@ and [docs/EXCHANGES.md](docs/EXCHANGES.md) (what exchanges, wallets and indexers
    versions come from the coordinator and must be identical on every producer. A mismatch = stop and tell the human.
 5. **Never pause or resume a producer by hand while a ceremony runs** (only the agent does; see OPERATOR-QUICKSTART, risk A-21). **Never skip or reorder gates.** Never ignite before VERIFIED, never flip public traffic outside the agent's
    own flip step (producer mode: the `on_live` hook, which runs *before* LIVE is journaled; api mode: the
-   FLIPPED step), never edit the journal, never delete a non-terminal journal. ABORTED is a safe, designed outcome: report it, do not "fix" it by retrying blindly.
+   FLIPPED step), never edit the journal, never delete a non-terminal journal, never run an older agent version on a journal a newer one wrote. ABORTED is a safe, designed outcome: report it, do not "fix" it by retrying blindly.
 6. **Never handle key material in the open.** Do not print, echo, log, commit or paste `PVT_…`, WIF keys,
    staker keys, signer keys, API tokens or wallet passwords. Share diagnostics only via `pulse-cutover report`
    (it redacts).
@@ -381,7 +381,10 @@ stateDiagram-v2
 6. **One ceremony at a time, journal is truth.** Before any run: check
    `status`. If a journal exists and is non-terminal, resume (same command)
    or `abort` — never delete a journal to "start clean" on a box you don't
-   fully own.
+   fully own. **Never run an older agent version on a journal written by a
+   newer one** (never downgrade mid-ceremony; `rollback` with the version that
+   ran the cut or newer). From rc.30 the agent refuses a journal containing a
+   record kind or state it does not know.
 
 ## Failure → next action
 

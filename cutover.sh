@@ -28,9 +28,10 @@ case "$CMD" in
     echo "aborting: stopping the agent (the ratchet means nothing user-visible ran unless FLIPPED/LIVE printed)"
     # r30 round 13: SIGTERM first and WAIT for the agent to exit. It stops only at a safe point (never inside a pause or
     # resume of the producer, which always reaches its journaled outcome), so the rollback below never finds this
-    # agent's own pause with "ownership unknown". SIGKILL only after the wait, loudly.
+    # agent's own pause with "ownership unknown". SIGKILL only after the wait, loudly. The default wait (90 s) exceeds
+    # the agent's producer-read retry window (30 s) with margin, so a stop requested during a read outage still lands.
     if pkill -TERM -f 'pulse-cutover run'; then
-      WAITED=0; STOP_WAIT=${PULSE_CUTOVER_STOP_WAIT:-30}
+      WAITED=0; STOP_WAIT=${PULSE_CUTOVER_STOP_WAIT:-90}
       while pgrep -f 'pulse-cutover run' >/dev/null 2>&1 && [ "$WAITED" -lt "$STOP_WAIT" ]; do
         sleep 1; WAITED=$((WAITED+1))
       done

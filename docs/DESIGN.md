@@ -170,7 +170,7 @@ stateDiagram-v2
   never taken for ours. Journals written before round 11 contain no resume intents and are folded exactly as before.
   **Round 13.** (a) A graceful stop: SIGTERM / SIGINT only set a flag, checked between states and inside the ARMED and
   snapshot waits, never inside a pause or resume episode; the run journals `stopped_by_signal` and exits 6.
-  `cutover.sh abort` sends SIGTERM, waits (default 30 s, `PULSE_CUTOVER_STOP_WAIT`) for the agent to exit and only
+  `cutover.sh abort` sends SIGTERM, waits (default 90 s since rc.30, longer than the 30 s producer-read retry window; `PULSE_CUTOVER_STOP_WAIT`) for the agent to exit and only
   then runs `rollback`; SIGKILL only after the wait, loudly. So the common operator abort can no longer leave the
   agent's own pause with "ownership unknown". (b) A resume whose RPC answers ok is confirmed by a (retried) read:
   still paused or unreadable is ownership unknown, as after a failed RPC. A producer rollback that resumed, or met an

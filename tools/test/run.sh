@@ -448,7 +448,7 @@ chmod +x "$SB"/*
 printf 'journal_path = "%s/j.jsonl"\nmode = "producer"\n' "$T" > "$T/abort.toml"
 run_abort() { : > "$LOG"; rm -f "$T/abort.state"; ABORT_LOG="$LOG" ABORT_STATE="$T/abort.state" ABORT_ALIVE_FOR="$1" \
   PULSE_CUTOVER_STOP_WAIT="$2" PULSE_CUTOVER_CONFIG="$T/abort.toml" PATH="$SB:$PATH" bash "$ROOT/cutover.sh" abort >"$T/abort.out" 2>&1; }
-run_abort 2 30
+run_abort 2 90
 order=$(tr '\n' '|' < "$LOG")
 case "$order" in
   "pkill -TERM -f pulse-cutover run|pgrep|pgrep|pgrep|pgrep|pulse-cutover rollback|") ok "abort: SIGTERM, waits until the agent exits, then rollback (no SIGKILL)";;
@@ -460,6 +460,7 @@ case "$order" in
   pkill\ -TERM*pkill\ -KILL*"pulse-cutover rollback|") ok "abort: SIGKILL only after the bounded wait, before rollback";;
   *) bad "abort: SIGKILL after the wait (got: $order)";;
 esac
+grep -q 'STOP_WAIT=${PULSE_CUTOVER_STOP_WAIT:-90}' "$ROOT/cutover.sh" && ok "abort: default stop wait is 90s (above the 30s producer-read retry window)" || bad "abort: default stop wait is not 90s"
 grep -q "did not stop within 2s of SIGTERM" "$T/abort.out" && ok "abort: a forced kill is announced loudly" || bad "abort: missing SIGKILL warning"
 
 echo; echo "$PASS passed, $FAIL failed"; [ "$FAIL" = 0 ]

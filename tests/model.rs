@@ -1097,9 +1097,8 @@ fn model_checker_finds_no_invariant_violation() {
                  std::env::var("MODEL_SCENARIOS").ok().and_then(|s| s.parse().ok()).unwrap_or(300)),
     };
     let bad = run_many(start, count);
-    // Round 13: the classes the round-13 checker found stay visible (reported, and each has an #[ignore]d failing
-    // regression test) until the source fixes land; anything else fails the run. `MODEL_STRICT=1` fails on every
-    // violation: use it once OPEN_CLASSES is emptied.
+    // Round 13 introduced OPEN_CLASSES for classes found but not yet fixed in the source; since round 14 it is empty,
+    // so every violation fails the run. `MODEL_STRICT=1` also ignores OPEN_CLASSES (CI and evidence runs use it).
     let strict = std::env::var("MODEL_STRICT").is_ok();
     let unexpected: Vec<_> = bad.iter().filter(|(_, v, t)| strict || !OPEN_CLASSES.contains(&classify(v, t))).cloned().collect();
     if !bad.is_empty() && unexpected.is_empty() {
@@ -1109,8 +1108,8 @@ fn model_checker_finds_no_invariant_violation() {
         unexpected.len(), report(&unexpected));
 }
 
-/// Classes found by the round-13 checker and still open in the source (F1-A, R13-A, R13-B; see `classify`). Empty this
-/// list as each fix lands (and un-ignore its class test).
+/// Classes the checker found that are still open in the source (see `classify`). Empty since round 14 (F1-A, R13-A
+/// and R13-B were fixed); a newly found class may be listed here only with an #[ignore]d failing class test.
 const OPEN_CLASSES: &[&str] = &[];
 
 /// Directed: review round 9, R9-2. The ceremony pauses (ours), a coordinator abort makes it resume its own pause, the
