@@ -582,3 +582,11 @@ journals written by pre-round-6 agents, the operator-abort sequence). Run on the
 | R13-B | 21 | a pre-round-6 journal is stranded by this agent over someone else's pause; the legacy rule "STRANDED means the older agent paused" makes that pause look like ours and a plain rollback resumes it | source (round 13) |
 
 Each class has an `#[ignore]`d regression test in `tests/model.rs`; the default run fails on anything outside them.
+
+**Round 14 (2026-10-15).** F1-A, R13-A and R13-B are closed in the source, `OPEN_CLASSES` is empty and every class test
+runs by default. Strict run (`MODEL_STRICT=1`), 20,000 scenarios: **0 violations**: 3,340 crashes, 7,084 external
+pauses, 844 external un-pauses of the agent's own pause, 2,054 older-agent journals, 4,073 configs without `on_abort`,
+999 forced releases, 830 resume outcomes unknown, 7,138 `schedule_at_h`; final states LIVE 7,124, ABORTED 9,306,
+STRANDED 1,955, HALTED 446. Join model, 1,000 scenarios: **0 violations** (933 segments, 146 join pause intents, 99
+acks, 48 unacknowledged). One residual is documented, not open: an un-pause and re-pause of the agent's pause entirely
+between two of its reads (risk A-21; `model_residual_r13_a…`, ignored, fails by design).
