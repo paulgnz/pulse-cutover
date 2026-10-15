@@ -60,7 +60,23 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   While an event is active (not aborted and not complete), a *different* event is refused (409). An event that RAN
   (LIVE) is closed with a signed `complete` (`control/coord.mjs complete`, needs an earlier arm and the event_hash);
   never sign an abort for a finished ceremony: agents record an abort as final for that id (tombstone) and report
-  it. **Event ids are single-use**, even after an abort or completion. Stores written by rc.5 (no `used` map) are migrated on start: the active event and every event id in
+  it. Since rc.31 the relay **refuses (409, not relayed) an abort once the fleet demonstrably went forward**: the
+  verdict is LIVE / STALLED, or at least `quorum` roster members' FRESH reports for this event are past chain creation.
+  The refusal says so plainly: it is a veto no member has received. Any lesser sign of creation (one member's report, a
+  high-water mark, an unretired creation-evidence entry, e.g. of an earlier event at the same H) does not block the
+  veto: the abort is relayed and an ALARM is logged. Every case is recorded in the event history and shown as a fleet
+  warning. `coord.mjs abort --after-creation yes` signs `acknowledge_past_creation: true`, which relays a refused abort
+  (alarmed; agents never honour an abort after their own ignition).
+  **Exit marks (rc.31):** a member whose `producer`-role report for the event's own H ends ABORTED / STRANDED without
+  ever verifying gets a durable per-event `exited` mark in `event_max` (never lowered); a later report in any other
+  state sets `reentered` and raises an ALARM. The same mark carries a sticky `verified_seen` (any sign the member
+  verified: a VERIFIED-or-later state or transition, verification evidence, creation evidence or a creation-evidence log
+  entry); while it is true no exit mark is ever set (round 3, review HIGH-1). Round 4: a re-entered member's later reports for the event are served
+  with `conflict: true` (every agent gate skips them); the server state has a state id and a generation, the coord file
+  anchors the current event's marks on them, and a start on lost, replaced or older server state marks them LOST for
+  good (`marks_state.complete: false` in `/api/status`). When the relay's own view proves the event's quorum unreachable
+  it raises "ALARM QUORUM UNREACHABLE: sign an abort" (fleet warning and event log) with the `coord.mjs abort` command. rc.31 agents never count a marked member at a gate for that event and refuse to ARM
+  their own producer for it, so a new attempt needs a new event id. **Event ids are single-use**, even after an abort or completion. Stores written by rc.5 (no `used` map) are migrated on start: the active event and every event id in
   their history count as used.
 - **event_hash (the contract every signer and verifier must share):** `event_hash` = lowercase hex sha256 over the
   **UTF-8 bytes of the exact `payload` string** of the signed event message, byte for byte as signed and as stored by

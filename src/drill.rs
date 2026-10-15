@@ -1246,6 +1246,32 @@ pub struct DrillOutcome {
     pub evidence_complete: bool,
     /// The compare matched outright.
     pub compare_match: bool,
+    /// rc.31: the compare did not match, and EVERY failing table is one of the known PulseVM v1.0.0 compare gaps
+    /// (`upstream::KNOWN_COMPARE_DIFFERENCES`) with exactly its recorded signature, and every other required table
+    /// matched. Still a mismatch (`compare` stays "MISMATCH"); the CLI exits 7 instead of 5.
+    pub compare_known_gaps_only: bool,
+}
+
+/// rc.31: classify a compare that did not match. Some(list of matched known differences) only when every failing
+/// table is a known v1.0.0 gap whose failure is exactly that gap's signature (`upstream::known_compare_difference`),
+/// and no required table is unreported. Anything else (a table outside the list, the right table with another
+/// failure, missing output) is None: a real mismatch.
+pub fn known_gaps_only(failing: &[String], output: &str, chain_id: &str) -> Option<Vec<Value>> {
+    if failing.is_empty() || output.is_empty() {
+        return None;
+    }
+    let mut known = vec![];
+    for t in failing {
+        if !upstream::KNOWN_COMPARE_DIFFERENCES.contains(&t.as_str()) {
+            return None;
+        }
+        let sig = upstream::known_compare_difference(t, output, chain_id).ok()?;
+        known.push(json!({"table": t, "matched": sig}));
+    }
+    if !upstream::compare_missing_tables(output, failing).is_empty() {
+        return None;
+    }
+    Some(known)
 }
 
 /// Run one readiness drill at `opts.height`. `ops` is wrapped in a [`DrillGuard`]; nothing else is used.
@@ -1765,6 +1791,25 @@ fn drive<O: ChainOps>(
     }
 
     let compare_word = if compare_match { "MATCH" } else { "MISMATCH" };
+    // rc.31 (fleet run: every drill "failed" on the two known v1.0.0 gaps, indistinguishable from a real mismatch).
+    let failing_names: Vec<String> = failing
+        .iter()
+        .filter_map(|t| t.as_str().map(str::to_string))
+        .collect();
+    let compare_output = compare
+        .as_ref()
+        .and_then(|v| v["output"].as_str())
+        .unwrap_or("");
+    let known = if compare_match {
+        None
+    } else {
+        known_gaps_only(&failing_names, compare_output, &chain_id)
+    };
+    let compare_class = match (&known, compare_match) {
+        (_, true) => "match",
+        (Some(_), false) => "known_gaps_only",
+        (None, false) => "mismatch",
+    };
     let result = json!({
         "state": "DONE",
         "stage": "done",
@@ -1774,6 +1819,8 @@ fn drive<O: ChainOps>(
         "fingerprints_digest": fingerprints_digest,
         "compare": compare_word,
         "compare_failing_tables": failing,
+        "compare_class": compare_class,
+        "compare_known_gaps": known.clone().unwrap_or_default(),
         "tools": tools_evidence(&up),
         "timings_ms": Value::Object(timings),
         "source_head_at_end": head_end,
@@ -1786,6 +1833,7 @@ fn drive<O: ChainOps>(
         view: log.view.clone(),
         evidence_complete: true,
         compare_match,
+        compare_known_gaps_only: known.is_some(),
     })
 }
 
@@ -2374,6 +2422,7 @@ pub fn beacon_view(cfg: &Config) -> Option<Value> {
         "fingerprints_digest": hex("fingerprints_digest"),
         "compare": v["compare"].as_str().filter(|s| matches!(*s, "MATCH" | "MISMATCH")),
         "compare_failing_tables": tables,
+        "compare_class": v["compare_class"].as_str().filter(|s| matches!(*s, "match" | "known_gaps_only" | "mismatch")),
         "timings_ms": Value::Object(timings),
         "error": v["error"].as_str().map(crate::beacon::sanitize_short),
         "finished_ts_ms": v["finished_ts_ms"].as_u64(),

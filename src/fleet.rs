@@ -37,6 +37,8 @@ pub struct MemberView {
     /// The relay's per-event high-water mark for this producer showed it past chain creation (state),
     /// even if the report that showed it is gone (an instance replaced since). rc.23 review #2.
     pub max_past: Option<String>,
+    /// rc.31 round 3: the relay's mark says this member may have verified (`ExitMark::may_have_verified`).
+    pub verified_mark: bool,
 }
 
 /// The beacons the relay lists for one producer: (report, age_ms, conflict).
@@ -63,6 +65,95 @@ fn beacons(p: &Value) -> Vec<(Value, Option<u64>, bool)> {
         ));
     }
     v
+}
+
+/// rc.31: the relay's per-event mark facts for one producer entry (an rc.31+ relay; an older one has none of them).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExitMark {
+    /// Durable exit mark: the member's report for the event's own H ended ABORTED / STRANDED without verifying.
+    pub exited: bool,
+    /// A report in another state arrived after the exit mark.
+    pub reentered: bool,
+    /// Round 3 (review HIGH-1): the relay saw any sign the member verified (sticky). None = not reported (older relay).
+    pub verified_seen: Option<bool>,
+    /// The high-water state rank (VERIFIED and STRANDED = 4).
+    pub rank: Option<u64>,
+    /// The state the exit mark recorded.
+    pub exit_state: Option<String>,
+}
+
+impl ExitMark {
+    /// Might this member have been counted at a peer's gate? `verified_seen`, or (older relay) a rank of VERIFIED or
+    /// more. Unknown with no mark at all: false here; callers that need "proved never verified" use `never_verified`.
+    pub fn may_have_verified(&self) -> bool {
+        match self.verified_seen {
+            Some(v) => v,
+            None => self.rank.is_some_and(|r| r >= 4),
+        }
+    }
+
+    /// Round 3: positively proved never to have verified: an explicit `verified_seen: false` AND a high-water rank below
+    /// VERIFIED (or exactly STRANDED's rank with a STRANDED exit). A missing field never proves anything.
+    pub fn never_verified(&self) -> bool {
+        self.verified_seen == Some(false)
+            && self.rank.is_some_and(|r| {
+                r < 4 || (r == 4 && self.exit_state.as_deref() == Some("STRANDED"))
+            })
+    }
+}
+
+/// rc.31 (review M1): the relay's per-event mark for `event` on one producer entry.
+pub fn exit_mark(p: &Value, event: &str) -> ExitMark {
+    let m = &p["event_max"];
+    let mark = match m["event_id"].as_str() {
+        Some(id) => (id == event).then_some(m),
+        None => m.get(event),
+    };
+    let Some(mark) = mark else {
+        return ExitMark::default();
+    };
+    ExitMark {
+        exited: mark["exited"].is_object(),
+        reentered: mark["reentered"].as_bool() == Some(true),
+        verified_seen: mark["verified_seen"].as_bool(),
+        rank: mark["rank"].as_u64(),
+        exit_state: mark["exited"]["state"].as_str().map(str::to_string),
+    }
+}
+
+/// rc.31 round 3 (review M-a): the oldest agent whose beacons and gates honour exit marks.
+pub const MIN_EXIT_MARK_AGENT: (u64, u64, u64, u64) = (0, 5, 0, 31);
+
+/// Is `v` (a beacon's `agent_version`, e.g. `0.5.0-rc.31` or `0.5.0`) at least `MIN_EXIT_MARK_AGENT`? Unparseable or
+/// another pre-release kind: false (unknown is never "new enough").
+pub fn agent_honours_exit_marks(v: &str) -> bool {
+    let (core, pre) = match v.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (v, None),
+    };
+    let nums: Vec<u64> = core.split('.').filter_map(|x| x.parse().ok()).collect();
+    if nums.len() != 3 || core.split('.').count() != 3 {
+        return false;
+    }
+    let rc = match pre {
+        None => u64::MAX,
+        Some(p) => match p.strip_prefix("rc.").and_then(|n| n.parse::<u64>().ok()) {
+            Some(n) => n,
+            None => return false,
+        },
+    };
+    (nums[0], nums[1], nums[2], rc) >= MIN_EXIT_MARK_AGENT
+}
+
+/// rc.31 (review M1): has the relay recorded that THIS node's producer exited `event` without verifying? Then the
+/// event is over for this producer, whatever journal it runs on: a new attempt needs a new event id.
+pub fn own_exit_marked(status: &Value, co: &Coordination, producer: &str) -> bool {
+    let Some(event) = co.event_id.as_deref() else {
+        return false;
+    };
+    producers(status, &co.network)
+        .iter()
+        .any(|p| p["name"].as_str() == Some(producer) && exit_mark(p, event).exited)
 }
 
 /// The network's producer list from a `/api/status` document.
@@ -194,9 +285,12 @@ pub fn members(status: &Value, co: &Coordination) -> Vec<MemberView> {
                 .into_iter()
                 .filter(|(r, _, _)| for_event(r))
                 .filter(|(r, _, _)| {
-                    instance_id
-                        .as_deref()
-                        .is_none_or(|id| r["instance_id"].as_str() == Some(id))
+                    // rc.31 (review L5): instance ids compare case-insensitively everywhere.
+                    instance_id.as_deref().is_none_or(|id| {
+                        r["instance_id"]
+                            .as_str()
+                            .is_some_and(|x| x.eq_ignore_ascii_case(id))
+                    })
                 })
                 .collect();
             // rc.27 review (review blocker): a blocking fact from ANY of this producer's instances counts, not only from
@@ -224,10 +318,14 @@ pub fn members(status: &Value, co: &Coordination) -> Vec<MemberView> {
                 .iter()
                 .min_by_key(|(_, age, _)| age.unwrap_or(u64::MAX))
                 .map(|(r, _, _)| r.clone());
+            let verified_mark = entry
+                .zip(event)
+                .is_some_and(|(p, e)| exit_mark(p, e).may_have_verified());
             MemberView {
                 producer,
                 instance_id,
                 max_past,
+                verified_mark,
                 last,
                 report: fresh.map(|(r, _, _)| r.clone()),
                 missing: bs.is_empty(),
@@ -377,6 +475,123 @@ fn own_report_visible(status: &Value, co: &Coordination, me: (&str, &str)) -> bo
         })
 }
 
+/// rc.31 round 4 (review MEDIUM-1): what this agent has seen of the fleet and of the relay during the event, journaled so
+/// it survives relay restarts, restores and its own restarts. Only ever makes decisions MORE conservative.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FleetMemory {
+    /// Peers this agent ever saw VERIFIED-or-later (a report, or a relay mark): "may have verified" forever.
+    pub verified_peers: std::collections::BTreeSet<String>,
+    /// The relay's marks state as first seen for the event: (state_id, highest generation since).
+    pub relay_state: Option<(String, u64)>,
+    /// The relay's marks went backwards or were reported incomplete at some point: never trusted again for the event.
+    pub relay_regressed: bool,
+}
+
+/// The relay's `marks_state` for this event (an rc.31 round 4+ relay), if it serves one.
+pub fn marks_state<'a>(status: &'a Value, co: &Coordination) -> Option<&'a Value> {
+    let ev = co.event_id.as_deref()?;
+    status["networks"]
+        .as_array()?
+        .iter()
+        .find(|n| n["id"].as_str() == Some(co.network.as_str()))
+        .map(|n| &n["marks_state"])
+        .filter(|m| m["event_id"].as_str() == Some(ev))
+}
+
+/// Ok when the relay's marks can be trusted for a proof that someone is OUT: it serves `marks_state` for this event with
+/// `complete: true`, and neither its state id nor its generation went backwards against what this agent journaled.
+pub fn marks_trusted(status: &Value, co: &Coordination, mem: &FleetMemory) -> Result<(), String> {
+    if mem.relay_regressed {
+        return Err("the relay's marks went backwards earlier in this event (a restart on lost or older state)".into());
+    }
+    let Some(m) = marks_state(status, co) else {
+        return Err("the relay does not say whether its marks are complete (older relay)".into());
+    };
+    if m["complete"].as_bool() != Some(true) {
+        return Err(
+            "the relay reports this event's marks as INCOMPLETE (its state was lost or restored)"
+                .into(),
+        );
+    }
+    let (Some(id), Some(g)) = (m["state_id"].as_str(), m["generation"].as_u64()) else {
+        return Err("the relay's marks state has no state id or generation".into());
+    };
+    if let Some((jid, jg)) = &mem.relay_state {
+        if jid != id || g < *jg {
+            return Err(format!(
+                "the relay's marks went backwards (state {jid}/{jg} journaled, {id}/{g} now)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Err when the relay itself says this event's marks were lost, or this agent saw them go backwards: then the absence
+/// of creation evidence or of a VERIFIED mark proves nothing, and the old chain is not resumed on that view.
+fn marks_not_lost(status: &Value, co: &Coordination, mem: &FleetMemory) -> Result<(), String> {
+    if mem.relay_regressed {
+        return Err("the relay's marks went backwards earlier in this event (restart on lost or older state): what peers did is unknown".into());
+    }
+    if let Some(m) = marks_state(status, co) {
+        if m["complete"].as_bool() == Some(false) {
+            return Err("the relay reports this event's marks as INCOMPLETE (state lost or restored): creation evidence may be gone".into());
+        }
+        if let (Some((jid, jg)), Some(id), Some(g)) = (
+            &mem.relay_state,
+            m["state_id"].as_str(),
+            m["generation"].as_u64(),
+        ) {
+            if jid != id || g < *jg {
+                return Err(format!("the relay's marks went backwards (state {jid}/{jg} journaled, {id}/{g} now): what peers did is unknown"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every roster member other than this node that the relay shows VERIFIED-or-later for this event, in any report of any
+/// instance (state, transitions, verification or creation evidence) or in its mark.
+pub fn peers_seen_verified(
+    status: &Value,
+    co: &Coordination,
+    me: Option<(&str, &str)>,
+) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Some(event) = co.event_id.as_deref() else {
+        return out;
+    };
+    let countable = COUNTABLE_STATES;
+    for p in producers(status, &co.network) {
+        let Some(name) = p["name"].as_str() else {
+            continue;
+        };
+        if me.is_some_and(|(mp, _)| mp == name) {
+            continue;
+        }
+        if !co.roster.is_empty() && !co.roster.iter().any(|m| m.producer == name) {
+            continue;
+        }
+        let em = exit_mark(p, event);
+        let by_report = beacons(p).iter().any(|(r, _, _)| {
+            let c = &r["ceremony"];
+            r["coord"]["event_id"].as_str() == Some(event)
+                && (c["state"].as_str().is_some_and(|s| countable.contains(&s))
+                    || past_create(r)
+                    || !c["evidence"]["snapshot_sha256"].is_null()
+                    || !c["evidence"]["fingerprints_digest"].is_null()
+                    || c["transitions"].as_array().is_some_and(|t| {
+                        t.iter()
+                            .any(|x| x["state"].as_str().is_some_and(|s| countable.contains(&s)))
+                    }))
+        });
+        if by_report || em.may_have_verified() {
+            out.insert(name.to_string());
+        }
+    }
+    out
+}
+
+/// rc.31 round 4: `resume_guard` without journaled fleet memory (tests, read-only displays).
 /// May an agent that froze writes resume the old chain? Err(why) unless (unknown is never "no"):
 ///
 /// - the event has a roster and a quorum (without them reachability cannot be judged), the relay
@@ -397,6 +612,18 @@ pub fn resume_guard(
     me: Option<(&str, &str)>,
     signed_abort: bool,
 ) -> Result<Value, String> {
+    resume_guard_with(status, co, me, signed_abort, &FleetMemory::default())
+}
+
+/// `resume_guard` with this agent's journaled fleet memory (round 4: peers it ever saw verified stay in the ceremony;
+/// a relay whose marks were lost or went backwards proves nothing).
+pub fn resume_guard_with(
+    status: Option<&Value>,
+    co: &Coordination,
+    me: Option<(&str, &str)>,
+    signed_abort: bool,
+    mem: &FleetMemory,
+) -> Result<Value, String> {
     let q = quorum_of(co);
     if co.roster.is_empty() || q == 0 {
         return Err("the event has no roster or quorum: whether the fleet can still commit without this node cannot be judged".into());
@@ -404,6 +631,7 @@ pub fn resume_guard(
     let Some(status) = status else {
         return Err("the coordinator relay did not answer: whether peers started chain creation or ignition is unknown".into());
     };
+    marks_not_lost(status, co, mem)?;
     let all = members(status, co);
     // rc.24 fleet run c5 (F6): this node's OWN report for the event must be visible and fresh on the relay before
     // it may resume. Otherwise its peers cannot account for it (they strand, since it "may have ignited unseen")
@@ -468,10 +696,28 @@ pub fn resume_guard(
                 m.producer
             ));
         }
-        if !matches!(st, "ABORTED" | "STRANDED") {
+        // rc.31 round 3 (review HIGH-1, 3b): a member the relay's mark shows as having verified may have been counted at
+        // a peer's gate: still in the ceremony, whatever its report says now (a crash + fresh journal + abort, or a
+        // forged report, must not let this node resume while the gate that counted it creates).
+        let verified = m.verified_mark || mem.verified_peers.contains(&m.producer);
+        if !matches!(st, "ABORTED" | "STRANDED") || (!signed_abort && verified) {
             in_ceremony.push(m.producer.clone());
         }
-        seen.push(json!({"producer": m.producer, "state": st, "fresh": m.report.is_some()}));
+        seen.push(json!({"producer": m.producer, "state": st, "fresh": m.report.is_some(), "verified_mark": verified}));
+    }
+    // rc.31 round 3 (review LOW, pre-existing): under a signed abort, if at least `quorum` members (this node included)
+    // may have verified, some gate may have passed and its creator's beacon may have gone dark before reporting
+    // create_started: no resume on the signed abort alone.
+    if signed_abort {
+        let verified: Vec<&str> = all
+            .iter()
+            .filter(|m| m.verified_mark || mem.verified_peers.contains(&m.producer))
+            .map(|m| m.producer.as_str())
+            .collect();
+        if verified.len() >= q {
+            return Err(format!("{} members ({}) may have verified (relay marks), quorum {q}: a gate may have passed and a \
+                chain may be in creation unseen; a signed abort alone does not prove otherwise", verified.len(), verified.join(", ")));
+        }
     }
     if !signed_abort && in_ceremony.len() >= q {
         return Err(format!("{} other members ({}) are still in the ceremony, quorum {q}: they can reach it without this node and ignite",
@@ -481,6 +727,197 @@ pub fn resume_guard(
         json!({"members": seen, "still_in_ceremony": in_ceremony, "quorum": q,
         "by": if signed_abort { "signed coordinator abort, every member accounted for" } else { "quorum unreachable without this node" }}),
     )
+}
+
+/// States a journal reaches only after the fleet gate could have counted it (VERIFIED evidence or later).
+const COUNTABLE_STATES: [&str; 5] = ["VERIFIED", "IGNITED", "FLIPPED", "LIVE", "HALTED"];
+
+/// Why one report does NOT prove its member durably out of the event (None = it does).
+///
+/// Out = a report for THIS event and THIS H whose journal ended ABORTED or STRANDED without ever reaching VERIFIED: its
+/// transition list (present, as every beacon since rc.10 sends it) has no VERIFIED-or-later entry, its evidence carries
+/// no verification result (`snapshot_sha256`, `fingerprints_digest`), and nothing about creation, a join, ignition or an
+/// abort still in progress. Such a member was never counted by any peer's fleet gate (the gate counts VERIFIED-or-later
+/// reports with matching evidence only), and its journal can only re-enter the ceremony by `join`, which needs a LIVE
+/// quorum that can only have formed through the gate.
+fn not_out(r: &Value, event: &str, h: u64) -> Option<String> {
+    let c = &r["ceremony"];
+    let st = c["state"].as_str().unwrap_or("none");
+    if r["coord"]["event_id"].as_str() != Some(event) {
+        return Some("report is not for this event".into());
+    }
+    if c["evidence"]["h"].as_u64() != Some(h) {
+        return Some("report does not carry this event's H".into());
+    }
+    if !matches!(st, "ABORTED" | "STRANDED") {
+        return Some(format!("state {st}"));
+    }
+    if past_create(r) || r["foreign_past_create"].is_string() {
+        return Some("past chain creation or ignition".into());
+    }
+    let Some(tr) = c["transitions"].as_array() else {
+        return Some(
+            "no transition list (older beacon): whether it ever verified is unknown".into(),
+        );
+    };
+    if tr.iter().any(|t| {
+        t["state"]
+            .as_str()
+            .is_some_and(|s| COUNTABLE_STATES.contains(&s))
+    }) {
+        return Some("it reached VERIFIED (a peer's gate may have counted it)".into());
+    }
+    if ["snapshot_sha256", "fingerprints_digest"]
+        .iter()
+        .any(|k| !c["evidence"][*k].is_null())
+    {
+        return Some("it carries verification evidence".into());
+    }
+    if c["aborting"].as_bool() == Some(true) || c["rollback_pending"].as_bool() == Some(true) {
+        // Not needed for the proof (an aborting node is going back), but an unsettled abort is not a final state.
+        return Some("its abort is still in progress".into());
+    }
+    None
+}
+
+/// rc.31 (fleet runs h4/h5, quorum 5, one member refused ARM or was aborted in FROZEN; the other four froze writes for
+/// minutes and would have waited the whole `fleet_timeout_secs`): PROOF that this event's quorum can no longer be
+/// reached, so a member still before its point of no return may stop waiting. `Some(proof)` only when ALL hold:
+///
+/// - the event has a roster, a quorum `q` with `1 <= q <= N` (N = roster size), and an event id;
+/// - no OTHER member is known past chain creation or ignition for this event (fresh report, any report, the relay's
+///   high-water mark or creation-evidence log): if anyone may have created a chain, waiting is not this rule's call;
+/// - this node's own fresh report for the event is visible on the relay (review M1 d, as for a resume);
+/// - at least `N - q + 1` OTHER members are DURABLY OUT: the relay holds its durable EXIT mark for the member and this
+///   event (an rc.31+ relay; never lowered; not re-entered since), and `not_out` is None for every report the relay
+///   lists for that member and this event, at least one of them fresh, none identity-conflicted.
+///
+/// Review M1: a report alone is not durable (a fresh journal under the same event id replaces it). The exit mark is:
+/// rc.31 gates never count a marked member again, an rc.31 agent refuses to ARM for an event its own producer exited,
+/// and the relay alarms on a re-entry. So, with every member on rc.31+, even if every remaining member, this node, the
+/// silent and the stale ones included, reached VERIFIED with equal evidence, at most `N - out < q` could ever be counted
+/// at a gate: no chain can be created, no LIVE quorum can form for a `join`. (A member on an older agent ignores marks:
+/// the fleet must run one agent version, risk register D-5.) Absent, stale, conflicted, foreign-H or older-beacon data never counts as out (it only ever keeps the
+/// node waiting, which is the pre-rc.31 behaviour). This only decides WHEN to stop waiting: a node that froze writes
+/// still resumes the old chain only through `resume_guard`, unchanged.
+pub fn quorum_unreachable(
+    status: &Value,
+    co: &Coordination,
+    me: Option<(&str, &str)>,
+    h: u64,
+) -> Option<Value> {
+    quorum_unreachable_with(status, co, me, h, &FleetMemory::default())
+}
+
+/// `quorum_unreachable` with this agent's journaled fleet memory (round 4, review MEDIUM-1): the relay's marks must be
+/// complete and must not have gone backwards, and a peer this agent ever saw verified is never out.
+pub fn quorum_unreachable_with(
+    status: &Value,
+    co: &Coordination,
+    me: Option<(&str, &str)>,
+    h: u64,
+    mem: &FleetMemory,
+) -> Option<Value> {
+    if marks_trusted(status, co, mem).is_err() {
+        return None;
+    }
+    let seen_now = peers_seen_verified(status, co, me);
+    let n = co.roster.len();
+    let q = quorum_of(co);
+    let event = co.event_id.as_deref()?;
+    if n == 0 || q == 0 || q > n {
+        return None;
+    }
+    // Review M1 (d): this node's own report must be visible, as for a resume: peers must be able to account for it.
+    let me_v = me?;
+    if !own_report_visible(status, co, me_v) {
+        return None;
+    }
+    let prods = producers(status, &co.network);
+    let all = members(status, co);
+    // Round 3 (review M-a): every roster member's latest report must come from an agent that honours exit marks
+    // (rc.31+); an older agent's gate would still count a marked member. Missing or unparseable: no proof.
+    // Review LOW 6: the version of the agent that RAN the member's ceremony (ARMED evidence), not its beacon's.
+    // Round 5 (review MEDIUM-2): and every member armed with the early abort ON (bound to the signed event).
+    if all.iter().any(|m| {
+        let ev = m.last.as_ref().map(|r| &r["ceremony"]["evidence"]);
+        !ev.and_then(|e| e["agent_version"].as_str())
+            .is_some_and(agent_honours_exit_marks)
+            || ev.and_then(|e| e["early_abort"].as_bool()) != Some(true)
+    }) {
+        return None;
+    }
+    // Anyone (but this node) past creation by ANY evidence the relay keeps: not this rule's decision.
+    if all
+        .iter()
+        .filter(|m| !is_self(m, me))
+        .any(|m| m.max_past.is_some())
+    {
+        return None;
+    }
+    let mut out = vec![];
+    for m in co.roster.iter() {
+        if m.producer == me_v.0
+            && m.instance_id
+                .as_deref()
+                .is_none_or(|x| x.eq_ignore_ascii_case(me_v.1))
+        {
+            continue;
+        }
+        let Some(p) = prods
+            .iter()
+            .find(|p| p["name"].as_str() == Some(m.producer.as_str()))
+        else {
+            continue;
+        };
+        // Review M1: the relay's DURABLE exit mark is required (an rc.31+ relay; it never lowers, and rc.31 gates never
+        // count a marked member again). A member that reported progress after exiting (re-entered) is not counted out.
+        // Round 3 (review HIGH-1): and the relay must positively show the member NEVER verified (sticky verified_seen
+        // false, rank below VERIFIED): one a peer's gate may have counted is never out, whatever it reports now.
+        let em = exit_mark(p, event);
+        if !em.exited || em.reentered || !em.never_verified() {
+            continue;
+        }
+        // Round 4 (c): a peer this agent ever saw VERIFIED-or-later (journaled, or in this view) is never out.
+        if mem.verified_peers.contains(&m.producer) || seen_now.contains(&m.producer) {
+            continue;
+        }
+        let reports: Vec<_> = beacons(p)
+            .into_iter()
+            .filter(|(r, _, _)| r["coord"]["event_id"].as_str() == Some(event))
+            .filter(|(r, _, _)| {
+                // Review L5: instance ids compare case-insensitively, as in own_report_visible.
+                m.instance_id.as_deref().is_none_or(|id| {
+                    r["instance_id"]
+                        .as_str()
+                        .is_some_and(|x| x.eq_ignore_ascii_case(id))
+                })
+            })
+            .collect();
+        let max_age = co.report_max_age_secs * 1000;
+        let fresh = reports
+            .iter()
+            .any(|(_, age, _)| age.is_some_and(|a| a <= max_age));
+        if reports.is_empty()
+            || !fresh
+            || reports.iter().any(|(_, _, conflict)| *conflict)
+            || reports
+                .iter()
+                .any(|(r, _, _)| not_out(r, event, h).is_some())
+        {
+            continue;
+        }
+        let r = &reports[0].0;
+        out.push(
+            json!({"producer": m.producer, "state": r["ceremony"]["state"],
+            "last_error": r["ceremony"]["last_error_class"]}),
+        );
+    }
+    let possible = n - out.len().min(n);
+    (possible < q).then(|| {
+        json!({"roster": n, "quorum": q, "durably_out": out, "at_most_reachable": possible,
+            "rule": "members the relay durably marked as exited without verifying (ABORTED/STRANDED, never VERIFIED) are never counted by an rc.31 gate"})
+    })
 }
 
 /// The largest group and whether it is the ONLY one that reaches `q` (rc.23 review #9: two groups on
@@ -753,6 +1190,7 @@ mod tests {
             degraded_patience_secs: 900,
             degraded_retry_secs: 10,
             fleet_stall_secs: 300,
+            early_abort: true,
         }
     }
     fn rep(state: &str, extra: Value) -> Value {
@@ -1332,6 +1770,280 @@ mod tests {
     }
 
     /// rc.24 fleet rehearsal (c3a): a HALTED peer whose validator runs the chain still counts; a split is "hard".
+    #[test]
+    fn quorum_unreachable_needs_durable_never_verified_exits_and_nothing_past_creation() {
+        let me = Some(("bp1", "i"));
+        let out = || {
+            json!({"coord": {"event_id": "e1"}, "ceremony": {"state": "ABORTED", "evidence": {"h": 120},
+            "transitions": [{"state": "ARMED"}, {"state": "ABORTED"}]}})
+        };
+        let c5 = co(&["bp1", "bp2", "bp3", "bp4", "bp5"], 5);
+        // bp1 = this node (its own fresh report), bp5 exited; `mark` adds the relay's durable exit mark on bp5.
+        let base = |bp5: Value, age: u64, mark: Option<bool>| {
+            let mut s = status_me(&[
+                ("bp2", rep("FROZEN", json!({})), 1000),
+                ("bp3", rep("FROZEN", json!({})), 1000),
+                ("bp4", rep("FROZEN", json!({})), 1000),
+                ("bp5", bp5, age),
+            ]);
+            if let Some(re) = mark {
+                s["networks"][0]["producers"][4]["event_max"] = json!({"e1": {"past_create": false, "rank": 2,
+                    "verified_seen": false, "exited": {"state": "ABORTED", "at": 1}, "reentered": re}});
+            }
+            // Round 3 (M-a): every report from an rc.31 agent; round 4: complete relay marks.
+            for p in s["networks"][0]["producers"].as_array_mut().unwrap() {
+                for b in p["beacons"].as_array_mut().unwrap() {
+                    b["report"]["agent_version"] = json!("0.5.0-rc.31");
+                    if b["report"]["ceremony"].is_object() {
+                        b["report"]["ceremony"]["evidence"]["agent_version"] = json!("0.5.0-rc.31");
+                        b["report"]["ceremony"]["evidence"]["early_abort"] = json!(true);
+                    }
+                }
+            }
+            s["networks"][0]["marks_state"] =
+                json!({"event_id": "e1", "state_id": "s1", "generation": 10, "complete": true});
+            s
+        };
+        let p = quorum_unreachable(&base(out(), 1000, Some(false)), &c5, me, 120)
+            .expect("q = N, one durable exit");
+        assert_eq!(p["at_most_reachable"], 4);
+        assert!(
+            quorum_unreachable(&base(out(), 1000, None), &c5, me, 120).is_none(),
+            "no relay mark (older relay)"
+        );
+        assert!(
+            quorum_unreachable(&base(out(), 1000, Some(true)), &c5, me, 120).is_none(),
+            "re-entered"
+        );
+        assert!(
+            quorum_unreachable(&base(out(), 1000, Some(false)), &c5, me, 121).is_none(),
+            "another H"
+        );
+        assert!(
+            quorum_unreachable(&base(out(), 61_000, Some(false)), &c5, me, 120).is_none(),
+            "stale"
+        );
+        assert!(
+            quorum_unreachable(&base(out(), 1000, Some(false)), &c5, None, 120).is_none(),
+            "no own identity"
+        );
+        // Own report invisible (review M1 d).
+        let mut hidden = base(out(), 1000, Some(false));
+        hidden["networks"][0]["producers"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        assert!(
+            quorum_unreachable(&hidden, &c5, me, 120).is_none(),
+            "own report not visible"
+        );
+        // Conflicted (one token, two machines) never proves anything.
+        let mut conflicted = base(out(), 1000, Some(false));
+        conflicted["networks"][0]["producers"][4]["beacons"][0]["conflict"] = json!(true);
+        assert!(
+            quorum_unreachable(&conflicted, &c5, me, 120).is_none(),
+            "conflicted"
+        );
+        // A second instance of bp5 still in the ceremony: not out.
+        let mut two = base(out(), 1000, Some(false));
+        two["networks"][0]["producers"][4]["beacons"]
+            .as_array_mut()
+            .unwrap()
+            .push(
+                json!({"age_ms": 1000, "report": rep("FROZEN", json!({"evidence": {"h": 120}}))}),
+            );
+        assert!(
+            quorum_unreachable(&two, &c5, me, 120).is_none(),
+            "another instance still in"
+        );
+        // Anyone else past creation: not this rule's decision.
+        let mut past = base(out(), 1000, Some(false));
+        past["networks"][0]["producers"][1]["beacons"][0]["report"] =
+            rep("VERIFIED", json!({"create_started": true}));
+        assert!(
+            quorum_unreachable(&past, &c5, me, 120).is_none(),
+            "a peer started creation"
+        );
+        // No roster: never.
+        assert!(
+            quorum_unreachable(&base(out(), 1000, Some(false)), &co(&[], 5), me, 120).is_none()
+        );
+        // Review L5: a pinned instance id matches case-insensitively.
+        let mut pinned = co(&["bp1", "bp2", "bp3", "bp4", "bp5"], 5);
+        pinned.roster[4].instance_id = Some("ABCDEF".into());
+        let mut up = base(out(), 1000, Some(false));
+        up["networks"][0]["producers"][4]["beacons"][0]["report"]["instance_id"] = json!("abcdef");
+        assert!(quorum_unreachable(&up, &pinned, me, 120).is_some());
+        // Round 3 (HIGH-1): a mark the relay knows verified, or cannot say did not, never proves anything.
+        for m in [
+            json!({"past_create": false, "rank": 4, "verified_seen": true, "exited": {"state": "ABORTED", "at": 1}}),
+            json!({"past_create": false, "rank": 2, "exited": {"state": "ABORTED", "at": 1}}),
+            json!({"past_create": false, "rank": 4, "verified_seen": false, "exited": {"state": "ABORTED", "at": 1}}),
+            json!({"past_create": false, "verified_seen": false, "exited": {"state": "ABORTED", "at": 1}}),
+        ] {
+            let mut v = base(out(), 1000, Some(false));
+            v["networks"][0]["producers"][4]["event_max"] = json!({"e1": m.clone()});
+            assert!(quorum_unreachable(&v, &c5, me, 120).is_none(), "{m}");
+        }
+        // A STRANDED exit (rank 4 = STRANDED's own rank) with verified_seen false is out.
+        let mut st = base(out(), 1000, Some(false));
+        st["networks"][0]["producers"][4]["event_max"] = json!({"e1": {"past_create": false, "rank": 4,
+            "verified_seen": false, "exited": {"state": "STRANDED", "at": 1}}});
+        assert!(quorum_unreachable(&st, &c5, me, 120).is_some());
+        // Round 3 (M-a): a member on an older agent, or without a version: no proof.
+        let mut old = base(out(), 1000, Some(false));
+        old["networks"][0]["producers"][2]["beacons"][0]["report"]["ceremony"]["evidence"]
+            ["agent_version"] = json!("0.5.0-rc.30");
+        assert!(quorum_unreachable(&old, &c5, me, 120).is_none());
+        let mut nov = base(out(), 1000, Some(false));
+        nov["networks"][0]["producers"][2]["beacons"][0]["report"]["ceremony"]["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_version");
+        assert!(quorum_unreachable(&nov, &c5, me, 120).is_none());
+    }
+
+    #[test]
+    fn round4_lost_or_older_relay_marks_and_remembered_verified_peers_never_prove_out() {
+        let me = Some(("bp1", "i"));
+        let c5 = co(&["bp1", "bp2", "bp3", "bp4", "bp5"], 5);
+        let out = json!({"coord": {"event_id": "e1"}, "agent_version": "0.5.0-rc.31", "ceremony": {"state": "ABORTED",
+            "evidence": {"h": 120}, "transitions": [{"state": "ARMED"}, {"state": "ABORTED"}]}});
+        let mut st = status_me(&[
+            ("bp2", rep("FROZEN", json!({})), 1000),
+            ("bp3", rep("FROZEN", json!({})), 1000),
+            ("bp4", rep("FROZEN", json!({})), 1000),
+            ("bp5", out, 1000),
+        ]);
+        for p in st["networks"][0]["producers"].as_array_mut().unwrap() {
+            for b in p["beacons"].as_array_mut().unwrap() {
+                b["report"]["agent_version"] = json!("0.5.0-rc.31");
+                b["report"]["ceremony"]["evidence"]["agent_version"] = json!("0.5.0-rc.31");
+                b["report"]["ceremony"]["evidence"]["early_abort"] = json!(true);
+            }
+        }
+        st["networks"][0]["producers"][4]["event_max"] = json!({"e1": {"past_create": false, "rank": 2,
+            "verified_seen": false, "exited": {"state": "ABORTED", "at": 1}}});
+        let ok = |st: &Value, mem: &FleetMemory| {
+            quorum_unreachable_with(st, &c5, me, 120, mem).is_some()
+        };
+        // Without marks_state (an older relay): no proof.
+        assert!(!ok(&st, &FleetMemory::default()));
+        st["networks"][0]["marks_state"] =
+            json!({"event_id": "e1", "state_id": "s1", "generation": 10, "complete": true});
+        assert!(ok(&st, &FleetMemory::default()));
+        // The relay says the marks are incomplete (lost or restored state): no proof, and no resume either.
+        let mut lost = st.clone();
+        lost["networks"][0]["marks_state"]["complete"] = json!(false);
+        assert!(!ok(&lost, &FleetMemory::default()));
+        assert!(resume_guard(Some(&lost), &c5, me, false)
+            .unwrap_err()
+            .contains("INCOMPLETE"));
+        // The generation went backwards against what this agent journaled, or the state id changed: no proof.
+        let older = FleetMemory {
+            relay_state: Some(("s1".into(), 11)),
+            ..Default::default()
+        };
+        assert!(!ok(&st, &older));
+        let other = FleetMemory {
+            relay_state: Some(("s0".into(), 1)),
+            ..Default::default()
+        };
+        assert!(!ok(&st, &other));
+        assert!(resume_guard_with(Some(&st), &c5, me, false, &other).is_err());
+        let same = FleetMemory {
+            relay_state: Some(("s1".into(), 9)),
+            ..Default::default()
+        };
+        assert!(ok(&st, &same));
+        let regressed = FleetMemory {
+            relay_regressed: true,
+            ..Default::default()
+        };
+        assert!(!ok(&st, &regressed));
+        // A peer this agent once saw VERIFIED is never out, whatever the relay says now.
+        let mut seen = FleetMemory::default();
+        seen.verified_peers.insert("bp5".into());
+        assert!(!ok(&st, &seen));
+        // ...and stays in the ceremony for the resume guard (3b).
+        let c4 = co(&["bp1", "bp2", "bp3", "bp4", "bp5"], 4);
+        let mut v = status_me(&[
+            ("bp2", rep("VERIFIED", json!({})), 1000),
+            ("bp3", rep("VERIFIED", json!({})), 1000),
+            ("bp4", rep("ABORTED", json!({})), 1000),
+            ("bp5", rep("ABORTED", json!({})), 1000),
+        ]);
+        v["networks"][0]["marks_state"] =
+            json!({"event_id": "e1", "state_id": "s1", "generation": 10, "complete": true});
+        assert!(resume_guard_with(Some(&v), &c4, me, false, &FleetMemory::default()).is_ok());
+        let mut both = FleetMemory::default();
+        both.verified_peers
+            .extend(["bp4".to_string(), "bp5".to_string()]);
+        assert!(resume_guard_with(Some(&v), &c4, me, false, &both).is_err());
+    }
+
+    #[test]
+    fn agent_version_gate_for_exit_marks() {
+        for (v, ok) in [
+            ("0.5.0-rc.31", true),
+            ("0.5.0-rc.40", true),
+            ("0.5.0", true),
+            ("0.5.1-rc.1", true),
+            ("1.0.0", true),
+            ("0.5.0-rc.30", false),
+            ("0.4.9", false),
+            ("0.5.0-beta.40", false),
+            ("0.5", false),
+            ("x.y.z", false),
+            ("", false),
+        ] {
+            assert_eq!(agent_honours_exit_marks(v), ok, "{v}");
+        }
+    }
+
+    #[test]
+    fn resume_guard_counts_members_that_verified_as_in_the_ceremony() {
+        let me = Some(("bp1", "i"));
+        let c = co(&["bp1", "bp2", "bp3", "bp4", "bp5"], 4);
+        let ab = || rep("ABORTED", json!({}));
+        let mut v = status_me(&[
+            ("bp2", rep("VERIFIED", json!({})), 1000),
+            ("bp3", rep("VERIFIED", json!({})), 1000),
+            ("bp4", ab(), 1000),
+            ("bp5", ab(), 1000),
+        ]);
+        assert!(
+            resume_guard(Some(&v), &c, me, false).is_ok(),
+            "pre-round-3 view: 2 in < 4"
+        );
+        for i in [3, 4] {
+            v["networks"][0]["producers"][i]["event_max"] =
+                json!({"e1": {"past_create": false, "rank": 4, "verified_seen": true}});
+        }
+        let err = resume_guard(Some(&v), &c, me, false).unwrap_err();
+        assert!(err.contains("still in the ceremony"), "{err}");
+        // An older relay's mark (no verified_seen) with a VERIFIED rank counts too.
+        for i in [3, 4] {
+            v["networks"][0]["producers"][i]["event_max"] =
+                json!({"e1": {"past_create": false, "rank": 4}});
+        }
+        assert!(resume_guard(Some(&v), &c, me, false).is_err());
+        // LOW (signed abort): >= quorum members (this node included) may have verified: no resume on the abort alone.
+        let mut sv = status_me(&[
+            ("bp2", ab(), 1000),
+            ("bp3", ab(), 1000),
+            ("bp4", ab(), 1000),
+            ("bp5", ab(), 1000),
+        ]);
+        assert!(resume_guard(Some(&sv), &c, me, true).is_ok());
+        for i in [0, 1, 2, 3] {
+            sv["networks"][0]["producers"][i]["event_max"] =
+                json!({"e1": {"past_create": false, "rank": 4, "verified_seen": true}});
+        }
+        let err = resume_guard(Some(&sv), &c, me, true).unwrap_err();
+        assert!(err.contains("may have verified"), "{err}");
+    }
+
     #[test]
     fn halted_members_on_the_chain_count_and_splits_are_hard() {
         let c = co(&["bp1", "bp2", "bp3", "bp4"], 4);

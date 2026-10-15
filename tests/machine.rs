@@ -146,6 +146,12 @@ struct MockOps {
     fleet_polls: Cell<u32>,
     /// Override for GET /api/status (roster fleet-gate tests).
     status_doc: RefCell<Option<serde_json::Value>>,
+    /// rc.31: generated (agreeing) relay docs carry a durable exit mark for event e1 on these producers.
+    exit_marked: RefCell<Vec<String>>,
+    /// rc.31 round 3: the relay serves those marks only up to this poll (0 = always); later it "forgets" them.
+    exit_marked_until: Cell<u32>,
+    /// rc.31 round 5: the relay remembers those exits as `exit_seen` only (the event's early abort is off).
+    exit_seen_only: Cell<bool>,
     /// rc.23: after this many status polls, serve this document instead.
     status_doc_after: RefCell<Option<(u32, serde_json::Value)>>,
     /// rc.23: the next N status polls fail (a transient relay error).
@@ -345,6 +351,9 @@ impl MockOps {
             fleet_agree_after: Cell::new(0),
             fleet_polls: Cell::new(0),
             status_doc: RefCell::new(None),
+            exit_marked: RefCell::new(vec![]),
+            exit_marked_until: Cell::new(0),
+            exit_seen_only: Cell::new(false),
             status_doc_after: RefCell::new(None),
             status_fail_times: Cell::new(0),
             fail_status_on_hook: RefCell::new(None),
@@ -1009,8 +1018,23 @@ impl ChainOps for MockOps {
                 1
             };
             // The relay always reports each report's age (the gate requires fresh reports).
-            let producers: Vec<_> = (0..n).map(|i| serde_json::json!({"name": format!("bp{i}"), "age_ms": 1000,
-                "report": {"coord": {"event_id": "e1"}, "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}}})).collect();
+            let marked = self.exit_marked.borrow().clone();
+            let producers: Vec<_> = (0..n).map(|i| {
+                let name = format!("bp{i}");
+                let mut p = serde_json::json!({"name": name, "age_ms": 1000,
+                    "report": {"coord": {"event_id": "e1"}, "ceremony": {"state": "VERIFIED", "evidence": ours.clone()}}});
+                let until = self.exit_marked_until.get();
+                if marked.contains(&name) && (until == 0 || polls <= until) {
+                    p["event_max"] = if self.exit_seen_only.get() {
+                        serde_json::json!({"e1": {"past_create": false, "state": "VERIFIED",
+                            "exit_seen": {"state": "ABORTED", "at": 1}, "verified_seen": true, "rank": 4}})
+                    } else {
+                        serde_json::json!({"e1": {"past_create": false, "state": "VERIFIED",
+                            "exited": {"state": "ABORTED", "at": 1}, "reentered": true}})
+                    };
+                }
+                p
+            }).collect();
             return Ok(Some(
                 serde_json::json!({"networks": [{"id": "rehearsal", "producers": producers}]}),
             ));
@@ -5634,7 +5658,28 @@ fn fake_compare_failing(dir: &std::path::Path, failing: &[&str]) {
         // The v1.0.0 signatures (tests/fixtures/compare-v1.0.0-408461570.log).
         if *t == "global_property" {
             body.push_str(&format!("echo 'table {t}: nodeos=Some(TableReport {{ rows: 1, sha256: \"aa\" }}) arena=Some(TableReport {{ rows: 1, sha256: \"bb\" }})'\n"));
-            body.push_str(&format!("echo 'table {t}: first differing row index 0'\necho '  nodeos present=true bytes=157 hex=01'\necho '  arena present=true bytes=143 hex=01'\n"));
+            // rc.31 review L3: the matcher compares the row bytes, so the recorded v1.0.0 rows are replayed verbatim.
+            let fixture = std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/compare-v1.0.0-408461570.log"
+            ))
+            .unwrap();
+            body.push_str(&format!("echo 'table {t}: first differing row index 0'\n"));
+            for l in fixture.lines().filter(|l| {
+                l.trim_start().starts_with("nodeos present=")
+                    || l.trim_start().starts_with("arena present=")
+            }) {
+                // Round 3: the matcher checks the row's chain_id against the configured source chain: re-key the
+                // recorded rows (testnet chain_id) to this mock's chain.
+                let ours = hex::encode(CHAIN_ID);
+                let rekeyed = l
+                    .replace(
+                        "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3",
+                        &ours[..60],
+                    )
+                    .replace("71ee83bcf52142d61019d95f9cc5427b", &ours[..32]);
+                body.push_str(&format!("echo '{rekeyed}'\n"));
+            }
         } else {
             body.push_str(&format!("echo 'table {t}: nodeos=Some(TableReport {{ rows: 1, sha256: \"aa\" }}) arena=None'\n"));
             body.push_str(&format!("echo 'table {t}: first differing row index 0'\n"));
@@ -8727,7 +8772,8 @@ fn rc23_second_guard_pass_waits_a_beacon_cycle_and_sees_a_late_create_started() 
         doc
     };
     *ops.status_doc.borrow_mut() = Some(doc(serde_json::json!({"state": "VERIFIED"})));
-    // Polls: 1 = first guard, 2 = withdrawal seen; from poll 3 (after the settle) bp4 reports create_started.
+    // Polls: 1 = first guard, 2 = withdrawal seen; from poll 3 (after the settle) bp4 reports create_started. (The
+    // early abort is off: no rc.31 ARM-time or quorum-reachability reads.)
     *ops.status_doc_after.borrow_mut() = Some((
         2,
         doc(serde_json::json!({"state": "VERIFIED", "create_started": true})),
@@ -8937,8 +8983,8 @@ fn rc24_a_short_of_quorum_fleet_view_is_waited_out_within_the_grace() {
     let d = tempfile::tempdir().unwrap();
     let (cfg, ops) = rc23_degraded_rig_head(d.path(), "IGNITED", 900, 120);
     *ops.flaky_hook.borrow_mut() = Some(("resume-traffic".into(), 2));
-    // Read 1 is the fleet gate; read 2 (the first degraded check) shows the peers at the cut (short of a quorum);
-    // from read 3 they show blocks past it.
+    // Read 1 is the fleet gate; read 2 (the first degraded check) shows the peers at the cut (short of a quorum); from
+    // read 3 they show blocks past it. (The early abort is off: no rc.31 ARM-time reads.)
     let ours = ops.status_doc.borrow().clone().unwrap();
     let mut caught_up = ours.clone();
     for p in caught_up["networks"][0]["producers"]
@@ -9020,21 +9066,46 @@ fn rc29_operator_rollback_from_verified_runs_the_resume_guard() {
 
 #[test]
 fn rc29_operator_rollback_from_verified_resumes_when_the_guard_passes() {
+    let view = || {
+        rc23_status(&[
+            (
+                "bp1",
+                serde_json::json!({"state": "VERIFIED", "aborting": true}),
+            ),
+            ("bp2", serde_json::json!({"state": "ABORTED"})),
+            ("bp3", serde_json::json!({"state": "ABORTED"})),
+            ("bp4", serde_json::json!({"state": "VERIFIED"})),
+            ("bp5", serde_json::json!({"state": "FROZEN"})),
+        ])
+    };
+    // rc.31 round 4 (review MEDIUM-1 c): this journal saw bp2..bp5 VERIFIED-or-later before it was killed: they may have
+    // been counted at a gate, so they stay in the ceremony whatever the relay says now. The guard refuses.
+    {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = rc23_fleet_config(d.path());
+        let ops = MockOps::new(d.path(), 110);
+        rc29_killed_at_verified(d.path(), &cfg, &ops);
+        *ops.status_doc.borrow_mut() = Some(view());
+        let (j, rec) = open_journal(&cfg.journal_path);
+        let err = Machine::new(&cfg, &ops, j, rec)
+            .operator_rollback_opts(false, false)
+            .unwrap_err();
+        assert!(err.contains("still in the ceremony"), "{err}");
+        assert_eq!(ops.resumes.get(), 0);
+    }
+    // A journal that never saw them verified (its fleet memory stripped): every peer before chain creation and the
+    // quorum unreachable without this node: the guard passes (twice) and the rollback resumes.
     let d = tempfile::tempdir().unwrap();
     let cfg = rc23_fleet_config(d.path());
     let ops = MockOps::new(d.path(), 110);
     rc29_killed_at_verified(d.path(), &cfg, &ops);
-    // Every peer before chain creation and the quorum unreachable without this node.
-    *ops.status_doc.borrow_mut() = Some(rc23_status(&[
-        (
-            "bp1",
-            serde_json::json!({"state": "VERIFIED", "aborting": true}),
-        ),
-        ("bp2", serde_json::json!({"state": "ABORTED"})),
-        ("bp3", serde_json::json!({"state": "ABORTED"})),
-        ("bp4", serde_json::json!({"state": "VERIFIED"})),
-        ("bp5", serde_json::json!({"state": "FROZEN"})),
-    ]));
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.contains("peers_seen_verified"))
+        .collect();
+    std::fs::write(&cfg.journal_path, kept.join("\n") + "\n").unwrap();
+    *ops.status_doc.borrow_mut() = Some(view());
     let (j, rec) = open_journal(&cfg.journal_path);
     let out = Machine::new(&cfg, &ops, j, rec)
         .operator_rollback_opts(false, false)
@@ -13538,4 +13609,839 @@ fn final_l3_a_journal_with_an_unknown_record_kind_is_refused() {
         "{err}"
     );
     assert!(Journal::open(&path).is_err());
+}
+
+/// rc.31 round 5: the signed event with `early_abort: true`, and a mock whose relay serves it.
+fn rc31_event() -> serde_json::Value {
+    signed(
+        serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "early_abort": true}),
+    )
+}
+fn rc31_event_hash() -> String {
+    pulse_cutover::coord::payload_hash(&rc31_event()).unwrap()
+}
+fn rc31_ops(dir: &std::path::Path) -> MockOps {
+    let ops = MockOps::new(dir, 110);
+    *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"event": rc31_event()}));
+    ops
+}
+
+/// rc.31: the rc.23 fleet with the (signed-event) early abort turned ON.
+fn rc31_fleet_config(dir: &std::path::Path) -> Config {
+    let text = std::fs::read_to_string({
+        rc23_fleet_config(dir);
+        dir.join("fleet.toml")
+    })
+    .unwrap()
+    .replacen(
+        "[coordination]\n",
+        "[coordination]\nearly_abort = true\n",
+        1,
+    )
+    // Round 5: bound to a signed event that turns it on (the relay serves it: rc31_ops).
+    .replace(&mock_event_hash(), &rc31_event_hash());
+    std::fs::write(dir.join("fleet.toml"), &text).unwrap();
+    load_toml(dir, "fleet.toml", &text).unwrap()
+}
+
+// ---- rc.31: early abort when the event's quorum is provably unreachable (fleet runs h4/h5) ----------------------
+
+/// rc.31 rig: the rc.23 fleet (bp1..bp5, this node = bp1) with quorum = N = 5, as in runs h4/h5.
+fn rc31_q5_config(dir: &std::path::Path) -> Config {
+    let text = std::fs::read_to_string({
+        rc31_fleet_config(dir);
+        dir.join("fleet.toml")
+    })
+    .unwrap()
+    .replace("fleet_quorum = 4", "fleet_quorum = 5");
+    load_toml(dir, "fleet-q5.toml", &text).unwrap()
+}
+
+/// The same rig with a scheduled snapshot (schedule_at_h): FROZEN waits for H to finalize, polling every 2 s (mock
+/// clock), so the early abort can act after the freeze and before VERIFIED.
+fn rc31_q5_scheduled_config(dir: &std::path::Path) -> Config {
+    let text = std::fs::read_to_string({
+        rc31_q5_config(dir);
+        dir.join("fleet-q5.toml")
+    })
+    .unwrap()
+    .replace("poll_ms = 1\n", "poll_ms = 2000\n")
+    .replacen(
+        "[ceremony]\n",
+        "[ceremony]\nfreeze_strategy = \"schedule_at_h\"\n",
+        1,
+    )
+    .replacen(
+        "[snapshot]\n",
+        &format!("[snapshot]\ndir = \"{}\"\n", dir.display()),
+        1,
+    );
+    load_toml(dir, "fleet-q5-sched.toml", &text).unwrap()
+}
+
+/// A member that ended the event without ever verifying (refused ARM, or aborted in FROZEN): its report.
+fn rc31_out(state: &str) -> serde_json::Value {
+    serde_json::json!({"state": state, "evidence": {"h": 120},
+        "transitions": [{"state": "ARMED", "ts": "t"}, {"state": state, "ts": "t"}]})
+}
+
+/// An rc.31 relay's mark for `who` (round 3: explicit verified_seen false, a rank below VERIFIED).
+fn rc31_mark(mut doc: serde_json::Value, who: &[&str], reentered: bool) -> serde_json::Value {
+    for p in doc["networks"][0]["producers"].as_array_mut().unwrap() {
+        if who.contains(&p["name"].as_str().unwrap_or("")) {
+            p["event_max"] = serde_json::json!({"e1": {"past_create": false, "state": "ABORTED", "rank": 2,
+                "verified_seen": false, "exited": {"state": "ABORTED", "at": 1}, "reentered": reentered}});
+        }
+    }
+    doc
+}
+
+/// Round 3 (review M-a): every report from an rc.31 agent; round 4: an rc.31 relay whose event marks are complete.
+fn rc31_v(mut doc: serde_json::Value) -> serde_json::Value {
+    for p in doc["networks"][0]["producers"].as_array_mut().unwrap() {
+        for b in p["beacons"].as_array_mut().unwrap() {
+            b["report"]["agent_version"] = serde_json::json!("0.5.0-rc.31");
+            // Review LOW 6: the gate reads the version of the agent that RAN the ceremony (ARMED evidence).
+            if b["report"]["ceremony"].is_object() {
+                b["report"]["ceremony"]["evidence"]["agent_version"] =
+                    serde_json::json!("0.5.0-rc.31");
+                b["report"]["ceremony"]["evidence"]["early_abort"] = serde_json::json!(true);
+            }
+        }
+    }
+    doc["networks"][0]["marks_state"] =
+        serde_json::json!({"event_id": "e1", "state_id": "s1", "generation": 10, "complete": true});
+    doc
+}
+
+#[test]
+fn rc31_a_member_that_refused_arm_means_this_node_never_freezes() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc31_q5_config(d.path());
+    let ops = rc31_ops(d.path());
+    *ops.status_doc.borrow_mut() = Some(rc31_v(rc31_mark(
+        rc23_status(&[
+            ("bp2", serde_json::json!({"state": "ARMED"})),
+            ("bp3", serde_json::json!({"state": "ARMED"})),
+            ("bp4", serde_json::json!({"state": "ARMED"})),
+            ("bp5", rc31_out("ABORTED")),
+        ]),
+        &["bp5"],
+        false,
+    )));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(
+        text.contains("fleet quorum unreachable before the freeze")
+            && text.contains("\"at_most_reachable\":4"),
+        "{text}"
+    );
+    let hooks = ops.hooks.borrow().clone();
+    assert!(
+        !hooks.iter().any(|h| h == "freeze-writes"),
+        "nothing was frozen: {hooks:?}"
+    );
+    assert!(
+        !text.contains("\"side_effect\":\"source_pause\""),
+        "never paused: {text}"
+    );
+}
+
+#[test]
+fn rc31_unreachable_quorum_after_the_freeze_aborts_while_waiting_for_h() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc31_q5_scheduled_config(d.path());
+    let ops = rc31_ops(d.path());
+    ops.schedule_ok.set(true);
+    *ops.status_doc.borrow_mut() = Some(rc31_v(rc23_status(&[
+        ("bp2", serde_json::json!({"state": "FROZEN"})),
+        ("bp3", serde_json::json!({"state": "FROZEN"})),
+        ("bp4", serde_json::json!({"state": "FROZEN"})),
+        ("bp5", serde_json::json!({"state": "FROZEN"})),
+    ])));
+    // After the two ARM-time reads (own exit mark; early-abort ARM checks) and the forced pre-freeze read, bp4 was aborted in FROZEN (h4) and the relay holds its exit mark.
+    *ops.status_doc_after.borrow_mut() = Some((
+        3,
+        rc31_v(rc31_mark(
+            rc23_status(&[
+                ("bp2", serde_json::json!({"state": "FROZEN"})),
+                ("bp3", serde_json::json!({"state": "FROZEN"})),
+                ("bp4", rc31_out("ABORTED")),
+                ("bp5", serde_json::json!({"state": "FROZEN"})),
+            ]),
+            &["bp4"],
+            false,
+        )),
+    ));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(
+        text.contains("fleet quorum unreachable while waiting for H to finalize"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\"resume_guard\":\"clear\""),
+        "the ordinary guard decided the resume: {text}"
+    );
+    assert!(
+        ops.hooks.borrow().iter().any(|h| h == "reopen-writes"),
+        "writes reopened"
+    );
+}
+
+/// Round 3 (review HIGH-1, 3a): at the fleet gate this node is VERIFIED itself (a peer's gate may have counted it): no
+/// early abort, the fleet timeout decides as before rc.31.
+#[test]
+fn rc31_no_early_abort_once_this_node_is_verified() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc31_q5_config(d.path());
+    let ops = rc31_ops(d.path());
+    *ops.status_doc.borrow_mut() = Some(rc31_v(rc23_status(&[
+        ("bp2", serde_json::json!({"state": "FROZEN"})),
+        ("bp3", serde_json::json!({"state": "FROZEN"})),
+        ("bp4", serde_json::json!({"state": "FROZEN"})),
+        ("bp5", serde_json::json!({"state": "FROZEN"})),
+    ])));
+    *ops.status_doc_after.borrow_mut() = Some((
+        4,
+        rc31_v(rc31_mark(
+            rc23_status(&[
+                ("bp2", serde_json::json!({"state": "VERIFIED"})),
+                ("bp3", serde_json::json!({"state": "VERIFIED"})),
+                ("bp4", rc31_out("ABORTED")),
+                ("bp5", serde_json::json!({"state": "SNAPSHOTTED"})),
+            ]),
+            &["bp4"],
+            false,
+        )),
+    ));
+    let _ = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(!text.contains("fleet quorum unreachable"), "{text}");
+    assert!(
+        text.contains("fleet did not reach verified agreement"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\"exit_marks_seen\":[\"bp4\"]"),
+        "the mark is journaled (M-b): {text}"
+    );
+}
+
+#[test]
+fn rc31_unreachable_but_guard_blocked_keeps_waiting_and_strands_at_the_timeout_as_before() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc31_q5_scheduled_config(d.path());
+    let ops = rc31_ops(d.path());
+    ops.schedule_ok.set(true);
+    // bp4 refused ARM (marked); bp5 reports from an rc.31 agent but its report is stale ("may have ignited since"), so
+    // the resume guard refuses: no early abort, the run waits as before and strands at the fleet timeout.
+    let mut doc = rc31_v(rc31_mark(
+        rc23_status(&[
+            ("bp2", serde_json::json!({"state": "FROZEN"})),
+            ("bp3", serde_json::json!({"state": "FROZEN"})),
+            ("bp4", rc31_out("ABORTED")),
+            ("bp5", serde_json::json!({"state": "FROZEN"})),
+        ]),
+        &["bp4"],
+        false,
+    ));
+    doc["networks"][0]["producers"][4]["beacons"][0]["age_ms"] = serde_json::json!(600_000);
+    *ops.status_doc_after.borrow_mut() = Some((3, doc));
+    *ops.status_doc.borrow_mut() = Some(rc31_v(rc23_status(&[
+        ("bp2", serde_json::json!({"state": "ARMED"})),
+        ("bp3", serde_json::json!({"state": "ARMED"})),
+        ("bp4", serde_json::json!({"state": "ARMED"})),
+        ("bp5", serde_json::json!({"state": "ARMED"})),
+    ])));
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("\"early_abort\":\"deferred\""), "{text}");
+    assert_eq!(
+        text.matches("\"early_abort\":\"deferred\"").count(),
+        1,
+        "journaled once"
+    );
+    assert!(
+        text.contains("fleet did not reach verified agreement"),
+        "{text}"
+    );
+    assert_eq!(ops.resumes.get(), 0);
+}
+
+#[test]
+fn rc31_evidence_that_does_not_prove_a_member_out_never_aborts_early() {
+    // Each of these leaves the quorum (5) possibly reachable as far as the relay can PROVE: no early abort.
+    let base = |bp5: serde_json::Value| {
+        rc23_status(&[
+            ("bp2", serde_json::json!({"state": "ARMED"})),
+            ("bp3", serde_json::json!({"state": "ARMED"})),
+            ("bp4", serde_json::json!({"state": "ARMED"})),
+            ("bp5", bp5),
+        ])
+    };
+    let marked =
+        |bp5: serde_json::Value, reentered: bool| rc31_v(rc31_mark(base(bp5), &["bp5"], reentered));
+    let with_mark = |m: serde_json::Value| {
+        let mut d = rc31_v(base(rc31_out("ABORTED")));
+        d["networks"][0]["producers"][4]["event_max"] = serde_json::json!({"e1": m});
+        d
+    };
+    let mut cases: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "an exit report without the relay's durable mark (older relay)",
+            rc31_v(base(rc31_out("ABORTED"))),
+        ),
+        ("marked but re-entered", marked(rc31_out("ABORTED"), true)),
+        (
+            "marked, report without a transition list",
+            marked(
+                serde_json::json!({"state": "ABORTED", "evidence": {"h": 120}}),
+                false,
+            ),
+        ),
+        (
+            "marked, report after VERIFIED",
+            marked(
+                serde_json::json!({"state": "ABORTED", "evidence": {"h": 120},
+            "transitions": [{"state": "ARMED", "ts": "t"}, {"state": "VERIFIED", "ts": "t"}, {"state": "ABORTED", "ts": "t"}]}),
+                false,
+            ),
+        ),
+        (
+            "marked, report for another H",
+            marked(
+                serde_json::json!({"state": "ABORTED", "evidence": {"h": 999},
+            "transitions": [{"state": "ARMED", "ts": "t"}, {"state": "ABORTED", "ts": "t"}]}),
+                false,
+            ),
+        ),
+        // Round 3 (HIGH-1): the relay saw this member verify (or cannot say it did not).
+        (
+            "marked, verified_seen",
+            with_mark(
+                serde_json::json!({"past_create": false, "rank": 4, "verified_seen": true,
+            "exited": {"state": "ABORTED", "at": 1}}),
+            ),
+        ),
+        (
+            "marked, verified_seen missing (older relay)",
+            with_mark(serde_json::json!({"past_create": false, "rank": 2,
+            "exited": {"state": "ABORTED", "at": 1}})),
+        ),
+        (
+            "marked, ABORTED with a VERIFIED-rank high-water mark",
+            with_mark(serde_json::json!({"past_create": false, "rank": 4,
+            "verified_seen": false, "exited": {"state": "ABORTED", "at": 1}})),
+        ),
+        (
+            "marked, no rank",
+            with_mark(
+                serde_json::json!({"past_create": false, "verified_seen": false,
+            "exited": {"state": "ABORTED", "at": 1}}),
+            ),
+        ),
+    ];
+    // Round 3 (M-a): one member on an older agent, or with no version at all.
+    let mut old = marked(rc31_out("ABORTED"), false);
+    old["networks"][0]["producers"][2]["beacons"][0]["report"]["ceremony"]["evidence"]
+        ["agent_version"] = serde_json::json!("0.5.0-rc.30");
+    cases.push(("a member on rc.30", old));
+    let mut none = marked(rc31_out("ABORTED"), false);
+    none["networks"][0]["producers"][0]["beacons"][0]["report"]["ceremony"]["evidence"]
+        .as_object_mut()
+        .unwrap()
+        .remove("agent_version");
+    cases.push(("this node's report without a version", none));
+    let mut stale = marked(rc31_out("ABORTED"), false);
+    stale["networks"][0]["producers"][4]["beacons"][0]["age_ms"] = serde_json::json!(600_000);
+    cases.push(("marked, stale report", stale));
+    for (why, doc) in cases {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = rc31_q5_config(d.path());
+        let ops = rc31_ops(d.path());
+        *ops.status_doc.borrow_mut() = Some(doc);
+        let _ = run_machine_result(&cfg, &ops);
+        let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+        assert!(!text.contains("fleet quorum unreachable"), "{why}: {text}");
+        assert!(!text.contains("\"quorum_unreachable\""), "{why}: {text}");
+    }
+    // Review M1 (d): this node's own report not visible on the relay: no early abort either.
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc31_q5_config(d.path());
+    let ops = rc31_ops(d.path());
+    let mut doc = marked(rc31_out("ABORTED"), false);
+    doc["networks"][0]["producers"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|p| p["name"] != "bp1");
+    *ops.status_doc.borrow_mut() = Some(doc);
+    let _ = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(
+        !text.contains("fleet quorum unreachable"),
+        "own report invisible: {text}"
+    );
+}
+
+#[test]
+fn rc31_with_quorum_below_n_one_refusal_is_not_enough() {
+    // q = 4 of 5: one member out leaves 4 possible: reachable, no early abort (the rc.23 behaviour).
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc31_fleet_config(d.path());
+    let ops = rc31_ops(d.path());
+    *ops.status_doc.borrow_mut() = Some(rc31_v(rc31_mark(
+        rc23_status(&[
+            ("bp2", serde_json::json!({"state": "ARMED"})),
+            ("bp3", serde_json::json!({"state": "ARMED"})),
+            ("bp4", serde_json::json!({"state": "ARMED"})),
+            ("bp5", rc31_out("ABORTED")),
+        ]),
+        &["bp5"],
+        false,
+    )));
+    let _ = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(!text.contains("fleet quorum unreachable"), "{text}");
+    assert!(
+        ops.hooks.borrow().iter().any(|h| h == "freeze-writes"),
+        "it froze as before"
+    );
+    // Two out of five: at most 3 < 4 can agree: unreachable before the freeze.
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc31_fleet_config(d.path());
+    let ops = rc31_ops(d.path());
+    *ops.status_doc.borrow_mut() = Some(rc31_v(rc31_mark(
+        rc23_status(&[
+            ("bp2", serde_json::json!({"state": "ARMED"})),
+            ("bp3", serde_json::json!({"state": "ARMED"})),
+            ("bp4", rc31_out("ABORTED")),
+            ("bp5", rc31_out("ABORTED")),
+        ]),
+        &["bp4", "bp5"],
+        false,
+    )));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(
+        text.contains("fleet quorum unreachable before the freeze"),
+        "{text}"
+    );
+}
+
+/// Review M1, the exact scenario (N = 5, q = 3): bp3..bp5 refuse ARM (ABORTED, the relay marks them exited); bp1, bp2
+/// abort before freezing. bp3's operator fixes the config and re-runs on a FRESH journal under the same event: its
+/// agent refuses to ARM (its own exit mark), and even an agent that did ARM is never counted by a peer's gate.
+#[test]
+fn rc31_m1_a_member_that_exited_cannot_come_back_under_the_same_event() {
+    let q3 = |d: &std::path::Path| {
+        let text = std::fs::read_to_string({
+            rc31_fleet_config(d);
+            d.join("fleet.toml")
+        })
+        .unwrap()
+        .replace("fleet_quorum = 4", "fleet_quorum = 3");
+        load_toml(d, "fleet-q3.toml", &text).unwrap()
+    };
+    // (1) bp1 (this node) with q = 3: three marked exits leave at most 2: abort before the freeze.
+    let d = tempfile::tempdir().unwrap();
+    let cfg = q3(d.path());
+    let ops = rc31_ops(d.path());
+    *ops.status_doc.borrow_mut() = Some(rc31_v(rc31_mark(
+        rc23_status(&[
+            ("bp2", serde_json::json!({"state": "ARMED"})),
+            ("bp3", rc31_out("ABORTED")),
+            ("bp4", rc31_out("ABORTED")),
+            ("bp5", rc31_out("ABORTED")),
+        ]),
+        &["bp3", "bp4", "bp5"],
+        false,
+    )));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    assert!(std::fs::read_to_string(&cfg.journal_path)
+        .unwrap()
+        .contains("fleet quorum unreachable before the freeze"));
+
+    // (2) An exited member (here bp1's own producer carries the mark) re-run on a FRESH journal: refused at ARM.
+    let d = tempfile::tempdir().unwrap();
+    let cfg = q3(d.path());
+    let ops = rc31_ops(d.path());
+    *ops.status_doc.borrow_mut() = Some(rc31_mark(
+        rc23_status(&[
+            (
+                "bp1",
+                serde_json::json!({"state": "ARMED", "evidence": {"h": 120}}),
+            ),
+            ("bp2", serde_json::json!({"state": "ARMED"})),
+        ]),
+        &["bp1"],
+        true,
+    ));
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(
+        err.contains("already exited event e1 without verifying") && err.contains("NEW event id"),
+        "{err}"
+    );
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "freeze-writes"));
+    assert_eq!(ops.pauses.get(), 0);
+
+    // (3) A gate never counts a marked member, even one reporting VERIFIED with equal evidence (an agent that skipped
+    // the ARM check): three agreeing producers of which one is marked do not make a quorum of 3.
+    let d = tempfile::tempdir().unwrap();
+    let cfg = coord_config(d.path(), 120, 3, 5);
+    let ops = MockOps::new(d.path(), 110);
+    ops.fleet_agree.set(3);
+    *ops.exit_marked.borrow_mut() = vec!["bp1".into()];
+    // Never ignites (stops at the gate; without a roster the resume guard strands it).
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(
+        text.contains("fleet did not reach verified agreement") && text.contains("durably marked"),
+        "{text}"
+    );
+    // (4) Round 3 (review M-b): the relay serves the mark for two gate reads, then forgets it: the journaled mark keeps
+    // the member excluded (fail closed).
+    let d = tempfile::tempdir().unwrap();
+    let cfg = coord_config(d.path(), 120, 3, 5);
+    let ops = MockOps::new(d.path(), 110);
+    ops.fleet_agree.set(3);
+    *ops.exit_marked.borrow_mut() = vec!["bp1".into()];
+    ops.exit_marked_until.set(2);
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(
+        text.contains("\"exit_marks_seen\":[\"bp1\"]")
+            && text.contains("fleet did not reach verified agreement"),
+        "{text}"
+    );
+    // Control: without the mark the same fleet goes LIVE.
+    let d = tempfile::tempdir().unwrap();
+    let cfg = coord_config(d.path(), 120, 3, 5);
+    let ops = MockOps::new(d.path(), 110);
+    ops.fleet_agree.set(3);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+}
+
+/// Review HIGH-1 (round 3), the resume side: N = 5, q = 4. All five verified; this node's peers X, Y then report
+/// ABORTED (a crash + fresh journal + abort, or a forged report) before B's create_started shows. The relay's marks
+/// say X and Y verified: they still count as in the ceremony, so this node strands instead of resuming.
+#[test]
+fn rc31_high1_members_that_verified_stay_in_the_ceremony_for_the_resume_guard() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc31_fleet_config(d.path());
+    let ops = rc31_ops(d.path());
+    ops.burnoff_tx_per_block.set(1); // abort after the freeze (FROZEN): the guard decides
+    let mut doc = rc31_v(rc23_status(&[
+        ("bp2", serde_json::json!({"state": "VERIFIED"})),
+        ("bp3", serde_json::json!({"state": "VERIFIED"})),
+        ("bp4", rc31_out("ABORTED")),
+        ("bp5", rc31_out("ABORTED")),
+    ]));
+    for i in [3, 4] {
+        doc["networks"][0]["producers"][i]["event_max"] =
+            serde_json::json!({"e1": {"past_create": false, "rank": 4, "verified_seen": true}});
+    }
+    *ops.status_doc.borrow_mut() = Some(doc.clone());
+    assert_eq!(run_machine(&cfg, &ops), State::Stranded);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(text.contains("are still in the ceremony"), "{text}");
+    assert_eq!(ops.resumes.get(), 0);
+    // Control: without the verified marks the same view resumes (pre-round-3 behaviour).
+    for i in [3, 4] {
+        doc["networks"][0]["producers"][i]
+            .as_object_mut()
+            .unwrap()
+            .remove("event_max");
+    }
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc31_fleet_config(d.path());
+    let ops = rc31_ops(d.path());
+    ops.burnoff_tx_per_block.set(1);
+    *ops.status_doc.borrow_mut() = Some(doc);
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+}
+
+/// Round 4 (review MEDIUM-1): the relay restarts on lost or older state mid-event. (1) It reports the event's marks as
+/// incomplete: no early abort, and the resume guard strands. (2) It does not say so, but this agent journaled earlier
+/// that bp4 and bp5 were VERIFIED: after the restore they show fresh never-verified exit marks, and still they are never
+/// counted out (no early abort), and the guard keeps them in the ceremony.
+#[test]
+fn rc31_round4_relay_state_loss_never_proves_members_out() {
+    let before = || {
+        rc31_v(rc23_status(&[
+            ("bp2", serde_json::json!({"state": "FROZEN"})),
+            ("bp3", serde_json::json!({"state": "FROZEN"})),
+            ("bp4", serde_json::json!({"state": "VERIFIED"})),
+            ("bp5", serde_json::json!({"state": "VERIFIED"})),
+        ]))
+    };
+    let restored = |complete: bool| {
+        let mut d = rc31_v(rc31_mark(
+            rc23_status(&[
+                ("bp2", serde_json::json!({"state": "FROZEN"})),
+                ("bp3", serde_json::json!({"state": "FROZEN"})),
+                ("bp4", rc31_out("ABORTED")),
+                ("bp5", rc31_out("ABORTED")),
+            ]),
+            &["bp4", "bp5"],
+            false,
+        ));
+        d["networks"][0]["marks_state"]["complete"] = serde_json::json!(complete);
+        d
+    };
+    for complete in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let text = std::fs::read_to_string({
+            rc31_q5_scheduled_config(d.path());
+            d.path().join("fleet-q5-sched.toml")
+        })
+        .unwrap()
+        .replace("fleet_quorum = 5", "fleet_quorum = 4");
+        let cfg = load_toml(d.path(), "fleet-q4-sched.toml", &text).unwrap();
+        let ops = rc31_ops(d.path());
+        ops.schedule_ok.set(true);
+        *ops.status_doc.borrow_mut() = Some(before());
+        *ops.status_doc_after.borrow_mut() = Some((3, restored(complete)));
+        let _ = run_machine_result(&cfg, &ops);
+        let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+        assert!(
+            !text.contains("fleet quorum unreachable"),
+            "complete={complete}: {text}"
+        );
+        assert!(
+            text.contains("\"peers_seen_verified\":[\"bp4\",\"bp5\"]"),
+            "journaled before the restore: {text}"
+        );
+        assert_eq!(
+            ops.resumes.get(),
+            0,
+            "never resumed on that view (complete={complete})"
+        );
+        if !complete {
+            assert!(text.contains("\"relay_marks_regressed\":true"), "{text}");
+        }
+    }
+}
+
+/// rc.31 (review): the early abort is OFF unless the signed event turns it on. With it off, a view that proves the
+/// quorum unreachable changes nothing: no quorum-reachability read decides anything, the node freezes and waits for the
+/// fleet timeout exactly as rc.30 did, and no exit tombstone is written.
+#[test]
+fn rc31_flag_off_never_takes_an_early_abort_path() {
+    let d = tempfile::tempdir().unwrap();
+    let text = std::fs::read_to_string({
+        rc23_fleet_config(d.path());
+        d.path().join("fleet.toml")
+    })
+    .unwrap()
+    .replace("fleet_quorum = 4", "fleet_quorum = 5");
+    let cfg = load_toml(d.path(), "fleet-q5-off.toml", &text).unwrap();
+    assert!(
+        !cfg.coordination.as_ref().unwrap().early_abort,
+        "off by default"
+    );
+    let ops = MockOps::new(d.path(), 110);
+    *ops.status_doc.borrow_mut() = Some(rc31_v(rc31_mark(
+        rc23_status(&[
+            ("bp2", serde_json::json!({"state": "ARMED"})),
+            ("bp3", serde_json::json!({"state": "ARMED"})),
+            ("bp4", serde_json::json!({"state": "ARMED"})),
+            ("bp5", rc31_out("ABORTED")),
+        ]),
+        &["bp5"],
+        false,
+    )));
+    let _ = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(!text.contains("fleet quorum unreachable"), "{text}");
+    assert!(
+        !text.contains("quorum_unreachable")
+            && !text.contains("\"early_abort\":\"deferred\"")
+            && text.contains("\"early_abort\":false"),
+        "{text}"
+    );
+    assert!(
+        ops.hooks.borrow().iter().any(|h| h == "freeze-writes"),
+        "it froze as rc.30 did"
+    );
+    assert!(
+        text.contains("fleet did not reach verified agreement"),
+        "the fleet timeout decided: {text}"
+    );
+    assert!(
+        !pulse_cutover::coord::exit_tombstone_path(&cfg, "e1").exists(),
+        "no exit tombstone with the flag off"
+    );
+    // The signed event decides: `await` derives early_abort from it (absent = off).
+    let ev_on = serde_json::json!({"event_id": "e9", "h": 120, "early_abort": true});
+    let ev_off = serde_json::json!({"event_id": "e9", "h": 120});
+    for (ev, want) in [(ev_on, true), (ev_off, false)] {
+        let out = d.path().join("derived.toml");
+        pulse_cutover::coord::derived_config(&d.path().join("fleet-q5-off.toml"), &ev, None, &out)
+            .unwrap();
+        let c = Config::load(&out).unwrap();
+        assert_eq!(c.coordination.unwrap().early_abort, want);
+    }
+}
+
+/// rc.31 (review, early abort ON): N = 5, q = 3. This box ended the event early (its local exit tombstone);
+/// the relay then lost its state (no marks, `complete: false`, or no answer). A fresh journal under the same event
+/// must not ARM in any of those cases.
+#[test]
+fn rc31_review_a_fresh_arm_after_relay_loss_is_refused() {
+    let setup = |d: &std::path::Path| {
+        let text = std::fs::read_to_string({
+            rc31_fleet_config(d);
+            d.join("fleet.toml")
+        })
+        .unwrap()
+        .replace("fleet_quorum = 4", "fleet_quorum = 3");
+        load_toml(d, "fleet-q3.toml", &text).unwrap()
+    };
+    // (1) The first run: three marked exits, this node aborts before freezing and leaves its exit tombstone.
+    let d = tempfile::tempdir().unwrap();
+    let cfg = setup(d.path());
+    let ops = rc31_ops(d.path());
+    *ops.status_doc.borrow_mut() = Some(rc31_v(rc31_mark(
+        rc23_status(&[
+            ("bp2", serde_json::json!({"state": "ARMED"})),
+            ("bp3", rc31_out("ABORTED")),
+            ("bp4", rc31_out("ABORTED")),
+            ("bp5", rc31_out("ABORTED")),
+        ]),
+        &["bp3", "bp4", "bp5"],
+        false,
+    )));
+    assert_eq!(run_machine(&cfg, &ops), State::Aborted);
+    assert!(
+        pulse_cutover::coord::exit_tombstone(&cfg, "e1").is_some(),
+        "tombstone written"
+    );
+    // (2) The relay restarts on lost state (no marks for anyone, marks complete again from its point of view) and the
+    // operator re-runs on a fresh journal under the same event: refused by the local tombstone.
+    std::fs::rename(&cfg.journal_path, d.path().join("journal.old")).unwrap();
+    let ops = rc31_ops(d.path());
+    *ops.status_doc.borrow_mut() = Some(rc31_v(rc23_status(&[
+        ("bp2", serde_json::json!({"state": "ARMED"})),
+        ("bp3", serde_json::json!({"state": "ARMED"})),
+    ])));
+    let err = run_machine_result(&cfg, &ops).unwrap_err();
+    assert!(err.contains("local exit tombstone"), "{err}");
+    assert!(!ops.hooks.borrow().iter().any(|h| h == "freeze-writes"));
+    // (3) Another box (no tombstone) under the same event: refused while the relay's marks are incomplete, and when
+    // the relay does not answer.
+    for (why, doc) in [
+        ("incomplete marks", {
+            let mut v = rc31_v(rc23_status(&[(
+                "bp2",
+                serde_json::json!({"state": "ARMED"}),
+            )]));
+            v["networks"][0]["marks_state"]["complete"] = serde_json::json!(false);
+            Some(v)
+        }),
+        (
+            "no marks state (older relay)",
+            Some(rc23_status(&[(
+                "bp2",
+                serde_json::json!({"state": "ARMED"}),
+            )])),
+        ),
+        ("relay down", None),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = setup(d.path());
+        let ops = rc31_ops(d.path());
+        match doc {
+            Some(v) => *ops.status_doc.borrow_mut() = Some(v),
+            None => ops.coord_down.set(true),
+        }
+        let err = run_machine_result(&cfg, &ops).unwrap_err();
+        assert!(err.contains("mission control"), "{why}: {err}");
+        assert!(
+            !ops.hooks.borrow().iter().any(|h| h == "freeze-writes"),
+            "{why}"
+        );
+    }
+}
+
+/// rc.31 round 5 (review MEDIUM-1): with the event's early abort OFF the relay keeps no exit mark (only `exit_seen` for
+/// its own alarm) and the agent never refuses an ARM over one: an h5-style refuse → fix → re-ARM on the same event is
+/// counted at the gate as in rc.30, and the fleet goes LIVE.
+#[test]
+fn rc31_flag_off_a_refused_then_fixed_member_is_counted_as_in_rc30() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = coord_config(d.path(), 120, 3, 5);
+    let ops = MockOps::new(d.path(), 110);
+    ops.fleet_agree.set(3);
+    *ops.exit_marked.borrow_mut() = vec!["bp1".into()];
+    ops.exit_seen_only.set(true);
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    // This node's own producer exited earlier (an exit mark from a relay that had it on): with the flag off, no ARM refusal.
+    let d = tempfile::tempdir().unwrap();
+    let cfg = rc23_fleet_config(d.path());
+    let ops = MockOps::new(d.path(), 110);
+    *ops.status_doc.borrow_mut() = Some(rc31_mark(
+        rc23_status(&[(
+            "bp1",
+            serde_json::json!({"state": "ARMED", "evidence": {"h": 120}}),
+        )]),
+        &["bp1"],
+        false,
+    ));
+    let _ = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(!text.contains("already exited event"), "{text}");
+    assert!(
+        ops.hooks.borrow().iter().any(|h| h == "freeze-writes"),
+        "it armed and froze"
+    );
+}
+
+/// rc.31 round 5 (review MEDIUM-2): a config with the early abort on while the signed event says off runs it OFF in a
+/// rehearsal (no proof is ever taken) and is refused at ARM on XPR mainnet (the binding check).
+#[test]
+fn rc31_flag_on_in_config_but_off_in_the_signed_event_never_proves() {
+    let d = tempfile::tempdir().unwrap();
+    let text = std::fs::read_to_string({
+        rc23_fleet_config(d.path());
+        d.path().join("fleet.toml")
+    })
+    .unwrap()
+    .replace("fleet_quorum = 4", "fleet_quorum = 5")
+    .replacen(
+        "[coordination]\n",
+        "[coordination]\nearly_abort = true\n",
+        1,
+    );
+    let cfg = load_toml(d.path(), "fleet-mismatch.toml", &text).unwrap();
+    let ops = MockOps::new(d.path(), 110); // the relay serves the default event: no early_abort
+    *ops.status_doc.borrow_mut() = Some(rc31_v(rc31_mark(
+        rc23_status(&[
+            ("bp2", serde_json::json!({"state": "ARMED"})),
+            ("bp3", serde_json::json!({"state": "ARMED"})),
+            ("bp4", serde_json::json!({"state": "ARMED"})),
+            ("bp5", rc31_out("ABORTED")),
+        ]),
+        &["bp5"],
+        false,
+    )));
+    let _ = run_machine_result(&cfg, &ops);
+    let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    assert!(
+        text.contains("\"early_abort\":false") && text.contains("\"early_abort\":\"off\""),
+        "{text}"
+    );
+    assert!(!text.contains("fleet quorum unreachable"), "{text}");
+    assert!(ops.hooks.borrow().iter().any(|h| h == "freeze-writes"));
+    // The mainnet binding: the signed event's early_abort must equal the config's.
+    let ev = serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1"});
+    let problems = pulse_cutover::coord::mainnet_event_problems(
+        Some(&serde_json::json!({"event": signed(ev)})),
+        &cfg,
+        &hex::encode(CHAIN_ID),
+    );
+    assert!(
+        problems.iter().any(|p| p.contains("early_abort")),
+        "{problems:?}"
+    );
 }

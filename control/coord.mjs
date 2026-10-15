@@ -6,6 +6,7 @@
 //        --lead 24 --cpu-scale 143 --key coordinator.pem [--event-id ev-…]
 //        (--cpu-scale none omits import_cpu_scale: use it for import_backend = "upstream", where it does nothing)
 //        [--roster bp1,bp2,…|producer:instance_id,…] [--quorum N] [--release-sha256 <hex>] [--snapshot-sha256 <hex>] [--metal-network-id N]
+//        [--early-abort yes]  (rc.31: agents stop early on a provably unreachable quorum; OFF unless signed on)
 //        (fleet bindings, signed with the event; see control/coordlib.mjs. Without --roster the agents' fleet gate
 //         has no roster and falls back to counting whoever reports)
 //   node control/coord.mjs arm   --url … --net rehearsal --event-id ev-… --key coordinator.pem --event-file ev-….event.json
@@ -13,6 +14,8 @@
 //   node control/coord.mjs complete --url … --net rehearsal --event-id ev-… --key coordinator.pem --event-file ev-….event.json
 //        (closes an event that RAN — LIVE — so the next one can be published; never sign an abort for that:
 //         an abort tells every agent "stop", and they record it as final)
+//        abort [--after-creation yes]: the relay refuses an abort once any member is past chain creation (rc.31);
+//         this flag signs an explicit acknowledgement, which the relay accepts and logs as an alarm
 //
 // Keep the private key offline/secure. Agents only act on messages signed by keys in THEIR config.
 // arm/abort carry event_hash = sha256 over the UTF-8 bytes of the exact signed event `payload` string (no
@@ -56,7 +59,9 @@ if (cmd !== 'event') {
 let payloadObj;
 try {
   payloadObj = cmd === 'event' ? eventPayload(a)
-    : { v: 1, type: cmd, network: a.net, event_id: a['event-id'], event_hash: eventHash, issued_at_ms: Date.now() };
+    : { v: 1, type: cmd, network: a.net, event_id: a['event-id'], event_hash: eventHash, issued_at_ms: Date.now(),
+      // rc.31: the relay refuses an abort for an event already past chain creation unless the signer acknowledges it.
+      ...(cmd === 'abort' && a['after-creation'] === 'yes' ? { acknowledge_past_creation: true } : {}) };
 } catch (e) { console.error(String(e.message || e)); process.exit(2); }
 const payload = JSON.stringify(payloadObj);
 const msg = { payload, sig: sign(null, Buffer.from(payload), key).toString('hex'), key: rawPub(key) };

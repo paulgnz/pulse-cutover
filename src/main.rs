@@ -310,7 +310,10 @@ on the local socket says the recorded export container does not exist; anything 
 its drill (drill_id), and only that drill, or this command, removes it. `status` and the beacon show the marker.
 
 Exit codes: 0 = evidence complete and the compare matched; 5 = evidence complete, the compare did NOT
-match (the finding a drill exists to surface; the fingerprint is still reported); 1 = the drill failed.";
+match (the finding a drill exists to surface; the fingerprint is still reported); 7 = evidence complete, the compare
+did not match ONLY on the known PulseVM v1.0.0 gaps (contract_index_double, global_property), each with exactly its
+recorded signature and every other table matching (still a mismatch: `compare` stays MISMATCH, `compare_class` says
+known_gaps_only); 1 = the drill failed.";
 
 const HELP_JOIN: &str = "\
 pulse-cutover join --config ceremony-<event>.toml --event <event_id> [--reverify]
@@ -909,6 +912,16 @@ fn cmd_drill(args: &[String]) -> Result<(), String> {
         "{}",
         serde_json::to_string_pretty(&out.view).unwrap_or_default()
     );
+    if out.evidence_complete && !out.compare_match && out.compare_known_gaps_only {
+        // rc.31: distinct from a real mismatch, never reported as a match.
+        eprintln!(
+            "readiness drill DONE: the 21-table compare did NOT match, but ONLY on the known PulseVM v1.0.0 compare gaps \
+             (tables: {}; each failure equals its recorded signature, every other table matched). A real ceremony \
+             would still refuse to verify without the rehearsal allowlist. Exit 7.",
+            out.view["compare_failing_tables"]
+        );
+        std::process::exit(7);
+    }
     if out.evidence_complete && !out.compare_match {
         eprintln!(
             "readiness drill DONE, but the 21-table compare did NOT match (tables: {}): a real ceremony would refuse \

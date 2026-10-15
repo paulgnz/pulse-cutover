@@ -14,7 +14,7 @@ Status words used on this page, and nowhere loosely:
 | **Estimate** | arithmetic from measured parts; not itself measured |
 | **Not built** | a design or a requirement only |
 
-*Last updated 2026-10-15, pulse-cutover v0.5.0-rc.30, PulseVM v1.0.0.*
+*Last updated 2026-10-16, pulse-cutover v0.5.0-rc.31, PulseVM v1.0.0.*
 
 ---
 
@@ -128,6 +128,10 @@ makes every check happen before that point, and tries to make the whole network 
   the relay positively says "no abort" for this exact signed event (rehearsed);
 - resume guard: a frozen node resumes the old chain only if the fleet view shows nobody can still go forward;
   otherwise STRANDED (rehearsed in fault runs);
+- early abort (rc.31, OFF by default; the signed event can turn it on): once mission control holds durable exit marks for enough roster members (they ended the event
+  without ever verifying; a marked member is never counted at a gate for that event again and cannot re-ARM it) that
+  the quorum cannot be reached, a node that has not frozen never freezes, and a frozen one aborts at once through the
+  resume guard instead of waiting out the fleet timeout (tests and model checkers; not yet rehearsed on the fleet);
 - `join`: a stranded node can follow the chain a LIVE quorum runs, after checking its own evidence (rehearsed);
 - a built-in refusal to ignite XPR mainnet while known PulseVM prerequisites are unmet (implemented).
 

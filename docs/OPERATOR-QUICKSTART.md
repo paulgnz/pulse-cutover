@@ -22,7 +22,7 @@ Log in to the server that runs your **producer** nodeos. Download the installer 
 read it, then run it:
 
 ```bash
-V=v0.5.0-rc.30
+V=v0.5.0-rc.31
 curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 less beacon-install.sh          # you are about to run this as root: read it
 sudo bash beacon-install.sh
@@ -121,6 +121,12 @@ from the event's signed roster and the beacons' reports (`fleet` in `GET /api/st
 | `STALLED` (rc.27, red) | a quorum is LIVE on one chain, but a quorum of those BPs' beacons report the post-LIVE watch failing (no new block beyond `post_live_max_idle_secs` and the workload probe failing) | the new chain is not taking transactions: check validators and the `target_live` detail; it clears by itself when blocks resume |
 | `STRANDED` (rc.26) | every reporting member stopped before chain creation and is sealed (STRANDED or ABORTED), at least one STRANDED | the coordinator decides: `pulse-cutover rollback` on each STRANDED box (it re-runs the resume guard), or `join` once a quorum is LIVE |
 | `ABORTED` | every roster member is present with a fresh report and every one aborted before chain creation (rc.29; a missing or stale member keeps the verdict at PENDING/STRANDED) | the old chain continues; wait for a new event |
+
+**Re-running after an abort (rc.31).** A producer that ended an event without verifying (a refused ARM, an abort before
+VERIFIED) carries a durable exit mark on mission control for that event id: peers may already have stopped because of
+it. Fixing the config and re-running on a fresh journal under the **same** event id is refused at ARM (and never counted
+by an rc.31 peer's gate; mission control raises an ALARM on the re-entry). A new attempt needs a **new event id** from the
+coordinator.
 
 **One release per fleet.** Every BP of an event must run the same pulse-cutover release, the one mission control
 announces for the event (`upgrade every agent to vX before arming`). An older agent's reports lack fields the newer

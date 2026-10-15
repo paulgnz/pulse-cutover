@@ -684,6 +684,9 @@ fn apply_line(acc: &mut Acc, v: &Value) {
                 Some("ARMED") => {
                     acc.armed_ts_ms = v["ts_ms"].as_u64();
                     put(ev, "h", &d["resolved_h"]);
+                    // rc.31: the version of the agent that RAN this ceremony (the early abort's version gate).
+                    put(ev, "agent_version", &d["agent_version"]);
+                    put(ev, "early_abort", &d["early_abort"]);
                     put(ev, "chain_id", &d["chain_id"]);
                 }
                 Some("FROZEN") => put(ev, "freeze_at", &d["freeze_at"]),

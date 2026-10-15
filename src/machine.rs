@@ -45,6 +45,18 @@ pub struct Machine<'a, O: ChainOps> {
     scheduled: bool,
     /// Last time the coordinator's abort signal was polled (rate limit).
     last_coord_check_ms: u64,
+    /// rc.31: rate-limit clock of the quorum-reachability poll, and whether a "unreachable, guard not yet clear" note
+    /// was journaled (once per run).
+    last_quorum_check_ms: u64,
+    quorum_blocked_noted: bool,
+    /// rc.31 round 3 (review M-b): producers whose exit mark this ceremony has seen (journaled), loaded lazily.
+    exit_marks_seen: Option<std::collections::BTreeSet<String>>,
+    /// rc.31 round 4 (review MEDIUM-1): the journaled fleet memory, loaded lazily; and when the relay marks state was
+    /// last journaled (rate limit).
+    fleet_mem: Option<crate::fleet::FleetMemory>,
+    /// rc.31 round 5: the early abort as bound at ARM (config AND signed event), from the ARMED record.
+    early_abort_armed: Option<bool>,
+    fleet_mem_state_journaled_ms: u64,
     /// Ignition may have started on this node (`ignite_started` journaled BEFORE the ignite
     /// command runs, or IGNITED or later, now or in a previous run). From here on a local
     /// failure SEALS (HALTED + alert) instead of resuming the source.
@@ -273,6 +285,186 @@ fn coordinator_abort_state<O: ChainOps>(
     }
 }
 
+/// rc.31: what one look at the relay says about whether this event's quorum can still be reached.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuorumPoll {
+    /// Not asked (rate limit, no roster), the relay did not answer, or the quorum may still be reached.
+    Reachable,
+    /// Provably unreachable (`fleet::quorum_unreachable`) and, for a node that froze writes, the resume guard passes on
+    /// the same view: stop waiting and abort.
+    Unreachable(serde_json::Value),
+    /// Provably unreachable, but the resume guard would refuse on this view (a member missing, stale, ...): keep
+    /// waiting; the fleet timeout (or a signed abort) still ends the wait as before.
+    GuardBlocked(serde_json::Value, String),
+}
+
+/// rc.31: the relay status document prepared as `Machine::fleet_status` prepares it (foreign-H reports neutralised,
+/// creation evidence annotated), from one read.
+fn prepare_status(
+    cfg: &Config,
+    resolved_h: Option<u64>,
+    mut doc: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let co = cfg.coordination.as_ref()?;
+    if !doc.is_object() {
+        return None;
+    }
+    let h = resolved_h?;
+    crate::fleet::drop_foreign_ceremonies(&mut doc, &co.network, h);
+    crate::fleet::annotate_evidence(&mut doc, &co.network, co.event_id.as_deref(), h);
+    Some(doc)
+}
+
+/// rc.31: judge quorum reachability on a prepared status document. `frozen` = this node froze writes for the event
+/// (FROZEN..VERIFIED, producer mode): then an early abort also needs the resume guard to pass on the same view.
+fn quorum_verdict(
+    cfg: &Config,
+    resolved_h: Option<u64>,
+    status: &serde_json::Value,
+    frozen: bool,
+    mem: &crate::fleet::FleetMemory,
+) -> QuorumPoll {
+    let (Some(co), Some(h)) = (cfg.coordination.as_ref(), resolved_h) else {
+        return QuorumPoll::Reachable;
+    };
+    let me = cfg
+        .beacon
+        .as_ref()
+        .map(|b| (b.producer.clone(), crate::beacon::instance_id(cfg)));
+    let me_ref = me.as_ref().map(|(p, i)| (p.as_str(), i.as_str()));
+    let Some(proof) = crate::fleet::quorum_unreachable_with(status, co, me_ref, h, mem) else {
+        return QuorumPoll::Reachable;
+    };
+    if frozen {
+        if let Err(why) = crate::fleet::resume_guard_with(Some(status), co, me_ref, false, mem) {
+            return QuorumPoll::GuardBlocked(proof, why);
+        }
+    }
+    QuorumPoll::Unreachable(proof)
+}
+
+/// rc.31: one rate-limited (10 s unless `force`) read of the relay for `quorum_verdict`. Without a roster, an event id
+/// or an answer from the relay: Reachable (absent data never proves anything).
+fn quorum_poll<O: ChainOps>(
+    cfg: &Config,
+    ops: &O,
+    resolved_h: Option<u64>,
+    last: &mut u64,
+    force: bool,
+) -> Option<serde_json::Value> {
+    let co = cfg.coordination.as_ref()?;
+    if co.roster.is_empty() || co.event_id.is_none() || cfg.ceremony.mode != Mode::Producer {
+        return None;
+    }
+    let now = ops.now_ms();
+    if !force && *last != 0 && now.saturating_sub(*last) < 10_000 {
+        return None;
+    }
+    *last = now.max(1);
+    let url = format!("{}/api/status", co.url.trim_end_matches('/'));
+    match ops.get_json(&url) {
+        Ok(Some(doc)) => prepare_status(cfg, resolved_h, doc),
+        _ => None,
+    }
+}
+
+/// rc.31 round 4 (review MEDIUM-1): this journal's fleet memory for `event`: peers seen VERIFIED-or-later, the relay's
+/// marks state (first state id, highest generation journaled) and whether it ever went backwards.
+fn journaled_fleet_memory(path: &std::path::Path, event: &str) -> crate::fleet::FleetMemory {
+    let mut mem = crate::fleet::FleetMemory::default();
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    for v in text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    {
+        let d = &v["data"];
+        if d["event_id"].as_str() != Some(event) {
+            continue;
+        }
+        for p in d["peers_seen_verified"].as_array().into_iter().flatten() {
+            if let Some(p) = p.as_str() {
+                mem.verified_peers.insert(p.to_string());
+            }
+        }
+        if let (Some(id), Some(g)) = (
+            d["relay_marks_state"]["state_id"].as_str(),
+            d["relay_marks_state"]["generation"].as_u64(),
+        ) {
+            match &mem.relay_state {
+                None => mem.relay_state = Some((id.to_string(), g)),
+                Some((jid, jg)) if jid == id && g > *jg => {
+                    mem.relay_state = Some((id.to_string(), g))
+                }
+                Some((jid, _)) if jid != id => mem.relay_regressed = true,
+                _ => {}
+            }
+        }
+        if d["relay_marks_regressed"].as_bool() == Some(true) {
+            mem.relay_regressed = true;
+        }
+    }
+    mem
+}
+
+/// What a fresh relay view adds to `mem` (no journaling): its VERIFIED-or-later peers, and the marks state checks.
+/// The second value says why the relay's marks are no longer trusted, when this view shows it for the first time.
+fn merged_fleet_memory(
+    cfg: &Config,
+    doc: &serde_json::Value,
+    mem: &crate::fleet::FleetMemory,
+) -> (crate::fleet::FleetMemory, Option<String>) {
+    let mut m = mem.clone();
+    let Some(co) = cfg.coordination.as_ref() else {
+        return (m, None);
+    };
+    let me = cfg
+        .beacon
+        .as_ref()
+        .map(|b| (b.producer.clone(), crate::beacon::instance_id(cfg)));
+    m.verified_peers.extend(crate::fleet::peers_seen_verified(
+        doc,
+        co,
+        me.as_ref().map(|(p, i)| (p.as_str(), i.as_str())),
+    ));
+    let mut regressed_why = None;
+    if let Some(ms) = crate::fleet::marks_state(doc, co) {
+        let (id, g) = (ms["state_id"].as_str(), ms["generation"].as_u64());
+        if ms["complete"].as_bool() == Some(false) {
+            regressed_why = Some("the relay reports the event's marks as incomplete".to_string());
+        } else if let (Some(id), Some(g)) = (id, g) {
+            match &m.relay_state {
+                None => m.relay_state = Some((id.to_string(), g)),
+                Some((jid, jg)) if jid != id || g < *jg => {
+                    regressed_why = Some(format!(
+                        "relay marks state {jid}/{jg} journaled, {id}/{g} now"
+                    ));
+                }
+                Some(_) => m.relay_state = Some((id.to_string(), g)),
+            }
+        }
+    }
+    if regressed_why.is_some() {
+        m.relay_regressed = true;
+    }
+    (m, regressed_why)
+}
+
+/// rc.31 round 3 (review M-b): the exit marks this journal recorded for `event` (`exit_marks_seen` evidence).
+fn journaled_exit_marks(path: &std::path::Path, event: &str) -> std::collections::BTreeSet<String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["data"]["event_id"].as_str() == Some(event))
+        .flat_map(|v| {
+            v["data"]["exit_marks_seen"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|p| p.as_str().map(str::to_string))
+        .collect()
+}
+
 /// The target chain ids from the last journaled `join` record (blockchain_id, subnet_id).
 fn journaled_join_ids(path: &std::path::Path) -> Option<(String, Option<String>)> {
     let text = std::fs::read_to_string(path).ok()?;
@@ -459,6 +651,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             source_stopped,
             scheduled,
             last_coord_check_ms: 0,
+            last_quorum_check_ms: 0,
+            quorum_blocked_noted: false,
+            exit_marks_seen: None,
+            fleet_mem: None,
+            early_abort_armed: None,
+            fleet_mem_state_journaled_ms: 0,
             reached_ignited,
             staged_sha256,
             unhalted,
@@ -1307,6 +1505,26 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 info.last_irreversible_block_num + self.cfg.ceremony.freeze_margin.unwrap_or(0)
             };
             self.resolved_h = Some(resolved_h);
+            // rc.31 round 5 (review MEDIUM-2): the early abort is on for this ceremony only when the config says so
+            // AND the relay's signed event (verified here) says so; journaled in the ARMED record for every later run.
+            let early_abort = self
+                .cfg
+                .coordination
+                .as_ref()
+                .is_some_and(|c| c.early_abort)
+                && self.cfg.ceremony.mode == Mode::Producer
+                && self.cfg.coordination.as_ref().is_some_and(|co| {
+                    self.ops
+                        .get_json(&format!(
+                            "{}/api/coord/{}",
+                            co.url.trim_end_matches('/'),
+                            co.network
+                        ))
+                        .ok()
+                        .flatten()
+                        .is_some_and(|d| crate::coord::signed_early_abort(&d, self.cfg))
+                });
+            self.early_abort_armed = Some(early_abort);
             self.journal.transition(
                 State::Armed,
                 json!({
@@ -1315,6 +1533,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     "pause_ack": true,
                     "freeze_height": self.cfg.ceremony.freeze_height,
                     "resolved_h": resolved_h,
+                    // rc.31 (review LOW 6): the RUNNER's version, reported by the beacon as ceremony evidence (the version
+                    // gate of the early abort reads this, not the beacon's own version).
+                    "agent_version": env!("CARGO_PKG_VERSION"),
+                    "early_abort": early_abort,
                     "simulate_freeze": self.cfg.ceremony.simulate_freeze,
                     "chain_id": info.chain_id,
                     "head_at_arm": info.head_block_num,
@@ -1609,6 +1831,40 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 if fresh_arm && paused && self.cfg.ceremony.mode == Mode::Producer {
                     problems.push("producer already paused at arm time".into());
                 }
+                // rc.31 (review M1): an event this producer already exited without verifying (the relay's durable exit
+                // mark) is over for it, on this journal or a fresh one: peers may have stopped on that fact.
+                // Round 5 (review MEDIUM-1): exit marks and their ARM refusal belong to the early abort: off = rc.30.
+                if fresh_arm && self.cfg.ceremony.mode == Mode::Producer {
+                    if self.early_abort_on() {
+                        if let Some(why) = self.own_exit_problem() {
+                            problems.push(why);
+                        }
+                    }
+                    // rc.31 (review, with the early abort on): the local exit tombstone, and a relay that answers
+                    // with complete marks, are required for a fresh ARM.
+                    if self.early_abort_on() {
+                        problems.extend(self.early_abort_arm_problems());
+                    } else if self
+                        .cfg
+                        .coordination
+                        .as_ref()
+                        .is_some_and(|c| c.early_abort && c.event_id.is_some())
+                    {
+                        // Round 5 (LOW-2): the config asks for the early abort but the signed event could not confirm it.
+                        // An unanswered relay refuses the ARM; a signed event that says off runs it off (journaled).
+                        let co = self.cfg.coordination.as_ref().expect("checked");
+                        let url =
+                            format!("{}/api/coord/{}", co.url.trim_end_matches('/'), co.network);
+                        match self.ops.get_json(&url) {
+                            Ok(Some(d)) if d.is_object() => {
+                                self.journal.evidence(State::Armed, json!({"early_abort": "off",
+                                    "note": "coordination.early_abort is set but the signed event does not turn it on: the ceremony runs without it"}))?;
+                            }
+                            _ => problems.push("coordination.early_abort is set, but mission control did not answer at ARM, so the \
+                                signed event's early-abort setting could not be confirmed: retry when it answers".into()),
+                        }
+                    }
+                }
             }
             Err(e) if !(resumed && self.reached_ignited) => {
                 problems.push(format!("producer_api unreachable: {e}"))
@@ -1859,6 +2115,73 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         out
     }
 
+    /// rc.31: has the fleet made this event's quorum provably unreachable? Then abort now instead of waiting for the
+    /// fleet timeout (`QuorumPoll::Unreachable`), through the ordinary `abort` (resume guard, pause ownership, episodes,
+    /// release scoping all unchanged). Ok(true) = aborted. A guard-blocked proof is journaled once and the wait goes on.
+    fn quorum_unreachable_abort(&mut self, during: &str, force: bool) -> Result<bool, String> {
+        // rc.31: OFF unless the (signed) event turns it on: then the ceremony waits for the fleet timeout as rc.30 did.
+        if !self.early_abort_on() {
+            return Ok(false);
+        }
+        // Round 3 (review HIGH-1, 3a): never once this node is VERIFIED (a peer's gate may have counted it).
+        if !matches!(
+            self.state,
+            State::Armed | State::Frozen | State::Snapshotted
+        ) {
+            return Ok(false);
+        }
+        let frozen = self.needs_resume_guard();
+        let mut last = self.last_quorum_check_ms;
+        let doc = quorum_poll(self.cfg, self.ops, self.resolved_h, &mut last, force);
+        self.last_quorum_check_ms = last;
+        let Some(doc) = doc else {
+            return Ok(false);
+        };
+        let mem = self.note_fleet_view(&doc)?;
+        let v = quorum_verdict(self.cfg, self.resolved_h, &doc, frozen, &mem);
+        self.act_on_quorum(v, during)
+    }
+
+    fn act_on_quorum(&mut self, v: QuorumPoll, during: &str) -> Result<bool, String> {
+        match v {
+            QuorumPoll::Reachable => Ok(false),
+            QuorumPoll::GuardBlocked(proof, why) => {
+                if !self.quorum_blocked_noted {
+                    self.quorum_blocked_noted = true;
+                    self.journal.evidence(self.state, json!({"quorum_unreachable": proof, "early_abort": "deferred",
+                        "why": why, "during": during,
+                        "note": "the event's quorum is unreachable, but the resume guard would strand this node on this view: \
+                                 waiting (fleet timeout and signed aborts still apply)"}))?;
+                }
+                Ok(false)
+            }
+            QuorumPoll::Unreachable(proof) => {
+                // Review fix 1: the local exit tombstone is written BEFORE the early abort is reported; if it cannot be
+                // written, no early abort (the wait goes on as before).
+                if let Some(ev) = self
+                    .cfg
+                    .coordination
+                    .as_ref()
+                    .and_then(|c| c.event_id.clone())
+                {
+                    if let Err(e) = crate::coord::record_exit_tombstone(
+                        self.cfg,
+                        &ev,
+                        "early abort: fleet quorum unreachable",
+                    ) {
+                        self.journal.evidence(self.state, json!({"early_abort": "not taken", "why": format!("exit tombstone not written: {e}")}))?;
+                        return Ok(false);
+                    }
+                }
+                self.abort(
+                    &format!("fleet quorum unreachable {during}: enough roster members ended the event without verifying"),
+                    json!({"quorum_unreachable": proof, "during": during}),
+                )?;
+                Ok(true)
+            }
+        }
+    }
+
     /// Positive authorization for a step that cannot be undone (creating the target chain,
     /// ignition): in a coordinated ceremony the relay must ANSWER, and carry no abort. A relay that
     /// cannot be reached is "unknown", never "no abort": retried for up to 30 s, then the step is
@@ -1956,7 +2279,52 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     && (if upstream_backend { same("protocol_schedule_hash") } else { true })
                     && event_ok
             };
-            let producers = match self.ops.get_json(&status_url) {
+            let fetched = self.ops.get_json(&status_url);
+            // rc.31 round 3 (review HIGH-1, 3a): no early abort at the gate: this node is VERIFIED itself (and may have
+            // been counted at a peer's gate), so the fleet timeout path decides, as before rc.31.
+            // Review M-b: exit marks seen for this event are journaled; the gate keeps excluding those members even if
+            // the relay later forgets them (fail closed: it only ever makes this gate stricter, and journaled marks
+            // never trigger an early abort).
+            if let (Ok(Some(raw)), Some(_)) = (&fetched, event_id.as_deref()) {
+                // Round 4 (review MEDIUM-1 c): the gate's reads also feed the journaled fleet memory.
+                if let Some(doc) = prepare_status(self.cfg, self.resolved_h, raw.clone()) {
+                    self.note_fleet_view(&doc)?;
+                }
+            }
+            if let (Ok(Some(doc)), Some(ev)) = (&fetched, event_id.as_deref()) {
+                if self.exit_marks_seen.is_none() {
+                    self.exit_marks_seen = Some(journaled_exit_marks(&self.cfg.journal_path, ev));
+                }
+                let live: Vec<String> = doc["networks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|n| n["id"].as_str() == Some(co.network.as_str()))
+                    .flat_map(|n| n["producers"].as_array().cloned().unwrap_or_default())
+                    .filter(|p| crate::fleet::exit_mark(p, ev).exited)
+                    .filter_map(|p| p["name"].as_str().map(str::to_string))
+                    .collect();
+                let known = self.exit_marks_seen.clone().unwrap_or_default();
+                let new: Vec<String> = live.into_iter().filter(|p| !known.contains(p)).collect();
+                if !new.is_empty() {
+                    self.journal.evidence(
+                        self.state,
+                        json!({"exit_marks_seen": new, "event_id": ev,
+                        "note": "the relay marked these members as having exited the event without verifying: this gate never counts them again"}),
+                    )?;
+                    if let Some(k) = self.exit_marks_seen.as_mut() {
+                        k.extend(new);
+                    }
+                }
+            }
+            let seen_marks = self.exit_marks_seen.clone().unwrap_or_default();
+            let marked = |p: &serde_json::Value| {
+                event_id
+                    .as_deref()
+                    .is_some_and(|e| crate::fleet::exit_mark(p, e).exited)
+                    || p["name"].as_str().is_some_and(|n| seen_marks.contains(n))
+            };
+            let producers = match fetched {
                 Ok(Some(st)) => st["networks"]
                     .as_array()
                     .and_then(|nets| {
@@ -2074,6 +2442,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         p["conflict"].as_bool().unwrap_or(false),
                     ));
                 }
+                if marked(p) {
+                    excluded.push(json!({"producer": p["name"], "why": "the relay durably marked this member as having exited the event without verifying (rc.31): never counted again for this event"}));
+                }
                 for (r, age, conflict) in v {
                     if let Some(why) = exclusion(&r, age, conflict) {
                         excluded.push(json!({"producer": p["name"], "instance_id": r["instance_id"], "why": why}));
@@ -2116,6 +2487,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 // per producer, only with a fresh, non-conflicted agreeing report.
                 producers
                     .iter()
+                    .filter(|p| !marked(p))
                     .filter(|p| reports_of(p).iter().any(&agrees))
                     .count()
             } else {
@@ -2129,6 +2501,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         else {
                             return false;
                         };
+                        // rc.31 (review M1): a member the relay durably marked as having exited this event without
+                        // verifying never counts again, whatever it reports now (a fresh journal under the same event).
+                        if marked(p) {
+                            return false;
+                        }
                         reports_of(p).iter().any(|r| {
                             let id_ok = m
                                 .instance_id
@@ -2322,7 +2699,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                             "fresh": m.report.is_some(), "missing": m.missing, "conflict": m.conflict, "max_past": m.max_past})).collect();
                     let signed = co.event_id.as_deref().is_some_and(|e| crate::coord::is_tombstoned(self.cfg, e));
                     json!({"relay_answered": status.is_some(), "members": members,
-                        "guard": match crate::fleet::resume_guard(status.as_ref(), co, me.as_ref().map(|(p, i)| (p.as_str(), i.as_str())), signed) {
+                        "guard": match crate::fleet::resume_guard_with(status.as_ref(), co, me.as_ref().map(|(p, i)| (p.as_str(), i.as_str())), signed,
+                            &co.event_id.as_deref().map(|e| journaled_fleet_memory(&self.cfg.journal_path, e)).unwrap_or_default()) {
                             Ok(_) => "would pass".to_string(), Err(why) => why }})
                 });
                 self.journal.evidence(self.state, json!({"resume_guard": "overridden by the operator (--force-stranded --i-understand)",
@@ -2537,6 +2915,29 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.past_point_of_no_return() {
             return self.halt(reason, detail);
         }
+        // rc.31 (review fix 1, early abort on): ending the event before VERIFIED leaves a local exit tombstone outside the
+        // run directory, written before the exit is reported: a fresh journal on this box can never re-ARM the event.
+        if self.early_abort_on()
+            && matches!(
+                self.state,
+                State::Armed | State::Frozen | State::Snapshotted
+            )
+        {
+            if let Some(ev) = self
+                .cfg
+                .coordination
+                .as_ref()
+                .and_then(|c| c.event_id.clone())
+            {
+                if let Err(e) = crate::coord::record_exit_tombstone(self.cfg, &ev, reason) {
+                    self.journal.evidence(
+                        self.state,
+                        json!({"exit_tombstone_failed": e, "event_id": ev}),
+                    )?;
+                    eprintln!("WARNING: the local exit tombstone for {ev} could not be written ({e}): never re-ARM this event on this box");
+                }
+            }
+        }
         // Round-2 review: a shadow refusal is final, and a shadow journal's abort resumes its source only after the
         // identity is proven in this run (a resume preflight failure at VERIFIED, e.g., reaches here first).
         if self.shadow_refused {
@@ -2637,6 +3038,159 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.state,
                 State::Frozen | State::Snapshotted | State::Verified
             )
+    }
+
+    /// rc.31 round 4 (review MEDIUM-1): fold one relay view into the journaled fleet memory (peers seen VERIFIED-or-later,
+    /// the relay's marks state, a regression) and journal what is new. Returns the memory to decide with.
+    fn note_fleet_view(
+        &mut self,
+        doc: &serde_json::Value,
+    ) -> Result<crate::fleet::FleetMemory, String> {
+        let Some(ev) = self
+            .cfg
+            .coordination
+            .as_ref()
+            .and_then(|c| c.event_id.clone())
+        else {
+            return Ok(crate::fleet::FleetMemory::default());
+        };
+        if self.fleet_mem.is_none() {
+            self.fleet_mem = Some(journaled_fleet_memory(&self.cfg.journal_path, &ev));
+        }
+        let old = self.fleet_mem.clone().unwrap_or_default();
+        let (new, regressed_why) = merged_fleet_memory(self.cfg, doc, &old);
+        let added: Vec<String> = new
+            .verified_peers
+            .difference(&old.verified_peers)
+            .cloned()
+            .collect();
+        if !added.is_empty() {
+            self.journal.evidence(self.state, json!({"peers_seen_verified": added, "event_id": ev,
+                "note": "seen VERIFIED-or-later: these peers may have been counted at a gate, whatever the relay says later"}))?;
+        }
+        if let (Some(why), false) = (&regressed_why, old.relay_regressed) {
+            self.journal.evidence(
+                self.state,
+                json!({"relay_marks_regressed": true, "event_id": ev, "why": why}),
+            )?;
+        }
+        if let Some((id, g)) = &new.relay_state {
+            let first = old.relay_state.as_ref().is_none_or(|(jid, _)| jid != id);
+            let grew = old.relay_state.as_ref().is_some_and(|(_, jg)| g > jg);
+            let now = self.ops.now_ms();
+            if first || (grew && now.saturating_sub(self.fleet_mem_state_journaled_ms) >= 30_000) {
+                self.journal.evidence(
+                    self.state,
+                    json!({"relay_marks_state": {"state_id": id, "generation": g}, "event_id": ev}),
+                )?;
+                self.fleet_mem_state_journaled_ms = now;
+            }
+        }
+        // Review LOW 7: the exit marks seen are journaled from EVERY relay read (ARMED and FROZEN polls too, not only
+        // the gate's), so the gate keeps excluding those members even if the relay later forgets them.
+        if self.exit_marks_seen.is_none() {
+            self.exit_marks_seen = Some(journaled_exit_marks(&self.cfg.journal_path, &ev));
+        }
+        let co_net = self
+            .cfg
+            .coordination
+            .as_ref()
+            .map(|c| c.network.clone())
+            .unwrap_or_default();
+        let known = self.exit_marks_seen.clone().unwrap_or_default();
+        let fresh_marks: Vec<String> = doc["networks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|n| n["id"].as_str() == Some(co_net.as_str()))
+            .flat_map(|n| n["producers"].as_array().cloned().unwrap_or_default())
+            .filter(|p| crate::fleet::exit_mark(p, &ev).exited)
+            .filter_map(|p| p["name"].as_str().map(str::to_string))
+            .filter(|p| !known.contains(p))
+            .collect();
+        if !fresh_marks.is_empty() {
+            self.journal.evidence(self.state, json!({"exit_marks_seen": fresh_marks, "event_id": ev,
+                "note": "the relay marked these members as having exited the event without verifying: no gate of this ceremony counts them again"}))?;
+            if let Some(k) = self.exit_marks_seen.as_mut() {
+                k.extend(fresh_marks);
+            }
+        }
+        self.fleet_mem = Some(new.clone());
+        Ok(new)
+    }
+
+    /// rc.31 (review): with the early abort on, a fresh ARM refuses (1) when this box's local exit tombstone says
+    /// it already ended the event without verifying (whatever the relay says), (2) unless the relay serves the event's
+    /// marks state with `complete: true`, (3) when the relay does not answer at all.
+    fn early_abort_arm_problems(&self) -> Vec<String> {
+        let mut out = vec![];
+        let Some(co) = self.cfg.coordination.as_ref() else {
+            return out;
+        };
+        let Some(event) = co.event_id.as_deref() else {
+            return out;
+        };
+        if let Some(t) = crate::coord::exit_tombstone(self.cfg, event) {
+            out.push(format!("this box already ended event {event} without verifying (local exit tombstone {}: {}): \
+                the event is over for this producer; a new attempt needs a NEW event id", crate::coord::exit_tombstone_path(self.cfg, event).display(),
+                t["reason"].as_str().unwrap_or("?")));
+        }
+        let url = format!("{}/api/status", co.url.trim_end_matches('/'));
+        match self.ops.get_json(&url) {
+            Ok(Some(doc)) if doc.is_object() => {
+                match crate::fleet::marks_state(&doc, co) {
+                    Some(m) if m["complete"].as_bool() == Some(true) => {}
+                    Some(_) => out.push(format!("mission control reports event {event}'s marks as INCOMPLETE (its state was lost or \
+                        restored): with the early abort on, nobody may ARM this event again; the coordinator must sign an abort and a new event")),
+                    None => out.push(format!("mission control does not serve event {event}'s marks state (an older relay?): \
+                        the early abort needs an rc.31+ relay")),
+                }
+            }
+            _ => out.push("mission control did not answer at ARM: with the early abort on, an ARM needs the relay's view \
+                (exit marks, marks state) first; retry when it answers".into()),
+        }
+        out
+    }
+
+    /// rc.31: is the early abort on for this ceremony (`[coordination] early_abort`, from the signed event)?
+    fn early_abort_on(&self) -> bool {
+        if !(self
+            .cfg
+            .coordination
+            .as_ref()
+            .is_some_and(|c| c.early_abort && c.event_id.is_some())
+            && self.cfg.ceremony.mode == Mode::Producer)
+        {
+            return false;
+        }
+        // Round 5: bound at ARM to the signed event (the ARMED record); a journal without it (older agent) = off.
+        match self.early_abort_armed {
+            Some(v) => v,
+            None => std::fs::read_to_string(&self.cfg.journal_path)
+                .ok()
+                .and_then(|t| {
+                    t.lines()
+                        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                        .find(|v| v["kind"] == "transition" && v["state"] == "ARMED")
+                        .map(|v| v["data"]["early_abort"].as_bool() == Some(true))
+                })
+                .unwrap_or(false),
+        }
+    }
+
+    /// rc.31 (review M1): Some(problem) when the relay shows this node's producer durably exited this event without
+    /// verifying. One read; an unanswered relay is no evidence either way (rc.31 gates still never count a marked
+    /// member, and the relay alarms on a re-entry).
+    fn own_exit_problem(&self) -> Option<String> {
+        let co = self.cfg.coordination.as_ref()?;
+        let event = co.event_id.as_deref()?;
+        let producer = self.cfg.beacon.as_ref().map(|b| b.producer.clone())?;
+        let url = format!("{}/api/status", co.url.trim_end_matches('/'));
+        let doc = self.ops.get_json(&url).ok().flatten()?;
+        crate::fleet::own_exit_marked(&doc, co, &producer).then(|| {
+            format!("producer {producer} already exited event {event} without verifying (mission control's durable exit \
+                     mark): this event is over for it, on any journal; a new attempt needs a NEW event id from the coordinator")
+        })
     }
 
     /// This node as the relay knows it: (beacon producer, beacon instance id).
@@ -2901,9 +3455,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 .is_some_and(|d| {
                     crate::coord::aborted(&d, &co.coordinator_keys, &co.network, &event)
                 });
+        let mem = match status.as_ref() {
+            Some(doc) => self.note_fleet_view(doc)?,
+            None => self
+                .fleet_mem
+                .clone()
+                .unwrap_or_else(|| journaled_fleet_memory(&self.cfg.journal_path, &event)),
+        };
         let me = self.me();
         let me_ref = me.as_ref().map(|(p, i)| (p.as_str(), i.as_str()));
-        match crate::fleet::resume_guard(status.as_ref(), &co, me_ref, signed_abort) {
+        match crate::fleet::resume_guard_with(status.as_ref(), &co, me_ref, signed_abort, &mem) {
             Ok(ev) => {
                 self.journal.evidence(
                     self.state,
@@ -3366,6 +3927,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 )?;
                 return Ok(());
             }
+            // rc.31: a roster member that refused ARM or aborted before verifying can make the quorum unreachable:
+            // then this node never freezes writes at all.
+            if self.quorum_unreachable_abort("before the freeze", false)? {
+                return Ok(());
+            }
             let now = self.ops.now_ms();
             if now.saturating_sub(last_heartbeat) >= 30_000 {
                 self.journal.evidence(
@@ -3380,6 +3946,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.ops.sleep_ms(self.cfg.poll_ms);
         };
 
+        // rc.31: one forced look right before the freeze (the wait above polls every 10 s).
+        if self.quorum_unreachable_abort("before the freeze", true)? {
+            return Ok(());
+        }
         if !self.production_gate()? {
             return Ok(());
         }
@@ -3612,6 +4182,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let h = self.h();
         let deadline = self.ops.now_ms() + self.cfg.source.snapshot_timeout_secs * 1000;
         let mut last_heartbeat = 0u64;
+        let mut first_look = true;
         loop {
             let info = self.ops.source_info()?;
             if info.last_irreversible_block_num >= h {
@@ -3624,6 +4195,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 )?;
                 return Ok(None);
             }
+            // A fresh look on entering the wait (the freeze just happened), then every 10 s.
+            if self.quorum_unreachable_abort("while waiting for H to finalize", first_look)? {
+                return Ok(None);
+            }
+            first_look = false;
             let now = self.ops.now_ms();
             if now > deadline {
                 self.abort(
@@ -3974,10 +4550,30 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             )));
         };
         let chain_id = self.chain_id.clone().unwrap_or_default();
+        let early =
+            stage == State::Snapshotted && self.needs_resume_guard() && self.early_abort_on();
+        let mem_snapshot = match self
+            .cfg
+            .coordination
+            .as_ref()
+            .and_then(|c| c.event_id.clone())
+        {
+            Some(ev) if early => self
+                .fleet_mem
+                .clone()
+                .unwrap_or_else(|| journaled_fleet_memory(&self.cfg.journal_path, &ev)),
+            _ => crate::fleet::FleetMemory::default(),
+        };
+        let resolved_h = self.resolved_h;
+        let mut last_quorum = self.last_quorum_check_ms;
         let outcome = {
             let journal = &mut self.journal;
             let (cfg, ops) = (self.cfg, self.ops);
             let mut last_coord = self.last_coord_check_ms;
+            // rc.31: during the ceremony's own verification (not `join --reverify`), a provably unreachable quorum
+            // stops the pipeline like a signed abort does (guard-blocked proofs are left to the fleet gate to journal).
+            let quorum_proof: std::cell::RefCell<Option<serde_json::Value>> =
+                std::cell::RefCell::new(None);
             let out = upstream::run_pipeline(
                 &up,
                 self.ops,
@@ -3991,11 +4587,42 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 },
                 // A signed abort is honoured between steps and while each tool runs (it kills
                 // the tool), not only at the fleet gate after VERIFIED.
-                |force| coordinator_abort_poll(cfg, ops, &mut last_coord, force),
+                |force| {
+                    if coordinator_abort_poll(cfg, ops, &mut last_coord, force) {
+                        return true;
+                    }
+                    if !early {
+                        return false;
+                    }
+                    // The journaled memory as of the pipeline's start, plus this view (journaled at the next machine read).
+                    let Some(doc) = quorum_poll(cfg, ops, resolved_h, &mut last_quorum, false)
+                    else {
+                        return false;
+                    };
+                    let (m, _) = merged_fleet_memory(cfg, &doc, &mem_snapshot);
+                    match quorum_verdict(cfg, resolved_h, &doc, true, &m) {
+                        QuorumPoll::Unreachable(p) => {
+                            *quorum_proof.borrow_mut() = Some(p);
+                            true
+                        }
+                        _ => false,
+                    }
+                },
             );
             self.last_coord_check_ms = last_coord;
-            out
+            self.last_quorum_check_ms = last_quorum;
+            (out, quorum_proof.into_inner())
         };
+        let (outcome, quorum_proof) = outcome;
+        if let (Err(upstream::PipelineError::Aborted { during }), Some(proof)) =
+            (&outcome, &quorum_proof)
+        {
+            return Ok(Err((
+                "fleet quorum unreachable during upstream verification: enough roster members ended the event without verifying".into(),
+                json!({"quorum_unreachable": proof, "during": format!("upstream verification ({during})"),
+                       "verify_wall_ms": self.ops.now_ms().saturating_sub(started)}),
+            )));
+        }
         let outcome = match outcome {
             Ok(o) => o,
             Err(upstream::PipelineError::Aborted { during }) => {

@@ -57,6 +57,8 @@ export function eventPayload(a, now = Date.now()) {
     ...(a['release-sha256'] ? { release_sha256: a['release-sha256'].toLowerCase() } : {}),
     ...(a['snapshot-sha256'] ? { snapshot_sha256: a['snapshot-sha256'].toLowerCase() } : {}),
     ...(a['metal-network-id'] !== undefined ? { metal_network_id: Number(a['metal-network-id']) } : {}),
+    // rc.31: the fleet-wide early-abort setting (off unless the coordinator signs it on).
+    ...(a['early-abort'] === 'yes' ? { early_abort: true } : {}),
     issued_at_ms: now,
   };
 }

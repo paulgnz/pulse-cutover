@@ -272,7 +272,7 @@ export const PROFILES = ['readiness', 'ceremony'];
 export const ROLES = ['producer', 'history', 'api', 'seed', 'query'];
 export const EVIDENCE_ALLOW = ['h', 'chain_id', 'freeze_at', 'cut_height', 'cut_block_id', 'burnoff_transactions', 'snapshot_sha256',
   'fingerprints_digest', 'target_head_id', 'write_gap_ms', 'state_diff_identical', 'state_digest', 'state_diff_b_head', 'lineage_at_cut',
-  'boot_genesis_sha256', 'head_at_pause', 'compare_allowed_digest', 'protocol_schedule_hash'];
+  'boot_genesis_sha256', 'head_at_pause', 'compare_allowed_digest', 'protocol_schedule_hash', 'agent_version', 'early_abort'];
 
 class Bad extends Error {}
 const bad = (path, what) => { throw new Bad(`${path}: ${what}`); };
@@ -516,6 +516,8 @@ export function projectDrill(d) {
     fingerprints_digest: hex(d.fingerprints_digest, 'drill.fingerprints_digest'),
     compare: d.compare == null ? null : (['MATCH', 'MISMATCH'].includes(d.compare) ? d.compare : bad('drill.compare', 'must be MATCH|MISMATCH')),
     compare_failing_tables: tables.map((t, i) => str(t, `drill.compare_failing_tables[${i}]`, { max: 48, re: /^[a-z0-9_]+$/ })),
+    // rc.31: a MISMATCH only on the known PulseVM v1.0.0 compare gaps (the agent checks each table's exact signature).
+    compare_class: d.compare_class == null ? null : (['match', 'known_gaps_only', 'mismatch'].includes(d.compare_class) ? d.compare_class : bad('drill.compare_class', 'must be match|known_gaps_only|mismatch')),
     timings_ms: tOut,
     error: d.error == null ? null : (typeof d.error === 'string' && d.error.length <= 400 ? redact(d.error, 120) : bad('drill.error', 'must be a string ≤ 400')),
     finished_ts_ms: int(d.finished_ts_ms, 'drill.finished_ts_ms'),
@@ -671,13 +673,62 @@ export function movementArmed(ev, marks, fresh) {
  * head seen from that point, src_max the highest.
  * @returns the new mark, or null when nothing changed
  */
-export function nextEventMark(cur, ce, sourceHead, armed, now) {
+/** States whose journal the agents' fleet gate may have counted (VERIFIED evidence or later). */
+const COUNTABLE = ['VERIFIED', 'IGNITED', 'FLIPPED', 'LIVE', 'HALTED'];
+/**
+ * rc.31 (review M1): did this report END the event for its member without it ever verifying? ABORTED / STRANDED for the
+ * event's own H, a transition list (every beacon since rc.10) with no VERIFIED-or-later entry, no verification evidence,
+ * no creation evidence and no abort in progress. Such a member was never counted by any gate; the relay keeps the fact
+ * as a durable per-event EXIT mark (never lowered) that rc.31 agents enforce: their fleet gates never count a member
+ * with an exit mark again, an agent refuses to ARM for an event its own producer exited, and only the mark (not a
+ * report) lets an agent count a member out of reach of the quorum.
+ */
+export function exitWithoutVerify(ce, evH) {
+  if (!ce || !Number.isInteger(evH) || ce.evidence?.h !== evH) return false;
+  if (!['ABORTED', 'STRANDED'].includes(ce.state) || creationEvidence(ce)) return false;
+  const tr = ce.transitions;
+  if (!Array.isArray(tr) || !tr.length || tr.some((t) => COUNTABLE.includes(t?.state))) return false;
+  if (ce.evidence?.snapshot_sha256 != null || ce.evidence?.fingerprints_digest != null) return false;
+  return ce.aborting !== true && ce.rollback_pending !== true;
+}
+/**
+ * rc.31 round 3 (review HIGH-1): any sign that a member's journal reached VERIFIED (and so may have been counted at a
+ * peer's gate): a VERIFIED-or-later state or transition, verification evidence, or creation evidence.
+ */
+export function verifiedSign(ce) {
+  if (!ce) return false;
+  if (COUNTABLE.includes(ce.state) || creationEvidence(ce)) return true;
+  if (ce.evidence?.snapshot_sha256 != null || ce.evidence?.fingerprints_digest != null) return true;
+  return Array.isArray(ce.transitions) && ce.transitions.some((t) => COUNTABLE.includes(t?.state));
+}
+/**
+ * @param opts.role    the report's role: only a `producer` report can set an exit mark (review M-c)
+ * @param opts.logged  the relay's creation-evidence log holds an observation for this producer and event
+ */
+export function nextEventMark(cur, ce, sourceHead, armed, now, evH = null, opts = {}) {
   // The agents' definition (creationEvidence): an ABORTED report after creation / ignition started also counts, so the
   // old-chain movement rule arms on it (rc.28 review).
   const past = creationEvidence(ce);
   const rank = Math.max(Number.isInteger(cur?.rank) ? cur.rank : 0, stateRank(ce?.state));
   const next = { past_create: !!(cur?.past_create || past), state: past ? (ce?.state || null) : (cur?.state ?? ce?.state ?? null),
     at: now, rank };
+  // rc.31 round 3 (review HIGH-1): `verified_seen` is sticky. Once the relay saw any sign that this member verified, no
+  // later report (an honest crash + fresh journal + abort, or a forged one) can give it an exit mark: a member a peer's
+  // gate may have counted is never "out". A mark from an older relay (no verified_seen) with a VERIFIED-or-later rank
+  // counts as seen. Always written explicitly: agents treat a missing field as "unknown, not out".
+  const legacySeen = cur && cur.verified_seen === undefined && Number.isInteger(cur.rank) && cur.rank >= STATE_RANK.VERIFIED;
+  next.verified_seen = !!(cur?.verified_seen || legacySeen || verifiedSign(ce) || opts.logged === true);
+  // rc.31: an exit without verifying. Round 5 (review MEDIUM-1): it becomes the durable EXIT mark (which agents and
+  // the relay enforce) only when the signed event turns the early abort on (`opts.exitMarks`); otherwise it is only
+  // remembered as `exit_seen` for the relay's own QUORUM UNREACHABLE alarm, and rc.30 behaviour is unchanged.
+  const exitNow = !next.verified_seen && (opts.role ?? 'producer') === 'producer' && exitWithoutVerify(ce, evH)
+    ? { state: ce.state, at: now } : null;
+  const exited = cur?.exited || (opts.exitMarks === true ? exitNow : null);
+  if (exited) next.exited = exited;
+  const seen = cur?.exit_seen || cur?.exited || exitNow;
+  if (seen && !exited) next.exit_seen = seen;
+  // A later report in any other state is a RE-ENTRY (sticky), except a legitimate join after a LIVE quorum (LOW-1).
+  if (cur?.reentered || (cur?.exited && ce && !['ABORTED', 'STRANDED'].includes(ce.state) && ce.joined !== true)) next.reentered = true;
   let srcFirst = Number.isInteger(cur?.src_first) ? cur.src_first : null, srcMax = Number.isInteger(cur?.src_max) ? cur.src_max : null;
   if (Number.isInteger(sourceHead) && (armed || srcFirst != null)) {
     if (srcFirst == null) srcFirst = sourceHead;
@@ -686,6 +737,8 @@ export function nextEventMark(cur, ce, sourceHead, armed, now) {
   if (srcFirst != null) { next.src_first = srcFirst; next.src_max = srcMax ?? srcFirst; }
   if (!cur) return next;
   const same = cur.past_create === next.past_create && cur.state === next.state && cur.rank === next.rank
+    && !!cur.exited === !!next.exited && !!cur.reentered === !!next.reentered && cur.verified_seen === next.verified_seen
+    && !!cur.exit_seen === !!next.exit_seen
     && (cur.src_first ?? null) === (next.src_first ?? null) && (cur.src_max ?? null) === (next.src_max ?? null);
   return same ? null : next;
 }
@@ -749,7 +802,7 @@ export function ceremonyFor(report, ev) {
 }
 /** @param eventMax { producer: {past_create, state, rank?, src_first?, src_max?} } for THIS event — the relay's per-event high-water mark (an
  *  instance replacement cannot lower it). */
-export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}) {
+export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}, opts = {}) {
   if (!ev) return null;
   const roster = Array.isArray(ev.roster) && ev.roster.length ? ev.roster : null;
   const names = roster ? roster.map((m) => m.producer) : Object.keys(byProducer).filter((p) => (byProducer[p] || []).some((s) => s.report?.coord?.event_id === ev.event_id));
@@ -772,7 +825,9 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}) {
     const loggedPast = logged.obs.some((o) => o.h === null || o.h === ev.h);
     const foreignPast = mine.some((x) => !ceremonyFor(x.report, ev) && pastCreate(x.report?.ceremony))
       || logged.obs.some((o) => o.h !== null && Number.isInteger(ev.h) && o.h !== ev.h) || logged.overflow;
+    const thisMark = !!em && (em.event_id === undefined || em.event_id === ev.event_id) ? em : null;
     return { producer, state: ce?.state || null, fresh: !!s && !s.silent, conflict: mine.length > 0 && !usable.length,
+      exited: !!thisMark?.exited, reentered: thisMark?.reentered === true,
       missing: !s, target: ce?.target || null, resumed: resumedOldChain(ce), past: pastCreate(ce) || markPast || anyPast || loggedPast, foreign_past: foreignPast,
       degraded: ce?.degraded === true,
       joined: ce?.joined === true, unsealed: ce?.state === 'STRANDED' && ce?.sealed === false, source_head: s?.report?.source?.head ?? null, head_at_pause: ce?.evidence?.head_at_pause ?? null,
@@ -841,6 +896,30 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}) {
   const liveChain = best ? { chain: best[0].split('|')[0], after_cut_id: best[0].split('|')[1], members: best[1] } : null;
   // rc.27: protocol upgrade schedule warnings (not alarms: nothing has split YET, but it will at activation).
   const warnings = [];
+  // rc.31 (review fix 4): the relay's own view proves the quorum unreachable (the agents' rule: enough members
+  // durably marked as exited without verifying, nobody past creation, marks complete). Whether or not the agents' early
+  // abort is on, the SAFE path is a signed abort (final, authenticated): say so loudly, with the exact command.
+  let quorumUnreachable = null;
+  if (roster && quorum && !past.length && opts.marksComplete !== false) {
+    const out = members.filter((m) => {
+      const em = eventMax?.[m.producer];
+      const mk = em && (em.event_id === undefined || em.event_id === ev.event_id) ? em : null;
+      // Round 5: the alarm works whatever the event's early-abort flag: an exit mark, or an exit only seen.
+      const ex = mk?.exited || mk?.exit_seen;
+      if (!ex || mk.reentered || mk.verified_seen !== false || !Number.isInteger(mk.rank)) return false;
+      if (!(mk.rank < STATE_RANK.VERIFIED || (mk.rank === STATE_RANK.STRANDED && ex.state === 'STRANDED'))) return false;
+      return m.fresh && ['ABORTED', 'STRANDED'].includes(m.state);
+    }).map((m) => m.producer);
+    const atMost = roster.length - out.length;
+    if (atMost < quorum) {
+      quorumUnreachable = { out, at_most_reachable: atMost, quorum };
+      warnings.unshift(`ALARM QUORUM UNREACHABLE: ${out.join(', ')} ended event ${ev.event_id} without verifying; at most ${atMost} of ${roster.length} can agree (quorum ${quorum}). Sign an abort: node control/coord.mjs abort --url <mission-control-url> --net ${ev.network || '<network>'} --event-id ${ev.event_id} --key <coordinator-key.pem> --event-file ${ev.event_id}.event.json`);
+    }
+  }
+  // rc.31 (review M1): a member that exited this event without verifying and then reported progress again.
+  for (const m of members.filter((x) => x.reentered)) {
+    warnings.push(`ALARM: ${m.producer} re-entered this event after exiting it without verifying; rc.31 agents never count it at a gate for this event again (a new attempt needs a NEW event id)`);
+  }
   for (const m of members.filter((x) => x.foreign_past)) {
     warnings.push(`${m.producer} has creation evidence for ANOTHER H (or an overflowed evidence log): a stale journal or a wrong event config; agents treat it as blocking (no resume) — fence that target, then retire the observation by id`);
   }
@@ -885,10 +964,10 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}) {
   for (const m of members.filter((x) => x.unsealed)) warnings.unshift(`UNSEALED: ${m.producer} is STRANDED but its source producer could NOT be confirmed paused: pause it by hand now`);
   const unaccounted = members.filter((m) => m.missing || !m.fresh).map((m) => `${m.producer}: ${m.missing ? 'no report' : `silent (${m.state || '?'})`}`);
   const notLive = !liveChain && verdict !== 'SPLIT' ? unaccounted : liveChain ? members.filter((m) => !liveChain.members.includes(m.producer)).map((m) => `${m.producer}: ${m.missing ? 'no report' : m.conflict ? 'identity conflict' : !m.fresh ? `silent (${m.state || '?'})` : m.state}`) : [];
-  return { event_id: ev.event_id, h: ev.h ?? null, roster: roster ? roster.length : null, quorum, verdict, alarms, warnings,
+  return { event_id: ev.event_id, h: ev.h ?? null, roster: roster ? roster.length : null, quorum, verdict, alarms, warnings, quorum_unreachable: quorumUnreachable,
     live_chain: liveChain, not_live: notLive,
     detail: !roster ? 'no roster in the event: LIVE needs a roster and quorum' : null,
-    members: members.map(({ producer, state, fresh, missing, conflict, resumed, past: p, degraded, joined, target }) =>
-      ({ producer, state, fresh, missing, conflict, resumed, past_create: p, degraded, joined,
+    members: members.map(({ producer, state, fresh, missing, conflict, resumed, past: p, degraded, joined, target, exited, reentered }) =>
+      ({ producer, state, fresh, missing, conflict, resumed, past_create: p, degraded, joined, exited, reentered,
         target_chain: target ? (target.blockchain_id || target.chain_id) : null, head: target?.head ?? null, after_cut_id: target?.after_cut_id ?? null })) };
 }

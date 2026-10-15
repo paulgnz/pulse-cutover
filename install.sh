@@ -26,7 +26,7 @@ set -euo pipefail
 # `artifacts.agent_release_tag`. Bumped by the release process together with tools/beacon-install.sh
 # (VERSION_DEFAULT); the two must agree (tools/test/run.sh checks). Never "latest": GitHub's
 # "latest release" alias skips pre-releases, so it resolved to a six-week-old v0.4.0 for every rc.
-AGENT_RELEASE_DEFAULT="v0.5.0-rc.30"
+AGENT_RELEASE_DEFAULT="v0.5.0-rc.31"
 
 MODE=""
 MANIFEST=""

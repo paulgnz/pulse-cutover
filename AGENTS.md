@@ -312,7 +312,16 @@ re-runs the current (idempotent) step — a crashed/killed agent can simply be
 re-run with the same config. `LIVE` and `ABORTED` are terminal: a journal
 ending in either will not re-run; a new ceremony needs a fresh journal path
 AND a reset target (an ignited PulseVM chain cannot be re-ignited — see
-`examples/loop/reset.sh`).
+`examples/loop/reset.sh`). **In a coordinated ceremony a new attempt also needs a
+NEW event id from the coordinator** (rc.31): a producer that ended an event
+without verifying is durably marked on mission control, its peers may already
+have stopped on that fact, so an rc.31 agent refuses to ARM that producer for the
+same event id on ANY journal, and no rc.31 gate counts it for that event again.
+Never re-run a coordinated event on a fresh journal under the old event id. The early abort is OFF unless the signed event
+turns it on (`early_abort`; the config must match, and the agent checks the signed event at ARM). With it off the
+ceremony behaves as rc.30 did, except that a resume guard may STRAND where rc.30 resumed (a peer this agent saw verified,
+or relay marks lost or restored) and mission control may raise the alarm below; whenever an agent stops early, or mission control shows "ALARM QUORUM UNREACHABLE",
+the coordinator signs an abort for the event (`node control/coord.mjs abort …`, the exact command is in the alarm).
 
 ## State machine, in agent terms
 
@@ -395,6 +404,8 @@ stateDiagram-v2
 | `install.sh` exit 1 | read the printed reasons — each names its fix; nothing was half-installed; re-run after fixing |
 | `cutover.sh` refuses pre-start ("NOT starting") | manifest vs live-chain mismatch; verify chain_id/freeze height with the human/coordinator |
 | ceremony ABORTED | `pulse-cutover status` + read the journal's last `error` line (`data.message`); run `report`; surface reason + bundle to the human. Source chain is still authoritative — no user impact unless the journal shows FLIPPED (then confirm the revert ran: `flip_cmd_output`/abort lines) |
+| ABORTED: "fleet quorum unreachable …" (rc.31) | enough roster members ended the event without verifying (mission control holds their durable exit marks) that the quorum cannot be reached: the journal's `quorum_unreachable` names them. Expected and safe (before the freeze nothing was frozen; after it the resume guard decided). Tell the human; a new attempt needs a NEW event id from the coordinator. `early_abort: deferred` = the proof held but the resume guard would have stranded this node: it kept waiting as before |
+| preflight refused: "already exited event … without verifying" (rc.31) | this producer ended the event earlier (any journal); its peers may have stopped on that. Do NOT move the journal aside and retry: ask the coordinator for a NEW event id |
 | agent process died mid-run | re-run the same `pulse-cutover run --config …` — it resumes from the journal |
 | ceremony LIVE | verify: public URL serves the same chain_id, head advancing; report bundle for the record |
 | stuck at IGNITED, target head == H | the new chain has no transactions: check the `post_ignite` hook ran (journal `post_ignite_hook`; `Permission denied` = missing execute bit). Tell the human; with approval, run the hook by hand |
