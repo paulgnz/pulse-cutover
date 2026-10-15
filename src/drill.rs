@@ -31,7 +31,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::config::{Config, ImportBackend};
 use crate::journal::Journal;
@@ -48,7 +48,10 @@ pub const MIN_LEAD_BLOCKS: u64 = 20;
 
 /// Where drills live: `<journal dir>/drill/`. Fixed (no flag), so the beacon always finds the latest result.
 pub fn drill_root(cfg: &Config) -> PathBuf {
-    cfg.journal_path.parent().unwrap_or_else(|| Path::new(".")).join("drill")
+    cfg.journal_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("drill")
 }
 
 pub fn latest_path(cfg: &Config) -> PathBuf {
@@ -82,7 +85,11 @@ pub enum DrillActivity {
     /// No drill recorded, or the latest one finished.
     Idle,
     /// `latest.json` says RUNNING and its process (same pid and start time) or its pipeline process group is alive.
-    Running { h: u64, pid: Option<u32>, group: Option<u32> },
+    Running {
+        h: u64,
+        pid: Option<u32>,
+        group: Option<u32>,
+    },
     /// `latest.json` says RUNNING but nothing of it is alive (the drill process died): reported, never blocking.
     Stale { h: u64 },
 }
@@ -94,13 +101,24 @@ fn group_not_proven_gone(cfg: &Config, h: u64) -> Option<u32> {
 }
 
 fn journal_dir_of(cfg: &Config) -> PathBuf {
-    cfg.journal_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf()
+    cfg.journal_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf()
 }
 
 fn group_not_proven_gone_at(journal_dir: &Path, h: u64) -> Option<u32> {
-    let pgid = crate::ops::hook_pgid_path(&journal_dir.join("drill").join(h.to_string()).join("drill.jsonl"));
+    let pgid = crate::ops::hook_pgid_path(
+        &journal_dir
+            .join("drill")
+            .join(h.to_string())
+            .join("drill.jsonl"),
+    );
     match crate::ops::recorded_group_status(&pgid) {
-        Some((g, crate::ops::GroupStatus::Live(_) | crate::ops::GroupStatus::Unknown(_))) => Some(g),
+        Some((g, crate::ops::GroupStatus::Live(_) | crate::ops::GroupStatus::Unknown(_))) => {
+            Some(g)
+        }
         _ => None,
     }
 }
@@ -115,28 +133,46 @@ pub fn activity(cfg: &Config) -> DrillActivity {
 /// [`activity`] for the drill whose config keeps its journal in `journal_dir` (r30 round 6: a ceremony under
 /// another journal directory evaluates a drill named by the producer's work marker).
 pub fn activity_at(journal_dir: &Path) -> DrillActivity {
-    let Ok(text) = std::fs::read_to_string(journal_dir.join("drill").join("latest.json")) else { return DrillActivity::Idle };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else { return DrillActivity::Idle };
+    let Ok(text) = std::fs::read_to_string(journal_dir.join("drill").join("latest.json")) else {
+        return DrillActivity::Idle;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return DrillActivity::Idle;
+    };
     if v["kind"].as_str() != Some(DRILL_KIND) {
         return DrillActivity::Idle;
     }
-    let Some(h) = v["h"].as_u64() else { return DrillActivity::Idle };
+    let Some(h) = v["h"].as_u64() else {
+        return DrillActivity::Idle;
+    };
     // r30 round 5 (review R5-3): an export container that was started and not verified gone may still be running
     // (killing the docker CLI does not stop a daemon-managed container): the drill counts as running.
     let container_live = container_not_verified_gone(&v);
     if v["state"].as_str() != Some("RUNNING") {
         return match group_not_proven_gone_at(journal_dir, h) {
-            Some(g) => DrillActivity::Running { h, pid: None, group: Some(g) },
-            None if container_live => DrillActivity::Running { h, pid: None, group: None },
+            Some(g) => DrillActivity::Running {
+                h,
+                pid: None,
+                group: Some(g),
+            },
+            None if container_live => DrillActivity::Running {
+                h,
+                pid: None,
+                group: None,
+            },
             None => DrillActivity::Idle,
         };
     }
-    let pid = v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()).filter(|p| *p > 1).filter(|p| {
-        match (crate::ops::process_start(*p), v["pid_start"].as_str()) {
-            (Some(now), Some(want)) => now == want,
-            _ => false,
-        }
-    });
+    let pid = v["pid"]
+        .as_u64()
+        .and_then(|p| u32::try_from(p).ok())
+        .filter(|p| *p > 1)
+        .filter(
+            |p| match (crate::ops::process_start(*p), v["pid_start"].as_str()) {
+                (Some(now), Some(want)) => now == want,
+                _ => false,
+            },
+        );
     let group = group_not_proven_gone_at(journal_dir, h);
     if pid.is_some() || group.is_some() || container_live {
         DrillActivity::Running { h, pid, group }
@@ -203,8 +239,13 @@ pub struct PinnedProgram {
 
 impl<'a, O: ChainOps> DrillGuard<'a, O> {
     pub fn new(inner: &'a O) -> Self {
-        DrillGuard { inner, violations: RefCell::new(vec![]), scheduled: RefCell::new(None), programs: RefCell::new(vec![]),
-            docker_host: RefCell::new(None) }
+        DrillGuard {
+            inner,
+            violations: RefCell::new(vec![]),
+            scheduled: RefCell::new(None),
+            programs: RefCell::new(vec![]),
+            docker_host: RefCell::new(None),
+        }
     }
 
     /// Allow exactly these pinned programs (`argv[0]`) for [`ChainOps::run_argv_cancellable`]; docker argument
@@ -262,10 +303,13 @@ impl<O: ChainOps> ChainOps for DrillGuard<'_, O> {
     }
     fn unschedule_snapshot(&self, height: u64) -> Result<bool, String> {
         // By height it could remove someone else's request at the same height (a ceremony's): never.
-        self.refuse(&format!("unschedule_snapshot({height}) by height (a drill only removes its own request, by id)"))
+        self.refuse(&format!(
+            "unschedule_snapshot({height}) by height (a drill only removes its own request, by id)"
+        ))
     }
     fn unschedule_snapshot_request(&self, id: u64, height: u64) -> Result<bool, String> {
-        if !matches!(*self.scheduled.borrow(), Some((mh, Some(mine))) if mine == id && mh == height) {
+        if !matches!(*self.scheduled.borrow(), Some((mh, Some(mine))) if mine == id && mh == height)
+        {
             return self.refuse(&format!(
                 "unschedule_snapshot_request({id} at {height}) of a request this drill did not schedule"
             ));
@@ -308,21 +352,40 @@ impl<O: ChainOps> ChainOps for DrillGuard<'_, O> {
     fn run_long(&self, _cmd: &str) -> Result<String, String> {
         self.refuse("run_long (a drill never runs a shell command)")
     }
-    fn run_long_cancellable(&self, _cmd: &str, _cancel: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
+    fn run_long_cancellable(
+        &self,
+        _cmd: &str,
+        _cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<String>, String> {
         self.refuse("run_long_cancellable (a drill never runs a shell command)")
     }
-    fn run_argv_cancellable(&self, argv: &[String], cancel: &mut dyn FnMut() -> bool) -> Result<Option<String>, String> {
+    fn run_argv_cancellable(
+        &self,
+        argv: &[String],
+        cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<String>, String> {
         let prog = argv.first().cloned().unwrap_or_default();
-        let Some(pin) = self.programs.borrow().iter().find(|p| p.path == prog).cloned() else {
-            return self.refuse(&format!("running {prog:?} (not one of the drill's validated programs)"));
+        let Some(pin) = self
+            .programs
+            .borrow()
+            .iter()
+            .find(|p| p.path == prog)
+            .cloned()
+        else {
+            return self.refuse(&format!(
+                "running {prog:?} (not one of the drill's validated programs)"
+            ));
         };
         if pin.docker {
             let want = self.docker_host.borrow().clone();
-            let named = argv.get(1).map(String::as_str) == Some("--host") && want.is_some()
+            let named = argv.get(1).map(String::as_str) == Some("--host")
+                && want.is_some()
                 && argv.get(2) == want.as_ref();
             if !named {
-                return self.refuse(&format!("running docker without `--host {}` (the local daemon)",
-                    want.unwrap_or_else(|| "?".into())));
+                return self.refuse(&format!(
+                    "running docker without `--host {}` (the local daemon)",
+                    want.unwrap_or_else(|| "?".into())
+                ));
             }
         }
         // r30 round 5: the content is checked again right before the run (the config-time check could be stale).
@@ -415,29 +478,48 @@ fn exec_problems(cfg: &Config) -> Vec<String> {
         }
         _ => {}
     }
-    p.extend(pinned_program_problem("upstream.import_bin", &up.import_bin, up.import_bin_sha256.as_ref()));
-    p.extend(pinned_program_problem("upstream.fingerprint_bin", &up.fingerprint_bin, up.fingerprint_bin_sha256.as_ref()));
+    p.extend(pinned_program_problem(
+        "upstream.import_bin",
+        &up.import_bin,
+        up.import_bin_sha256.as_ref(),
+    ));
+    p.extend(pinned_program_problem(
+        "upstream.fingerprint_bin",
+        &up.fingerprint_bin,
+        up.fingerprint_bin_sha256.as_ref(),
+    ));
     if let Some(c) = &up.compare_bin {
-        p.extend(pinned_program_problem("upstream.compare_bin", c, up.compare_bin_sha256.as_ref()));
+        p.extend(pinned_program_problem(
+            "upstream.compare_bin",
+            c,
+            up.compare_bin_sha256.as_ref(),
+        ));
     }
     p
 }
 
 /// The docker daemon socket a drill talks to (`/var/run/docker.sock` unless configured).
 pub fn docker_socket(up: &crate::config::Upstream) -> PathBuf {
-    up.docker_socket.clone().unwrap_or_else(|| PathBuf::from("/var/run/docker.sock"))
+    up.docker_socket
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/var/run/docker.sock"))
 }
 
 /// `name@sha256:<64 lowercase hex>` → the digest; anything else (a tag, a short or upper-case digest) → None.
 pub fn image_digest(img: &str) -> Option<String> {
     let (name, d) = img.rsplit_once("@sha256:")?;
-    (!name.is_empty() && d.len() == 64 && d.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)))
-        .then(|| d.to_string())
+    (!name.is_empty()
+        && d.len() == 64
+        && d.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)))
+    .then(|| d.to_string())
 }
 
 /// A lowercase 64-hex sha256 pin.
 pub fn valid_pin(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    s.len() == 64
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 /// r30 round 5 (review R5-2): a native-executable check alone admits `/bin/bash` as a "tool" (it would then run the
@@ -448,14 +530,22 @@ pub fn pinned_program_problem(key: &str, path: &Path, pin: Option<&String>) -> O
         return Some(why);
     }
     let Some(pin) = pin else {
-        return Some(format!("{key} {} has no sha256 pin ({key}_sha256): a drill runs only pinned content", path.display()));
+        return Some(format!(
+            "{key} {} has no sha256 pin ({key}_sha256): a drill runs only pinned content",
+            path.display()
+        ));
     };
     if !valid_pin(pin) {
-        return Some(format!("{key}_sha256 {pin:?} is not 64 lowercase hex characters"));
+        return Some(format!(
+            "{key}_sha256 {pin:?} is not 64 lowercase hex characters"
+        ));
     }
     match crate::verify::sha256_file(path) {
         Ok((sha, _)) if sha.eq_ignore_ascii_case(pin) => None,
-        Ok((sha, _)) => Some(format!("{key} {} has sha256 {sha}, not its pin {pin}: refused", path.display())),
+        Ok((sha, _)) => Some(format!(
+            "{key} {} has sha256 {sha}, not its pin {pin}: refused",
+            path.display()
+        )),
         Err(e) => Some(format!("{key} {}: cannot hash it: {e}", path.display())),
     }
 }
@@ -464,17 +554,26 @@ pub fn pinned_program_problem(key: &str, path: &Path, pin: Option<&String>) -> O
 /// the local daemon.
 fn socket_problem(p: &Path) -> Vec<String> {
     if !p.is_absolute() {
-        return vec![format!("upstream.docker_socket {} is not an absolute path", p.display())];
+        return vec![format!(
+            "upstream.docker_socket {} is not an absolute path",
+            p.display()
+        )];
     }
     match std::fs::symlink_metadata(p) {
         Err(e) => vec![format!("upstream.docker_socket {}: {e}", p.display())],
-        Ok(m) if m.file_type().is_symlink() => vec![format!("upstream.docker_socket {} is a symlink: refused", p.display())],
+        Ok(m) if m.file_type().is_symlink() => vec![format!(
+            "upstream.docker_socket {} is a symlink: refused",
+            p.display()
+        )],
         Ok(m) => {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::FileTypeExt;
                 if !m.file_type().is_socket() {
-                    return vec![format!("upstream.docker_socket {} is not a unix socket", p.display())];
+                    return vec![format!(
+                        "upstream.docker_socket {} is not a unix socket",
+                        p.display()
+                    )];
                 }
             }
             let _ = m;
@@ -488,7 +587,8 @@ pub fn valid_image(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 255
         && !s.starts_with('-')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '@' | '-'))
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '@' | '-'))
 }
 
 /// `name` = a single-named regular file (not a symlink, not hard-linked), not writable by group or others.
@@ -498,7 +598,10 @@ fn plain_file_problem(key: &str, path: &Path) -> Option<String> {
         Err(e) => return Some(format!("{key} {}: {e}", path.display())),
     };
     if m.file_type().is_symlink() {
-        return Some(format!("{key} {} is a symlink: a drill only runs a file by its own name", path.display()));
+        return Some(format!(
+            "{key} {} is a symlink: a drill only runs a file by its own name",
+            path.display()
+        ));
     }
     if !m.is_file() {
         return Some(format!("{key} {} is not a regular file", path.display()));
@@ -507,10 +610,17 @@ fn plain_file_problem(key: &str, path: &Path) -> Option<String> {
     {
         use std::os::unix::fs::MetadataExt;
         if m.nlink() != 1 {
-            return Some(format!("{key} {} has {} names (a hard link): refused", path.display(), m.nlink()));
+            return Some(format!(
+                "{key} {} has {} names (a hard link): refused",
+                path.display(),
+                m.nlink()
+            ));
         }
         if m.mode() & 0o022 != 0 {
-            return Some(format!("{key} {} is writable by group or others: refused", path.display()));
+            return Some(format!(
+                "{key} {} is writable by group or others: refused",
+                path.display()
+            ));
         }
     }
     None
@@ -519,7 +629,10 @@ fn plain_file_problem(key: &str, path: &Path) -> Option<String> {
 /// A drill tool must be an absolute path to a native executable (ELF, or Mach-O on macOS), never a script.
 fn native_executable_problems(key: &str, path: &Path) -> Vec<String> {
     if !path.is_absolute() {
-        return vec![format!("{key} {} is not an absolute path: a drill runs its tools by absolute path only", path.display())];
+        return vec![format!(
+            "{key} {} is not an absolute path: a drill runs its tools by absolute path only",
+            path.display()
+        )];
     }
     if let Some(why) = plain_file_problem(key, path) {
         return vec![why];
@@ -527,7 +640,10 @@ fn native_executable_problems(key: &str, path: &Path) -> Vec<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if std::fs::metadata(path).map(|m| m.permissions().mode() & 0o111 == 0).unwrap_or(true) {
+        if std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 == 0)
+            .unwrap_or(true)
+        {
             return vec![format!("{key} {} is not executable", path.display())];
         }
     }
@@ -540,7 +656,11 @@ fn native_executable_problems(key: &str, path: &Path) -> Vec<String> {
         return vec![format!("{key} {}: cannot read its header", path.display())];
     }
     if !is_native_executable_magic(&magic) {
-        let what = if magic.starts_with(b"#!") { "a script" } else { "not a native executable" };
+        let what = if magic.starts_with(b"#!") {
+            "a script"
+        } else {
+            "not a native executable"
+        };
         return vec![format!(
             "{key} {} is {what}: a drill runs only native executables (ELF or Mach-O) by argument vector, never a \
              script or shell",
@@ -553,23 +673,42 @@ fn native_executable_problems(key: &str, path: &Path) -> Vec<String> {
 /// ELF, or Mach-O (32/64-bit, either byte order, universal).
 pub fn is_native_executable_magic(m: &[u8; 4]) -> bool {
     m == b"\x7fELF"
-        || matches!(u32::from_be_bytes(*m), 0xfeed_face | 0xfeed_facf | 0xcefa_edfe | 0xcffa_edfe | 0xcafe_babe)
+        || matches!(
+            u32::from_be_bytes(*m),
+            0xfeed_face | 0xfeed_facf | 0xcefa_edfe | 0xcffa_edfe | 0xcafe_babe
+        )
 }
 
 /// The export tools directory: absolute, a real directory (not a symlink), holding `export.sh` as a plain file.
 fn tools_dir_problems(d: &Path) -> Vec<String> {
     if !d.is_absolute() {
-        return vec![format!("upstream.export_tools_dir {} is not an absolute path", d.display())];
+        return vec![format!(
+            "upstream.export_tools_dir {} is not an absolute path",
+            d.display()
+        )];
     }
     match std::fs::symlink_metadata(d) {
         Err(e) => return vec![format!("upstream.export_tools_dir {}: {e}", d.display())],
         Ok(m) if m.file_type().is_symlink() => {
-            return vec![format!("upstream.export_tools_dir {} is a symlink: refused", d.display())]
+            return vec![format!(
+                "upstream.export_tools_dir {} is a symlink: refused",
+                d.display()
+            )]
         }
-        Ok(m) if !m.is_dir() => return vec![format!("upstream.export_tools_dir {} is not a directory", d.display())],
+        Ok(m) if !m.is_dir() => {
+            return vec![format!(
+                "upstream.export_tools_dir {} is not a directory",
+                d.display()
+            )]
+        }
         _ => {}
     }
-    plain_file_problem("export.sh in upstream.export_tools_dir", &d.join("export.sh")).into_iter().collect()
+    plain_file_problem(
+        "export.sh in upstream.export_tools_dir",
+        &d.join("export.sh"),
+    )
+    .into_iter()
+    .collect()
 }
 
 /// r30 round 4: the producer API a snapshot request is bound to must be ONE unambiguous endpoint: a query,
@@ -590,7 +729,11 @@ fn producer_api_problem(url: &str) -> Option<String> {
 /// `p` made absolute with symlinks resolved, also when it (or its tail) does not exist yet: the longest existing
 /// ancestor is canonicalized and the rest appended.
 fn canonical(p: &Path) -> PathBuf {
-    let abs = if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().unwrap_or_default().join(p) };
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
     let mut tail = vec![];
     let mut cur = abs.as_path();
     loop {
@@ -626,12 +769,17 @@ pub fn lock_dir(cfg: &Config) -> PathBuf {
         return default;
     }
     let journal_dir = canonical(&journal_dir_of(cfg));
-    journal_dir.parent().map(|p| p.join("locks")).unwrap_or_else(|| journal_dir.join("locks"))
+    journal_dir
+        .parent()
+        .map(|p| p.join("locks"))
+        .unwrap_or_else(|| journal_dir.join("locks"))
 }
 
 fn dir_writable(d: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = std::ffi::CString::new(d.as_os_str().as_bytes()) else { return false };
+    let Ok(c) = std::ffi::CString::new(d.as_os_str().as_bytes()) else {
+        return false;
+    };
     // SAFETY: a valid NUL-terminated path; access(2) only reads it.
     unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
 }
@@ -643,7 +791,10 @@ fn dir_writable(d: &Path) -> bool {
 pub fn producer_resource_key(cfg: &Config) -> String {
     match &cfg.snapshot.dir {
         Some(d) => format!("snapshot-dir:{}", canonical(d).display()),
-        None => format!("journal-dir:{}", canonical(cfg.journal_path.parent().unwrap_or(Path::new("."))).display()),
+        None => format!(
+            "journal-dir:{}",
+            canonical(cfg.journal_path.parent().unwrap_or(Path::new("."))).display()
+        ),
     }
 }
 
@@ -669,12 +820,20 @@ pub enum MarkerWork {
     /// No marker.
     None,
     /// A drill (under `journal_dir`) whose work is alive or cannot be shown stopped.
-    Live { journal_dir: PathBuf, h: u64, pid: Option<u32>, group: Option<u32> },
+    Live {
+        journal_dir: PathBuf,
+        h: u64,
+        pid: Option<u32>,
+        group: Option<u32>,
+    },
     /// A marker that cannot be read or parsed, or whose drill cannot be shown finished: unknown is never "stopped".
     Unknown(String),
     /// The marker's drill is verified finished (its work is gone): a leftover marker. `drill_id`: the drill that
     /// wrote it (r30 round 7), None for a marker from before round 7.
-    Done { journal_dir: PathBuf, drill_id: Option<String> },
+    Done {
+        journal_dir: PathBuf,
+        drill_id: Option<String>,
+    },
 }
 
 /// The work marker's raw fields (r30 round 7): who wrote it and what work it may have left.
@@ -699,7 +858,8 @@ pub fn read_marker(cfg: &Config) -> Result<Option<MarkerRecord>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let v: Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
     Ok(Some(MarkerRecord {
         journal_dir: v["journal_dir"].as_str().map(PathBuf::from),
         h: v["h"].as_u64(),
@@ -721,7 +881,9 @@ fn marker_process_alive(m: &MarkerRecord) -> bool {
 /// The drill id `latest.json` under `journal_dir` names, if any.
 fn latest_drill_id_at(journal_dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(journal_dir.join("drill").join("latest.json")).ok()?;
-    serde_json::from_str::<Value>(&text).ok()?["drill_id"].as_str().map(str::to_string)
+    serde_json::from_str::<Value>(&text).ok()?["drill_id"]
+        .as_str()
+        .map(str::to_string)
 }
 
 pub fn marker_work(cfg: &Config) -> MarkerWork {
@@ -758,7 +920,12 @@ pub fn marker_work(cfg: &Config) -> MarkerWork {
             };
             let group = group_not_proven_gone_at(&journal_dir, mh);
             if marker_process_alive(&rec) || group.is_some() {
-                return MarkerWork::Live { journal_dir, h: mh, pid: rec.pid.filter(|_| marker_process_alive(&rec)), group };
+                return MarkerWork::Live {
+                    journal_dir,
+                    h: mh,
+                    pid: rec.pid.filter(|_| marker_process_alive(&rec)),
+                    group,
+                };
             }
             return MarkerWork::Unknown(format!(
                 "the work marker's drill {id} at H = {mh} under {} is not running and never published its result: its                  export may have started; verify and remove it with `pulse-cutover drill --clear-marker`",
@@ -766,8 +933,16 @@ pub fn marker_work(cfg: &Config) -> MarkerWork {
         }
     }
     match activity_at(&journal_dir) {
-        DrillActivity::Running { h, pid, group } => MarkerWork::Live { journal_dir, h, pid, group },
-        _ => MarkerWork::Done { journal_dir, drill_id: marker_id },
+        DrillActivity::Running { h, pid, group } => MarkerWork::Live {
+            journal_dir,
+            h,
+            pid,
+            group,
+        },
+        _ => MarkerWork::Done {
+            journal_dir,
+            drill_id: marker_id,
+        },
     }
 }
 
@@ -799,7 +974,9 @@ fn write_work_marker(cfg: &Config, h: u64, drill_id: &str, container: &str) -> R
 /// never named this id, the drill failed before any work started and the marker is removed; otherwise only once
 /// that record is not running (its pipeline group and export container verified gone).
 pub fn clear_work_marker_if_done(cfg: &Config, drill_id: &str) {
-    let Ok(Some(m)) = read_marker(cfg) else { return };
+    let Ok(Some(m)) = read_marker(cfg) else {
+        return;
+    };
     if m.drill_id.as_deref() != Some(drill_id) {
         return; // someone else's marker (or one from before round 7): never ours to remove
     }
@@ -818,7 +995,9 @@ fn new_drill_id() -> String {
     let mut b = [0u8; 16];
     if getrandom_fill(&mut b).is_err() {
         use sha2::{Digest, Sha256};
-        let d = Sha256::digest(format!("{}:{:?}", std::process::id(), std::time::SystemTime::now()).as_bytes());
+        let d = Sha256::digest(
+            format!("{}:{:?}", std::process::id(), std::time::SystemTime::now()).as_bytes(),
+        );
         b.copy_from_slice(&d[..16]);
     }
     hex::encode(b)
@@ -902,12 +1081,17 @@ fn linked_output_problems(cfg: &Config, h: u64) -> Vec<String> {
         pgid_file(cfg, h),
         PathBuf::from(format!("{}.lock", producer_lock_base(cfg).display())),
     ];
-    for name in [format!("compare-report-{h}.json"), format!("checkpoint-{h}.bin.manifest.json")] {
+    for name in [
+        format!("compare-report-{h}.json"),
+        format!("checkpoint-{h}.bin.manifest.json"),
+    ] {
         paths.push(dir.join(name));
     }
     let mut p = vec![];
     for path in paths {
-        let Ok(m) = std::fs::symlink_metadata(&path) else { continue };
+        let Ok(m) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
         if m.file_type().is_symlink() {
             p.push(format!(
                 "{} is a symlink (to {}): a drill never writes through a link (it could overwrite a protected file); \
@@ -974,8 +1158,10 @@ fn write_fresh(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut f = nofollow(std::fs::OpenOptions::new().write(true).create_new(true))
         .open(path)
         .map_err(|e| format!("create {}: {e}", path.display()))?;
-    f.write_all(bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-    f.sync_all().map_err(|e| format!("fsync {}: {e}", path.display()))
+    f.write_all(bytes)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    f.sync_all()
+        .map_err(|e| format!("fsync {}: {e}", path.display()))
 }
 
 /// Append to the drill's own log without following a link, and refuse a file with other names (a hard link).
@@ -987,9 +1173,14 @@ fn append_nofollow(path: &Path, line: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let m = f.metadata().map_err(|e| format!("stat drill log {}: {e}", path.display()))?;
+        let m = f
+            .metadata()
+            .map_err(|e| format!("stat drill log {}: {e}", path.display()))?;
         if m.nlink() > 1 {
-            return Err(format!("drill log {} has other names (a hard link): refused", path.display()));
+            return Err(format!(
+                "drill log {} has other names (a hard link): refused",
+                path.display()
+            ));
         }
     }
     writeln!(f, "{line}").map_err(|e| format!("write drill log: {e}"))?;
@@ -1004,7 +1195,9 @@ pub fn normalized_endpoint(url: &str) -> String {
             "{}://{}{}{}",
             u.scheme(),
             u.host_str().unwrap_or("").to_ascii_lowercase(),
-            u.port_or_known_default().map(|p| format!(":{p}")).unwrap_or_default(),
+            u.port_or_known_default()
+                .map(|p| format!(":{p}"))
+                .unwrap_or_default(),
             u.path().trim_end_matches('/')
         ),
         Err(_) => url.trim().trim_end_matches('/').to_string(),
@@ -1036,8 +1229,12 @@ impl DrillLog {
         // A fresh temp inode (never written through a link), then rename: rename replaces the NAME `latest.json`,
         // never a file a symlink there pointed at.
         let tmp = self.latest.with_extension("json.tmp");
-        write_fresh(&tmp, &serde_json::to_vec_pretty(&self.view).unwrap_or_default())?;
-        std::fs::rename(&tmp, &self.latest).map_err(|e| format!("rename {}: {e}", self.latest.display()))
+        write_fresh(
+            &tmp,
+            &serde_json::to_vec_pretty(&self.view).unwrap_or_default(),
+        )?;
+        std::fs::rename(&tmp, &self.latest)
+            .map_err(|e| format!("rename {}: {e}", self.latest.display()))
     }
 }
 
@@ -1052,27 +1249,45 @@ pub struct DrillOutcome {
 }
 
 /// Run one readiness drill at `opts.height`. `ops` is wrapped in a [`DrillGuard`]; nothing else is used.
-pub fn run<O: ChainOps>(cfg: &Config, ops: &O, opts: &DrillOptions) -> Result<DrillOutcome, String> {
+pub fn run<O: ChainOps>(
+    cfg: &Config,
+    ops: &O,
+    opts: &DrillOptions,
+) -> Result<DrillOutcome, String> {
     run_with_guard(cfg, &DrillGuard::new(ops), opts)
 }
 
 /// [`run`] with a caller-made guard. Any violation the guard recorded during the run (or before it) fails the
 /// drill, even when the run itself returned Ok.
-pub fn run_with_guard<O: ChainOps>(cfg: &Config, guard: &DrillGuard<'_, O>, opts: &DrillOptions) -> Result<DrillOutcome, String> {
+pub fn run_with_guard<O: ChainOps>(
+    cfg: &Config,
+    guard: &DrillGuard<'_, O>,
+    opts: &DrillOptions,
+) -> Result<DrillOutcome, String> {
     // r30 round 7: the work marker is cleaned up inside run_guarded, while the drill still holds the producer lock.
     let res = run_guarded(cfg, guard, opts);
     let v = guard.violations.borrow().clone();
     if !v.is_empty() {
         // Defense in depth: the guard already refused each call; a drill that even tried is a bug to report.
-        return Err(format!("readiness drill tried forbidden operations (all refused): {}", v.join(", ")));
+        return Err(format!(
+            "readiness drill tried forbidden operations (all refused): {}",
+            v.join(", ")
+        ));
     }
     res
 }
 
-fn run_guarded<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillOptions) -> Result<DrillOutcome, String> {
+fn run_guarded<O: ChainOps>(
+    cfg: &Config,
+    ops: &DrillGuard<'_, O>,
+    opts: &DrillOptions,
+) -> Result<DrillOutcome, String> {
     let problems = config_problems(cfg);
     if !problems.is_empty() {
-        return Err(format!("this config cannot run a readiness drill: {}", problems.join("; ")));
+        return Err(format!(
+            "this config cannot run a readiness drill: {}",
+            problems.join("; ")
+        ));
     }
     // Every path the drill will write is checked before it creates anything (lock files included).
     let overlap = path_overlap_problems(cfg, opts.height);
@@ -1085,8 +1300,11 @@ fn run_guarded<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillO
         .map_err(|e| format!("a readiness drill needs this journal's lock: {e}"))?;
     // Round 2: and the drill root's own lock, so configs that share a journal directory (and so `latest.json`) but
     // name different journal files cannot run two drills at once.
-    let _root_lock = Journal::lock(&root_lock_base(cfg))
-        .map_err(|e| format!("a readiness drill needs the drill directory's lock (another drill is running): {e}"))?;
+    let _root_lock = Journal::lock(&root_lock_base(cfg)).map_err(|e| {
+        format!(
+            "a readiness drill needs the drill directory's lock (another drill is running): {e}"
+        )
+    })?;
     // Round 5: and the producer's own lock, shared with a ceremony (or drill) on the same producer under ANY journal
     // directory.
     let _producer_lock = Journal::lock(&producer_lock_base(cfg)).map_err(|e| format!(
@@ -1107,8 +1325,9 @@ fn run_guarded<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillO
     // the work marker exists, so a refusal leaves nothing behind.
     // r30 round 8 (review R8-7): the discovery must succeed (an unreadable source is refused, never read as "not
     // mainnet"), and the drill reuses this checked answer instead of asking again.
-    let info = ops.source_info()
-        .map_err(|e| format!("cannot read the source chain before the drill ({e}): refused, nothing started"))?;
+    let info = ops.source_info().map_err(|e| {
+        format!("cannot read the source chain before the drill ({e}): refused, nothing started")
+    })?;
     if cfg.ceremony.lock_dir.is_none() && crate::config::is_xpr_mainnet(&info.chain_id) {
         return Err("the source is XPR MAINNET: set an explicit [ceremony] lock_dir (the same one the ceremony uses) \
                     before running a drill".into());
@@ -1123,12 +1342,21 @@ fn run_guarded<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillO
     res
 }
 
-fn run_marked<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillOptions, drill_id: &str, container: &str,
-                           info: crate::ops::ChainInfo) -> Result<DrillOutcome, String> {
+fn run_marked<O: ChainOps>(
+    cfg: &Config,
+    ops: &DrillGuard<'_, O>,
+    opts: &DrillOptions,
+    drill_id: &str,
+    container: &str,
+    info: crate::ops::ChainInfo,
+) -> Result<DrillOutcome, String> {
     let h = opts.height;
     if let Some(pinned) = &cfg.ceremony.chain_id {
         if !pinned.eq_ignore_ascii_case(&info.chain_id) {
-            return Err(format!("source chain_id {} != configured ceremony.chain_id {pinned}", info.chain_id));
+            return Err(format!(
+                "source chain_id {} != configured ceremony.chain_id {pinned}",
+                info.chain_id
+            ));
         }
     }
     let dir = drill_dir(cfg, h);
@@ -1147,11 +1375,15 @@ fn run_marked<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillOp
     }
 
     // Claim H atomically: exactly one drill creates this directory.
-    std::fs::create_dir_all(drill_root(cfg)).map_err(|e| format!("create {}: {e}", drill_root(cfg).display()))?;
+    std::fs::create_dir_all(drill_root(cfg))
+        .map_err(|e| format!("create {}: {e}", drill_root(cfg).display()))?;
     match std::fs::create_dir(&dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(format!("a drill at H = {h} already ran here ({}); every drill height is used once", dir.display()))
+            return Err(format!(
+                "a drill at H = {h} already ran here ({}); every drill height is used once",
+                dir.display()
+            ))
         }
         Err(e) => return Err(format!("create {}: {e}", dir.display())),
     }
@@ -1218,13 +1450,22 @@ fn run_marked<O: ChainOps>(cfg: &Config, ops: &DrillGuard<'_, O>, opts: &DrillOp
 /// After a failure or cancel: if this drill's snapshot request at H may still be pending (H not final yet, or the
 /// chain cannot be read), remove it so nodeos does not write a snapshot nobody will use. Recorded either way.
 fn unschedule_if_pending<O: ChainOps>(ops: &DrillGuard<'_, O>, h: u64, log: &mut DrillLog) {
-    let Some((sh, id)) = ops.scheduled_request() else { return }; // never scheduled (failed before)
+    let Some((sh, id)) = ops.scheduled_request() else {
+        return;
+    }; // never scheduled (failed before)
     if sh != h {
         return;
     }
-    let lib = ops.source_info().map(|i| i.last_irreversible_block_num).ok();
+    let lib = ops
+        .source_info()
+        .map(|i| i.last_irreversible_block_num)
+        .ok();
     if lib.is_some_and(|l| l >= h) {
-        let _ = log.record(ops.now_ms(), "snapshot_request", json!({"unscheduled": false, "why": "H is final: nodeos already wrote it"}));
+        let _ = log.record(
+            ops.now_ms(),
+            "snapshot_request",
+            json!({"unscheduled": false, "why": "H is final: nodeos already wrote it"}),
+        );
         return;
     }
     let Some(id) = id else {
@@ -1234,7 +1475,9 @@ fn unschedule_if_pending<O: ChainOps>(ops: &DrillGuard<'_, O>, h: u64, log: &mut
     };
     let rec = match ops.unschedule_snapshot_request(id, h) {
         Ok(true) => json!({"unscheduled": true, "snapshot_request_id": id}),
-        Ok(false) => json!({"unscheduled": false, "snapshot_request_id": id, "why": "that request is no longer pending (or the producer API cannot unschedule)"}),
+        Ok(false) => {
+            json!({"unscheduled": false, "snapshot_request_id": id, "why": "that request is no longer pending (or the producer API cannot unschedule)"})
+        }
         Err(e) => json!({"unscheduled": false, "snapshot_request_id": id, "error": e}),
     };
     let _ = log.record(ops.now_ms(), "snapshot_request", rec);
@@ -1255,19 +1498,29 @@ fn drive<O: ChainOps>(
     const CANCELLED: &str = "cancelled by `pulse-cutover drill --cancel`";
 
     // 1. Schedule the snapshot at exactly H (the same producer-API call the ceremony makes at ARM).
-    let request_id = ops.schedule_snapshot_request(h).map_err(|e| format!("schedule_snapshot({h}) failed: {e}"))?;
+    let request_id = ops
+        .schedule_snapshot_request(h)
+        .map_err(|e| format!("schedule_snapshot({h}) failed: {e}"))?;
     // The request id is persisted so `--cancel` of a dead drill removes exactly this request, never by height.
     // ...bound to the producer API it was made on and its height (round 3: an id means nothing on another node).
     let endpoint = normalized_endpoint(&cfg.source.producer_api_url);
-    log.record(ops.now_ms(), "snapshot_scheduled", json!({"h": h, "snapshot_request_id": request_id,
-        "snapshot_request_endpoint": endpoint}))?;
-    log.publish(json!({"stage": "waiting_for_h", "snapshot_request_id": request_id, "snapshot_request_h": h,
-        "snapshot_request_endpoint": endpoint}))?;
+    log.record(
+        ops.now_ms(),
+        "snapshot_scheduled",
+        json!({"h": h, "snapshot_request_id": request_id,
+        "snapshot_request_endpoint": endpoint}),
+    )?;
+    log.publish(
+        json!({"stage": "waiting_for_h", "snapshot_request_id": request_id, "snapshot_request_h": h,
+        "snapshot_request_endpoint": endpoint}),
+    )?;
 
     // 2. Wait for H to be produced and then final. The chain keeps running: nothing is frozen.
     let head_now = ops.source_info()?.head_block_num;
     // Generous: 1 s per block still to come (blocks are 0.5 s), plus the configured snapshot timeout for finality.
-    let deadline = ops.now_ms() + (h.saturating_sub(head_now) * 1000) + cfg.source.snapshot_timeout_secs * 1000;
+    let deadline = ops.now_ms()
+        + (h.saturating_sub(head_now) * 1000)
+        + cfg.source.snapshot_timeout_secs * 1000;
     let mut produced_ms: Option<u64> = None;
     let mut last_beat = 0u64;
     loop {
@@ -1283,10 +1536,17 @@ fn drive<O: ChainOps>(
             return Err(CANCELLED.into());
         }
         if now > deadline {
-            return Err(format!("H = {h} did not become final in time (lib {})", i.last_irreversible_block_num));
+            return Err(format!(
+                "H = {h} did not become final in time (lib {})",
+                i.last_irreversible_block_num
+            ));
         }
         if now.saturating_sub(last_beat) >= 30_000 {
-            log.record(now, "awaiting_h_final", json!({"head": i.head_block_num, "lib": i.last_irreversible_block_num}))?;
+            log.record(
+                now,
+                "awaiting_h_final",
+                json!({"head": i.head_block_num, "lib": i.last_irreversible_block_num}),
+            )?;
             last_beat = now;
         }
         ops.sleep_ms(cfg.poll_ms);
@@ -1305,16 +1565,29 @@ fn drive<O: ChainOps>(
             return Err(CANCELLED.into());
         }
         if ops.now_ms() > deadline {
-            return Err(format!("scheduled snapshot {} did not appear in time", snapshot.display()));
+            return Err(format!(
+                "scheduled snapshot {} did not appear in time",
+                snapshot.display()
+            ));
         }
         ops.sleep_ms(cfg.poll_ms);
     }
-    timings.insert("snapshot_file_wait".into(), json!(ops.now_ms().saturating_sub(final_ms)));
+    timings.insert(
+        "snapshot_file_wait".into(),
+        json!(ops.now_ms().saturating_sub(final_ms)),
+    );
     let t = ops.now_ms();
     let (sha256, size) = crate::verify::sha256_file(&snapshot)?;
-    timings.insert("snapshot_sha256".into(), json!(ops.now_ms().saturating_sub(t)));
-    log.record(ops.now_ms(), "snapshot", json!({"file": snapshot.display().to_string(), "block_id_at_h": id_h,
-        "sha256": sha256, "bytes": size}))?;
+    timings.insert(
+        "snapshot_sha256".into(),
+        json!(ops.now_ms().saturating_sub(t)),
+    );
+    log.record(
+        ops.now_ms(),
+        "snapshot",
+        json!({"file": snapshot.display().to_string(), "block_id_at_h": id_h,
+        "sha256": sha256, "bytes": size}),
+    )?;
     log.publish(json!({"stage": "converting", "block_id_at_h": id_h, "snapshot_sha256": sha256, "snapshot_bytes": size,
         "timings_ms": Value::Object(timings.clone())}))?;
 
@@ -1327,13 +1600,26 @@ fn drive<O: ChainOps>(
     // r30 round 4: no shell anywhere. The export is a fixed `docker run` vector from the validated explicit fields;
     // the tools run by argument vector; the guard allows exactly these four programs.
     // r30 round 7: the name the work marker already recorded (so the marker alone can verify it gone).
-    let container_name = log.view["planned_export_container"].as_str().map(str::to_string)
+    let container_name = log.view["planned_export_container"]
+        .as_str()
+        .map(str::to_string)
         .unwrap_or_else(|| format!("pulse-drill-{h}-{}", container_suffix(h, started)));
     let export = upstream::DrillExport {
-        image: up.export_image.clone().ok_or("upstream.export_image is required for a drill")?,
-        tools_dir: up.export_tools_dir.clone().ok_or("upstream.export_tools_dir is required for a drill")?,
-        chain_state_db_size_mb: up.chain_state_db_size_mb.ok_or("upstream.chain_state_db_size_mb is required for a drill")?,
-        docker_bin: up.docker_bin.clone().ok_or("upstream.docker_bin is required for a drill")?,
+        image: up
+            .export_image
+            .clone()
+            .ok_or("upstream.export_image is required for a drill")?,
+        tools_dir: up
+            .export_tools_dir
+            .clone()
+            .ok_or("upstream.export_tools_dir is required for a drill")?,
+        chain_state_db_size_mb: up
+            .chain_state_db_size_mb
+            .ok_or("upstream.chain_state_db_size_mb is required for a drill")?,
+        docker_bin: up
+            .docker_bin
+            .clone()
+            .ok_or("upstream.docker_bin is required for a drill")?,
         docker_socket: docker_socket(&up),
         container_name: container_name.clone(),
         cidfile: work.parent().unwrap_or(work).join("export.cid"),
@@ -1341,13 +1627,27 @@ fn drive<O: ChainOps>(
     allow_pinned_programs(ops, &up)?;
     // The container's name is recorded BEFORE it can exist, so a cancel (or the next run of anything that reads
     // activity) knows which container to stop and verify gone.
-    log.record(ops.now_ms(), "export_container", json!({"name": container_name}))?;
+    log.record(
+        ops.now_ms(),
+        "export_container",
+        json!({"name": container_name}),
+    )?;
     log.publish(json!({"export_container": container_name, "export_container_gone": false}))?;
     let chain_id = ops.source_info()?.chain_id;
     let mut blobs: Vec<Value> = vec![];
     let conv_started = ops.now_ms();
-    let res = upstream::run_pipeline_exec(&up, ops, &upstream::PipelineExec::Argv(export), &snapshot, &sha256, h,
-        &id_h, &chain_id, |v| blobs.push(v), |_| cancel.exists());
+    let res = upstream::run_pipeline_exec(
+        &up,
+        ops,
+        &upstream::PipelineExec::Argv(export),
+        &snapshot,
+        &sha256,
+        h,
+        &id_h,
+        &chain_id,
+        |v| blobs.push(v),
+        |_| cancel.exists(),
+    );
     for b in &blobs {
         log.record(ops.now_ms(), "pipeline", b.clone())?;
     }
@@ -1365,15 +1665,28 @@ fn drive<O: ChainOps>(
     if let Some(ms) = compare.as_ref().and_then(|v| v["compare_wall_ms"].as_u64()) {
         timings.insert("compare".into(), json!(ms));
     }
-    let compare_result = compare.as_ref().and_then(|v| v["result"].as_str().map(str::to_string));
-    let failing: Vec<Value> = compare.as_ref().and_then(|v| v["failing_tables"].as_array().cloned()).unwrap_or_default();
+    let compare_result = compare
+        .as_ref()
+        .and_then(|v| v["result"].as_str().map(str::to_string));
+    let failing: Vec<Value> = compare
+        .as_ref()
+        .and_then(|v| v["failing_tables"].as_array().cloned())
+        .unwrap_or_default();
 
     let (state_root, compare_match) = match res {
         Ok(out) => {
             // The pipeline does not time its last step: conversion total minus the timed steps.
-            let timed: u64 = ["export", "import", "compare"].iter()
-                .map(|k| timings.get(*k).and_then(Value::as_u64).unwrap_or(0)).sum();
-            timings.insert("fingerprint_approx".into(), json!(ops.now_ms().saturating_sub(conv_started).saturating_sub(timed)));
+            let timed: u64 = ["export", "import", "compare"]
+                .iter()
+                .map(|k| timings.get(*k).and_then(Value::as_u64).unwrap_or(0))
+                .sum();
+            timings.insert(
+                "fingerprint_approx".into(),
+                json!(ops
+                    .now_ms()
+                    .saturating_sub(conv_started)
+                    .saturating_sub(timed)),
+            );
             (out.state_root, true)
         }
         Err(PipelineError::Failed(e)) if compare_result.as_deref() == Some("MISMATCH") => {
@@ -1382,15 +1695,22 @@ fn drive<O: ChainOps>(
             log.record(ops.now_ms(), "compare_mismatch", json!({"error": e}))?;
             let checkpoint = work.join(format!("checkpoint-{h}.bin"));
             if !checkpoint.exists() {
-                return Err(format!("compare failed and no checkpoint exists to fingerprint: {e}"));
+                return Err(format!(
+                    "compare failed and no checkpoint exists to fingerprint: {e}"
+                ));
             }
             let arena = work.join(format!("arena-fingerprint-{h}"));
             let _ = std::fs::remove_dir_all(&arena);
-            std::fs::create_dir_all(&arena).map_err(|e| format!("create {}: {e}", arena.display()))?;
-            let argv = vec![up.fingerprint_bin.display().to_string(), checkpoint.display().to_string(),
-                arena.display().to_string()];
+            std::fs::create_dir_all(&arena)
+                .map_err(|e| format!("create {}: {e}", arena.display()))?;
+            let argv = vec![
+                up.fingerprint_bin.display().to_string(),
+                checkpoint.display().to_string(),
+                arena.display().to_string(),
+            ];
             let t = ops.now_ms();
-            let out = ops.run_argv_cancellable(&argv, &mut || cancel.exists())
+            let out = ops
+                .run_argv_cancellable(&argv, &mut || cancel.exists())
                 .map_err(|e| format!("xpr_state_fingerprint failed: {e}"))?
                 .ok_or_else(|| CANCELLED.to_string())?;
             timings.insert("fingerprint".into(), json!(ops.now_ms().saturating_sub(t)));
@@ -1398,25 +1718,43 @@ fn drive<O: ChainOps>(
             (root, false)
         }
         Err(PipelineError::Failed(e)) => return Err(format!("conversion failed: {e}")),
-        Err(PipelineError::Aborted { during }) if cancelled(&cancel) => return Err(format!("{CANCELLED} (during {during})")),
-        Err(PipelineError::Aborted { during }) => return Err(format!("conversion stopped during {during}")),
+        Err(PipelineError::Aborted { during }) if cancelled(&cancel) => {
+            return Err(format!("{CANCELLED} (during {during})"))
+        }
+        Err(PipelineError::Aborted { during }) => {
+            return Err(format!("conversion stopped during {during}"))
+        }
     };
     let end = ops.now_ms();
-    timings.insert("conversion_total".into(), json!(end.saturating_sub(conv_started)));
-    timings.insert("h_final_to_evidence".into(), json!(end.saturating_sub(final_ms)));
+    timings.insert(
+        "conversion_total".into(),
+        json!(end.saturating_sub(conv_started)),
+    );
+    timings.insert(
+        "h_final_to_evidence".into(),
+        json!(end.saturating_sub(final_ms)),
+    );
     timings.insert("total".into(), json!(end.saturating_sub(started)));
 
-    let root_ok = state_root.as_deref().is_some_and(|r| r.len() >= 16 && r.chars().all(|c| c.is_ascii_hexdigit()));
+    let root_ok = state_root
+        .as_deref()
+        .is_some_and(|r| r.len() >= 16 && r.chars().all(|c| c.is_ascii_hexdigit()));
     if !root_ok {
-        return Err(format!("xpr_state_fingerprint printed no usable state_root ({state_root:?})"));
+        return Err(format!(
+            "xpr_state_fingerprint printed no usable state_root ({state_root:?})"
+        ));
     }
     // The same digest a real ceremony's VERIFIED record carries (machine.rs: {"upstream_state_root": root}).
-    let fingerprints_digest = crate::beacon::fingerprints_digest(&json!({"upstream_state_root": state_root}));
+    let fingerprints_digest =
+        crate::beacon::fingerprints_digest(&json!({"upstream_state_root": state_root}));
     let head_end = ops.source_info().map(|i| i.head_block_num).unwrap_or(0);
 
     // Keep the small evidence files, drop the multi-GB work files unless asked to keep them.
     let evidence_dir = work.parent().unwrap_or(work).to_path_buf();
-    for name in [format!("compare-report-{h}.json"), format!("checkpoint-{h}.bin.manifest.json")] {
+    for name in [
+        format!("compare-report-{h}.json"),
+        format!("checkpoint-{h}.bin.manifest.json"),
+    ] {
         let src = work.join(&name);
         if let Ok(bytes) = std::fs::read(&src) {
             let _ = write_fresh(&evidence_dir.join(&name), &bytes);
@@ -1444,22 +1782,54 @@ fn drive<O: ChainOps>(
     });
     log.record(end, "done", result.clone())?;
     log.publish(result)?;
-    Ok(DrillOutcome { view: log.view.clone(), evidence_complete: true, compare_match })
+    Ok(DrillOutcome {
+        view: log.view.clone(),
+        evidence_complete: true,
+        compare_match,
+    })
 }
 
 /// The pinned programs a drill may run, allowed on its guard: the docker CLI (bound to the local socket) and the tools.
-fn allow_pinned_programs<O: ChainOps>(ops: &DrillGuard<'_, O>, up: &crate::config::Upstream) -> Result<(), String> {
-    let pin = |p: &Option<String>, key: &str| p.clone().ok_or_else(|| format!("upstream.{key}_sha256 is required for a drill"));
-    let docker = up.docker_bin.clone().ok_or("upstream.docker_bin is required for a drill")?;
+fn allow_pinned_programs<O: ChainOps>(
+    ops: &DrillGuard<'_, O>,
+    up: &crate::config::Upstream,
+) -> Result<(), String> {
+    let pin = |p: &Option<String>, key: &str| {
+        p.clone()
+            .ok_or_else(|| format!("upstream.{key}_sha256 is required for a drill"))
+    };
+    let docker = up
+        .docker_bin
+        .clone()
+        .ok_or("upstream.docker_bin is required for a drill")?;
     let mut programs = vec![
-        PinnedProgram { path: docker.display().to_string(), sha256: pin(&up.docker_bin_sha256, "docker_bin")?, docker: true },
-        PinnedProgram { path: up.import_bin.display().to_string(), sha256: pin(&up.import_bin_sha256, "import_bin")?, docker: false },
-        PinnedProgram { path: up.fingerprint_bin.display().to_string(), sha256: pin(&up.fingerprint_bin_sha256, "fingerprint_bin")?, docker: false },
+        PinnedProgram {
+            path: docker.display().to_string(),
+            sha256: pin(&up.docker_bin_sha256, "docker_bin")?,
+            docker: true,
+        },
+        PinnedProgram {
+            path: up.import_bin.display().to_string(),
+            sha256: pin(&up.import_bin_sha256, "import_bin")?,
+            docker: false,
+        },
+        PinnedProgram {
+            path: up.fingerprint_bin.display().to_string(),
+            sha256: pin(&up.fingerprint_bin_sha256, "fingerprint_bin")?,
+            docker: false,
+        },
     ];
     if let Some(c) = &up.compare_bin {
-        programs.push(PinnedProgram { path: c.display().to_string(), sha256: pin(&up.compare_bin_sha256, "compare_bin")?, docker: false });
+        programs.push(PinnedProgram {
+            path: c.display().to_string(),
+            sha256: pin(&up.compare_bin_sha256, "compare_bin")?,
+            docker: false,
+        });
     }
-    ops.allow_programs(programs, Some(format!("unix://{}", docker_socket(up).display())));
+    ops.allow_programs(
+        programs,
+        Some(format!("unix://{}", docker_socket(up).display())),
+    );
     Ok(())
 }
 
@@ -1468,7 +1838,9 @@ fn container_suffix(h: u64, now_ms: u64) -> String {
     use sha2::{Digest, Sha256};
     let mut seed = [0u8; 16];
     let _ = getrandom_fill(&mut seed);
-    let d = Sha256::digest(format!("{h}:{now_ms}:{}:{}", std::process::id(), hex::encode(seed)).as_bytes());
+    let d = Sha256::digest(
+        format!("{h}:{now_ms}:{}:{}", std::process::id(), hex::encode(seed)).as_bytes(),
+    );
     hex::encode(&d[..6])
 }
 
@@ -1487,8 +1859,17 @@ pub fn tools_evidence(up: &crate::config::Upstream) -> Value {
         "fingerprint_bin_sha256": up.fingerprint_bin_sha256,
         "export_image_digest": up.export_image.as_deref().and_then(image_digest),
     });
-    let canon = ["docker_bin_sha256", "import_bin_sha256", "compare_bin_sha256", "fingerprint_bin_sha256", "export_image_digest"]
-        .iter().map(|k| format!("{k}={}", pins[*k].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n");
+    let canon = [
+        "docker_bin_sha256",
+        "import_bin_sha256",
+        "compare_bin_sha256",
+        "fingerprint_bin_sha256",
+        "export_image_digest",
+    ]
+    .iter()
+    .map(|k| format!("{k}={}", pins[*k].as_str().unwrap_or("")))
+    .collect::<Vec<_>>()
+    .join("\n");
     use sha2::{Digest, Sha256};
     let mut v = pins;
     v["tools_digest"] = json!(hex::encode(Sha256::digest(canon.as_bytes())));
@@ -1507,11 +1888,20 @@ pub enum ContainerStatus {
 /// other failure is Unknown (never counted as gone).
 pub fn container_status<O: ChainOps>(ops: &O, prefix: &[String], name: &str) -> ContainerStatus {
     let mut argv = prefix.to_vec();
-    argv.extend(["inspect".into(), "--type".into(), "container".into(), "--format".into(), "{{.State.Status}}".into(), name.into()]);
+    argv.extend([
+        "inspect".into(),
+        "--type".into(),
+        "container".into(),
+        "--format".into(),
+        "{{.State.Status}}".into(),
+        name.into(),
+    ]);
     match ops.run_argv_cancellable(&argv, &mut || false) {
         Ok(Some(out)) => ContainerStatus::Present(out.trim().chars().take(40).collect()),
         Ok(None) => ContainerStatus::Unknown("inspect was cancelled".into()),
-        Err(e) if e.contains("No such object") || e.contains("No such container") => ContainerStatus::Gone,
+        Err(e) if e.contains("No such object") || e.contains("No such container") => {
+            ContainerStatus::Gone
+        }
         Err(e) => ContainerStatus::Unknown(e.chars().take(200).collect()),
     }
 }
@@ -1519,13 +1909,25 @@ pub fn container_status<O: ChainOps>(ops: &O, prefix: &[String], name: &str) -> 
 /// Stop (kill, then remove) and verify gone the export container this drill recorded. Ok(()) when none is recorded,
 /// it is already verified gone, or the daemon now says it does not exist; Err(why) otherwise (the view keeps
 /// `export_container_gone: false`, so the drill keeps counting as running).
-fn settle_export_container<O: ChainOps>(cfg: &Config, ops: &O, log: &mut DrillLog) -> Result<(), String> {
-    let Some(name) = log.view["export_container"].as_str().map(str::to_string) else { return Ok(()) };
+fn settle_export_container<O: ChainOps>(
+    cfg: &Config,
+    ops: &O,
+    log: &mut DrillLog,
+) -> Result<(), String> {
+    let Some(name) = log.view["export_container"].as_str().map(str::to_string) else {
+        return Ok(());
+    };
     if log.view["export_container_gone"].as_bool() == Some(true) {
         return Ok(());
     }
-    let up = cfg.upstream.as_ref().ok_or("no [upstream] section to reach docker")?;
-    let docker = up.docker_bin.as_ref().ok_or("upstream.docker_bin is not configured")?;
+    let up = cfg
+        .upstream
+        .as_ref()
+        .ok_or("no [upstream] section to reach docker")?;
+    let docker = up
+        .docker_bin
+        .as_ref()
+        .ok_or("upstream.docker_bin is not configured")?;
     let prefix = upstream::drill_docker_prefix(docker, &docker_socket(up));
     let mut last = container_status(ops, &prefix, &name);
     if last != ContainerStatus::Gone {
@@ -1550,7 +1952,11 @@ fn settle_export_container<O: ChainOps>(cfg: &Config, ops: &O, log: &mut DrillLo
         return Ok(());
     }
     let why = format!("export container {name} not verified gone ({last:?})");
-    let _ = log.record(now, "export_container_not_gone", json!({"name": name, "status": format!("{last:?}")}));
+    let _ = log.record(
+        now,
+        "export_container_not_gone",
+        json!({"name": name, "status": format!("{last:?}")}),
+    );
     Err(why)
 }
 
@@ -1586,12 +1992,20 @@ fn wait_until_not_running(cfg: &Config, wait: std::time::Duration) -> bool {
 /// 3. If no drill process is left to finish its own record, remove ONLY the snapshot request id that drill
 ///    recorded, on the producer API it recorded, and only while that request is still the single-block request at
 ///    the recorded H (never by height alone), and mark it FAILED.
-pub fn cancel<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> Result<String, String> {
+pub fn cancel<O: ChainOps>(
+    cfg: &Config,
+    ops: &O,
+    wait: std::time::Duration,
+) -> Result<String, String> {
     // r30 round 7: the marker is cleared inside cancel_inner, under the locks, and only for the cancelled drill's id.
     cancel_inner(cfg, ops, wait)
 }
 
-fn cancel_inner<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -> Result<String, String> {
+fn cancel_inner<O: ChainOps>(
+    cfg: &Config,
+    ops: &O,
+    wait: std::time::Duration,
+) -> Result<String, String> {
     let (h, live_pid) = match activity(cfg) {
         DrillActivity::Idle => return Ok("no readiness drill is running on this box".into()),
         DrillActivity::Running { h, pid, .. } => (h, pid),
@@ -1599,13 +2013,17 @@ fn cancel_inner<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -
     };
     let overlap = path_overlap_problems(cfg, h);
     if !overlap.is_empty() {
-        return Err(format!("cancel refused, nothing changed: {}", overlap.join("; ")));
+        return Err(format!(
+            "cancel refused, nothing changed: {}",
+            overlap.join("; ")
+        ));
     }
     if let Some(why) = producer_api_problem(&cfg.source.producer_api_url) {
         return Err(format!("cancel refused, nothing changed: {why}"));
     }
     let read_view = || {
-        std::fs::read_to_string(latest_path(cfg)).ok()
+        std::fs::read_to_string(latest_path(cfg))
+            .ok()
             .and_then(|t| serde_json::from_str::<Value>(&t).ok())
             .filter(Value::is_object)
             .unwrap_or_else(|| json!({"kind": DRILL_KIND, "drill": true, "h": h}))
@@ -1614,8 +2032,11 @@ fn cancel_inner<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -
     // now, before writing anything.
     let mut locks: Option<(std::fs::File, std::fs::File, std::fs::File)> = None;
     let take_locks = || -> Result<(std::fs::File, std::fs::File, std::fs::File), String> {
-        let j = Journal::lock(&cfg.journal_path)
-            .map_err(|e| format!("cancel refused, nothing changed: a ceremony or a drill holds this journal ({e})"))?;
+        let j = Journal::lock(&cfg.journal_path).map_err(|e| {
+            format!(
+                "cancel refused, nothing changed: a ceremony or a drill holds this journal ({e})"
+            )
+        })?;
         let r = Journal::lock(&root_lock_base(cfg))
             .map_err(|e| format!("cancel refused, nothing changed: another readiness drill holds the drill directory ({e})"))?;
         let pl = Journal::lock(&producer_lock_base(cfg)).map_err(|e| format!(
@@ -1630,16 +2051,29 @@ fn cancel_inner<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -
     }
     let dir = drill_dir(cfg, h);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let mut log = DrillLog { path: dir.join("drill.jsonl"), latest: latest_path(cfg), view: read_view() };
+    let mut log = DrillLog {
+        path: dir.join("drill.jsonl"),
+        latest: latest_path(cfg),
+        view: read_view(),
+    };
     if live_pid.is_some() {
-        write_fresh(&cancel_path(cfg, h), format!("{}\n", ops.now_ms()).as_bytes())?;
+        write_fresh(
+            &cancel_path(cfg, h),
+            format!("{}\n", ops.now_ms()).as_bytes(),
+        )?;
     }
     log.record(ops.now_ms(), "cancel_requested", json!({"pid": live_pid}))?;
 
     if live_pid.is_some() && wait_until_not_running(cfg, wait) {
-        return Ok(format!("readiness drill at H = {h} cancelled: it stopped itself (see {})", dir.join("drill.jsonl").display()));
+        return Ok(format!(
+            "readiness drill at H = {h} cancelled: it stopped itself (see {})",
+            dir.join("drill.jsonl").display()
+        ));
     }
-    let killed = crate::ops::kill_recorded_hook_group_keep_evidence(&pgid_file(cfg, h), std::time::Duration::from_secs(10));
+    let killed = crate::ops::kill_recorded_hook_group_keep_evidence(
+        &pgid_file(cfg, h),
+        std::time::Duration::from_secs(10),
+    );
     let killed_s = match &killed {
         Ok(Some(d)) => d.clone(),
         Ok(None) => "no live pipeline process group".to_string(),
@@ -1647,14 +2081,20 @@ fn cancel_inner<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -
     };
     log.record(ops.now_ms(), "cancel_group", json!({"result": killed_s}))?;
     if live_pid.is_some() && wait_until_not_running(cfg, wait) {
-        return Ok(format!("readiness drill at H = {h} cancelled after stopping its pipeline ({killed_s})"));
+        return Ok(format!(
+            "readiness drill at H = {h} cancelled after stopping its pipeline ({killed_s})"
+        ));
     }
     // Success only when the pipeline group is verified gone. A failed kill, or a group still alive, is an
     // incomplete cancel: the record stays RUNNING (a ceremony's ARM keeps refusing), the group record is kept, and
     // the command fails.
     let group_left = group_not_proven_gone(cfg, h);
     if killed.is_err() || group_left.is_some() {
-        log.record(ops.now_ms(), "cancel_incomplete", json!({"result": killed_s, "live_group": group_left}))?;
+        log.record(
+            ops.now_ms(),
+            "cancel_incomplete",
+            json!({"result": killed_s, "live_group": group_left}),
+        )?;
         return Err(format!(
             "cancel INCOMPLETE for the readiness drill at H = {h}: its pipeline process group is still alive or could \
              not be proven gone ({killed_s}{}); it was not marked cancelled. Stop it by hand, then run \
@@ -1680,11 +2120,16 @@ fn cancel_inner<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -
     // running.
     if container_not_verified_gone(&log.view) {
         let settled = match &cfg.upstream {
-            Some(up) => allow_pinned_programs(&guard, up).and_then(|()| settle_export_container(cfg, &guard, &mut log)),
+            Some(up) => allow_pinned_programs(&guard, up)
+                .and_then(|()| settle_export_container(cfg, &guard, &mut log)),
             None => Err("no [upstream] section to reach docker".into()),
         };
         if let Err(why) = settled {
-            log.record(ops.now_ms(), "cancel_incomplete", json!({"export_container": why}))?;
+            log.record(
+                ops.now_ms(),
+                "cancel_incomplete",
+                json!({"export_container": why}),
+            )?;
             return Err(format!(
                 "cancel INCOMPLETE for the readiness drill at H = {h}: {why}. It was not marked cancelled; stop the \
                  container by hand (`docker rm -f <name>` on the local daemon), then run `pulse-cutover drill --cancel` again"
@@ -1702,14 +2147,20 @@ fn cancel_inner<O: ChainOps>(cfg: &Config, ops: &O, wait: std::time::Duration) -
         }
     }
     let now = ops.now_ms();
-    log.record(now, "cancelled", json!({"by": "pulse-cutover drill --cancel", "drill_process": "not running"}))?;
+    log.record(
+        now,
+        "cancelled",
+        json!({"by": "pulse-cutover drill --cancel", "drill_process": "not running"}),
+    )?;
     log.publish(json!({"state": "FAILED",
         "error": "cancelled by `pulse-cutover drill --cancel` (the drill process was not running)",
         "finished_ts_ms": now}))?;
     if let Some(id) = log.view["drill_id"].as_str() {
         clear_work_marker_if_done(cfg, id); // the locks are held (`_locks`)
     }
-    Ok(format!("readiness drill at H = {h} marked cancelled; its process was not running ({killed_s})"))
+    Ok(format!(
+        "readiness drill at H = {h} marked cancelled; its process was not running ({killed_s})"
+    ))
 }
 
 /// Round 3: a recorded snapshot request may only be cleaned up through the producer API it was made on, at the
@@ -1751,19 +2202,32 @@ fn binding_problem(cfg: &Config, view: &Value, h: u64) -> Option<String> {
 /// export container does not exist. Anything unknown refuses (nothing changed). The removal is recorded in this
 /// config's drill directory.
 pub fn clear_marker<O: ChainOps>(cfg: &Config, ops: &O) -> Result<String, String> {
-    let marker = read_marker(cfg).map_err(|e| format!("clear-marker refused, nothing changed: the work marker cannot be \
-        read ({e}); inspect {} and remove it by hand only after checking no drill work runs", work_marker_path(cfg).display()))?;
-    let Some(m) = marker else { return Ok("no drill work marker on this producer".into()) };
+    let marker = read_marker(cfg).map_err(|e| {
+        format!(
+            "clear-marker refused, nothing changed: the work marker cannot be \
+        read ({e}); inspect {} and remove it by hand only after checking no drill work runs",
+            work_marker_path(cfg).display()
+        )
+    })?;
+    let Some(m) = marker else {
+        return Ok("no drill work marker on this producer".into());
+    };
     let (Some(jd), Some(h), Some(id)) = (m.journal_dir.clone(), m.h, m.drill_id.clone()) else {
         return Err("clear-marker refused, nothing changed: the marker is from before round 7 (no drill id) or names no \
             journal_dir / h: run `pulse-cutover drill --cancel` with that drill's config".into());
     };
     let overlap = path_overlap_problems(cfg, h);
     if !overlap.is_empty() {
-        return Err(format!("clear-marker refused, nothing changed: {}", overlap.join("; ")));
+        return Err(format!(
+            "clear-marker refused, nothing changed: {}",
+            overlap.join("; ")
+        ));
     }
-    let _j = Journal::lock(&cfg.journal_path)
-        .map_err(|e| format!("clear-marker refused, nothing changed: a ceremony or a drill holds this journal ({e})"))?;
+    let _j = Journal::lock(&cfg.journal_path).map_err(|e| {
+        format!(
+            "clear-marker refused, nothing changed: a ceremony or a drill holds this journal ({e})"
+        )
+    })?;
     let _r = Journal::lock(&root_lock_base(cfg))
         .map_err(|e| format!("clear-marker refused, nothing changed: a readiness drill holds the drill directory ({e})"))?;
     let _p = Journal::lock(&producer_lock_base(cfg)).map_err(|e| format!(
@@ -1772,7 +2236,9 @@ pub fn clear_marker<O: ChainOps>(cfg: &Config, ops: &O) -> Result<String, String
         return Err(format!("clear-marker refused, nothing changed: {why}"));
     }
     // Re-read under the producer lock: the marker cannot change from here on.
-    let Some(m2) = read_marker(cfg).map_err(|e| format!("clear-marker refused, nothing changed: {e}"))? else {
+    let Some(m2) =
+        read_marker(cfg).map_err(|e| format!("clear-marker refused, nothing changed: {e}"))?
+    else {
         return Ok("no drill work marker on this producer".into());
     };
     if m2.drill_id.as_deref() != Some(id.as_str()) {
@@ -1787,12 +2253,21 @@ pub fn clear_marker<O: ChainOps>(cfg: &Config, ops: &O) -> Result<String, String
             cannot be inspected"));
     }
     let Some(container) = m2.container.clone() else {
-        return Err("clear-marker refused, nothing changed: the marker records no export container".into());
+        return Err(
+            "clear-marker refused, nothing changed: the marker records no export container".into(),
+        );
     };
-    let up = cfg.upstream.as_ref().ok_or("clear-marker refused, nothing changed: no [upstream] section to reach docker")?;
-    let docker = up.docker_bin.as_ref().ok_or("clear-marker refused, nothing changed: upstream.docker_bin is not configured")?;
+    let up = cfg
+        .upstream
+        .as_ref()
+        .ok_or("clear-marker refused, nothing changed: no [upstream] section to reach docker")?;
+    let docker = up
+        .docker_bin
+        .as_ref()
+        .ok_or("clear-marker refused, nothing changed: upstream.docker_bin is not configured")?;
     let guard = DrillGuard::new(ops);
-    allow_pinned_programs(&guard, up).map_err(|e| format!("clear-marker refused, nothing changed: {e}"))?;
+    allow_pinned_programs(&guard, up)
+        .map_err(|e| format!("clear-marker refused, nothing changed: {e}"))?;
     let prefix = upstream::drill_docker_prefix(docker, &docker_socket(up));
     match container_status(&guard, &prefix, &container) {
         ContainerStatus::Gone => {}
@@ -1801,14 +2276,22 @@ pub fn clear_marker<O: ChainOps>(cfg: &Config, ops: &O) -> Result<String, String
     }
     let v = guard.violations.borrow().clone();
     if !v.is_empty() {
-        return Err(format!("clear-marker refused, nothing changed: forbidden operations attempted: {}", v.join(", ")));
+        return Err(format!(
+            "clear-marker refused, nothing changed: forbidden operations attempted: {}",
+            v.join(", ")
+        ));
     }
-    std::fs::create_dir_all(drill_root(cfg)).map_err(|e| format!("create {}: {e}", drill_root(cfg).display()))?;
+    std::fs::create_dir_all(drill_root(cfg))
+        .map_err(|e| format!("create {}: {e}", drill_root(cfg).display()))?;
     let record = json!({"kind": DRILL_KIND, "event": "work_marker_cleared", "ts_ms": ops.now_ms(), "drill_id": id, "h": h,
         "journal_dir": jd, "export_container": container, "verified": {"process": "not running", "pipeline_group": "none",
         "export_container": "gone (docker inspect on the local socket)"}});
-    write_fresh(&drill_root(cfg).join(format!("marker-cleared-{id}.json")), record.to_string().as_bytes())?;
-    std::fs::remove_file(work_marker_path(cfg)).map_err(|e| format!("remove {}: {e}", work_marker_path(cfg).display()))?;
+    write_fresh(
+        &drill_root(cfg).join(format!("marker-cleared-{id}.json")),
+        record.to_string().as_bytes(),
+    )?;
+    std::fs::remove_file(work_marker_path(cfg))
+        .map_err(|e| format!("remove {}: {e}", work_marker_path(cfg).display()))?;
     Ok(format!("drill work marker of drill {id} (H = {h}) removed: its process, pipeline group and export container are \
         verified gone"))
 }
@@ -1826,7 +2309,10 @@ pub fn marker_summary(cfg: &Config) -> Option<Value> {
         MarkerWork::Unknown(_) => "unknown",
         MarkerWork::Done { .. } => "done",
     };
-    let id = m.as_ref().and_then(|m| m.drill_id.clone()).filter(|s| s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit()));
+    let id = m
+        .as_ref()
+        .and_then(|m| m.drill_id.clone())
+        .filter(|s| s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit()));
     Some(json!({"state": state, "h": m.as_ref().and_then(|m| m.h), "drill_id": id}))
 }
 
@@ -1837,19 +2323,36 @@ pub fn marker_summary(cfg: &Config) -> Option<Value> {
 pub fn beacon_view(cfg: &Config) -> Option<Value> {
     // r30 round 7: an orphaned or live work marker on this producer is shown even when this box has no drill record.
     let marker = marker_summary(cfg);
-    let latest = std::fs::read_to_string(latest_path(cfg)).ok()
+    let latest = std::fs::read_to_string(latest_path(cfg))
+        .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
         .filter(|v| v["kind"].as_str() == Some(DRILL_KIND));
     let Some(v) = latest else {
         let m = marker?;
-        return Some(json!({"kind": DRILL_KIND, "h": m["h"].as_u64(), "state": null, "work_marker": m}));
+        return Some(
+            json!({"kind": DRILL_KIND, "h": m["h"].as_u64(), "state": null, "work_marker": m}),
+        );
     };
-    let hex = |k: &str| v[k].as_str().filter(|s| (16..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit()))
-        .map(str::to_ascii_lowercase);
-    let tables: Vec<Value> = v["compare_failing_tables"].as_array().map(|a| {
-        a.iter().filter_map(|t| t.as_str()).filter(|t| t.len() <= 48 && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
-            .take(30).map(|t| json!(t)).collect()
-    }).unwrap_or_default();
+    let hex = |k: &str| {
+        v[k].as_str()
+            .filter(|s| (16..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase)
+    };
+    let tables: Vec<Value> = v["compare_failing_tables"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str())
+                .filter(|t| {
+                    t.len() <= 48
+                        && t.chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                })
+                .take(30)
+                .map(|t| json!(t))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut timings = serde_json::Map::new();
     if let Some(t) = v["timings_ms"].as_object() {
         for (k, val) in t {
@@ -1883,13 +2386,23 @@ pub fn beacon_view(cfg: &Config) -> Option<Value> {
 
 /// The `tools` pins of a drill view: only 64-hex values under the known keys.
 fn tools_view(t: &Value) -> Value {
-    let keys = ["docker_bin_sha256", "import_bin_sha256", "compare_bin_sha256", "fingerprint_bin_sha256",
-        "export_image_digest", "tools_digest"];
+    let keys = [
+        "docker_bin_sha256",
+        "import_bin_sha256",
+        "compare_bin_sha256",
+        "fingerprint_bin_sha256",
+        "export_image_digest",
+        "tools_digest",
+    ];
     let mut out = serde_json::Map::new();
     for k in keys {
         if let Some(h) = t[k].as_str().filter(|s| valid_pin(s)) {
             out.insert(k.into(), json!(h));
         }
     }
-    if out.is_empty() { Value::Null } else { Value::Object(out) }
+    if out.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(out)
+    }
 }

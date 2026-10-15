@@ -16,13 +16,7 @@ use std::io::Write as _;
 
 use serde_json::json;
 
-use crate::{
-    config::Config,
-    journal::Journal,
-    machine::Machine,
-    ops::ChainOps,
-    state::State,
-};
+use crate::{config::Config, journal::Journal, machine::Machine, ops::ChainOps, state::State};
 
 #[derive(Debug, Clone)]
 pub struct RunMetrics {
@@ -216,7 +210,10 @@ pub fn run_loop<O: ChainOps>(cfg: &Config, ops: &O, runs: u32) -> Result<(), Str
 /// - A source that answers must report the configured chain (a real mainnet node under a testnet config is refused).
 /// - No ceremony (the base journal's lock) and no readiness drill (the drill-root lock, and the drill's activity record)
 ///   may be active on this box.
-pub fn loop_gate<O: ChainOps>(cfg: &Config, ops: &O) -> Result<(std::fs::File, std::fs::File, Option<std::fs::File>), String> {
+pub fn loop_gate<O: ChainOps>(
+    cfg: &Config,
+    ops: &O,
+) -> Result<(std::fs::File, std::fs::File, Option<std::fs::File>), String> {
     let chain = cfg.ceremony.chain_id.as_deref().map(str::trim).filter(|c| !c.is_empty()).ok_or(
         "loop refused: set ceremony.chain_id (the reset may stop or start the source, so the chain must be pinned in the \
          config, not learned from a node that may be down)")?;
@@ -230,14 +227,21 @@ pub fn loop_gate<O: ChainOps>(cfg: &Config, ops: &O) -> Result<(std::fs::File, s
     match ops.source_info() {
         Ok(info) => {
             if !info.chain_id.trim().eq_ignore_ascii_case(chain) {
-                return Err(format!("loop refused: the source reports chain_id {} but the config pins {chain}", info.chain_id));
+                return Err(format!(
+                    "loop refused: the source reports chain_id {} but the config pins {chain}",
+                    info.chain_id
+                ));
             }
             if crate::config::is_xpr_mainnet(&info.chain_id) && !cfg.is_shadow() {
                 return Err("loop refused: the source is XPR MAINNET".into());
             }
         }
         Err(e) => {
-            let allowed = cfg.r#loop.as_ref().is_some_and(|l| l.reset_when_source_down) && !mainnet;
+            let allowed = cfg
+                .r#loop
+                .as_ref()
+                .is_some_and(|l| l.reset_when_source_down)
+                && !mainnet;
             if !allowed {
                 return Err(format!("loop refused: the source does not answer ({e}), so its chain cannot be checked before \
                     reset_cmd (set [loop] reset_when_source_down = true to reset a stopped node; refused for mainnet)"));
@@ -247,14 +251,17 @@ pub fn loop_gate<O: ChainOps>(cfg: &Config, ops: &O) -> Result<(std::fs::File, s
     if cfg.is_shadow() {
         let problems = crate::shadow::identity_problems(cfg, ops);
         if !problems.is_empty() {
-            return Err(format!("loop refused: SHADOW identity not proven before reset_cmd (nothing was run): {}",
-                               problems.join("; ")));
+            return Err(format!(
+                "loop refused: SHADOW identity not proven before reset_cmd (nothing was run): {}",
+                problems.join("; ")
+            ));
         }
     }
     let journal_lock = Journal::lock(&cfg.journal_path)
         .map_err(|e| format!("loop refused: a ceremony holds this box's journal lock ({e})"))?;
-    let drill_lock = Journal::lock(&crate::drill::root_lock_base(cfg))
-        .map_err(|e| format!("loop refused: a readiness drill or ceremony holds the drill lock ({e})"))?;
+    let drill_lock = Journal::lock(&crate::drill::root_lock_base(cfg)).map_err(|e| {
+        format!("loop refused: a readiness drill or ceremony holds the drill lock ({e})")
+    })?;
     // Round 6 (review R6-4): and the producer's lock (order: journal, drill root, producer), held through reset_cmd.
     let producer_lock = match Journal::try_lock(&crate::drill::producer_lock_base(cfg)) {
         Ok(f) => Some(f),
@@ -298,15 +305,23 @@ fn write_metrics(file: &mut std::fs::File, m: &RunMetrics) -> Result<(), String>
 pub fn print_summary(all: &[RunMetrics]) {
     let live = all.iter().filter(|m| m.terminal == "LIVE").count();
     println!("\n================ LOOP SUMMARY ================");
-    println!("runs: {}   LIVE: {live}   non-LIVE: {}", all.len(), all.len() - live);
+    println!(
+        "runs: {}   LIVE: {live}   non-LIVE: {}",
+        all.len(),
+        all.len() - live
+    );
     for m in all {
         println!(
             "  run {:>3}: {:<12} gap={:>7}ms total={:>7}ms cut={} {}",
             m.run,
             m.terminal,
-            m.gap_ms.map(|g| g.to_string()).unwrap_or_else(|| "-".into()),
+            m.gap_ms
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| "-".into()),
             m.total_ms,
-            m.cut_height.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+            m.cut_height
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".into()),
             m.abort_reason.clone().unwrap_or_default(),
         );
     }

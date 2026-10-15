@@ -15,18 +15,10 @@
 //! necessarily a reachable one (the deferred-tx cluster is the canonical
 //! example). The ceremony journals the table and continues.
 
-use std::collections::{
-    BTreeMap,
-    BTreeSet,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use pulsevm_snapshot::SnapshotReader;
-use wasmparser::{
-    Imports,
-    Parser,
-    Payload,
-    TypeRef,
-};
+use wasmparser::{Imports, Parser, Payload, TypeRef};
 
 /// The served host-function table: the 183 `env` import names registered by
 /// upstream PulseVM v1.0.0 (tag v1.0.0 = 4a43d8bb, the `imports!` table in
@@ -66,9 +58,7 @@ pub struct ScanReport {
 }
 
 /// Function imports of one wasm module, split into `env` and everything else.
-pub fn wasm_env_imports(
-    wasm: &[u8],
-) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+pub fn wasm_env_imports(wasm: &[u8]) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
     let mut env = BTreeSet::new();
     let mut non_env = BTreeSet::new();
     for payload in Parser::new(0).parse_all(wasm) {
@@ -84,13 +74,10 @@ pub fn wasm_env_imports(
                         non_env.insert(format!("{module}::{name}"));
                     }
                 };
-                let is_func =
-                    |ty: &TypeRef| matches!(ty, TypeRef::Func(_) | TypeRef::FuncExact(_));
+                let is_func = |ty: &TypeRef| matches!(ty, TypeRef::Func(_) | TypeRef::FuncExact(_));
                 for group in reader {
                     match group.map_err(|e| e.to_string())? {
-                        Imports::Single(_, imp) => {
-                            record(imp.module, imp.name, is_func(&imp.ty))
-                        }
+                        Imports::Single(_, imp) => record(imp.module, imp.name, is_func(&imp.ty)),
                         Imports::Compact1 { module, items } => {
                             for item in items {
                                 let item = item.map_err(|e| e.to_string())?;
@@ -113,10 +100,7 @@ pub fn wasm_env_imports(
 }
 
 /// Scan every code object in a snapshot against the served import set.
-pub fn scan_snapshot_bytes(
-    bytes: &[u8],
-    served: &BTreeSet<String>,
-) -> Result<ScanReport, String> {
+pub fn scan_snapshot_bytes(bytes: &[u8], served: &BTreeSet<String>) -> Result<ScanReport, String> {
     let snapshot = SnapshotReader::new(bytes).map_err(|e| format!("parse snapshot: {e:?}"))?;
 
     // code_hash -> accounts running that code.
@@ -138,7 +122,10 @@ pub fn scan_snapshot_bytes(
         served_count: served.len(),
         ..Default::default()
     };
-    for code in snapshot.code().map_err(|e| format!("code section: {e:?}"))? {
+    for code in snapshot
+        .code()
+        .map_err(|e| format!("code section: {e:?}"))?
+    {
         let code = code.map_err(|e| format!("code row: {e:?}"))?;
         report.code_objects += 1;
         let hash = code.code_hash.to_string();
@@ -174,15 +161,13 @@ pub fn scan_snapshot_bytes(
         }
     }
     // Widest exposure first: most unserved imports, then most accounts.
-    report
-        .rows
-        .sort_by(|a, b| {
-            b.unserved
-                .len()
-                .cmp(&a.unserved.len())
-                .then(b.accounts.len().cmp(&a.accounts.len()))
-                .then(a.code_hash.cmp(&b.code_hash))
-        });
+    report.rows.sort_by(|a, b| {
+        b.unserved
+            .len()
+            .cmp(&a.unserved.len())
+            .then(b.accounts.len().cmp(&a.accounts.len()))
+            .then(a.code_hash.cmp(&b.code_hash))
+    });
     Ok(report)
 }
 
@@ -261,7 +246,7 @@ mod tests {
             out.extend(s.as_bytes());
         }
         let mut module = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // \0asm v1
-        // Type section: one type, () -> ().
+                                                                               // Type section: one type, () -> ().
         let mut types = Vec::new();
         leb(&mut types, 1);
         types.push(0x60);
@@ -306,7 +291,10 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect()
         );
-        assert_eq!(non_env, ["wasi::fd_write".to_string()].into_iter().collect());
+        assert_eq!(
+            non_env,
+            ["wasi::fd_write".to_string()].into_iter().collect()
+        );
     }
 
     #[test]
@@ -341,10 +329,7 @@ mod tests {
     fn mini_snapshot_scans_clean_with_zero_code_objects() {
         // MiniSnapshot carries an empty code section: the scan must parse the
         // real container format and report zero exposure (not error out).
-        use pulsevm_snapshot::testing::{
-            MiniSnapshot,
-            TestAccount,
-        };
+        use pulsevm_snapshot::testing::{MiniSnapshot, TestAccount};
         let mini = MiniSnapshot {
             chain_id: [0xCD; 32],
             head_block_num: 42,

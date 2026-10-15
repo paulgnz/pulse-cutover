@@ -11,7 +11,8 @@ use serde::Deserialize;
 
 /// XPR Network MAINNET chain_id. Rehearsal-only overrides are refused for it, at config load and
 /// again at ARM (when the chain_id is discovered rather than configured).
-pub const XPR_MAINNET_CHAIN_ID: &str = "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0";
+pub const XPR_MAINNET_CHAIN_ID: &str =
+    "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0";
 
 /// r30 round 7: why an XPR mainnet config without an explicit `[ceremony] lock_dir` is refused.
 pub const MAINNET_LOCK_DIR_REQUIRED: &str = "an XPR MAINNET config must set [ceremony] lock_dir explicitly (an absolute \
@@ -185,7 +186,10 @@ pub fn check_roster(roster: &[RosterMember]) -> Result<(), String> {
                     _ => true,
                 };
             if dup {
-                return Err(format!("roster lists {} more than once (each member may count once toward the quorum)", m.producer));
+                return Err(format!(
+                    "roster lists {} more than once (each member may count once toward the quorum)",
+                    m.producer
+                ));
             }
         }
     }
@@ -808,7 +812,8 @@ pub struct Target {
 impl Target {
     /// The Metal network id the target is expected on (config, else derived from the source chain).
     pub fn expected_metal_network(&self, source_chain_id: Option<&str>) -> Option<u64> {
-        self.metal_network_id.or_else(|| crate::beacon::expected_metal_network(source_chain_id))
+        self.metal_network_id
+            .or_else(|| crate::beacon::expected_metal_network(source_chain_id))
     }
 }
 
@@ -883,7 +888,14 @@ fn default_hook_timeout() -> u64 {
 
 impl Default for Hooks {
     fn default() -> Self {
-        Hooks { on_freeze: None, post_ignite: None, on_live: None, on_abort: None, on_halt: None, timeout_secs: default_hook_timeout() }
+        Hooks {
+            on_freeze: None,
+            post_ignite: None,
+            on_live: None,
+            on_abort: None,
+            on_halt: None,
+            timeout_secs: default_hook_timeout(),
+        }
     }
 }
 
@@ -949,24 +961,40 @@ impl Config {
             return Err("ceremony.quiescence_timeout_secs must be > 0 (0 would abort every ceremony at the pause)".into());
         }
         // rc.29: mission control calls a beacon silent after 3 × its interval, capped at 600 s.
-        if let Some(b) = config.beacon.as_ref().filter(|b| b.interval_secs == 0 || b.interval_secs > 200) {
+        if let Some(b) = config
+            .beacon
+            .as_ref()
+            .filter(|b| b.interval_secs == 0 || b.interval_secs > 200)
+        {
             return Err(format!("beacon.interval_secs = {} must be 1..=200 (mission control treats a beacon as silent \
                 after 3 × its interval, at most 600 s)", b.interval_secs));
         }
         if config.snapshot.golden_roots.is_some() && config.snapshot.capture_roots.is_some() {
-            return Err("snapshot.golden_roots and snapshot.capture_roots are mutually exclusive: \
+            return Err(
+                "snapshot.golden_roots and snapshot.capture_roots are mutually exclusive: \
                         a node either verifies against published goldens or captures its own"
-                .into());
+                    .into(),
+            );
         }
-        if config.r#loop.as_ref().is_some_and(|l| l.reset_when_source_down)
-            && config.ceremony.chain_id.as_deref().is_some_and(is_xpr_mainnet)
+        if config
+            .r#loop
+            .as_ref()
+            .is_some_and(|l| l.reset_when_source_down)
+            && config
+                .ceremony
+                .chain_id
+                .as_deref()
+                .is_some_and(is_xpr_mainnet)
         {
             return Err("loop.reset_when_source_down is refused for an XPR MAINNET chain_id (a reset must always see \
                         the source it acts on)".into());
         }
         if let Some(d) = &config.ceremony.lock_dir {
             if !d.is_absolute() {
-                return Err(format!("ceremony.lock_dir must be an absolute path (got {})", d.display()));
+                return Err(format!(
+                    "ceremony.lock_dir must be an absolute path (got {})",
+                    d.display()
+                ));
             }
         }
         if config.snapshot.path_map_from.is_some() != config.snapshot.path_map_to.is_some() {
@@ -974,13 +1002,22 @@ impl Config {
         }
         crate::shadow::check_config(&config)?;
         config.check_rehearsal_overrides()?;
-        if enforce_production && config.ceremony.chain_id.as_deref().is_some_and(is_xpr_mainnet) {
+        if enforce_production
+            && config
+                .ceremony
+                .chain_id
+                .as_deref()
+                .is_some_and(is_xpr_mainnet)
+        {
             let problems = config.mainnet_coordination_problems(false);
             if !problems.is_empty() {
                 return Err(problems.join("; "));
             }
         }
-        if enforce_production && config.ceremony.profile == Profile::Ceremony && !config.ceremony.rehearsal {
+        if enforce_production
+            && config.ceremony.profile == Profile::Ceremony
+            && !config.ceremony.rehearsal
+        {
             let problems = config.production_problems();
             if !problems.is_empty() {
                 return Err(format!(
@@ -1023,9 +1060,11 @@ impl Config {
             && config.coordination.is_some();
         if config.ceremony.freeze_height == 0 && !awaiting_event {
             if config.ceremony.freeze_margin.is_none() {
-                return Err("ceremony.freeze_height is 0: set the event's H (or use `await`, which \
+                return Err(
+                    "ceremony.freeze_height is 0: set the event's H (or use `await`, which \
                             takes H from the signed coordinator event)"
-                    .into());
+                        .into(),
+                );
             }
             if !config.ceremony.derive_h_at_arm {
                 return Err("ceremony.freeze_height = 0 with freeze_margin would DERIVE H at arm time. \
@@ -1038,37 +1077,49 @@ impl Config {
             && !config.ceremony.simulate_freeze
             && config.snapshot.dir.is_none()
         {
-            return Err("api mode (without simulate_freeze) cuts at exactly H via schedule_snapshot and \
+            return Err(
+                "api mode (without simulate_freeze) cuts at exactly H via schedule_snapshot and \
                         needs snapshot.dir (where nodeos writes snapshot-<block_id_at_H>.bin)"
-                .into());
+                    .into(),
+            );
         }
         if config.ceremony.mode == Mode::Api {
             if config.flip.is_none() {
-                return Err("api mode requires a [flip] section (cmd + public_url): the \
+                return Err(
+                    "api mode requires a [flip] section (cmd + public_url): the \
                             /v1 URL swap IS the user-visible cutover"
-                    .into());
+                        .into(),
+                );
             }
             if config.source.stop_cmd.is_none() {
-                return Err("api mode requires source.stop_cmd (the operator's own nodeos \
+                return Err(
+                    "api mode requires source.stop_cmd (the operator's own nodeos \
                             stop script; runs only after FLIPPED is healthy)"
-                    .into());
+                        .into(),
+                );
             }
         }
         if config.ceremony.simulate_freeze && config.ceremony.mode != Mode::Api {
-            return Err("simulate_freeze is only meaningful in api mode (a producer freezes \
+            return Err(
+                "simulate_freeze is only meaningful in api mode (a producer freezes \
                         the chain for real)"
-                .into());
+                    .into(),
+            );
         }
         if config.hyperion.is_some() && config.ceremony.mode != Mode::Api {
-            return Err("[hyperion] composes with api mode (mode = \"api\"): /v2 continuity \
+            return Err(
+                "[hyperion] composes with api mode (mode = \"api\"): /v2 continuity \
                         is an API-provider concern — the flip is the user-visible act"
-                .into());
+                    .into(),
+            );
         }
         if config.ceremony.import_backend == ImportBackend::Upstream && config.upstream.is_none() {
-            return Err("ceremony.import_backend = \"upstream\" requires an [upstream] section \
+            return Err(
+                "ceremony.import_backend = \"upstream\" requires an [upstream] section \
                         (work_dir, export_cmd, import_bin, fingerprint_bin — the official #61 \
                         pipeline the ceremony drives)"
-                .into());
+                    .into(),
+            );
         }
         if let Some(up) = &config.upstream {
             if up.genesis_base.is_some() != config.target.create_chain_cmd.is_some() {
@@ -1081,9 +1132,11 @@ impl Config {
             && config.ceremony.mode == Mode::Producer
             && config.snapshot.dir.is_none()
         {
-            return Err("freeze_strategy = \"schedule_at_h\" requires snapshot.dir (the host \
+            return Err(
+                "freeze_strategy = \"schedule_at_h\" requires snapshot.dir (the host \
                         directory where the scheduled snapshot-<block_id>.bin lands)"
-                .into());
+                    .into(),
+            );
         }
         // r30 round 7 (review F2): the default lock_dir depends on which user runs (a root ceremony and a non-root
         // drill or loop would lock different directories and stop excluding each other). XPR mainnet configs (the
@@ -1100,9 +1153,14 @@ impl Config {
     /// r30 round 7/8: Some(why) when this is an XPR mainnet ceremony-profile config without an explicit
     /// `[ceremony] lock_dir`. Refused by the entry points that start something new; a warning everywhere else.
     pub fn mainnet_lock_dir_problem(&self) -> Option<&'static str> {
-        (self.ceremony.profile == Profile::Ceremony && self.ceremony.lock_dir.is_none()
-            && self.ceremony.chain_id.as_deref().is_some_and(is_xpr_mainnet))
-            .then_some(MAINNET_LOCK_DIR_REQUIRED)
+        (self.ceremony.profile == Profile::Ceremony
+            && self.ceremony.lock_dir.is_none()
+            && self
+                .ceremony
+                .chain_id
+                .as_deref()
+                .is_some_and(is_xpr_mainnet))
+        .then_some(MAINNET_LOCK_DIR_REQUIRED)
     }
 
     /// Settings that are accepted but do nothing in this configuration, one line each (printed at
@@ -1112,7 +1170,9 @@ impl Config {
         // Not rejected: a coordinator event may carry import_cpu_scale and every producer must
         // hold the same value to accept it (signed payload, agreement check), so refusing a
         // non-default here would make an inert field block the event. Warned loudly instead.
-        if self.ceremony.import_backend == ImportBackend::Upstream && self.ceremony.import_cpu_scale != default_cpu_scale() {
+        if self.ceremony.import_backend == ImportBackend::Upstream
+            && self.ceremony.import_cpu_scale != default_cpu_scale()
+        {
             out.push(format!(
                 "ceremony.import_cpu_scale = {} is IGNORED with import_backend = \"upstream\": PulseVM v1.0.0 has no \
                  import CPU scale (the #61 checkpoint carries the source's CPU limits unchanged). It only has to match \
@@ -1123,7 +1183,11 @@ impl Config {
         }
         // rc.25 F6: the resume guard needs this node's own report visible on the relay. Without a beacon (or with a
         // beacon under a name the roster does not list) peers never see it and every guarded abort strands.
-        if let Some(co) = self.coordination.as_ref().filter(|co| !co.roster.is_empty()) {
+        if let Some(co) = self
+            .coordination
+            .as_ref()
+            .filter(|co| !co.roster.is_empty())
+        {
             match self.beacon.as_ref() {
                 None => out.push("[coordination] has a roster but no [beacon]: peers cannot see this node, so it is never counted \
                                   at the fleet gate and every guarded abort strands (the old chain is never resumed automatically)".into()),
@@ -1138,7 +1202,11 @@ impl Config {
         if let (Some(co), Some(b)) = (self.coordination.as_ref(), self.beacon.as_ref()) {
             if let Some(mine) = crate::beacon::instance_id_readonly(self) {
                 for m in co.roster.iter().filter(|m| m.producer == b.producer) {
-                    if let Some(pin) = m.instance_id.as_deref().filter(|p| !p.eq_ignore_ascii_case(&mine)) {
+                    if let Some(pin) = m
+                        .instance_id
+                        .as_deref()
+                        .filter(|p| !p.eq_ignore_ascii_case(&mine))
+                    {
                         out.push(format!(
                             "the event roster pins instance {pin} for producer {}, but this node's beacon instance is {mine}: \
                              this node will not recognize itself (its report never counts, and a guarded abort strands). \
@@ -1167,8 +1235,11 @@ impl Config {
         }
         // A SHADOW runs on a private network by definition (checked by `shadow::check_config` and verified against
         // the target at ARM): that is its identity, not a relaxation.
-        if let (Some(n), Some(want), false) = (self.target.metal_network_id,
-            crate::beacon::expected_metal_network(self.ceremony.chain_id.as_deref()), self.is_shadow()) {
+        if let (Some(n), Some(want), false) = (
+            self.target.metal_network_id,
+            crate::beacon::expected_metal_network(self.ceremony.chain_id.as_deref()),
+            self.is_shadow(),
+        ) {
             if n != want {
                 out.push(format!("target.metal_network_id = {n} (private Metal network; this chain moves to network {want})"));
             }
@@ -1204,10 +1275,16 @@ impl Config {
             out.push("target.post_live_probe_cmd is not set (a post-LIVE probe that executes the intended workload is required)".into());
         }
         if c.mode == Mode::Producer {
-            for (name, h) in [("on_freeze", &self.hooks.on_freeze), ("post_ignite", &self.hooks.post_ignite),
-                              ("on_live", &self.hooks.on_live), ("on_abort", &self.hooks.on_abort)] {
+            for (name, h) in [
+                ("on_freeze", &self.hooks.on_freeze),
+                ("post_ignite", &self.hooks.post_ignite),
+                ("on_live", &self.hooks.on_live),
+                ("on_abort", &self.hooks.on_abort),
+            ] {
                 if h.is_none() {
-                    out.push(format!("hooks.{name} is not set (required in producer mode)"));
+                    out.push(format!(
+                        "hooks.{name} is not set (required in producer mode)"
+                    ));
                 }
             }
             if c.freeze_strategy != FreezeStrategy::ScheduleAtH {
@@ -1219,8 +1296,15 @@ impl Config {
         }
         match c.import_backend {
             ImportBackend::Upstream => {
-                if self.upstream.as_ref().is_some_and(|u| u.compare_bin.is_none()) {
-                    out.push("upstream.compare_bin is not set (VERIFIED requires the state comparison)".into());
+                if self
+                    .upstream
+                    .as_ref()
+                    .is_some_and(|u| u.compare_bin.is_none())
+                {
+                    out.push(
+                        "upstream.compare_bin is not set (VERIFIED requires the state comparison)"
+                            .into(),
+                    );
                 }
             }
             ImportBackend::Fork => {
@@ -1245,7 +1329,9 @@ impl Config {
         // never a real mainnet cut; an API-mode shadow may run alone. A PRODUCER-mode shadow keeps the multi-party
         // controls of a real cut (signed event, roster, quorum ≥ 2), on a "shadow*" coordination network
         // (`shadow::check_config`).
-        if self.ceremony.profile != Profile::Ceremony || (self.is_shadow() && self.ceremony.mode == Mode::Api) {
+        if self.ceremony.profile != Profile::Ceremony
+            || (self.is_shadow() && self.ceremony.mode == Mode::Api)
+        {
             return out;
         }
         let Some(co) = &self.coordination else {
@@ -1285,7 +1371,11 @@ impl Config {
     pub fn check_rehearsal_overrides(&self) -> Result<(), String> {
         if let Some(up) = &self.upstream {
             for t in &up.rehearsal_allow_compare_mismatch {
-                if t.is_empty() || !t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+                if t.is_empty()
+                    || !t
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                {
                     return Err(format!(
                         "upstream.rehearsal_allow_compare_mismatch entry {t:?} is not a table name \
                          (exact names as xpr_19_table_compare prints them, e.g. \"global_property\")"
@@ -1307,7 +1397,13 @@ impl Config {
         if overrides.is_empty() {
             return Ok(());
         }
-        if self.ceremony.chain_id.as_deref().is_some_and(is_xpr_mainnet) && !self.is_shadow() {
+        if self
+            .ceremony
+            .chain_id
+            .as_deref()
+            .is_some_and(is_xpr_mainnet)
+            && !self.is_shadow()
+        {
             return Err(format!(
                 "rehearsal overrides are refused for XPR MAINNET (ceremony.chain_id {XPR_MAINNET_CHAIN_ID}): {}. \
                  They relax gates a real cut depends on; remove them.",
@@ -1333,7 +1429,9 @@ impl Config {
     /// `run`/`loop`: the cut height must be known (explicit H, or the rehearsal derive opt-in).
     /// A coordination config with freeze_height = 0 is for `await` only.
     pub fn ensure_h_known(&self) -> Result<(), String> {
-        if self.ceremony.freeze_height == 0 && !(self.ceremony.derive_h_at_arm && self.ceremony.freeze_margin.is_some()) {
+        if self.ceremony.freeze_height == 0
+            && !(self.ceremony.derive_h_at_arm && self.ceremony.freeze_margin.is_some())
+        {
             return Err("ceremony.freeze_height is 0: this config waits for a coordinator event. Run `pulse-cutover await` with it (H comes from the signed event), or set freeze_height"
                 .into());
         }
@@ -1342,10 +1440,12 @@ impl Config {
 
     pub fn ensure_ceremony_profile(&self) -> Result<(), String> {
         if self.ceremony.profile == Profile::Readiness {
-            return Err("this config is a READINESS-ONLY profile ([ceremony] profile = \"readiness\", \
+            return Err(
+                "this config is a READINESS-ONLY profile ([ceremony] profile = \"readiness\", \
                         written by beacon-install.sh): it reports readiness to mission control and \
                         cannot run a ceremony. Use the ceremony config staged for the event."
-                .into());
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -1369,7 +1469,8 @@ pub fn check_beacon_url(raw: &str) -> Result<(), String> {
     if raw.is_empty() {
         return Ok(());
     }
-    let u = url::Url::parse(raw).map_err(|e| format!("beacon.url {raw:?} is not a valid URL: {e}"))?;
+    let u =
+        url::Url::parse(raw).map_err(|e| format!("beacon.url {raw:?} is not a valid URL: {e}"))?;
     if !u.username().is_empty() || u.password().is_some() {
         return Err(format!("beacon.url {raw:?} contains userinfo (user@host): refused, the real destination would be ambiguous"));
     }
@@ -1386,6 +1487,8 @@ pub fn check_beacon_url(raw: &str) -> Result<(), String> {
             "beacon.url {raw:?} is plain http to a remote host: the bearer token would travel \
              unencrypted. Use https:// (http is allowed only to localhost)"
         )),
-        other => Err(format!("beacon.url {raw:?}: scheme {other:?} is not allowed (https only)")),
+        other => Err(format!(
+            "beacon.url {raw:?}: scheme {other:?} is not allowed (https only)"
+        )),
     }
 }

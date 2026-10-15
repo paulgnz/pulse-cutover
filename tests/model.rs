@@ -28,31 +28,18 @@
 //! `MODEL_SCENARIOS=20000 cargo test --test model -- --nocapture`. Replay one: `MODEL_SEED=<seed>`.
 
 use std::{
-    cell::{
-        Cell,
-        RefCell,
-    },
-    path::{
-        Path,
-        PathBuf,
-    },
+    cell::{Cell, RefCell},
+    path::{Path, PathBuf},
 };
 
 use pulse_cutover::{
     config::Config,
     journal::Journal,
     machine::Machine,
-    ops::{
-        ChainInfo,
-        ChainOps,
-        SnapshotResult,
-    },
+    ops::{ChainInfo, ChainOps, SnapshotResult},
     state::State,
 };
-use pulsevm_snapshot::testing::{
-    MiniSnapshot,
-    TestAccount,
-};
+use pulsevm_snapshot::testing::{MiniSnapshot, TestAccount};
 
 const CHAIN_ID: [u8; 32] = [0xAB; 32];
 const CRASH: &str = "MODEL-CRASH-INJECTED";
@@ -64,7 +51,10 @@ fn mini(head: u32) -> MiniSnapshot {
         head_block_num: head,
         head_slot: 1_514_764_800,
         head_producer: "eosio".parse().unwrap(),
-        accounts: vec![TestAccount { name: "cutdemo1".parse().unwrap(), key: [2u8; 33] }],
+        accounts: vec![TestAccount {
+            name: "cutdemo1".parse().unwrap(),
+            key: [2u8; 33],
+        }],
     }
 }
 
@@ -85,7 +75,11 @@ impl Rng {
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
     fn below(&mut self, n: u64) -> u64 {
-        if n == 0 { 0 } else { self.next() % n }
+        if n == 0 {
+            0
+        } else {
+            self.next() % n
+        }
     }
     fn chance(&mut self, pct: u64) -> bool {
         self.below(100) < pct
@@ -264,7 +258,9 @@ impl World {
     }
 
     fn releases(&self) -> usize {
-        self.journal_text().matches("\"side_effect\":\"external_pause_release\"").count()
+        self.journal_text()
+            .matches("\"side_effect\":\"external_pause_release\"")
+            .count()
     }
 
     /// Every agent operation passes through here: the crash point and the progress budget.
@@ -306,7 +302,10 @@ impl World {
             self.owner.set(None);
             self.agent_paused.set(false);
             self.ext_resume_agent_unread.set(true);
-            self.note(format!("external resume of the AGENT's pause at head {}", self.head.get()));
+            self.note(format!(
+                "external resume of the AGENT's pause at head {}",
+                self.head.get()
+            ));
         }
     }
 
@@ -315,7 +314,8 @@ impl World {
     fn begin_step(&self) {
         self.release_baseline.set(self.releases());
         let complete = Journal::replay(&self.journal)
-            .map(|r| r.state == Some(State::Aborted) && r.aborted_rollback_complete).unwrap_or(false);
+            .map(|r| r.state == Some(State::Aborted) && r.aborted_rollback_complete)
+            .unwrap_or(false);
         self.complete_before.set(complete);
     }
 
@@ -325,12 +325,17 @@ impl World {
         if h == 0 || self.head.get().saturating_sub(1) < h {
             return;
         }
-        let file = self.snap_dir.join(format!("snapshot-{}.bin", self.block_id(h)));
+        let file = self
+            .snap_dir
+            .join(format!("snapshot-{}.bin", self.block_id(h)));
         if !file.exists() {
             let _ = std::fs::create_dir_all(&self.snap_dir);
             let _ = std::fs::write(&file, mini(h as u32).build());
             self.target_head.set(h);
-            self.note(format!("scheduler wrote the snapshot of H={h} (head {})", self.head.get()));
+            self.note(format!(
+                "scheduler wrote the snapshot of H={h} (head {})",
+                self.head.get()
+            ));
         }
     }
 
@@ -427,7 +432,10 @@ impl ChainOps for World {
             self.owner.set(Some(Owner::Agent));
             self.note(format!("agent pause at head {}", self.head.get()));
         } else {
-            self.note(format!("agent pause on an already paused producer (owner {:?})", self.owner.get()));
+            self.note(format!(
+                "agent pause on an already paused producer (owner {:?})",
+                self.owner.get()
+            ));
         }
         if self.crash_after_pause.get() {
             self.crash_after_pause.set(false);
@@ -453,7 +461,10 @@ impl ChainOps for World {
             }
         }
         if j.contains("\"ignite_started\"") || j.contains("\"side_effect\":\"create_chain\"") {
-            self.violate("I4", "agent resumed the source after this journal's ignition / creation intent".into());
+            self.violate(
+                "I4",
+                "agent resumed the source after this journal's ignition / creation intent".into(),
+            );
         }
         if self.resume_fails.get() > 0 {
             self.resume_fails.set(self.resume_fails.get() - 1);
@@ -462,7 +473,10 @@ impl ChainOps for World {
         }
         if self.resume_ignored.get() > 0 {
             self.resume_ignored.set(self.resume_ignored.get() - 1);
-            self.note(format!("agent resume answered Ok but had no effect (owner {:?})", self.owner.get()));
+            self.note(format!(
+                "agent resume answered Ok but had no effect (owner {:?})",
+                self.owner.get()
+            ));
             return Ok(());
         }
         if self.paused.get() {
@@ -473,8 +487,11 @@ impl ChainOps for World {
         self.agent_paused.set(false);
         let outage = self.read_outage_after_resume.replace(0);
         if outage > 0 {
-            self.paused_read_fails.set(self.paused_read_fails.get() + outage);
-            self.note(format!("producer API outage right after the resume: the next {outage} reads fail"));
+            self.paused_read_fails
+                .set(self.paused_read_fails.get() + outage);
+            self.note(format!(
+                "producer API outage right after the resume: the next {outage} reads fail"
+            ));
         }
         if self.ext_pause_after_resume.get() {
             self.ext_pause_armed.set(true);
@@ -507,7 +524,11 @@ impl ChainOps for World {
         std::fs::write(&path, mini(cut as u32).build()).map_err(|e| e.to_string())?;
         self.head.set(cut + 1);
         self.target_head.set(cut);
-        Ok(SnapshotResult { snapshot_name: path.display().to_string(), head_block_num: cut, head_block_id: self.block_id(cut) })
+        Ok(SnapshotResult {
+            snapshot_name: path.display().to_string(),
+            head_block_num: cut,
+            head_block_id: self.block_id(cut),
+        })
     }
 
     fn schedule_snapshot(&self, height: u64) -> Result<(), String> {
@@ -587,7 +608,9 @@ impl ChainOps for World {
             return Ok(Some(serde_json::json!({"event": mock_event()})));
         }
         if url.ends_with("/api/status") {
-            return Ok(Some(serde_json::json!({"networks": [{"id": "rehearsal", "producers": []}]})));
+            return Ok(Some(
+                serde_json::json!({"networks": [{"id": "rehearsal", "producers": []}]}),
+            ));
         }
         Ok(None)
     }
@@ -613,7 +636,13 @@ fn model_config_with(dir: &Path, coordinated: bool, fail_freeze: bool, scheduled
 }
 
 /// `no_abort_hook` (round 13): a rehearsal-valid config without `on_abort` (nothing reopens writes on a rollback).
-fn model_config_full(dir: &Path, coordinated: bool, fail_freeze: bool, scheduled: bool, no_abort_hook: bool) -> Config {
+fn model_config_full(
+    dir: &Path,
+    coordinated: bool,
+    fail_freeze: bool,
+    scheduled: bool,
+    no_abort_hook: bool,
+) -> Config {
     let mut text = format!(
         r#"
 journal_path = "{d}/journal.jsonl"
@@ -648,17 +677,37 @@ on_live = "flip-gateway"
 {on_abort}on_halt = "page"
 "#,
         d = dir.display(),
-        freeze = if fail_freeze { "fail-freeze" } else { "freeze-writes" },
-        strategy = if scheduled { "freeze_strategy = \"schedule_at_h\"" } else { "" },
-        on_abort = if no_abort_hook { "" } else { "on_abort = \"reopen-writes\"\n" },
-        snapdir = if scheduled { format!("dir = \"{}/snapshots\"\n", dir.display()) } else { String::new() },
+        freeze = if fail_freeze {
+            "fail-freeze"
+        } else {
+            "freeze-writes"
+        },
+        strategy = if scheduled {
+            "freeze_strategy = \"schedule_at_h\""
+        } else {
+            ""
+        },
+        on_abort = if no_abort_hook {
+            ""
+        } else {
+            "on_abort = \"reopen-writes\"\n"
+        },
+        snapdir = if scheduled {
+            format!("dir = \"{}/snapshots\"\n", dir.display())
+        } else {
+            String::new()
+        },
     );
     if scheduled {
         std::fs::create_dir_all(dir.join("snapshots")).unwrap();
     }
     if coordinated {
         use ed25519_dalek::SigningKey;
-        let key = hex::encode(SigningKey::from_bytes(&[42u8; 32]).verifying_key().to_bytes());
+        let key = hex::encode(
+            SigningKey::from_bytes(&[42u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
         let hash = pulse_cutover::coord::payload_hash(&mock_event()).unwrap();
         text.push_str(&format!(
             "\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{key}\"]\nevent_id = \"e1\"\nevent_hash = \"{hash}\"\nfleet_quorum = 0\nfleet_timeout_secs = 5\n"
@@ -686,10 +735,16 @@ fn guarded<F: FnOnce() -> Result<String, String>>(world: &World, f: F) -> StepRe
     match r {
         Ok(x) => StepResult::Done(x),
         Err(p) => {
-            let msg = p.downcast_ref::<String>().cloned()
+            let msg = p
+                .downcast_ref::<String>()
+                .cloned()
                 .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
                 .unwrap_or_else(|| "non-string panic".into());
-            if msg.contains(CRASH) { StepResult::Crashed } else { StepResult::Panicked(msg) }
+            if msg.contains(CRASH) {
+                StepResult::Crashed
+            } else {
+                StepResult::Panicked(msg)
+            }
         }
     }
 }
@@ -698,7 +753,9 @@ fn open_journal(path: &Path) -> Result<(Journal, pulse_cutover::journal::Recover
     for _ in 0..100 {
         match Journal::open(path) {
             Ok(x) => return Ok(x),
-            Err(e) if e.contains("another pulse-cutover process holds") => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(e) if e.contains("another pulse-cutover process holds") => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
             Err(e) => return Err(e),
         }
     }
@@ -719,19 +776,37 @@ fn step_rollback(cfg: &Config, world: &World, force_stranded: bool) -> StepResul
     guarded(world, || {
         let (j, rec) = open_journal(&cfg.journal_path)?;
         let mut m = Machine::new(cfg, world, j, rec);
-        m.operator_rollback_opts(false, force_stranded).map(|o| format!("{} failed={:?} already={}", o.state.as_str(), o.failed, o.already))
+        m.operator_rollback_opts(false, force_stranded).map(|o| {
+            format!(
+                "{} failed={:?} already={}",
+                o.state.as_str(),
+                o.failed,
+                o.already
+            )
+        })
     })
 }
 
 fn step_unhalt(cfg_path: &Path) -> Result<String, String> {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_pulse-cutover"))
-        .args(["unhalt", "--config"]).arg(cfg_path).arg("--i-understand")
-        .output().map_err(|e| e.to_string())?;
-    if out.status.success() { Ok("unhalted".into()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
+        .args(["unhalt", "--config"])
+        .arg(cfg_path)
+        .arg("--i-understand")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok("unhalted".into())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
 }
 
 fn strand_transitions(world: &World) -> usize {
-    world.journal_text().lines().filter(|l| l.contains("\"kind\":\"transition\"") && l.contains("\"state\":\"STRANDED\"")).count()
+    world
+        .journal_text()
+        .lines()
+        .filter(|l| l.contains("\"kind\":\"transition\"") && l.contains("\"state\":\"STRANDED\""))
+        .count()
 }
 
 fn journal_state(world: &World) -> Result<Option<State>, String> {
@@ -743,14 +818,23 @@ fn check_after_step(world: &World, label: &str) {
     match journal_state(world) {
         Err(e) => world.violate("I5", format!("journal does not replay after {label}: {e}")),
         Ok(state) => {
-            if state == Some(State::Aborted) && world.journal_text().contains("rollback_done")
-                && world.paused.get() && world.owner.get() == Some(Owner::Agent) {
+            if state == Some(State::Aborted)
+                && world.journal_text().contains("rollback_done")
+                && world.paused.get()
+                && world.owner.get() == Some(Owner::Agent)
+            {
                 world.violate("I1", format!("journal ABORTED (rolled back) after {label}, but the AGENT's pause is still in place"));
             }
             // I7: a rollback that provably finished leaves the old chain writable (unless it never froze writes).
-            let complete = Journal::replay(&world.journal).map(|r| r.aborted_rollback_complete).unwrap_or(false);
-            if state == Some(State::Aborted) && complete && !world.writes_open.get() && !world.edge_new.get()
-                && !world.no_abort_hook.get() {
+            let complete = Journal::replay(&world.journal)
+                .map(|r| r.aborted_rollback_complete)
+                .unwrap_or(false);
+            if state == Some(State::Aborted)
+                && complete
+                && !world.writes_open.get()
+                && !world.edge_new.get()
+                && !world.no_abort_hook.get()
+            {
                 world.violate("I7", format!("journal ABORTED with rollback_done after {label}, but the old chain's writes are \
                     still frozen (a rollback that cannot reopen writes must strand and page)"));
             }
@@ -758,8 +842,16 @@ fn check_after_step(world: &World, label: &str) {
             // and whatever hooks are configured (an unresolved or unknown pause must strand and page instead).
             // Scope: a ceremony that froze writes (this journal, or the older agent of a legacy fixture). A refused ARM
             // or an abort before the freeze has nothing to undo and correctly leaves someone else's pause alone.
-            let froze = world.journal_text().contains("\"side_effect\":\"write_freeze\"") || world.legacy_froze.get();
-            if state == Some(State::Aborted) && complete && !world.complete_before.get() && world.paused.get() && froze {
+            let froze = world
+                .journal_text()
+                .contains("\"side_effect\":\"write_freeze\"")
+                || world.legacy_froze.get();
+            if state == Some(State::Aborted)
+                && complete
+                && !world.complete_before.get()
+                && world.paused.get()
+                && froze
+            {
                 world.violate("I7", format!("journal ABORTED with rollback_done after {label} while the producer is still \
                     paused (owner {:?}): a rollback must not report completion over a paused producer", world.owner.get()));
             }
@@ -783,25 +875,41 @@ fn scenario_with(seed: u64, r11: bool) -> (Vec<String>, Vec<String>) {
 /// paused the producer).
 fn write_legacy_journal(world: &World, kind: u64) {
     let (mut j, _) = open_journal(&world.journal).expect("legacy journal");
-    j.transition(State::Armed, serde_json::json!({"mode": "Producer", "freeze_height": H})).unwrap();
+    j.transition(
+        State::Armed,
+        serde_json::json!({"mode": "Producer", "freeze_height": H}),
+    )
+    .unwrap();
     if kind >= 1 {
         world.legacy_froze.set(true);
-        j.transition(State::Frozen, serde_json::json!({"frozen_ts_ms": 1_000_000u64, "head_at_freeze": H - 24})).unwrap();
+        j.transition(
+            State::Frozen,
+            serde_json::json!({"frozen_ts_ms": 1_000_000u64, "head_at_freeze": H - 24}),
+        )
+        .unwrap();
         world.writes_open.set(false);
     }
     if kind >= 2 {
         let hp = world.head.get() + 5;
         world.head.set(hp);
-        let snap = world.dir.join(format!("snapshot-{}.bin", world.block_id(H)));
+        let snap = world
+            .dir
+            .join(format!("snapshot-{}.bin", world.block_id(H)));
         std::fs::write(&snap, mini(H as u32).build()).unwrap();
         world.target_head.set(H);
-        j.transition(State::Snapshotted, serde_json::json!({"cut_height": H, "head_at_pause": hp,
-            "snapshot_file": snap.display().to_string(), "cut_block_id": world.block_id(H)})).unwrap();
+        j.transition(
+            State::Snapshotted,
+            serde_json::json!({"cut_height": H, "head_at_pause": hp,
+            "snapshot_file": snap.display().to_string(), "cut_block_id": world.block_id(H)}),
+        )
+        .unwrap();
         world.paused.set(true);
         world.owner.set(Some(Owner::Agent));
         world.agent_paused.set(true);
     }
-    world.note(format!("legacy journal fixture kind {kind} (written by an agent from before round 6)"));
+    world.note(format!(
+        "legacy journal fixture kind {kind} (written by an agent from before round 6)"
+    ));
 }
 
 /// `r11 = false` replays the round-10 generator exactly (the class A/B regression seeds were found with it): every
@@ -817,19 +925,33 @@ fn scenario_full(seed: u64, r11: bool, r13: bool) -> (Vec<String>, Vec<String>) 
     let fail_freeze = rng.chance(8);
     let scheduled = r11 && rng2.chance(50);
     let no_abort_hook = r13 && rng3.chance(20);
-    let legacy = if r13 && rng3.chance(10) { Some(rng3.below(3)) } else { None };
-    let cfg = model_config_full(dir.path(), coordinated, fail_freeze, scheduled, no_abort_hook);
+    let legacy = if r13 && rng3.chance(10) {
+        Some(rng3.below(3))
+    } else {
+        None
+    };
+    let cfg = model_config_full(
+        dir.path(),
+        coordinated,
+        fail_freeze,
+        scheduled,
+        no_abort_hook,
+    );
     let world = World::new(dir.path());
     world.scheduler.set(scheduled);
     world.no_abort_hook.set(no_abort_hook);
-    world.note(format!("seed {seed}: coordinated={coordinated} fail_freeze={fail_freeze} scheduled={scheduled} \
-        no_abort_hook={no_abort_hook} legacy={legacy:?}"));
+    world.note(format!(
+        "seed {seed}: coordinated={coordinated} fail_freeze={fail_freeze} scheduled={scheduled} \
+        no_abort_hook={no_abort_hook} legacy={legacy:?}"
+    ));
 
     // Faults.
     if rng.chance(45) {
         world.ext_pause_tick.set(1 + rng.below(40));
         if rng.chance(50) {
-            world.ext_resume_tick.set(world.ext_pause_tick.get() + 1 + rng.below(30));
+            world
+                .ext_resume_tick
+                .set(world.ext_pause_tick.get() + 1 + rng.below(30));
         }
     }
     if rng.chance(20) {
@@ -872,12 +994,18 @@ fn scenario_full(seed: u64, r11: bool, r13: bool) -> (Vec<String>, Vec<String>) 
             // An operator un-pauses the agent's own pause by hand, and someone pauses again later.
             world.ext_resume_agent_tick.set(1 + rng3.below(60));
             if rng3.chance(70) {
-                world.ext_pause2_tick.set(world.ext_resume_agent_tick.get() + 1 + rng3.below(30));
+                world
+                    .ext_pause2_tick
+                    .set(world.ext_resume_agent_tick.get() + 1 + rng3.below(30));
             }
         }
         if rng3.chance(12) {
             // A producer-API outage right after a resume: short (inside the 30 s retry) or long (outlasting it).
-            world.read_outage_after_resume.set(if rng3.chance(50) { 1 + rng3.below(4) as u32 } else { 5_000 });
+            world.read_outage_after_resume.set(if rng3.chance(50) {
+                1 + rng3.below(4) as u32
+            } else {
+                5_000
+            });
         }
     }
     if coordinated && rng.chance(35) {
@@ -925,7 +1053,11 @@ fn scenario_full(seed: u64, r11: bool, r13: bool) -> (Vec<String>, Vec<String>) 
         // Between steps the outside world may act (not inside the operator-abort sequence).
         // Same draw sequence as rounds 10-12 (regression seeds replay exactly).
         let ext = rng.below(4);
-        let crash_at = if rng.chance(25) { Some(world.calls.get() + 1 + rng.below(120)) } else { None };
+        let crash_at = if rng.chance(25) {
+            Some(world.calls.get() + 1 + rng.below(120))
+        } else {
+            None
+        };
         if !op_abort {
             match ext {
                 0 => world.external_pause(),
@@ -939,10 +1071,18 @@ fn scenario_full(seed: u64, r11: bool, r13: bool) -> (Vec<String>, Vec<String>) 
                 world.crash_at.set(c);
             }
         }
-        let pick = if std::mem::replace(&mut op_abort, false) { 5 } else { rng.below(10) };
+        let pick = if std::mem::replace(&mut op_abort, false) {
+            5
+        } else {
+            rng.below(10)
+        };
         let stranded_before = state == Some(State::Stranded);
         let strands_before = strand_transitions(&world);
-        let world_before = (world.paused.get(), world.owner.get(), world.writes_open.get());
+        let world_before = (
+            world.paused.get(),
+            world.owner.get(),
+            world.writes_open.get(),
+        );
         let (label, res) = match (state, pick) {
             (Some(State::Halted), 0..=4) => {
                 world.begin_step();
@@ -952,7 +1092,10 @@ fn scenario_full(seed: u64, r11: bool, r13: bool) -> (Vec<String>, Vec<String>) 
             }
             (_, 0..=4) => ("run", step_run(&cfg, &world)),
             (_, 5..=7) => ("rollback", step_rollback(&cfg, &world, false)),
-            _ => ("rollback --force-stranded", step_rollback(&cfg, &world, true)),
+            _ => (
+                "rollback --force-stranded",
+                step_rollback(&cfg, &world, true),
+            ),
         };
         world.note(format!("{label}: {res:?}"));
         if let StepResult::Panicked(m) = &res {
@@ -966,8 +1109,17 @@ fn scenario_full(seed: u64, r11: bool, r13: bool) -> (Vec<String>, Vec<String>) 
             strand_runs += 1;
             // I6 (strand loop): a plain re-run of a STRANDED journal, with nothing changed in the world since the step
             // began and no crash in it, stays sealed without writing another STRANDED transition.
-            let unchanged = world_before == (world.paused.get(), world.owner.get(), world.writes_open.get());
-            if stranded_before && unchanged && !matches!(res, StepResult::Crashed) && strand_transitions(&world) > strands_before {
+            let unchanged = world_before
+                == (
+                    world.paused.get(),
+                    world.owner.get(),
+                    world.writes_open.get(),
+                );
+            if stranded_before
+                && unchanged
+                && !matches!(res, StepResult::Crashed)
+                && strand_transitions(&world) > strands_before
+            {
                 world.violate("I6", "a plain re-run of a STRANDED journal (nothing changed) wrote another STRANDED transition".into());
             }
         }
@@ -976,22 +1128,41 @@ fn scenario_full(seed: u64, r11: bool, r13: bool) -> (Vec<String>, Vec<String>) 
     if strand_runs > 0 {
         world.note(format!("plain runs that ended STRANDED: {strand_runs}"));
     }
-    let fin = journal_state(&world).ok().flatten().map(|s| s.as_str().to_string()).unwrap_or_else(|| "none".into());
+    let fin = journal_state(&world)
+        .ok()
+        .flatten()
+        .map(|s| s.as_str().to_string())
+        .unwrap_or_else(|| "none".into());
     let j = world.journal_text();
     let mut tags = vec![format!("final:{fin}")];
-    for (k, needle) in [("crashed", "crash at op"), ("ext_pause", "external pause"), ("adopted", "\"adopted\":true"),
-                        ("forced_release", "external_pause_release"), ("writes_kept_frozen", "writes_kept_frozen"),
-                        ("nothing_to_undo", "nothing_to_undo"), ("scheduled", "snapshot_scheduled_at"),
-                        ("sched_file_wait", "scheduled_snapshot_file"), ("kept_paused_on_resume", "kept_paused_on_resume"),
-                        ("resumed_for_snapshot", "resumed_production_for_snapshot"), ("ownership_unknown", "\"pause_ownership_unknown\":true"),
-                        ("pause_ack", "source_pause_ack"), ("resume_lost", "resume took effect but the answer"),
-                        ("crash_after_resume", "crash right after the resume"),
-                        ("no_abort_hook", "no_abort_hook=true"), ("legacy", "legacy journal fixture"),
-                        ("ext_resume_of_agent_pause", "external resume of the AGENT's pause"),
-                        ("read_outage_after_resume", "outage right after the resume"),
-                        ("resume_outcome_unknown", "source_resume_outcome_unknown")] {
+    for (k, needle) in [
+        ("crashed", "crash at op"),
+        ("ext_pause", "external pause"),
+        ("adopted", "\"adopted\":true"),
+        ("forced_release", "external_pause_release"),
+        ("writes_kept_frozen", "writes_kept_frozen"),
+        ("nothing_to_undo", "nothing_to_undo"),
+        ("scheduled", "snapshot_scheduled_at"),
+        ("sched_file_wait", "scheduled_snapshot_file"),
+        ("kept_paused_on_resume", "kept_paused_on_resume"),
+        ("resumed_for_snapshot", "resumed_production_for_snapshot"),
+        ("ownership_unknown", "\"pause_ownership_unknown\":true"),
+        ("pause_ack", "source_pause_ack"),
+        ("resume_lost", "resume took effect but the answer"),
+        ("crash_after_resume", "crash right after the resume"),
+        ("no_abort_hook", "no_abort_hook=true"),
+        ("legacy", "legacy journal fixture"),
+        (
+            "ext_resume_of_agent_pause",
+            "external resume of the AGENT's pause",
+        ),
+        ("read_outage_after_resume", "outage right after the resume"),
+        ("resume_outcome_unknown", "source_resume_outcome_unknown"),
+    ] {
         let hay = format!("{j}\n{}", world.trace.borrow().join("\n"));
-        if hay.contains(needle) { tags.push(k.to_string()); }
+        if hay.contains(needle) {
+            tags.push(k.to_string());
+        }
     }
     let v = world.violations.borrow().clone();
     let mut t = world.trace.borrow().clone();
@@ -1004,8 +1175,12 @@ fn quiet_panics() {
     ONCE.call_once(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let payload = info.payload().downcast_ref::<String>().cloned()
-                .or_else(|| info.payload().downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+            let payload = info
+                .payload()
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| info.payload().downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
             if payload == CRASH || payload.starts_with("MODEL-NO-PROGRESS") {
                 return;
             }
@@ -1017,7 +1192,9 @@ fn quiet_panics() {
 /// Regression seeds of class R10-1 (review round 10, fixed in round 11): a resume that TOOK EFFECT but whose answer was
 /// lost, or after which the agent was killed before journaling it, used to leave the agent's pause episode open, so a
 /// later external pause was resumed as ours. Kept as a regression list (`model_known_open_seeds_all_clean`).
-const KNOWN_OPEN: &[u64] = &[287, 319, 675, 1447, 1959, 2067, 2225, 2553, 2558, 2659, 2866];
+const KNOWN_OPEN: &[u64] = &[
+    287, 319, 675, 1447, 1959, 2067, 2225, 2553, 2558, 2659, 2866,
+];
 
 /// Class R11-A (found by the round-11 checker, fixed in round 12): a STALE forced release used to authorize resuming a
 /// LATER external pause. Regression test: `model_i3_class_r11_a_stale_forced_release_seed_13295`.
@@ -1046,7 +1223,11 @@ fn run_many(start: u64, count: u64) -> Vec<(u64, Vec<String>, Vec<String>)> {
         classes.entry(classify(v, t)).or_default().push(*seed);
     }
     for (c, seeds) in &classes {
-        eprintln!("MODEL CLASS {c}: {} seed(s): {:?}", seeds.len(), &seeds[..seeds.len().min(40)]);
+        eprintln!(
+            "MODEL CLASS {c}: {} seed(s): {:?}",
+            seeds.len(),
+            &seeds[..seeds.len().min(40)]
+        );
     }
     if !open.is_empty() {
         eprintln!("MODEL: {} scenario(s) reached the class R10-1 shape (a resume that took effect unseen)", open.len());
@@ -1091,21 +1272,40 @@ fn report(bad: &[(u64, Vec<String>, Vec<String>)]) -> String {
 /// The CI run: seeds 1..=MODEL_SCENARIOS (default 300), or one MODEL_SEED.
 #[test]
 fn model_checker_finds_no_invariant_violation() {
-    let (start, count) = match std::env::var("MODEL_SEED").ok().and_then(|s| s.parse::<u64>().ok()) {
+    let (start, count) = match std::env::var("MODEL_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
         Some(s) => (s, 1),
-        None => (std::env::var("MODEL_START").ok().and_then(|s| s.parse().ok()).unwrap_or(1),
-                 std::env::var("MODEL_SCENARIOS").ok().and_then(|s| s.parse().ok()).unwrap_or(300)),
+        None => (
+            std::env::var("MODEL_START")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1),
+            std::env::var("MODEL_SCENARIOS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300),
+        ),
     };
     let bad = run_many(start, count);
     // Round 13 introduced OPEN_CLASSES for classes found but not yet fixed in the source; since round 14 it is empty,
     // so every violation fails the run. `MODEL_STRICT=1` also ignores OPEN_CLASSES (CI and evidence runs use it).
     let strict = std::env::var("MODEL_STRICT").is_ok();
-    let unexpected: Vec<_> = bad.iter().filter(|(_, v, t)| strict || !OPEN_CLASSES.contains(&classify(v, t))).cloned().collect();
+    let unexpected: Vec<_> = bad
+        .iter()
+        .filter(|(_, v, t)| strict || !OPEN_CLASSES.contains(&classify(v, t)))
+        .cloned()
+        .collect();
     if !bad.is_empty() && unexpected.is_empty() {
         eprintln!("MODEL: {} scenario(s) in the open classes {OPEN_CLASSES:?} (see the #[ignore]d class tests)", bad.len());
     }
-    assert!(unexpected.is_empty(), "{} of {count} scenarios violated an invariant outside the open classes:{}",
-        unexpected.len(), report(&unexpected));
+    assert!(
+        unexpected.is_empty(),
+        "{} of {count} scenarios violated an invariant outside the open classes:{}",
+        unexpected.len(),
+        report(&unexpected)
+    );
 }
 
 /// Classes the checker found that are still open in the source (see `classify`). Empty since round 14 (F1-A, R13-A
@@ -1154,7 +1354,12 @@ fn assert_seed_clean_with(seed: u64, r11: bool) {
     quiet_panics();
     let (v, t) = scenario_with(seed, r11);
     let open: Vec<&String> = t.iter().filter(|l| l.starts_with("KNOWN-OPEN")).collect();
-    assert!(v.is_empty() && open.is_empty(), "seed {seed}: {} {open:?}\n{}", v.join(" | "), t.join("\n"));
+    assert!(
+        v.is_empty() && open.is_empty(),
+        "seed {seed}: {} {open:?}\n{}",
+        v.join(" | "),
+        t.join("\n")
+    );
 }
 
 /// Class A (= review R9-2), found by the checker: own pause resumed, on_abort fails, someone else pauses, a later
@@ -1205,9 +1410,14 @@ fn directed_r10_2(dir: &Path) -> Vec<String> {
     let j = world.journal_text();
     // Round 12: the scenario must reach the snapshot resume ATTEMPT (its intent); with the external pause right after
     // it, the outcome is ownership unknown, so there is no `resumed_production_for_snapshot` record any more.
-    assert!(j.contains("\"during\":\"resuming production for the snapshot\""), "the scenario must reach the snapshot resume:\n{}",
-        world.trace.borrow().join("\n"));
-    if std::env::var("MODEL_TRACE").is_ok() { eprintln!("{}", world.trace.borrow().join("\n")); }
+    assert!(
+        j.contains("\"during\":\"resuming production for the snapshot\""),
+        "the scenario must reach the snapshot resume:\n{}",
+        world.trace.borrow().join("\n")
+    );
+    if std::env::var("MODEL_TRACE").is_ok() {
+        eprintln!("{}", world.trace.borrow().join("\n"));
+    }
     let v = world.violations.borrow().clone();
     if !v.is_empty() {
         eprintln!("{}", world.trace.borrow().join("\n"));
@@ -1274,7 +1484,12 @@ thread_local! {
 fn assert_seed_clean_r13(seed: u64) {
     quiet_panics();
     let (v, t) = scenario(seed);
-    assert!(v.is_empty(), "seed {seed} [{}]:{}", classify(&v, &t), report(&[(seed, v.clone(), t.clone())]));
+    assert!(
+        v.is_empty(),
+        "seed {seed} [{}]:{}",
+        classify(&v, &t),
+        report(&[(seed, v.clone(), t.clone())])
+    );
 }
 
 /// I3 is run-local and consumed per attempt (round 13). A release journaled by an EARLIER run authorizes nothing (the
@@ -1291,7 +1506,14 @@ fn oracle_i3_release_is_run_local_and_consumed_per_attempt() {
     world.external_pause();
     world.begin_step();
     let _ = world.resume();
-    assert!(world.violations.borrow().iter().any(|v| v.starts_with("I3")), "a stale release must not authorize a resume");
+    assert!(
+        world
+            .violations
+            .borrow()
+            .iter()
+            .any(|v| v.starts_with("I3")),
+        "a stale release must not authorize a resume"
+    );
     // 2. A release journaled by this run: one attempt (here refused by the producer) consumes it; a second attempt in
     //    the same run without a new release is flagged.
     let dir = tempfile::tempdir().unwrap();
@@ -1302,9 +1524,20 @@ fn oracle_i3_release_is_run_local_and_consumed_per_attempt() {
     std::fs::write(&world.journal, release).unwrap(); // journaled by this run, after the pause began
     world.resume_fails.set(1);
     assert!(world.resume().is_err());
-    assert!(world.violations.borrow().is_empty(), "a live release authorizes one attempt: {:?}", world.violations.borrow());
+    assert!(
+        world.violations.borrow().is_empty(),
+        "a live release authorizes one attempt: {:?}",
+        world.violations.borrow()
+    );
     let _ = world.resume();
-    assert!(world.violations.borrow().iter().any(|v| v.starts_with("I3")), "the refused attempt consumed the release");
+    assert!(
+        world
+            .violations
+            .borrow()
+            .iter()
+            .any(|v| v.starts_with("I3")),
+        "the refused attempt consumed the release"
+    );
     // 3. A release journaled before the external pause began authorizes nothing for that pause.
     let dir = tempfile::tempdir().unwrap();
     let world = World::new(dir.path());
@@ -1313,7 +1546,14 @@ fn oracle_i3_release_is_run_local_and_consumed_per_attempt() {
     std::fs::write(&world.journal, release).unwrap();
     world.external_pause();
     let _ = world.resume();
-    assert!(world.violations.borrow().iter().any(|v| v.starts_with("I3")), "a release for an earlier pause authorizes nothing");
+    assert!(
+        world
+            .violations
+            .borrow()
+            .iter()
+            .any(|v| v.starts_with("I3")),
+        "a release for an earlier pause authorizes nothing"
+    );
 }
 
 /// I7 scope (round 13): completion over a paused producer is flagged only for a ceremony that froze writes; a refused

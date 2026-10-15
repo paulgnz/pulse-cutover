@@ -9,22 +9,12 @@
 //! a little-endian, key-sorted byte stream. Golden files use the
 //! `golden_import_roots.txt` format: `# comments`, then `<table> <hex u64>`.
 
-use std::{
-    collections::BTreeMap,
-    io::Read,
-    path::Path,
-};
+use std::{collections::BTreeMap, io::Read, path::Path};
 
 use pulsevm_chaindb::ChainDatabase;
 use pulsevm_snapshot::SnapshotReader;
-use pulsevm_snapshot_import::{
-    ImportReport,
-    import_chainstate_scaled,
-};
-use sha2::{
-    Digest as _,
-    Sha256,
-};
+use pulsevm_snapshot_import::{import_chainstate_scaled, ImportReport};
+use sha2::{Digest as _, Sha256};
 
 /// The 19 logical state tables, in golden-file order.
 pub const TABLE_NAMES: [&str; 19] = [
@@ -61,10 +51,7 @@ pub struct VerifyOutcome {
 }
 
 fn table_root(bytes: &[u8]) -> u64 {
-    use std::hash::{
-        Hash,
-        Hasher,
-    };
+    use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut h);
     h.finish()
@@ -139,8 +126,7 @@ pub fn verify_snapshot(path: &Path, cpu_scale: u64) -> Result<VerifyOutcome, Str
     let roots1 = arena_roots(&db1);
 
     let db2 = ChainDatabase::new().map_err(|e| format!("fresh arena 2: {e:?}"))?;
-    import_chainstate_scaled(&db2, &snapshot, cpu_scale)
-        .map_err(|e| format!("import 2: {e:?}"))?;
+    import_chainstate_scaled(&db2, &snapshot, cpu_scale).map_err(|e| format!("import 2: {e:?}"))?;
     let roots2 = arena_roots(&db2);
 
     if roots1 != roots2 {
@@ -217,7 +203,9 @@ pub fn compare_goldens(
 /// Serialize roots in golden-file format with full provenance.
 pub fn format_goldens(outcome: &VerifyOutcome, cpu_scale: u64) -> String {
     let mut out = String::new();
-    out.push_str("# pulse-cutover captured fingerprints (dual fresh-arena import, verified equal)\n");
+    out.push_str(
+        "# pulse-cutover captured fingerprints (dual fresh-arena import, verified equal)\n",
+    );
     out.push_str(&format!(
         "# chain_id {} cut_height {} cut_block_id {}\n",
         outcome.chain_id, outcome.head_block_num, outcome.head_block_id
@@ -333,7 +321,12 @@ pub fn run_upstream_fingerprint(
             result.state_root = root;
             result.tables = tables;
             result.output = text;
-            result.status = if out.status.success() { "ran" } else { "failed" }.into();
+            result.status = if out.status.success() {
+                "ran"
+            } else {
+                "failed"
+            }
+            .into();
         }
         Err(e) => {
             result.status = "failed".into();
@@ -396,8 +389,14 @@ mod upstream_tests {
         assert_eq!(r.status, "ran");
         assert_eq!(r.exit_code, Some(0));
         assert_eq!(r.state_root.as_deref(), Some("feedface"));
-        assert_eq!(r.tables, vec![("permission".to_string(), "aa55".to_string())]);
-        assert_eq!(r.args, vec!["/data/cut.bin".to_string(), "extra".to_string()]);
+        assert_eq!(
+            r.tables,
+            vec![("permission".to_string(), "aa55".to_string())]
+        );
+        assert_eq!(
+            r.args,
+            vec!["/data/cut.bin".to_string(), "extra".to_string()]
+        );
         assert!(r.output.contains("args: /data/cut.bin extra"));
     }
 }

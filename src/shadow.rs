@@ -76,8 +76,15 @@ pub fn check_config(cfg: &Config) -> Result<(), String> {
                        chain_id, so anything signed for it is valid on mainnet (never sign there with a real key)"
             .into());
     }
-    if cfg.ceremony.chain_id.as_deref().map_or(true, |c| c.trim().is_empty()) {
-        problems.push("ceremony.chain_id must be set in a shadow ceremony (the chain it imitates)".into());
+    if cfg
+        .ceremony
+        .chain_id
+        .as_deref()
+        .map_or(true, |c| c.trim().is_empty())
+    {
+        problems.push(
+            "ceremony.chain_id must be set in a shadow ceremony (the chain it imitates)".into(),
+        );
     }
     match cfg.target.metal_network_id {
         None => problems.push("target.metal_network_id must be set: a shadow runs on a PRIVATE Metal network".into()),
@@ -132,7 +139,10 @@ pub fn check_config(cfg: &Config) -> Result<(), String> {
     if problems.is_empty() {
         Ok(())
     } else {
-        Err(format!("shadow ceremony config refused:\n  - {}", problems.join("\n  - ")))
+        Err(format!(
+            "shadow ceremony config refused:\n  - {}",
+            problems.join("\n  - ")
+        ))
     }
 }
 
@@ -152,7 +162,11 @@ fn strict_url(url: &str) -> Option<url::Url> {
 /// (scheme, host, port) of a URL, parsed strictly (None when ambiguous or unparsable).
 pub fn origin(url: &str) -> Option<(String, String, u16)> {
     let u = strict_url(url)?;
-    Some((u.scheme().to_string(), u.host_str()?.to_ascii_lowercase(), u.port_or_known_default()?))
+    Some((
+        u.scheme().to_string(),
+        u.host_str()?.to_ascii_lowercase(),
+        u.port_or_known_default()?,
+    ))
 }
 
 /// The complete API base the HTTP client calls (scheme, host, port, path without trailing slashes), parsed strictly;
@@ -163,13 +177,20 @@ pub fn api_base(url: &str) -> Option<(String, String, u16, String)> {
         return None;
     }
     let path = u.path().trim_end_matches('/').to_string();
-    Some((u.scheme().to_string(), u.host_str()?.to_ascii_lowercase(), u.port_or_known_default()?, path))
+    Some((
+        u.scheme().to_string(),
+        u.host_str()?.to_ascii_lowercase(),
+        u.port_or_known_default()?,
+        path,
+    ))
 }
 
 /// Loopback, RFC 1918, link-local, IPv6 loopback / unique-local / link-local, or a reserved private name suffix.
 /// Parsed with the URL parser the HTTP client uses; ambiguous syntax (backslashes, userinfo) counts as public.
 pub fn is_private_url(url: &str) -> bool {
-    let Some(u) = strict_url(url) else { return false };
+    let Some(u) = strict_url(url) else {
+        return false;
+    };
     match u.host() {
         Some(url::Host::Ipv4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         Some(url::Host::Ipv6(v6)) => {
@@ -179,9 +200,16 @@ pub fn is_private_url(url: &str) -> bool {
         Some(url::Host::Domain(d)) => {
             let host = d.trim_end_matches('.').to_ascii_lowercase();
             host == "localhost"
-                || [".localhost", ".local", ".internal", ".test", ".lan", ".home.arpa"]
-                    .iter()
-                    .any(|sfx| host.ends_with(sfx))
+                || [
+                    ".localhost",
+                    ".local",
+                    ".internal",
+                    ".test",
+                    ".lan",
+                    ".home.arpa",
+                ]
+                .iter()
+                .any(|sfx| host.ends_with(sfx))
         }
         None => false,
     }
@@ -196,7 +224,9 @@ pub fn is_shadow_network_name(name: &str) -> bool {
 /// the target through): everything before `/ext/`. None when the target RPC is not a metalgo /ext/ URL.
 pub fn metal_info_base(cfg: &Config) -> Option<String> {
     let u = &cfg.target.rpc_url;
-    u.find("/ext/").map(|i| u[..i].to_string()).filter(|b| b.contains("://"))
+    u.find("/ext/")
+        .map(|i| u[..i].to_string())
+        .filter(|b| b.contains("://"))
 }
 
 /// The shadow identity journaled on the ARMED record (Null outside a shadow): label, private network id, and a hash
@@ -204,7 +234,12 @@ pub fn metal_info_base(cfg: &Config) -> Option<String> {
 pub fn identity(cfg: &Config) -> Value {
     match cfg.shadow.as_ref().filter(|_| cfg.ceremony.shadow) {
         Some(sh) => {
-            let mut keys: Vec<&str> = sh.producer_keys.iter().map(|k| k.trim()).filter(|k| !k.is_empty()).collect();
+            let mut keys: Vec<&str> = sh
+                .producer_keys
+                .iter()
+                .map(|k| k.trim())
+                .filter(|k| !k.is_empty())
+                .collect();
             keys.sort_unstable();
             keys.dedup();
             json!({"label": sh.label, "metal_network_id": cfg.target.metal_network_id,
@@ -264,7 +299,10 @@ pub fn schedule_keys(schedule: &Value) -> Option<Vec<(String, String)>> {
 pub fn target_network_problems<O: ChainOps + ?Sized>(cfg: &Config, ops: &O) -> Vec<String> {
     let want = cfg.target.metal_network_id;
     let Some(base) = metal_info_base(cfg) else {
-        return vec![format!("target.rpc_url {} is not a metalgo /ext/ URL (shadow identity unverified)", cfg.target.rpc_url)];
+        return vec![format!(
+            "target.rpc_url {} is not a metalgo /ext/ URL (shadow identity unverified)",
+            cfg.target.rpc_url
+        )];
     };
     match ops.metal_network_id(&base) {
         Ok(Some(n)) if Some(n) == want && !crate::config::is_public_metal_network(n) => vec![],
@@ -284,12 +322,25 @@ pub const FAR_AHEAD_BLOCKS: u64 = 172_800;
 /// behind `target.rpc_url` whose network id the identity proof read), not merely on whatever `create_chain_cmd`
 /// talked to. `blockchain_id` = the journaled id (upstream backend); otherwise the id in `target.rpc_url`
 /// (`/ext/bc/<id>/...`). Fail-closed.
-pub fn target_chain_problems<O: ChainOps + ?Sized>(cfg: &Config, ops: &O, blockchain_id: Option<&str>) -> Vec<String> {
+pub fn target_chain_problems<O: ChainOps + ?Sized>(
+    cfg: &Config,
+    ops: &O,
+    blockchain_id: Option<&str>,
+) -> Vec<String> {
     let Some(base) = metal_info_base(cfg) else {
-        return vec![format!("target.rpc_url {} is not a metalgo /ext/ URL (target chain unverified)", cfg.target.rpc_url)];
+        return vec![format!(
+            "target.rpc_url {} is not a metalgo /ext/ URL (target chain unverified)",
+            cfg.target.rpc_url
+        )];
     };
-    let from_url = cfg.target.rpc_url.split("/ext/bc/").nth(1).and_then(|r| r.split('/').next())
-        .filter(|id| !id.is_empty() && !id.contains('{')).map(str::to_string);
+    let from_url = cfg
+        .target
+        .rpc_url
+        .split("/ext/bc/")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .filter(|id| !id.is_empty() && !id.contains('{'))
+        .map(str::to_string);
     let Some(id) = blockchain_id.map(str::to_string).or(from_url) else {
         return vec!["no blockchain id is known for the target (neither journaled nor in target.rpc_url): target chain unverified".into()];
     };
@@ -305,9 +356,16 @@ pub fn target_chain_problems<O: ChainOps + ?Sized>(cfg: &Config, ops: &O, blockc
 /// The full identity proof (module doc). Fail-closed: an unreadable answer is a problem. Empty = this really is a
 /// private shadow, independently of anything the operator declared.
 pub fn identity_problems<O: ChainOps + ?Sized>(cfg: &Config, ops: &O) -> Vec<String> {
-    let Some(sh) = cfg.shadow.as_ref().filter(|_| cfg.ceremony.shadow) else { return vec![] };
+    let Some(sh) = cfg.shadow.as_ref().filter(|_| cfg.ceremony.shadow) else {
+        return vec![];
+    };
     let mut out = target_network_problems(cfg, ops);
-    let allowed: Vec<String> = sh.producer_keys.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
+    let allowed: Vec<String> = sh
+        .producer_keys
+        .iter()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .collect();
     match ops.source_producer_schedule() {
         Ok(Some(v)) => match schedule_keys(&v) {
             Some(keys) => {
@@ -367,9 +425,24 @@ pub fn producer_binding_problems<O: ChainOps + ?Sized>(ops: &O) -> Vec<String> {
     let (mut compared, mut max_head, mut unreachable) = (0usize, None::<u64>, vec![]);
     for base in PUBLIC_XPR_MAINNET_APIS {
         let info = match ops.public_chain_post(base, "/v1/chain/get_info", json!({})) {
-            Ok(v) if v["chain_id"].as_str().is_some_and(crate::config::is_xpr_mainnet) => v,
-            Ok(v) => { unreachable.push(format!("{base}: not XPR mainnet (chain_id {})", v["chain_id"])); continue; }
-            Err(e) => { unreachable.push(format!("{base}: {e}")); continue; }
+            Ok(v)
+                if v["chain_id"]
+                    .as_str()
+                    .is_some_and(crate::config::is_xpr_mainnet) =>
+            {
+                v
+            }
+            Ok(v) => {
+                unreachable.push(format!(
+                    "{base}: not XPR mainnet (chain_id {})",
+                    v["chain_id"]
+                ));
+                continue;
+            }
+            Err(e) => {
+                unreachable.push(format!("{base}: {e}"));
+                continue;
+            }
         };
         let Some(mainnet_head) = info["head_block_num"].as_u64() else {
             unreachable.push(format!("{base}: get_info without head_block_num"));
@@ -377,7 +450,9 @@ pub fn producer_binding_problems<O: ChainOps + ?Sized>(ops: &O) -> Vec<String> {
         };
         max_head = max_head.max(Some(mainnet_head));
         if mainnet_head < num {
-            unreachable.push(format!("{base}: mainnet head {mainnet_head} is behind the producer's head {num}"));
+            unreachable.push(format!(
+                "{base}: mainnet head {mainnet_head} is behind the producer's head {num}"
+            ));
             continue;
         }
         match ops.public_chain_post(base, "/v1/chain/get_block", json!({"block_num_or_id": num})) {
@@ -412,23 +487,43 @@ pub fn producer_binding_problems<O: ChainOps + ?Sized>(ops: &O) -> Vec<String> {
 /// Part 3 of the proof: ask PUBLIC XPR mainnet. Every pinned endpoint that answers as XPR mainnet is consulted, and
 /// any one that recognises the declared keys or the source's block refuses the shadow; at least one must answer
 /// each question, else the proof fails closed.
-pub fn public_mainnet_problems<O: ChainOps + ?Sized>(declared_keys: &[String], ops: &O) -> Vec<String> {
+pub fn public_mainnet_problems<O: ChainOps + ?Sized>(
+    declared_keys: &[String],
+    ops: &O,
+) -> Vec<String> {
     let mut out = vec![];
     let (src_lib, src_id) = match ops.source_info() {
         Ok(info) => match ops.source_block_id(info.last_irreversible_block_num) {
             Ok((id, _)) => (info.last_irreversible_block_num, id),
-            Err(e) => return vec![format!("cannot read the source's block at its LIB {}: {e} (shadow source unverified)",
-                                          info.last_irreversible_block_num)],
+            Err(e) => {
+                return vec![format!(
+                    "cannot read the source's block at its LIB {}: {e} (shadow source unverified)",
+                    info.last_irreversible_block_num
+                )]
+            }
         },
-        Err(e) => return vec![format!("cannot read the source chain: {e} (shadow source unverified)")],
+        Err(e) => {
+            return vec![format!(
+                "cannot read the source chain: {e} (shadow source unverified)"
+            )]
+        }
     };
     let (mut schedules_read, mut blocks_compared, mut unreachable) = (0usize, 0usize, vec![]);
     let (mut max_head, mut behind): (Option<u64>, Vec<String>) = (None, vec![]);
     for base in PUBLIC_XPR_MAINNET_APIS {
         let info = match ops.public_chain_post(base, "/v1/chain/get_info", json!({})) {
-            Ok(v) if v["chain_id"].as_str().is_some_and(crate::config::is_xpr_mainnet) => v,
+            Ok(v)
+                if v["chain_id"]
+                    .as_str()
+                    .is_some_and(crate::config::is_xpr_mainnet) =>
+            {
+                v
+            }
             Ok(v) => {
-                unreachable.push(format!("{base}: not XPR mainnet (chain_id {})", v["chain_id"]));
+                unreachable.push(format!(
+                    "{base}: not XPR mainnet (chain_id {})",
+                    v["chain_id"]
+                ));
                 continue;
             }
             Err(e) => {
@@ -440,7 +535,11 @@ pub fn public_mainnet_problems<O: ChainOps + ?Sized>(declared_keys: &[String], o
             Ok(sched) => {
                 let mut mainnet_keys = vec![];
                 for part in ["active", "pending", "proposed"] {
-                    if let Some(k) = sched.get(part).filter(|v| !v.is_null()).and_then(|v| schedule_keys(&json!({"active": v}))) {
+                    if let Some(k) = sched
+                        .get(part)
+                        .filter(|v| !v.is_null())
+                        .and_then(|v| schedule_keys(&json!({"active": v})))
+                    {
                         mainnet_keys.extend(k);
                     }
                 }
@@ -468,15 +567,23 @@ pub fn public_mainnet_problems<O: ChainOps + ?Sized>(declared_keys: &[String], o
         // the source is never judged on its own: the "far ahead" rule below applies to the HIGHEST head any answering
         // mainnet endpoint reports, so one stuck endpoint cannot vouch for a source that a healthy one would expose.
         let Some(mainnet_head) = info["head_block_num"].as_u64() else {
-            unreachable.push(format!("{base}: get_info without head_block_num (block not compared)"));
+            unreachable.push(format!(
+                "{base}: get_info without head_block_num (block not compared)"
+            ));
             continue;
         };
         max_head = max_head.max(Some(mainnet_head));
         if mainnet_head < src_lib {
-            behind.push(format!("{base}: mainnet head {mainnet_head} is behind the source's LIB {src_lib}"));
+            behind.push(format!(
+                "{base}: mainnet head {mainnet_head} is behind the source's LIB {src_lib}"
+            ));
             continue;
         }
-        match ops.public_chain_post(base, "/v1/chain/get_block", json!({"block_num_or_id": src_lib})) {
+        match ops.public_chain_post(
+            base,
+            "/v1/chain/get_block",
+            json!({"block_num_or_id": src_lib}),
+        ) {
             Ok(b) => match b["id"].as_str() {
                 Some(id) => {
                     blocks_compared += 1;
@@ -530,15 +637,35 @@ mod tests {
 
     #[test]
     fn private_urls() {
-        for u in ["http://127.0.0.1:8080", "http://10.1.2.3", "https://192.168.1.5/x", "http://172.16.0.9:80",
-                  "http://[::1]:8888", "http://[fd00::1]/", "http://shadow.internal", "http://edge.local:80",
-                  "http://localhost", "http://a.b.test", "http://169.254.1.1"] {
+        for u in [
+            "http://127.0.0.1:8080",
+            "http://10.1.2.3",
+            "https://192.168.1.5/x",
+            "http://172.16.0.9:80",
+            "http://[::1]:8888",
+            "http://[fd00::1]/",
+            "http://shadow.internal",
+            "http://edge.local:80",
+            "http://localhost",
+            "http://a.b.test",
+            "http://169.254.1.1",
+        ] {
             assert!(is_private_url(u), "{u}");
         }
-        for u in ["https://api.example.com", "http://8.8.8.8", "http://172.32.0.1", "https://[2001:db8::1]/",
-                  "http://user@1.2.3.4", "", "http://", "https://localhost.example.com",
-                  "http://public.example\\@127.0.0.1:8888/", "http://public.example@127.0.0.1:8888/",
-                  "http://user:pw@10.0.0.1/", "http://10.0.0.1\\.evil.example/"] {
+        for u in [
+            "https://api.example.com",
+            "http://8.8.8.8",
+            "http://172.32.0.1",
+            "https://[2001:db8::1]/",
+            "http://user@1.2.3.4",
+            "",
+            "http://",
+            "https://localhost.example.com",
+            "http://public.example\\@127.0.0.1:8888/",
+            "http://public.example@127.0.0.1:8888/",
+            "http://user:pw@10.0.0.1/",
+            "http://10.0.0.1\\.evil.example/",
+        ] {
             assert!(!is_private_url(u), "{u}");
         }
     }
@@ -549,25 +676,54 @@ mod tests {
             {"producer_name": "a", "authority": [0, {"threshold": 1, "keys": [{"key": "PUB_K1_a", "weight": 1}]}]},
             {"producer_name": "b", "block_signing_key": "PUB_K1_b"}]}});
         let k = schedule_keys(&v).unwrap();
-        assert_eq!(k, vec![("a".into(), "PUB_K1_a".into()), ("b".into(), "PUB_K1_b".into())]);
-        assert!(schedule_keys(&json!({"active": {"producers": [{"producer_name": "x"}]}})).is_none());
+        assert_eq!(
+            k,
+            vec![
+                ("a".into(), "PUB_K1_a".into()),
+                ("b".into(), "PUB_K1_b".into())
+            ]
+        );
+        assert!(
+            schedule_keys(&json!({"active": {"producers": [{"producer_name": "x"}]}})).is_none()
+        );
         assert!(schedule_keys(&json!({"active": {"producers": []}})).is_none());
         assert!(schedule_keys(&json!({})).is_none());
     }
 
     #[test]
     fn origins_are_parsed_strictly() {
-        assert_eq!(origin("http://127.0.0.1:8888/v1"), Some(("http".into(), "127.0.0.1".into(), 8888)));
-        assert_eq!(origin("http://LOCALHOST:8888"), origin("http://localhost:8888/"));
-        assert_ne!(origin("http://127.0.0.1:8888"), origin("http://127.0.0.1:8889"));
-        assert_eq!(origin("https://node.internal"), Some(("https".into(), "node.internal".into(), 443)));
+        assert_eq!(
+            origin("http://127.0.0.1:8888/v1"),
+            Some(("http".into(), "127.0.0.1".into(), 8888))
+        );
+        assert_eq!(
+            origin("http://LOCALHOST:8888"),
+            origin("http://localhost:8888/")
+        );
+        assert_ne!(
+            origin("http://127.0.0.1:8888"),
+            origin("http://127.0.0.1:8889")
+        );
+        assert_eq!(
+            origin("https://node.internal"),
+            Some(("https".into(), "node.internal".into(), 443))
+        );
         assert!(origin("http://a@127.0.0.1:8888").is_none());
         assert!(origin("http://x\\@127.0.0.1:8888").is_none());
         // Round-2 review: the path is part of the identity (a path-routing proxy must not split reads and mutations).
         assert_eq!(api_base("http://gw:8888"), api_base("http://gw:8888/"));
-        assert_eq!(api_base("http://GW:8888/node/"), api_base("http://gw:8888/node"));
-        assert_ne!(api_base("http://gw:8888/shadow"), api_base("http://gw:8888/mainnet"));
-        assert_ne!(api_base("http://gw:8888"), api_base("http://gw:8888/mainnet"));
+        assert_eq!(
+            api_base("http://GW:8888/node/"),
+            api_base("http://gw:8888/node")
+        );
+        assert_ne!(
+            api_base("http://gw:8888/shadow"),
+            api_base("http://gw:8888/mainnet")
+        );
+        assert_ne!(
+            api_base("http://gw:8888"),
+            api_base("http://gw:8888/mainnet")
+        );
         assert!(api_base("http://gw:8888/x?route=mainnet").is_none());
         assert!(api_base("http://gw:8888/x#frag").is_none());
     }
@@ -577,7 +733,14 @@ mod tests {
         for n in ["shadow", "shadow-mainnet-1", "Shadow_X"] {
             assert!(is_shadow_network_name(n), "{n}");
         }
-        for n in ["mainnet", "xpr-mainnet", "production", "testnet", "rehearsal", " "] {
+        for n in [
+            "mainnet",
+            "xpr-mainnet",
+            "production",
+            "testnet",
+            "rehearsal",
+            " ",
+        ] {
             assert!(!is_shadow_network_name(n), "{n}");
         }
     }

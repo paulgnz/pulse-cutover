@@ -5,25 +5,12 @@
 //! the journal is both the audit record and the crash-resume source of truth.
 
 use std::{
-    fs::{
-        File,
-        OpenOptions,
-    },
-    io::{
-        BufRead,
-        BufReader,
-        Write,
-    },
-    path::{
-        Path,
-        PathBuf,
-    },
+    fs::{File, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
 };
 
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::state::State;
@@ -234,7 +221,14 @@ pub fn pause_episodes(events: &[PauseEvent], legacy_paused: bool, acks_tracked: 
         match e {
             PauseEvent::Pause { ours: true } => {
                 ever_ours = true;
-                eps.push((if acks_tracked { Owner::Unknown } else { Owner::Ours }, true));
+                eps.push((
+                    if acks_tracked {
+                        Owner::Unknown
+                    } else {
+                        Owner::Ours
+                    },
+                    true,
+                ));
             }
             PauseEvent::Pause { ours: false } => eps.push((Owner::External, true)),
             PauseEvent::Ack => {
@@ -290,7 +284,9 @@ impl Journal {
     pub fn try_lock(path: &Path) -> Result<File, LockError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| LockError::Io(format!("create lock dir {}: {e}", parent.display())))?;
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    LockError::Io(format!("create lock dir {}: {e}", parent.display()))
+                })?;
             }
         }
         let lock_path = PathBuf::from(format!("{}.lock", path.display()));
@@ -305,7 +301,9 @@ impl Journal {
         // Wait up to 2 s; a real concurrent agent holds the lock for the whole ceremony.
         let mut busy = lock.try_lock();
         for _ in 0..100 {
-            if !matches!(busy, Err(std::fs::TryLockError::WouldBlock)) { break; }
+            if !matches!(busy, Err(std::fs::TryLockError::WouldBlock)) {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
             busy = lock.try_lock();
         }
@@ -328,7 +326,11 @@ impl Journal {
         }
         // Exclusive lock FIRST: nothing below (tail repair, appends) may race another agent.
         let lock = Self::lock(path)?;
-        let torn = if path.exists() { Self::repair_torn_tail(path)? } else { false };
+        let torn = if path.exists() {
+            Self::repair_torn_tail(path)?
+        } else {
+            false
+        };
         let recovered = if path.exists() {
             let mut r = Self::replay(path)?;
             r.torn_tail = torn;
@@ -392,7 +394,9 @@ impl Journal {
             return Err("journal write: injected failure (No space left on device)".into());
         }
         writeln!(self.file, "{line}").map_err(|e| format!("journal write: {e}"))?;
-        self.file.sync_data().map_err(|e| format!("journal fsync: {e}"))?;
+        self.file
+            .sync_data()
+            .map_err(|e| format!("journal fsync: {e}"))?;
         self.seq += 1;
         Ok(entry)
     }
@@ -433,7 +437,8 @@ impl Journal {
     /// never silently dropped (that could roll recovery backward). Returns whether a torn tail
     /// was set aside.
     fn repair_torn_tail(path: &Path) -> Result<bool, String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("read journal {}: {e}", path.display()))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("read journal {}: {e}", path.display()))?;
         if bytes.is_empty() {
             return Ok(false);
         }
@@ -446,7 +451,11 @@ impl Journal {
             let complete = &bytes[..lf];
             let mut end = complete.len();
             loop {
-                let start = complete[..end].iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+                let start = complete[..end]
+                    .iter()
+                    .rposition(|b| *b == b'\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
                 let rec = &complete[start..end];
                 if rec.iter().all(is_ws) {
                     if start == 0 {
@@ -471,15 +480,22 @@ impl Journal {
         }
         if tail.iter().all(is_ws) {
             // Stray CR/blank bytes after the last LF: not a record. Trim so appends start clean.
-            let f = OpenOptions::new().write(true).open(path).map_err(|e| e.to_string())?;
-            f.set_len(tail_start as u64).map_err(|e| format!("trim journal tail: {e}"))?;
+            let f = OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|e| e.to_string())?;
+            f.set_len(tail_start as u64)
+                .map_err(|e| format!("trim journal tail: {e}"))?;
             f.sync_data().map_err(|e| e.to_string())?;
             return Ok(false);
         }
         let frag = tail.strip_suffix(b"\r").unwrap_or(tail);
         if serde_json::from_slice::<Entry>(frag).is_ok() {
             // Complete entry, only its newline missing: add it so the next append starts clean.
-            let mut f = OpenOptions::new().append(true).open(path).map_err(|e| e.to_string())?;
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(path)
+                .map_err(|e| e.to_string())?;
             f.write_all(b"\n").map_err(|e| e.to_string())?;
             f.sync_data().map_err(|e| e.to_string())?;
             return Ok(false);
@@ -487,20 +503,32 @@ impl Journal {
         let aside = PathBuf::from(format!(
             "{}.torn-{}",
             path.display(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
         ));
         {
             // The forensic copy (and its directory entry) must be durable BEFORE truncation.
             let mut f = File::create(&aside).map_err(|e| format!("save torn tail: {e}"))?;
-            f.write_all(tail).map_err(|e| format!("save torn tail: {e}"))?;
-            f.sync_all().map_err(|e| format!("fsync torn tail copy: {e}"))?;
-            let dir = aside.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            f.write_all(tail)
+                .map_err(|e| format!("save torn tail: {e}"))?;
+            f.sync_all()
+                .map_err(|e| format!("fsync torn tail copy: {e}"))?;
+            let dir = aside
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
             File::open(dir)
                 .and_then(|d| d.sync_all())
                 .map_err(|e| format!("fsync directory of torn tail copy {}: {e}", dir.display()))?;
         }
-        let f = OpenOptions::new().write(true).open(path).map_err(|e| e.to_string())?;
-        f.set_len(tail_start as u64).map_err(|e| format!("truncate torn tail: {e}"))?;
+        let f = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        f.set_len(tail_start as u64)
+            .map_err(|e| format!("truncate torn tail: {e}"))?;
         f.sync_data().map_err(|e| e.to_string())?;
         eprintln!(
             "journal: WARNING a partial last line (crash mid-write) was set aside to {} and \
@@ -522,8 +550,14 @@ impl Journal {
             .map_err(|e| e.to_string())?;
         // Only the bytes after the LAST LF can be a torn write (see repair_torn_tail): with
         // `lines()`, that fragment is the final element exactly when the file does not end in LF.
-        let ends_with_newline = std::fs::read(path).map(|b| b.last() == Some(&b'\n')).unwrap_or(true);
-        let tail_index = if ends_with_newline { None } else { lines.len().checked_sub(1) };
+        let ends_with_newline = std::fs::read(path)
+            .map(|b| b.last() == Some(&b'\n'))
+            .unwrap_or(true);
+        let tail_index = if ends_with_newline {
+            None
+        } else {
+            lines.len().checked_sub(1)
+        };
         for (i, line) in lines.iter().enumerate() {
             if line.trim().is_empty() {
                 continue;
@@ -531,16 +565,18 @@ impl Journal {
             let entry: Entry = match serde_json::from_str(line.trim_end_matches('\r')) {
                 Ok(e) => e,
                 Err(e) if Some(i) == tail_index => {
-                    eprintln!("journal: WARNING ignoring a partial last line (crash mid-write): {e}");
+                    eprintln!(
+                        "journal: WARNING ignoring a partial last line (crash mid-write): {e}"
+                    );
                     out.torn_tail = true;
                     continue;
                 }
                 Err(e) => {
                     return Err(format!(
-                        "corrupt journal line {} of {} (not the last line, so not a torn write): {e}",
-                        i + 1,
-                        path.display()
-                    ))
+                    "corrupt journal line {} of {} (not the last line, so not a torn write): {e}",
+                    i + 1,
+                    path.display()
+                ))
                 }
             };
             // Fail closed on a journal from a NEWER agent: a record kind this agent does not know (or, below, a state it
@@ -556,12 +592,19 @@ impl Journal {
             }
             if entry.kind == "transition" {
                 let st: State = entry.state.parse()?;
-                if matches!(st, State::Ignited | State::Flipped | State::Live | State::Halted) {
+                if matches!(
+                    st,
+                    State::Ignited | State::Flipped | State::Live | State::Halted
+                ) {
                     out.reached_ignited = true;
                 }
                 if st == State::Halted {
                     out.unhalted = false;
-                    out.halted_from = entry.data.get("halted_from").and_then(|v| v.as_str()).and_then(|v| v.parse().ok());
+                    out.halted_from = entry
+                        .data
+                        .get("halted_from")
+                        .and_then(|v| v.as_str())
+                        .and_then(|v| v.parse().ok());
                 }
                 // Every ABORTED transition (re)opens the rollback; only a later `rollback_done` closes
                 // it. Leaving ABORTED (a new ceremony on this journal) forgets the episode's steps.
@@ -576,14 +619,27 @@ impl Journal {
                 }
                 out.state = Some(st);
                 // The arming record (it carries "mode"; an unhalt returning to ARMED does not): bind the shadow identity.
-                if st == State::Armed && out.armed_shadow.is_none() && entry.data.get("mode").is_some() {
-                    out.armed_shadow = Some(entry.data.get("shadow").cloned().unwrap_or(Value::Null));
+                if st == State::Armed
+                    && out.armed_shadow.is_none()
+                    && entry.data.get("mode").is_some()
+                {
+                    out.armed_shadow =
+                        Some(entry.data.get("shadow").cloned().unwrap_or(Value::Null));
                 }
-                if st == State::Armed && out.undo_tracking.is_none() && entry.data.get("mode").is_some() {
-                    out.undo_tracking = Some(entry.data.get("undo_tracking").and_then(|v| v.as_bool()) == Some(true));
+                if st == State::Armed
+                    && out.undo_tracking.is_none()
+                    && entry.data.get("mode").is_some()
+                {
+                    out.undo_tracking = Some(
+                        entry.data.get("undo_tracking").and_then(|v| v.as_bool()) == Some(true),
+                    );
                 }
-                if st == State::Armed && out.pause_ack_tracking.is_none() && entry.data.get("mode").is_some() {
-                    out.pause_ack_tracking = Some(entry.data.get("pause_ack").and_then(|v| v.as_bool()) == Some(true));
+                if st == State::Armed
+                    && out.pause_ack_tracking.is_none()
+                    && entry.data.get("mode").is_some()
+                {
+                    out.pause_ack_tracking =
+                        Some(entry.data.get("pause_ack").and_then(|v| v.as_bool()) == Some(true));
                 }
                 if entry.state == State::Frozen.as_str() {
                     out.frozen_ts_ms = Some(entry.ts_ms);
@@ -593,15 +649,30 @@ impl Journal {
             // transition: that error is HALTED even if the process died before the transition.
             // (rc.7+ writes one HALTED transition carrying the reason.)
             if entry.kind == "error"
-                && entry.data.get("detail").and_then(|d| d.get("sealed")).and_then(|v| v.as_bool()) == Some(true)
+                && entry
+                    .data
+                    .get("detail")
+                    .and_then(|d| d.get("sealed"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
             {
-                out.halted_from = entry.state.parse().ok().filter(|s: &State| *s != State::Halted).or(out.halted_from);
+                out.halted_from = entry
+                    .state
+                    .parse()
+                    .ok()
+                    .filter(|s: &State| *s != State::Halted)
+                    .or(out.halted_from);
                 out.state = Some(State::Halted);
                 out.reached_ignited = true;
                 out.unhalted = false;
             }
             if entry.data.get("shadow_refused").and_then(|v| v.as_bool()) == Some(true)
-                || entry.data.get("detail").and_then(|d| d.get("shadow_refused")).and_then(|v| v.as_bool()) == Some(true)
+                || entry
+                    .data
+                    .get("detail")
+                    .and_then(|d| d.get("shadow_refused"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
             {
                 out.shadow_refused = true;
             }
@@ -609,7 +680,11 @@ impl Journal {
             // itself carries `external_pause_held` as a display field and is not an intent).
             if entry.kind != "transition"
                 && (entry.data.get("strand_intent").and_then(|v| v.as_bool()) == Some(true)
-                    || entry.data.get("external_pause_held").and_then(|v| v.as_bool()) == Some(true))
+                    || entry
+                        .data
+                        .get("external_pause_held")
+                        .and_then(|v| v.as_bool())
+                        == Some(true))
             {
                 out.strand_intent = true;
             }
@@ -627,7 +702,11 @@ impl Journal {
                 out.strand_intent = false;
                 out.segment = seg;
             }
-            if let Some(b) = entry.data.get("mainnet_event_verified").filter(|b| b.is_object()) {
+            if let Some(b) = entry
+                .data
+                .get("mainnet_event_verified")
+                .filter(|b| b.is_object())
+            {
                 out.mainnet_event_binding = Some(b.clone());
             }
             if out.legacy_takeover.is_none() {
@@ -638,7 +717,12 @@ impl Journal {
                     ));
                 }
             }
-            if entry.data.get("snapshot_scheduled_at").and_then(|v| v.as_u64()).is_some() {
+            if entry
+                .data
+                .get("snapshot_scheduled_at")
+                .and_then(|v| v.as_u64())
+                .is_some()
+            {
                 out.scheduled = true;
             }
             if entry.data.get("source_pause_ack").is_some() {
@@ -648,11 +732,21 @@ impl Journal {
             // (`source_resume_outcome_unknown`): the episode stays closing = ownership unknown. A round-11
             // `source_resume_cancelled` record is read the same way.
             // r30 round 11 (review R10-2): the pause_at_h recovery resume closes its episode like a rollback's resume.
-            if entry.data.get("resumed_production_for_snapshot").and_then(|v| v.as_bool()) == Some(true) {
+            if entry
+                .data
+                .get("resumed_production_for_snapshot")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
                 out.pause_events.push(PauseEvent::Resume);
             }
             // r30 round 14 (model R13-A): someone else un-paused this ceremony's own pause (a read saw it producing).
-            if entry.data.get("own_pause_released_externally").and_then(|v| v.as_bool()) == Some(true) {
+            if entry
+                .data
+                .get("own_pause_released_externally")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
                 out.pause_events.push(PauseEvent::Resume);
             }
             if let Some(se) = entry.data.get("side_effect").and_then(|v| v.as_str()) {
@@ -660,7 +754,9 @@ impl Journal {
                     "source_pause" => out.pause_events.push(PauseEvent::Pause {
                         ours: entry.data.get("adopted").and_then(|v| v.as_bool()) != Some(true),
                     }),
-                    "external_pause_release" => out.pause_events.push(PauseEvent::Release { live: false }),
+                    "external_pause_release" => {
+                        out.pause_events.push(PauseEvent::Release { live: false })
+                    }
                     "source_resume" => out.pause_events.push(PauseEvent::ResumeIntent),
                     "write_freeze" => out.writes_closed = true,
                     _ => {}
@@ -668,7 +764,9 @@ impl Journal {
                 // r30 round 7: a pause found after the freeze and ADOPTED for the cut (someone else paused the
                 // producer) is journaled as `side_effect: source_pause` with `adopted: true`; it is recovered as
                 // `source_pause_adopted`, never as this ceremony's own pause.
-                let se = if se == "source_pause" && entry.data.get("adopted").and_then(|v| v.as_bool()) == Some(true) {
+                let se = if se == "source_pause"
+                    && entry.data.get("adopted").and_then(|v| v.as_bool()) == Some(true)
+                {
                     "source_pause_adopted"
                 } else {
                     se
@@ -682,10 +780,20 @@ impl Journal {
                     out.reached_ignited = true;
                 }
             }
-            if entry.data.get("rollback_requested").and_then(|v| v.as_bool()) == Some(true) {
+            if entry
+                .data
+                .get("rollback_requested")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
                 out.rollback_pending = true;
             }
-            if entry.data.get("rollback_intent_cancelled").and_then(|v| v.as_bool()) == Some(true) {
+            if entry
+                .data
+                .get("rollback_intent_cancelled")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
                 out.rollback_pending = false;
             }
             if entry.data.get("rollback_incomplete").is_some() {
@@ -725,10 +833,16 @@ impl Journal {
             for (key, slot) in [
                 ("target_blockchain_id", &mut out.target_blockchain_id),
                 ("target_subnet_id", &mut out.target_subnet_id),
-                ("accepted_target_chain_id", &mut out.accepted_target_chain_id),
+                (
+                    "accepted_target_chain_id",
+                    &mut out.accepted_target_chain_id,
+                ),
                 ("boot_manifest_sha256", &mut out.boot_manifest_sha256),
                 ("boot_genesis_sha256", &mut out.boot_genesis_sha256),
-                ("boot_chain_config_sha256", &mut out.boot_chain_config_sha256),
+                (
+                    "boot_chain_config_sha256",
+                    &mut out.boot_chain_config_sha256,
+                ),
                 ("chain_id", &mut out.chain_id),
                 ("cut_block_id", &mut out.cut_block_id),
                 ("snapshot_file", &mut out.snapshot_file),

@@ -47,7 +47,10 @@ pub fn sanitize_short(s: &str) -> String {
             (r"`[^`]*`", "<cmd>"),
             (r"[a-zA-Z][a-zA-Z0-9+.-]*://\S+", "<url>"),
             (r"\b\d{1,3}(\.\d{1,3}){3}(:\d+)?\b", "<ip>"),
-            (r"\[?[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,7}\]?(:\d+)?", "<ip>"),
+            (
+                r"\[?[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,7}\]?(:\d+)?",
+                "<ip>",
+            ),
             (r"(~|\.{1,2})?/[^\s:;,'\x22)]+", "<path>"),
             (r"[A-Za-z0-9+/=_-]{40,}", "<blob>"),
         ]
@@ -94,14 +97,21 @@ fn post_json(a: &ureq::Agent, url: &str, body: Value) -> Result<Value, String> {
 /// Base URL of the local metalgo HTTP API, derived from the target rpc_url (…:9650/ext/bc/<id>/rpc).
 fn metal_base(cfg: &Config) -> String {
     let u = &cfg.target.rpc_url;
-    match u.find("/ext/") { Some(i) => u[..i].to_string(), None => "http://127.0.0.1:9650".into() }
+    match u.find("/ext/") {
+        Some(i) => u[..i].to_string(),
+        None => "http://127.0.0.1:9650".into(),
+    }
 }
 
 fn metal_rpc(b: &Budget, base: &str, path: &str, method: &str, params: Value) -> Option<Value> {
     let a = b.agent(Duration::from_secs(2))?;
-    post_json(&a, &format!("{base}{path}"), json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))
-        .ok()
-        .and_then(|v| v.get("result").cloned())
+    post_json(
+        &a,
+        &format!("{base}{path}"),
+        json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}),
+    )
+    .ok()
+    .and_then(|v| v.get("result").cloned())
 }
 
 /// The Metal network a source chain is expected to move onto (XPR mainnet → Metal mainnet 1,
@@ -116,7 +126,9 @@ pub fn expected_metal_network(chain_id: Option<&str>) -> Option<u64> {
 
 /// The target runs on a configured private Metal network (`target.metal_network_id`, not 1 or 5).
 fn private_metal(cfg: &Config) -> bool {
-    cfg.target.metal_network_id.is_some_and(|n| !crate::config::is_public_metal_network(n))
+    cfg.target
+        .metal_network_id
+        .is_some_and(|n| !crate::config::is_public_metal_network(n))
 }
 
 /// Last port-reachability verdict from mission control (it dials this server's IP on 9651 only).
@@ -124,7 +136,11 @@ fn private_metal(cfg: &Config) -> bool {
 static REACH: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
 
 fn staking_reachable(cfg: &Config, b: &Budget) -> Option<bool> {
-    let url = cfg.beacon.as_ref().map(|b| b.url.clone()).unwrap_or_default();
+    let url = cfg
+        .beacon
+        .as_ref()
+        .map(|b| b.url.clone())
+        .unwrap_or_default();
     let base = url.trim_end_matches("/api/report");
     if base.is_empty() || base == url {
         return None;
@@ -136,7 +152,13 @@ fn staking_reachable(cfg: &Config, b: &Budget) -> Option<bool> {
         }
     }
     let a = b.agent(Duration::from_secs(5))?;
-    let ok = a.get(&format!("{base}/api/reach")).call().ok()?.into_json::<Value>().ok()?["reachable"].as_bool()?;
+    let ok = a
+        .get(&format!("{base}/api/reach"))
+        .call()
+        .ok()?
+        .into_json::<Value>()
+        .ok()?["reachable"]
+        .as_bool()?;
     *g = Some((Instant::now(), ok));
     Some(ok)
 }
@@ -163,16 +185,29 @@ fn producer_api_exposure(cfg: &Config, b: &Budget) -> Option<(Vec<String>, u64)>
     let last = g.as_ref().and_then(|(_, l)| l.clone());
     let fresh = (|| {
         let a = b.agent(Duration::from_secs(6))?;
-        let v = a.get(&format!("{base}/api/exposure")).query("net", &bc.network).query("producer", &bc.producer)
-            .call().ok()?.into_json::<Value>().ok()?;
+        let v = a
+            .get(&format!("{base}/api/exposure"))
+            .query("net", &bc.network)
+            .query("producer", &bc.producer)
+            .call()
+            .ok()?
+            .into_json::<Value>()
+            .ok()?;
         let r = &v["producer_api"];
-        let open: Vec<String> = r["open"].as_array()?.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        let open: Vec<String> = r["open"]
+            .as_array()?
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
         Some((open, r["checked"].as_u64().unwrap_or(0)))
     })();
     if let Some((open, _)) = &fresh {
         if !open.is_empty() {
             // Local log only: the public report carries the count, never the URLs.
-            eprintln!("beacon: producer API answers from the internet at: {}", open.join(", "));
+            eprintln!(
+                "beacon: producer API answers from the internet at: {}",
+                open.join(", ")
+            );
         }
     }
     let out = fresh.or(last);
@@ -195,13 +230,34 @@ fn metal_healthy(b: &Budget, base: &str) -> Option<bool> {
 /// never the IP address (mission control's page is public).
 fn metal_info(cfg: &Config, b: &Budget) -> Value {
     let base = metal_base(cfg);
-    let Some(id) = metal_rpc(b, &base, "/ext/info", "info.getNodeID", json!({})) else { return Value::Null };
+    let Some(id) = metal_rpc(b, &base, "/ext/info", "info.getNodeID", json!({})) else {
+        return Value::Null;
+    };
     let ver = metal_rpc(b, &base, "/ext/info", "info.getNodeVersion", json!({}));
     let net = metal_rpc(b, &base, "/ext/info", "info.getNetworkID", json!({}));
     let peers = metal_rpc(b, &base, "/ext/info", "info.peers", json!({}));
-    let boot = |c: &str| metal_rpc(b, &base, "/ext/info", "info.isBootstrapped", json!({"chain": c})).and_then(|v| v["isBootstrapped"].as_bool());
-    let peer_n = peers.as_ref().and_then(|p| p["numPeers"].as_str().and_then(|n| n.parse::<u64>().ok()).or_else(|| p["peers"].as_array().map(|x| x.len() as u64)));
-    let network_id = net.as_ref().and_then(|v| v["networkID"].as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v["networkID"].as_u64()));
+    let boot = |c: &str| {
+        metal_rpc(
+            b,
+            &base,
+            "/ext/info",
+            "info.isBootstrapped",
+            json!({"chain": c}),
+        )
+        .and_then(|v| v["isBootstrapped"].as_bool())
+    };
+    let peer_n = peers.as_ref().and_then(|p| {
+        p["numPeers"]
+            .as_str()
+            .and_then(|n| n.parse::<u64>().ok())
+            .or_else(|| p["peers"].as_array().map(|x| x.len() as u64))
+    });
+    let network_id = net.as_ref().and_then(|v| {
+        v["networkID"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| v["networkID"].as_u64())
+    });
     json!({
         "node_id": id["nodeID"],
         "bls_public_key": id["nodePOP"]["publicKey"],
@@ -247,14 +303,26 @@ fn hook_ready(cmd: &str) -> (bool, String) {
             return (true, "configured and executable".into());
         }
     }
-    (false, if prog.contains('/') { "configured but the script does not exist" } else { "configured but the command is not on PATH" }.into())
+    (
+        false,
+        if prog.contains('/') {
+            "configured but the script does not exist"
+        } else {
+            "configured but the command is not on PATH"
+        }
+        .into(),
+    )
 }
 
 fn free_gb(dir: &Path) -> Option<f64> {
     // The snapshots dir may not exist yet (nodeos creates it on the first snapshot): measure the
     // filesystem it will live on, i.e. the nearest existing ancestor.
     let dir = dir.ancestors().find(|p| p.exists()).unwrap_or(dir);
-    let out = std::process::Command::new("df").arg("-Pk").arg(dir).output().ok()?;
+    let out = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(dir)
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let line = text.lines().nth(1)?;
     let avail_kb: f64 = line.split_whitespace().nth(3)?.parse().ok()?;
@@ -295,10 +363,16 @@ pub fn instance_id(cfg: &Config) -> String {
         }
     }
     let mut buf = [0u8; 16];
-    let random = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_ok();
+    let random = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok();
     // A preview (`beacon --once` with no url: installer dry-runs) must not write anything: it
     // gets an ephemeral id and persists nothing.
-    let persist = cfg.beacon.as_ref().map(|b| !b.url.is_empty()).unwrap_or(false);
+    let persist = cfg
+        .beacon
+        .as_ref()
+        .map(|b| !b.url.is_empty())
+        .unwrap_or(false);
     if random && !persist {
         return hex::encode(buf);
     }
@@ -310,7 +384,10 @@ pub fn instance_id(cfg: &Config) -> String {
         let path = dir.join("beacon.instance");
         // create_new: two beacons starting at once must not overwrite each other's id; the loser
         // reads the winner's.
-        let wrote = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
+        let wrote = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
             .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{id}\n").as_bytes()));
         if wrote.is_ok() {
             return id;
@@ -330,7 +407,10 @@ pub fn instance_id(cfg: &Config) -> String {
 pub fn instance_id_readonly(cfg: &Config) -> Option<String> {
     let b = cfg.beacon.as_ref().filter(|b| !b.url.is_empty())?;
     let token_file = b.token_file.as_ref()?;
-    if let Some(t) = token_file.parent().and_then(|d| std::fs::read_to_string(d.join("beacon.instance")).ok()) {
+    if let Some(t) = token_file
+        .parent()
+        .and_then(|d| std::fs::read_to_string(d.join("beacon.instance")).ok())
+    {
         let t = t.trim().to_lowercase();
         if t.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit()) {
             return Some(t);
@@ -343,13 +423,29 @@ pub fn instance_id_readonly(cfg: &Config) -> Option<String> {
 /// one machine (any config, any run directory); two machines sharing a token still differ, so the
 /// relay keeps flagging that as a conflict.
 fn derived_instance_id(token_file: Option<&PathBuf>) -> String {
-    let token = token_file.and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-    let machine = ["/etc/machine-id", "/var/lib/dbus/machine-id"].iter()
-        .find_map(|p| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
-        .or_else(|| std::process::Command::new("hostname").output().ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty()))
+    let token = token_file
+        .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
-    hex::encode(&Sha256::digest(format!("pulse-cutover-instance:{machine}:{}", token.trim()).as_bytes())[..16])
+    let machine = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+        .iter()
+        .find_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_default();
+    hex::encode(
+        &Sha256::digest(format!("pulse-cutover-instance:{machine}:{}", token.trim()).as_bytes())
+            [..16],
+    )
 }
 
 /// Incremental journal reader state: the beacon runs every few seconds against a journal that
@@ -402,17 +498,32 @@ static JOURNALS: Mutex<Option<HashMap<PathBuf, Acc>>> = Mutex::new(None);
 /// HEALTH check. The shared list lives in control/check-kinds.json (also read by mission control and
 /// matched by the dashboard's CHECKS map); tests on both sides assert they are equal.
 pub const SETUP_CHECKS: &[&str] = &[
-    "hook_on_freeze", "hook_post_ignite", "hook_on_live", "hook_on_abort",
-    "validator_running", "metal_synced", "metal_reachable", "producer_api_private",
-    "rehearsal_overrides", "shadow",
+    "hook_on_freeze",
+    "hook_post_ignite",
+    "hook_on_live",
+    "hook_on_abort",
+    "validator_running",
+    "metal_synced",
+    "metal_reachable",
+    "producer_api_private",
+    "rehearsal_overrides",
+    "shadow",
 ];
 
 /// A report with any failing HEALTH check (a failing setup check does not count).
 pub fn has_failing_health(report: &Value) -> bool {
-    report["checks"].as_array().map(|cs| cs.iter().any(|c| {
-        c["ok"].as_bool() == Some(false)
-            && !c["name"].as_str().map(|n| SETUP_CHECKS.contains(&n)).unwrap_or(false)
-    })).unwrap_or(false)
+    report["checks"]
+        .as_array()
+        .map(|cs| {
+            cs.iter().any(|c| {
+                c["ok"].as_bool() == Some(false)
+                    && !c["name"]
+                        .as_str()
+                        .map(|n| SETUP_CHECKS.contains(&n))
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn file_ident(m: &std::fs::Metadata) -> (u64, u64) {
@@ -430,19 +541,29 @@ fn file_ident(m: &std::fs::Metadata) -> (u64, u64) {
 
 /// The fleet digest of a VERIFIED record's fingerprints (full 256-bit: a shortened one would let different state collide).
 pub fn fingerprints_digest(fingerprints: &Value) -> String {
-    hex::encode(Sha256::digest(serde_json::to_string(fingerprints).unwrap_or_default().as_bytes()))
+    hex::encode(Sha256::digest(
+        serde_json::to_string(fingerprints)
+            .unwrap_or_default()
+            .as_bytes(),
+    ))
 }
 
 /// The verified evidence of a VERIFIED transition (or a `reverified` record) — accumulate only.
 fn put_verified(ev: &mut serde_json::Map<String, Value>, d: &Value) {
-    for (k, src) in [("snapshot_sha256", "sha256"), ("boot_genesis_sha256", "boot_genesis_sha256"),
-                     ("protocol_schedule_hash", "protocol_schedule_hash")] {
+    for (k, src) in [
+        ("snapshot_sha256", "sha256"),
+        ("boot_genesis_sha256", "boot_genesis_sha256"),
+        ("protocol_schedule_hash", "protocol_schedule_hash"),
+    ] {
         if !d[src].is_null() {
             ev.insert(k.into(), d[src].clone());
         }
     }
     if d["fingerprints"].is_object() {
-        ev.insert("fingerprints_digest".into(), json!(fingerprints_digest(&d["fingerprints"])));
+        ev.insert(
+            "fingerprints_digest".into(),
+            json!(fingerprints_digest(&d["fingerprints"])),
+        );
     }
     if let Some(dg) = compare_allowed_digest(&d["compare_allowed_mismatch"]) {
         ev.insert("compare_allowed_digest".into(), json!(dg));
@@ -452,7 +573,11 @@ fn put_verified(ev: &mut serde_json::Map<String, Value>, d: &Value) {
 /// The digest of the tables a rehearsal verification allowed to mismatch (sorted, comma-joined), None when it allowed
 /// none (rc.26 F7: `join --reverify` may accept the same rehearsal override only when the LIVE quorum carries the same set).
 pub fn compare_allowed_digest(allowed: &Value) -> Option<String> {
-    let mut t: Vec<&str> = allowed.as_array()?.iter().filter_map(|v| v.as_str()).collect();
+    let mut t: Vec<&str> = allowed
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
     if t.is_empty() {
         return None;
     }
@@ -526,14 +651,21 @@ fn apply_line(acc: &mut Acc, v: &Value) {
             acc.state = v["state"].clone();
             acc.degraded = None;
             acc.aborting = false;
-            acc.sealed = (v["state"].as_str() == Some("STRANDED")).then(|| d["sealed"].as_bool() != Some(false));
+            acc.sealed = (v["state"].as_str() == Some("STRANDED"))
+                .then(|| d["sealed"].as_bool() != Some(false));
             // A resumed old chain is about the last ABORTED; any later state (e.g. a join) is not on it.
             acc.source_resumed = v["state"].as_str() == Some("ABORTED")
-                && (acc.source_resumed || d["source_producer_resumed"].as_bool() == Some(true) || d.get("source_restarted").is_some());
-            if matches!(v["state"].as_str(), Some("IGNITED" | "FLIPPED" | "LIVE" | "HALTED")) {
+                && (acc.source_resumed
+                    || d["source_producer_resumed"].as_bool() == Some(true)
+                    || d.get("source_restarted").is_some());
+            if matches!(
+                v["state"].as_str(),
+                Some("IGNITED" | "FLIPPED" | "LIVE" | "HALTED")
+            ) {
                 acc.ignition_started = true;
             }
-            acc.forced_rollback = v["state"].as_str() == Some("ABORTED") && d["force_after_ignite"].as_bool() == Some(true);
+            acc.forced_rollback = v["state"].as_str() == Some("ABORTED")
+                && d["force_after_ignite"].as_bool() == Some(true);
             // rc.29: as the journal replay does, STRANDED also ends a pending rollback intent.
             if matches!(v["state"].as_str(), Some("ABORTED" | "STRANDED")) {
                 acc.rollback_pending = false;
@@ -544,7 +676,8 @@ fn apply_line(acc: &mut Acc, v: &Value) {
                 .then(|| d.get("reverts_ok").map(|_| false))
                 .flatten();
             acc.last_ts = v["ts"].clone();
-            acc.transitions.push(json!({"state": v["state"], "ts": v["ts"]}));
+            acc.transitions
+                .push(json!({"state": v["state"], "ts": v["ts"]}));
             let ev = &mut acc.ev;
             match v["state"].as_str() {
                 Some("ARMED") => {
@@ -598,7 +731,10 @@ pub fn journal_summary(path: &Path) -> Value {
             let ident = file_ident(&m);
             let mut acc = map.remove(path).unwrap_or_default();
             if acc.ident != ident || m.len() < acc.offset {
-                acc = Acc { ident, ..Default::default() }; // replaced or truncated: start over
+                acc = Acc {
+                    ident,
+                    ..Default::default()
+                }; // replaced or truncated: start over
             }
             if m.len() > acc.offset {
                 if let Ok(mut f) = std::fs::File::open(path) {
@@ -671,24 +807,71 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
 
     // Source chain.
     let info = match budget.agent(Duration::from_secs(3)) {
-        Some(a) => post_json(&a, &format!("{}/v1/chain/get_info", cfg.source.rpc_url.trim_end_matches('/')), json!({})),
+        Some(a) => post_json(
+            &a,
+            &format!(
+                "{}/v1/chain/get_info",
+                cfg.source.rpc_url.trim_end_matches('/')
+            ),
+            json!({}),
+        ),
         None => Err(skipped()),
     };
     let (head, lib, chain_id) = match &info {
-        Ok(v) => (v["head_block_num"].as_u64(), v["last_irreversible_block_num"].as_u64(), v["chain_id"].as_str().map(String::from)),
+        Ok(v) => (
+            v["head_block_num"].as_u64(),
+            v["last_irreversible_block_num"].as_u64(),
+            v["chain_id"].as_str().map(String::from),
+        ),
         Err(_) => (None, None, None),
     };
-    checks.push(check("source_api", info.is_ok(), match &info { Ok(_) => format!("head {} lib {}", head.unwrap_or(0), lib.unwrap_or(0)), Err(_) => "not reachable".into() }));
+    checks.push(check(
+        "source_api",
+        info.is_ok(),
+        match &info {
+            Ok(_) => format!("head {} lib {}", head.unwrap_or(0), lib.unwrap_or(0)),
+            Err(_) => "not reachable".into(),
+        },
+    ));
     if let Some(want) = &cfg.ceremony.chain_id {
         let ok = chain_id.as_deref() == Some(want.as_str());
-        checks.push(check("chain_id", ok, if ok { format!("{}…", &want[..16.min(want.len())]) } else { format!("node reports {}, config expects {}…", chain_id.as_deref().map(|c| format!("{}…", &c[..16.min(c.len())])).unwrap_or_else(|| "nothing".into()), &want[..16.min(want.len())]) }));
+        checks.push(check(
+            "chain_id",
+            ok,
+            if ok {
+                format!("{}…", &want[..16.min(want.len())])
+            } else {
+                format!(
+                    "node reports {}, config expects {}…",
+                    chain_id
+                        .as_deref()
+                        .map(|c| format!("{}…", &c[..16.min(c.len())]))
+                        .unwrap_or_else(|| "nothing".into()),
+                    &want[..16.min(want.len())]
+                )
+            },
+        ));
     }
     if cfg.ceremony.mode == crate::config::Mode::Producer {
         let p = match budget.agent(Duration::from_secs(2)) {
-            Some(a) => post_json(&a, &format!("{}/v1/producer/paused", cfg.source.producer_api_url.trim_end_matches('/')), json!({})),
+            Some(a) => post_json(
+                &a,
+                &format!(
+                    "{}/v1/producer/paused",
+                    cfg.source.producer_api_url.trim_end_matches('/')
+                ),
+                json!({}),
+            ),
             None => Err(skipped()),
         };
-        checks.push(check("producer_api", p.is_ok(), match &p { Ok(_) => "reachable locally".to_string(), Err(_) => "not reachable locally".into() }));
+        checks.push(check(
+            "producer_api",
+            p.is_ok(),
+            match &p {
+                Ok(_) => "reachable locally".to_string(),
+                Err(_) => "not reachable locally".into(),
+            },
+        ));
     }
     // Anyone who can reach /v1/producer can `resume` a producer the ceremony paused at H. Visible even when
     // unknown: an untested exposure is not a private one.
@@ -705,8 +888,22 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     if cfg.ceremony.profile == crate::config::Profile::Ceremony {
         let h = cfg.ceremony.freeze_height;
         if h > 0 {
-            let ok = past_ignite || state == "LIVE" || head.map(|x| x < h || !state.is_empty()).unwrap_or(false);
-            checks.push(check("freeze_height", ok, format!("H = {h}{}", head.map(|x| if x < h { format!(", {} blocks away", h - x) } else { String::new() }).unwrap_or_default())));
+            let ok = past_ignite
+                || state == "LIVE"
+                || head.map(|x| x < h || !state.is_empty()).unwrap_or(false);
+            checks.push(check(
+                "freeze_height",
+                ok,
+                format!(
+                    "H = {h}{}",
+                    head.map(|x| if x < h {
+                        format!(", {} blocks away", h - x)
+                    } else {
+                        String::new()
+                    })
+                    .unwrap_or_default()
+                ),
+            ));
         } else if cfg.coordination.is_some() && !cfg.ceremony.derive_h_at_arm {
             // An `await` config declares no H on purpose: H comes from the coordinator's SIGNED event (the
             // ceremony then runs a derived config with it). Not a setup failure, and never "derived from LIB".
@@ -716,10 +913,21 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
             };
             checks.push(check("freeze_height", true, detail));
         } else {
-            checks.push(check("freeze_height", cfg.ceremony.derive_h_at_arm, "H derived at ARM from LIB + freeze_margin (rehearsal)"));
+            checks.push(check(
+                "freeze_height",
+                cfg.ceremony.derive_h_at_arm,
+                "H derived at ARM from LIB + freeze_margin (rehearsal)",
+            ));
         }
         if cfg.ceremony.freeze_strategy == crate::config::FreezeStrategy::ScheduleAtH {
-            checks.push(check("freeze_lead_blocks", cfg.ceremony.freeze_lead_blocks > 0, format!("writes close {} blocks before H", cfg.ceremony.freeze_lead_blocks)));
+            checks.push(check(
+                "freeze_lead_blocks",
+                cfg.ceremony.freeze_lead_blocks > 0,
+                format!(
+                    "writes close {} blocks before H",
+                    cfg.ceremony.freeze_lead_blocks
+                ),
+            ));
         }
     }
 
@@ -728,8 +936,13 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     // for a real cut. Mission control labels it.
     let overrides = cfg.rehearsal_overrides();
     if !overrides.is_empty() {
-        checks.push(check("rehearsal_overrides", false, format!("rehearsal overrides active: {}", overrides.join("; "))));
-    } else if cfg.ceremony.profile == crate::config::Profile::Ceremony && !cfg.ceremony.rehearsal
+        checks.push(check(
+            "rehearsal_overrides",
+            false,
+            format!("rehearsal overrides active: {}", overrides.join("; ")),
+        ));
+    } else if cfg.ceremony.profile == crate::config::Profile::Ceremony
+        && !cfg.ceremony.rehearsal
         && !cfg.production_problems().is_empty()
     {
         // Loaded leniently for reporting: this config could not run a real cut (or a rehearsal) as written.
@@ -739,8 +952,18 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     } else if cfg.ceremony.rehearsal {
         // An explicit REHEARSAL ceremony (ceremony.rehearsal = true) is shown the same way: never a real cut.
         let relax = cfg.production_problems();
-        checks.push(check("rehearsal_overrides", false, format!("REHEARSAL ceremony (ceremony.rehearsal = true){}",
-            if relax.is_empty() { String::new() } else { format!("; relaxations: {}", relax.join("; ")) })));
+        checks.push(check(
+            "rehearsal_overrides",
+            false,
+            format!(
+                "REHEARSAL ceremony (ceremony.rehearsal = true){}",
+                if relax.is_empty() {
+                    String::new()
+                } else {
+                    format!("; relaxations: {}", relax.join("; "))
+                }
+            ),
+        ));
     }
 
     // SHADOW cutover: a failing setup check for as long as it is configured, so mission control shows it
@@ -753,24 +976,49 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     }
 
     // Hooks.
-    let hooks = [("on_freeze", &cfg.hooks.on_freeze), ("post_ignite", &cfg.hooks.post_ignite), ("on_live", &cfg.hooks.on_live), ("on_abort", &cfg.hooks.on_abort)];
+    let hooks = [
+        ("on_freeze", &cfg.hooks.on_freeze),
+        ("post_ignite", &cfg.hooks.post_ignite),
+        ("on_live", &cfg.hooks.on_live),
+        ("on_abort", &cfg.hooks.on_abort),
+    ];
     for (name, h) in hooks {
         if let Some(cmd) = h {
             let (ok, d) = hook_ready(cmd);
             checks.push(check(&format!("hook_{name}"), ok, d));
-        } else if cfg.ceremony.mode == crate::config::Mode::Producer && matches!(name, "on_freeze" | "post_ignite") {
-            checks.push(check(&format!("hook_{name}"), false, "not configured (needed for a multi-producer ceremony)"));
+        } else if cfg.ceremony.mode == crate::config::Mode::Producer
+            && matches!(name, "on_freeze" | "post_ignite")
+        {
+            checks.push(check(
+                &format!("hook_{name}"),
+                false,
+                "not configured (needed for a multi-producer ceremony)",
+            ));
         }
     }
 
     // Target side.
     let staged = &cfg.snapshot.staged_path;
     let staged_ok = past_verify || !staged.exists();
-    checks.push(check("staged_snapshot_absent", staged_ok, if past_verify { "staged by the ceremony (expected)".to_string() } else if staged_ok { "not pre-staged".to_string() } else { "a snapshot is already staged (would boot the target from a stale cut)".to_string() }));
+    checks.push(check(
+        "staged_snapshot_absent",
+        staged_ok,
+        if past_verify {
+            "staged by the ceremony (expected)".to_string()
+        } else if staged_ok {
+            "not pre-staged".to_string()
+        } else {
+            "a snapshot is already staged (would boot the target from a stale cut)".to_string()
+        },
+    ));
     let unit = &cfg.target.metalgo_unit;
     let ustate = unit_state(unit);
     let active = ustate == "active";
-    let metal = if active { metal_info(cfg, &budget) } else { Value::Null };
+    let metal = if active {
+        metal_info(cfg, &budget)
+    } else {
+        Value::Null
+    };
     // Mid-ignition the unit legitimately restarts, but only "activating" counts — a journal
     // saying "ignition" never makes a stopped or failed validator look healthy.
     let restarting = in_ignite && matches!(ustate.as_str(), "activating" | "reloading");
@@ -787,11 +1035,25 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         } else {
             let p = metal["bootstrapped"]["P"].as_bool().unwrap_or(false);
             let peers = metal["peers"].as_u64().unwrap_or(0);
-            let (net, want) = (metal["network_id"].as_u64(), metal["expected_network_id"].as_u64());
-            let net_ok = match (net, want) { (Some(n), Some(w)) => n == w, _ => true };
-            let private = if private_metal(cfg) { " · private network (rehearsal)" } else { "" };
+            let (net, want) = (
+                metal["network_id"].as_u64(),
+                metal["expected_network_id"].as_u64(),
+            );
+            let net_ok = match (net, want) {
+                (Some(n), Some(w)) => n == w,
+                _ => true,
+            };
+            let private = if private_metal(cfg) {
+                " · private network (rehearsal)"
+            } else {
+                ""
+            };
             let detail = if !net_ok {
-                format!("on Metal network {}, this target is configured for network {}", net.unwrap_or(0), want.unwrap_or(0))
+                format!(
+                    "on Metal network {}, this target is configured for network {}",
+                    net.unwrap_or(0),
+                    want.unwrap_or(0)
+                )
             } else if p {
                 format!("P-Chain synced · {peers} peers{private}")
             } else {
@@ -800,9 +1062,23 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
             checks.push(check("metal_synced", p && net_ok, detail));
             // Visible even when unknown: an untested staking port is not a ready one.
             match metal["staking_reachable"].as_bool() {
-                _ if private_metal(cfg) => checks.push(check("metal_reachable", true, format!(
-                    "private Metal network {}: staking port not probed from the internet", cfg.target.metal_network_id.unwrap_or(0)))),
-                Some(r) => checks.push(check("metal_reachable", r, if r { "port 9651 reachable from the internet" } else { "port 9651 not reachable from the internet" })),
+                _ if private_metal(cfg) => checks.push(check(
+                    "metal_reachable",
+                    true,
+                    format!(
+                        "private Metal network {}: staking port not probed from the internet",
+                        cfg.target.metal_network_id.unwrap_or(0)
+                    ),
+                )),
+                Some(r) => checks.push(check(
+                    "metal_reachable",
+                    r,
+                    if r {
+                        "port 9651 reachable from the internet"
+                    } else {
+                        "port 9651 not reachable from the internet"
+                    },
+                )),
                 None => checks.push(check("metal_reachable", false, "not tested yet")),
             }
         }
@@ -810,13 +1086,28 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
     // After LIVE: is the new chain still producing? (stage-2 run 2 stopped including transactions
     // seconds after LIVE while everything kept saying LIVE). Health, never an action.
     if state == "LIVE" {
-        if let Some(c) = crate::live_watch::check(cfg, &journal, budget.agent(Duration::from_secs(2)).as_ref(), true) {
+        if let Some(c) = crate::live_watch::check(
+            cfg,
+            &journal,
+            budget.agent(Duration::from_secs(2)).as_ref(),
+            true,
+        ) {
             checks.push(c);
         }
     }
-    if let Some(dir) = cfg.snapshot.dir.as_ref().or(staged.parent().map(|p| p.to_path_buf()).as_ref()) {
+    if let Some(dir) = cfg
+        .snapshot
+        .dir
+        .as_ref()
+        .or(staged.parent().map(|p| p.to_path_buf()).as_ref())
+    {
         let gb = free_gb(dir);
-        checks.push(check("disk_free", gb.map(|g| g >= 5.0).unwrap_or(false), gb.map(|g| format!("{:.0} GB free", g.floor())).unwrap_or_else(|| "unknown".into())));
+        checks.push(check(
+            "disk_free",
+            gb.map(|g| g >= 5.0).unwrap_or(false),
+            gb.map(|g| format!("{:.0} GB free", g.floor()))
+                .unwrap_or_else(|| "unknown".into()),
+        ));
     }
 
     // State diff (A3), if the post_ignite hook produced one next to the journal — but only if it
@@ -826,29 +1117,52 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
         let p = dir.join("state-diff.json");
         if let (Ok(t), Ok(m)) = (std::fs::read_to_string(&p), std::fs::metadata(&p)) {
             if let Ok(v) = serde_json::from_str::<Value>(&t) {
-                let mtime_ms = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64);
-                let after_arm = match (mtime_ms, journal["armed_ts_ms"].as_u64()) { (Some(mt), Some(a)) => mt >= a, _ => false };
+                let mtime_ms = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64);
+                let after_arm = match (mtime_ms, journal["armed_ts_ms"].as_u64()) {
+                    (Some(mt), Some(a)) => mt >= a,
+                    _ => false,
+                };
                 let cut = journal["evidence"]["cut_height"].as_u64();
-                let covers_cut = match (v["b"]["head_block_num"].as_u64(), cut) { (Some(b), Some(c)) => b >= c, (_, None) => false, _ => false };
+                let covers_cut = match (v["b"]["head_block_num"].as_u64(), cut) {
+                    (Some(b), Some(c)) => b >= c,
+                    (_, None) => false,
+                    _ => false,
+                };
                 if after_arm && covers_cut {
                     journal["evidence"]["state_diff_identical"] = v["identical"].clone();
                     journal["evidence"]["state_digest"] = v["b"]["digest"].clone();
                     journal["evidence"]["state_diff_b_head"] = v["b"]["head_block_num"].clone();
                 } else {
-                    journal["evidence"]["state_diff_ignored"] = json!("state-diff.json predates this ceremony or does not cover the cut");
+                    journal["evidence"]["state_diff_ignored"] =
+                        json!("state-diff.json predates this ceremony or does not cover the cut");
                 }
             }
         }
     }
     // Once a target may exist: what the fleet verdict compares (rc.23). The chain's Metal ids are public.
-    let may_have_target = past_ignite || journal["create_started"].as_bool() == Some(true)
+    let may_have_target = past_ignite
+        || journal["create_started"].as_bool() == Some(true)
         || journal["target_blockchain_id"].is_string();
     if may_have_target {
-        let view = crate::live_watch::target_view(cfg, &journal, budget.agent(Duration::from_secs(2)).as_ref());
+        let view = crate::live_watch::target_view(
+            cfg,
+            &journal,
+            budget.agent(Duration::from_secs(2)).as_ref(),
+        );
         journal["target"] = view;
     }
     if let Some(o) = journal.as_object_mut() {
-        for k in ["armed_ts_ms", "live_ts_ms", "target_blockchain_id", "target_subnet_id", "target_chain_id"] {
+        for k in [
+            "armed_ts_ms",
+            "live_ts_ms",
+            "target_blockchain_id",
+            "target_subnet_id",
+            "target_chain_id",
+        ] {
             o.remove(k);
         }
     }
@@ -891,18 +1205,29 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
 
 /// Loop forever (or once), posting reports. Never exits on a delivery failure.
 pub fn run(cfg: &Config, once: bool) -> Result<(), String> {
-    let b = cfg.beacon.as_ref().ok_or("config has no [beacon] section")?;
+    let b = cfg
+        .beacon
+        .as_ref()
+        .ok_or("config has no [beacon] section")?;
     crate::config::check_beacon_url(&b.url)?;
     let token = match &b.token_file {
-        Some(p) => std::fs::read_to_string(p).map_err(|e| format!("token_file {}: {e}", p.display()))?.trim().to_string(),
+        Some(p) => std::fs::read_to_string(p)
+            .map_err(|e| format!("token_file {}: {e}", p.display()))?
+            .trim()
+            .to_string(),
         None => String::new(),
     };
-    let a = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
+    let a = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .build();
     loop {
         let started = Instant::now();
         let report = build_report(cfg, &b.producer, &b.network);
         if once && b.url.is_empty() {
-            println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_default()
+            );
             return Ok(());
         }
         let mut req = a.post(&b.url);
@@ -912,12 +1237,18 @@ pub fn run(cfg: &Config, once: bool) -> Result<(), String> {
         match req.send_json(report.clone()) {
             Ok(_) => {
                 if once {
-                    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).unwrap_or_default()
+                    );
                     return Ok(());
                 }
             }
             Err(e) => {
-                eprintln!("beacon: delivery failed ({}); will retry", sanitize_short(&e.to_string()));
+                eprintln!(
+                    "beacon: delivery failed ({}); will retry",
+                    sanitize_short(&e.to_string())
+                );
                 if once {
                     return Err(format!("delivery failed: {e}"));
                 }
@@ -925,7 +1256,11 @@ pub fn run(cfg: &Config, once: bool) -> Result<(), String> {
         }
         // Keep the cadence: the interval counts from the start of the cycle, not its end.
         let interval = Duration::from_secs(b.interval_secs.max(1));
-        std::thread::sleep(interval.saturating_sub(started.elapsed()).max(Duration::from_millis(500)));
+        std::thread::sleep(
+            interval
+                .saturating_sub(started.elapsed())
+                .max(Duration::from_millis(500)),
+        );
     }
 }
 
@@ -935,7 +1270,14 @@ mod tests {
     #[test]
     fn compare_allowed_digest_is_order_independent_and_absent_when_empty() {
         let a = compare_allowed_digest(&json!(["global_property", "contract_index_double"]));
-        assert_eq!(a, compare_allowed_digest(&json!(["contract_index_double", "global_property", "global_property"])));
+        assert_eq!(
+            a,
+            compare_allowed_digest(&json!([
+                "contract_index_double",
+                "global_property",
+                "global_property"
+            ]))
+        );
         assert_eq!(a.as_deref().map(str::len), Some(64));
         assert_ne!(a, compare_allowed_digest(&json!(["global_property"])));
         assert_eq!(compare_allowed_digest(&json!([])), None);
@@ -958,21 +1300,60 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("j.jsonl");
         let line = |seq: u64, kind: &str, state: &str, data: Value| {
-            format!("{}\n", json!({"seq": seq, "ts_ms": 1000 + seq, "ts": "t", "kind": kind, "state": state, "data": data}))
+            format!(
+                "{}\n",
+                json!({"seq": seq, "ts_ms": 1000 + seq, "ts": "t", "kind": kind, "state": state, "data": data})
+            )
         };
-        std::fs::write(&p, line(0, "transition", "ARMED", json!({"resolved_h": 100, "chain_id": "ab"}))).unwrap();
+        std::fs::write(
+            &p,
+            line(
+                0,
+                "transition",
+                "ARMED",
+                json!({"resolved_h": 100, "chain_id": "ab"}),
+            ),
+        )
+        .unwrap();
         let s1 = journal_summary(&p);
         assert_eq!(s1["state"], "ARMED");
         assert_eq!(s1["evidence"]["h"], 100);
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
-        f.write_all(line(1, "transition", "VERIFIED", json!({"sha256": "ff", "fingerprints": {"a": "1"}})).as_bytes()).unwrap();
-        f.write_all(line(2, "error", "VERIFIED", json!({"message": "`/opt/x.sh` failed at /var/lib/y"})).as_bytes()).unwrap();
+        f.write_all(
+            line(
+                1,
+                "transition",
+                "VERIFIED",
+                json!({"sha256": "ff", "fingerprints": {"a": "1"}}),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        f.write_all(
+            line(
+                2,
+                "error",
+                "VERIFIED",
+                json!({"message": "`/opt/x.sh` failed at /var/lib/y"}),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
         f.write_all(b"{\"partial").unwrap(); // torn tail: not consumed
         let s2 = journal_summary(&p);
         assert_eq!(s2["state"], "VERIFIED");
-        assert_eq!(s2["evidence"]["h"], 100, "earlier facts survive incremental reads");
-        assert_eq!(s2["evidence"]["fingerprints_digest"].as_str().unwrap().len(), 64);
+        assert_eq!(
+            s2["evidence"]["h"], 100,
+            "earlier facts survive incremental reads"
+        );
+        assert_eq!(
+            s2["evidence"]["fingerprints_digest"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
         let e = s2["last_error_class"].as_str().unwrap();
         assert!(!e.contains("/opt") && !e.contains("/var"), "{e}");
         assert!(s2.get("last_error").is_none());
@@ -987,26 +1368,49 @@ mod tests {
         let mut seq = 0u64;
         let mut add = |kind: &str, state: &str, data: Value| {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&p)
+                .unwrap();
             writeln!(f, "{}", json!({"seq": seq, "ts_ms": 1000 + seq, "ts": "t", "kind": kind, "state": state, "data": data})).unwrap();
             seq += 1;
         };
-        add("transition", "VERIFIED", json!({"sha256": "ff", "boot_genesis_sha256": "ab".repeat(32)}));
+        add(
+            "transition",
+            "VERIFIED",
+            json!({"sha256": "ff", "boot_genesis_sha256": "ab".repeat(32)}),
+        );
         let s = journal_summary(&p);
         assert_eq!(s["create_started"], false);
         assert_eq!(s["evidence"]["boot_genesis_sha256"], "ab".repeat(32));
-        add("transition", "ABORTED", json!({"source_producer_resumed": true, "reverts_ok": true}));
-        add("evidence", "ABORTED", json!({"rollback_step": "resume", "ok": true}));
+        add(
+            "transition",
+            "ABORTED",
+            json!({"source_producer_resumed": true, "reverts_ok": true}),
+        );
+        add(
+            "evidence",
+            "ABORTED",
+            json!({"rollback_step": "resume", "ok": true}),
+        );
         assert_eq!(journal_summary(&p)["source_resumed"], true);
         add("evidence", "ABORTED", json!({"side_effect": "join"}));
         add("evidence", "ABORTED", json!({"target_blockchain_id": "X"}));
         add("transition", "VERIFIED", json!({"joined": true}));
         let s = journal_summary(&p);
-        assert_eq!(s["source_resumed"], false, "a later state is not on the old chain any more");
+        assert_eq!(
+            s["source_resumed"], false,
+            "a later state is not on the old chain any more"
+        );
         assert_eq!(s["create_started"], true);
         assert_eq!(s["joined"], true);
         add("transition", "IGNITED", json!({}));
-        add("evidence", "IGNITED", json!({"degraded": {"symptom": "post_ignite hook failed: `/opt/h.sh` exited 1", "site": "post_ignite"}}));
+        add(
+            "evidence",
+            "IGNITED",
+            json!({"degraded": {"symptom": "post_ignite hook failed: `/opt/h.sh` exited 1", "site": "post_ignite"}}),
+        );
         let s = journal_summary(&p);
         assert_eq!(s["degraded"], true);
         assert!(!s["degraded_reason"].as_str().unwrap().contains("/opt"));
@@ -1027,7 +1431,8 @@ mod tests {
     #[test]
     fn freeze_height_check_for_a_coordinated_await_config() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg_text = || format!(
+        let cfg_text = || {
+            format!(
             r#"
 journal_path = "{d}/journal.jsonl"
 [ceremony]
@@ -1049,17 +1454,27 @@ on_live = "true"
 {c}"#,
             d = dir.path().display(),
             c = "[coordination]\nurl = \"http://127.0.0.1:1\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"00\"]\n"
-        );
+        )
+        };
         let fh = |cfg: &Config| {
             let r = build_report(cfg, "p", "rehearsal");
-            r["checks"].as_array().unwrap().iter().find(|c| c["name"] == "freeze_height").cloned().unwrap()
+            r["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == "freeze_height")
+                .cloned()
+                .unwrap()
         };
         let path = dir.path().join("await.toml");
         std::fs::write(&path, cfg_text()).unwrap();
         let cfg = Config::load(&path).unwrap();
         let c = fh(&cfg);
         assert_eq!(c["ok"], true, "{c}");
-        assert!(c["detail"].as_str().unwrap().contains("signed event"), "{c}");
+        assert!(
+            c["detail"].as_str().unwrap().contains("signed event"),
+            "{c}"
+        );
         // once the ceremony journaled its cut, the check names it
         std::fs::write(dir.path().join("journal.jsonl"), format!("{}\n",
             json!({"seq": 0, "ts_ms": 1, "ts": "t", "kind": "transition", "state": "SNAPSHOTTED", "data": {"cut_height": 4242}}))).unwrap();
@@ -1070,7 +1485,8 @@ on_live = "true"
     fn beacon_cfg(dir: &Path, journal_dir: &Path, token_dir: &Path, url: &str) -> Config {
         std::fs::create_dir_all(token_dir).unwrap();
         std::fs::write(token_dir.join("beacon.token"), "tok-1\n").unwrap();
-        let text = format!(r#"
+        let text = format!(
+            r#"
 journal_path = "{j}/journal.jsonl"
 [ceremony]
 profile = "readiness"
@@ -1087,8 +1503,14 @@ url = "{url}"
 producer = "bp1"
 network = "rehearsal"
 token_file = "{t}/beacon.token"
-"#, j = journal_dir.display(), t = token_dir.display());
-        let p = dir.join(format!("b-{}.toml", journal_dir.file_name().unwrap().to_string_lossy()));
+"#,
+            j = journal_dir.display(),
+            t = token_dir.display()
+        );
+        let p = dir.join(format!(
+            "b-{}.toml",
+            journal_dir.file_name().unwrap().to_string_lossy()
+        ));
         std::fs::write(&p, text).unwrap();
         Config::load_for_report(&p).unwrap()
     }
@@ -1099,20 +1521,48 @@ token_file = "{t}/beacon.token"
     fn instance_id_is_stable_across_run_directories_and_never_written_to_the_journal_dir() {
         let dir = tempfile::tempdir().unwrap();
         let tokens = dir.path().join("etc");
-        let a = beacon_cfg(dir.path(), &dir.path().join("run-1"), &tokens, "https://mc.example/api/report");
-        let b = beacon_cfg(dir.path(), &dir.path().join("run-2"), &tokens, "https://mc.example/api/report");
+        let a = beacon_cfg(
+            dir.path(),
+            &dir.path().join("run-1"),
+            &tokens,
+            "https://mc.example/api/report",
+        );
+        let b = beacon_cfg(
+            dir.path(),
+            &dir.path().join("run-2"),
+            &tokens,
+            "https://mc.example/api/report",
+        );
         let id = instance_id(&a);
         assert_eq!(id.len(), 32);
-        assert_eq!(instance_id(&b), id, "a second run directory reuses the id kept next to the token");
-        assert_eq!(std::fs::read_to_string(tokens.join("beacon.instance")).unwrap().trim(), id);
+        assert_eq!(
+            instance_id(&b),
+            id,
+            "a second run directory reuses the id kept next to the token"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tokens.join("beacon.instance"))
+                .unwrap()
+                .trim(),
+            id
+        );
         assert_eq!(id, derived_instance_id(Some(&tokens.join("beacon.token"))),
             "the persisted id is the derived one: a process that cannot write the file (root ceremony vs unprivileged beacon) agrees");
         assert!(!dir.path().join("run-1").join("beacon.instance").exists());
         assert!(!dir.path().join("run-2").join("beacon.instance").exists());
         // An id left in a journal directory by rc.22 or older is ignored (it differs per run).
         std::fs::create_dir_all(dir.path().join("run-3")).unwrap();
-        std::fs::write(dir.path().join("run-3").join("beacon.instance"), format!("{}\n", "0".repeat(32))).unwrap();
-        let c = beacon_cfg(dir.path(), &dir.path().join("run-3"), &tokens, "https://mc.example/api/report");
+        std::fs::write(
+            dir.path().join("run-3").join("beacon.instance"),
+            format!("{}\n", "0".repeat(32)),
+        )
+        .unwrap();
+        let c = beacon_cfg(
+            dir.path(),
+            &dir.path().join("run-3"),
+            &tokens,
+            "https://mc.example/api/report",
+        );
         assert_eq!(instance_id(&c), id);
     }
 
@@ -1120,14 +1570,24 @@ token_file = "{t}/beacon.token"
     fn instance_id_without_a_writable_token_dir_is_derived_and_stable() {
         let dir = tempfile::tempdir().unwrap();
         let tokens = dir.path().join("ro");
-        let a = beacon_cfg(dir.path(), &dir.path().join("run-1"), &tokens, "https://mc.example/api/report");
+        let a = beacon_cfg(
+            dir.path(),
+            &dir.path().join("run-1"),
+            &tokens,
+            "https://mc.example/api/report",
+        );
         // The token file sits in a directory the beacon cannot write (a sandboxed unit's /etc).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tokens, std::fs::Permissions::from_mode(0o555)).unwrap();
         }
-        let b = beacon_cfg(dir.path(), &dir.path().join("run-2"), &dir.path().join("ro"), "https://mc.example/api/report");
+        let b = beacon_cfg(
+            dir.path(),
+            &dir.path().join("run-2"),
+            &dir.path().join("ro"),
+            "https://mc.example/api/report",
+        );
         let (x, y) = (instance_id(&a), instance_id(&b));
         #[cfg(unix)]
         {
@@ -1141,13 +1601,26 @@ token_file = "{t}/beacon.token"
         assert!(!dir.path().join("run-1").join("beacon.instance").exists());
         // Another token on the same machine is another server.
         std::fs::write(dir.path().join("other.token"), "tok-2\n").unwrap();
-        assert_ne!(derived_instance_id(Some(&dir.path().join("other.token"))), derived_instance_id(Some(&tokens.join("beacon.token"))));
+        assert_ne!(
+            derived_instance_id(Some(&dir.path().join("other.token"))),
+            derived_instance_id(Some(&tokens.join("beacon.token")))
+        );
     }
 
     #[test]
     fn expected_metal_network_maps_xpr_chains() {
-        assert_eq!(expected_metal_network(Some("71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd")), Some(5));
-        assert_eq!(expected_metal_network(Some("384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0")), Some(1));
+        assert_eq!(
+            expected_metal_network(Some(
+                "71ee83bcf52142d61019d95f9cc5427ba6a0d7ff8accd9e2088ae2abeaf3d3dd"
+            )),
+            Some(5)
+        );
+        assert_eq!(
+            expected_metal_network(Some(
+                "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0"
+            )),
+            Some(1)
+        );
         assert_eq!(expected_metal_network(Some("00")), None);
     }
 }

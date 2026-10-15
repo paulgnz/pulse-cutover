@@ -10,21 +10,12 @@
 use serde_json::json;
 
 use crate::{
-    config::{
-        Config,
-        FreezeStrategy,
-        ImportBackend,
-        Mode,
-    },
-    journal::{
-        Journal,
-        Recovered,
-    },
+    config::{Config, FreezeStrategy, ImportBackend, Mode},
+    journal::{Journal, Recovered},
     ops::ChainOps,
     scan,
     state::State,
-    upstream,
-    verify,
+    upstream, verify,
 };
 
 pub struct Machine<'a, O: ChainOps> {
@@ -177,7 +168,11 @@ pub struct RollbackOutcome {
 ///    broken SHiP connection — the post-LIVE continuity proof (first write
 ///    appearing in /v2) is the definitive check, and a real migration has
 ///    traffic immediately.
-pub fn hyperion_hydrated(health: &serde_json::Value, cut: u64, max_lag: u64) -> Option<serde_json::Value> {
+pub fn hyperion_hydrated(
+    health: &serde_json::Value,
+    cut: u64,
+    max_lag: u64,
+) -> Option<serde_json::Value> {
     let services = health.get("health")?.as_array()?;
     if services.is_empty() {
         return None;
@@ -225,9 +220,18 @@ fn coordinator_abort_poll<O: ChainOps>(cfg: &Config, ops: &O, last: &mut u64, fo
     coordinator_abort_state(cfg, ops, last, force) == AbortPoll::Aborted
 }
 
-fn coordinator_abort_state<O: ChainOps>(cfg: &Config, ops: &O, last: &mut u64, force: bool) -> AbortPoll {
-    let Some(co) = cfg.coordination.as_ref() else { return AbortPoll::Clear };
-    let Some(id) = co.event_id.as_deref() else { return AbortPoll::Clear };
+fn coordinator_abort_state<O: ChainOps>(
+    cfg: &Config,
+    ops: &O,
+    last: &mut u64,
+    force: bool,
+) -> AbortPoll {
+    let Some(co) = cfg.coordination.as_ref() else {
+        return AbortPoll::Clear;
+    };
+    let Some(id) = co.event_id.as_deref() else {
+        return AbortPoll::Clear;
+    };
     // An abort this node already saw is final, whatever the relay serves now (await tombstones).
     if crate::coord::is_tombstoned(cfg, id) {
         return AbortPoll::Aborted;
@@ -241,10 +245,22 @@ fn coordinator_abort_state<O: ChainOps>(cfg: &Config, ops: &O, last: &mut u64, f
     match ops.get_json(&url) {
         Ok(Some(doc)) if doc.is_object() => {
             if crate::coord::aborted(&doc, &co.coordinator_keys, &co.network, id) {
-                crate::coord::record_tombstone(cfg, id, "aborted", "signed abort seen by the ceremony");
+                crate::coord::record_tombstone(
+                    cfg,
+                    id,
+                    "aborted",
+                    "signed abort seen by the ceremony",
+                );
                 AbortPoll::Aborted
             } else if co.event_hash.is_some()
-                && crate::coord::carries_event(&doc, &co.coordinator_keys, &co.network, id, co.event_hash.as_deref()) {
+                && crate::coord::carries_event(
+                    &doc,
+                    &co.coordinator_keys,
+                    &co.network,
+                    id,
+                    co.event_hash.as_deref(),
+                )
+            {
                 // rc.29: only with the accepted payload's hash (a config without it, e.g. derived by rc.28, cannot tell
                 // this event from another payload signed under the same id): no hash = unknown before create/ignite.
                 AbortPoll::Clear
@@ -260,10 +276,14 @@ fn coordinator_abort_state<O: ChainOps>(cfg: &Config, ops: &O, last: &mut u64, f
 /// The target chain ids from the last journaled `join` record (blockchain_id, subnet_id).
 fn journaled_join_ids(path: &std::path::Path) -> Option<(String, Option<String>)> {
     let text = std::fs::read_to_string(path).ok()?;
-    text.lines().rev().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    text.lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find_map(|v| {
             let j = &v["data"]["join"];
-            j["blockchain_id"].as_str().map(|b| (b.to_string(), j["subnet_id"].as_str().map(str::to_string)))
+            j["blockchain_id"]
+                .as_str()
+                .map(|b| (b.to_string(), j["subnet_id"].as_str().map(str::to_string)))
         })
 }
 
@@ -271,18 +291,33 @@ fn journaled_join_ids(path: &std::path::Path) -> Option<(String, Option<String>)
 /// carrying both `protocol_upgrades` and `protocol_schedule_hash`, rebuilt and re-hashed (rc.27 review: the schedule's
 /// maximum version and empty-schedule exception come from what the fleet compared, never from a file that can change).
 /// None = no such record (a journal from an older agent).
-fn journaled_protocol_schedule(path: &std::path::Path) -> Option<Result<upstream::ProtocolSchedule, String>> {
+fn journaled_protocol_schedule(
+    path: &std::path::Path,
+) -> Option<Result<upstream::ProtocolSchedule, String>> {
     let text = std::fs::read_to_string(path).ok()?;
-    text.lines().rev().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).find_map(|v| {
-        let d = &v["data"];
-        let (Some(list), Some(hash)) = (d["protocol_upgrades"].as_array(), d["protocol_schedule_hash"].as_str()) else { return None };
-        let rebuilt = upstream::ProtocolSchedule::parse(json!({"protocol_upgrades": list}).to_string().as_bytes());
-        Some(match rebuilt {
-            Ok(s) if s.hash == hash => Ok(s),
-            Ok(s) => Err(format!("journaled protocol schedule does not match its journaled hash ({} != {hash})", s.hash)),
-            Err(e) => Err(format!("journaled protocol schedule is invalid: {e}")),
+    text.lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find_map(|v| {
+            let d = &v["data"];
+            let (Some(list), Some(hash)) = (
+                d["protocol_upgrades"].as_array(),
+                d["protocol_schedule_hash"].as_str(),
+            ) else {
+                return None;
+            };
+            let rebuilt = upstream::ProtocolSchedule::parse(
+                json!({"protocol_upgrades": list}).to_string().as_bytes(),
+            );
+            Some(match rebuilt {
+                Ok(s) if s.hash == hash => Ok(s),
+                Ok(s) => Err(format!(
+                    "journaled protocol schedule does not match its journaled hash ({} != {hash})",
+                    s.hash
+                )),
+                Err(e) => Err(format!("journaled protocol schedule is invalid: {e}")),
+            })
         })
-    })
 }
 
 /// What the upstream verification produced (SNAPSHOTTED→VERIFIED and `join --reverify` share it, rc.25 F5).
@@ -304,7 +339,11 @@ struct UpstreamVerified {
 impl UpstreamVerified {
     /// The evidence the fleet compares (the beacon's snapshot_sha256 / fingerprints_digest / boot_genesis_sha256).
     fn fleet_evidence(&self) -> serde_json::Value {
-        let fingerprints = self.outcome.state_root.as_ref().map(|r| json!({"upstream_state_root": r}));
+        let fingerprints = self
+            .outcome
+            .state_root
+            .as_ref()
+            .map(|r| json!({"upstream_state_root": r}));
         json!({"snapshot_sha256": self.sha256, "boot_genesis_sha256": self.boot_hashes.1,
             "fingerprints_digest": fingerprints.map(|f| crate::beacon::fingerprints_digest(&f)),
             "protocol_schedule_hash": self.protocol.hash})
@@ -332,7 +371,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // (the flip runs inside IGNITED, before FLIPPED is journaled).
         let started = |name: &str| recovered.side_effects.iter().any(|s| s == name);
         let flip_ran = matches!(state, State::Flipped | State::Live) || started("flip_cmd");
-        let hyperion_flip_ran = matches!(state, State::Flipped | State::Live) || started("hyperion_flip_cmd");
+        let hyperion_flip_ran =
+            matches!(state, State::Flipped | State::Live) || started("hyperion_flip_cmd");
         let source_stopped = started("source_stop_cmd");
         let scheduled = recovered.scheduled;
         let reached_ignited = recovered.reached_ignited;
@@ -348,13 +388,30 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // which pauses); its freeze only when it reached FROZEN.
         let derived_paused = legacy_undo
             && (recovered.head_at_pause.is_some()
-                || matches!(state, State::Snapshotted | State::Verified | State::Ignited | State::Flipped | State::Live
-                    | State::Halted | State::Stranded));
+                || matches!(
+                    state,
+                    State::Snapshotted
+                        | State::Verified
+                        | State::Ignited
+                        | State::Flipped
+                        | State::Live
+                        | State::Halted
+                        | State::Stranded
+                ));
         let derived_froze = legacy_undo
             && recovered.segment == 0
             && (recovered.frozen_ts_ms.is_some()
-                || matches!(state, State::Frozen | State::Snapshotted | State::Verified | State::Ignited | State::Flipped
-                    | State::Live | State::Halted | State::Stranded));
+                || matches!(
+                    state,
+                    State::Frozen
+                        | State::Snapshotted
+                        | State::Verified
+                        | State::Ignited
+                        | State::Flipped
+                        | State::Live
+                        | State::Halted
+                        | State::Stranded
+                ));
         // r30 round 14 (model R13-B): derive the older agent's ownership ONCE, from the journal as that agent left it,
         // and journal it, so a state this agent writes later (a strand over someone else's pause) never counts as the
         // older agent's pause. The record is written by `ensure_legacy_takeover`, the first thing every command does:
@@ -371,12 +428,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // r30 round 10: journals armed by round 10+ record a pause ack; an own intent without it is ownership unknown.
         // A journal with no arming record yet (None) is new: this run arms it with acks.
         let acks_tracked = recovered.pause_ack_tracking != Some(false);
-        let eps = crate::journal::pause_episodes(&recovered.pause_events, legacy_paused, acks_tracked);
+        let eps =
+            crate::journal::pause_episodes(&recovered.pause_events, legacy_paused, acks_tracked);
         let (paused_by_us, pause_adopted, ever_paused_by_us, pause_unknown) =
             (eps.ours, eps.external, eps.ever_ours, eps.unknown);
         let writes_closed_by_us = legacy_froze || recovered.writes_closed;
         let strand_intent = recovered.strand_intent;
-        let create_chain_started = recovered.side_effects.iter().any(|s| s == "create_chain") || joining;
+        let create_chain_started =
+            recovered.side_effects.iter().any(|s| s == "create_chain") || joining;
         Machine {
             cfg,
             ops,
@@ -410,7 +469,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             target_subnet_id: recovered.target_subnet_id,
             create_chain_started,
             accepted_target_chain_id: recovered.accepted_target_chain_id,
-            boot_hashes: (recovered.boot_manifest_sha256, recovered.boot_genesis_sha256, recovered.boot_chain_config_sha256),
+            boot_hashes: (
+                recovered.boot_manifest_sha256,
+                recovered.boot_genesis_sha256,
+                recovered.boot_chain_config_sha256,
+            ),
             joining,
             head_at_pause: recovered.head_at_pause,
             degraded_since_ms: recovered.degraded_since_ms,
@@ -452,9 +515,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if !self.shadow_refused {
             // Round-2 review: the FIRST durable record makes the refusal authoritative (journal replay recovers it), so a
             // crash between this and the ABORTED / rollback_done records can never reopen a rollback that resumes the source.
-            self.journal.evidence(self.state, json!({"shadow_refused": true, "reason": reason}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"shadow_refused": true, "reason": reason}),
+            )?;
             self.shadow_refused = true;
-            self.journal.error(self.state, reason, json!({"detail": detail, "shadow_refused": true}))?;
+            self.journal.error(
+                self.state,
+                reason,
+                json!({"detail": detail, "shadow_refused": true}),
+            )?;
         }
         self.finish_shadow_refusal(reason)
     }
@@ -491,18 +561,27 @@ impl<'a, O: ChainOps> Machine<'a, O> {
 
     /// Round-2 review: before anything that resumes the source of a SHADOW journal, the identity must be proven in this
     /// run. Ok(true) = proven (now or earlier in this run), or not a shadow; Ok(false) = refused, nothing touched.
-    fn shadow_reprove_before_resume(&mut self, why: &str, detail: &serde_json::Value) -> Result<bool, String> {
+    fn shadow_reprove_before_resume(
+        &mut self,
+        why: &str,
+        detail: &serde_json::Value,
+    ) -> Result<bool, String> {
         if !self.is_shadow_journal() || self.shadow_proven {
             return Ok(true);
         }
         let problems = crate::shadow::identity_problems(self.cfg, self.ops);
         if problems.is_empty() {
             self.shadow_proven = true;
-            self.journal.evidence(self.state, json!({"shadow_identity": format!("re-proven before {why}")}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"shadow_identity": format!("re-proven before {why}")}),
+            )?;
             return Ok(true);
         }
-        self.shadow_refuse(&format!("{why}: SHADOW identity not re-proven, so the source is NOT resumed"),
-            json!({"identity_problems": problems, "detail": detail}))?;
+        self.shadow_refuse(
+            &format!("{why}: SHADOW identity not re-proven, so the source is NOT resumed"),
+            json!({"identity_problems": problems, "detail": detail}),
+        )?;
         Ok(false)
     }
 
@@ -525,7 +604,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let problems = crate::shadow::identity_problems(self.cfg, self.ops);
         if problems.is_empty() {
             self.shadow_proven = true;
-            self.journal.evidence(self.state, json!({"shadow_identity": format!("proven in this run before {what}")}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"shadow_identity": format!("proven in this run before {what}")}),
+            )?;
             return Ok(());
         }
         let reason = format!("SHADOW identity not proven in this run, so {what} was refused (the source was not touched)");
@@ -555,17 +637,28 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// proven gone); the cut never waits on it. Its export container can only be stopped by `drill --cancel` with
     /// that drill's config (the ceremony never runs docker): journaled loudly.
     fn stop_foreign_drill_work(&mut self, why: &str) -> Result<(), String> {
-        let crate::drill::MarkerWork::Live { journal_dir, h, .. } = crate::drill::marker_work(self.cfg) else {
+        let crate::drill::MarkerWork::Live { journal_dir, h, .. } =
+            crate::drill::marker_work(self.cfg)
+        else {
             eprintln!("WARNING: {why}. The cut continues.");
             self.journal.evidence(self.state, json!({"readiness_drill_work_unknown": why,
                 "WARNING": "a drill work marker on this producer cannot be read after the freeze; the cut continues"}))?;
             return Ok(());
         };
         let dir = journal_dir.join("drill").join(h.to_string());
-        let cancel = crate::ops::write_fresh_in(&journal_dir, &dir.join("cancel"), format!("{}\n", self.ops.now_ms()).as_bytes());
+        let cancel = crate::ops::write_fresh_in(
+            &journal_dir,
+            &dir.join("cancel"),
+            format!("{}\n", self.ops.now_ms()).as_bytes(),
+        );
         let killed = crate::ops::kill_recorded_hook_group_keep_evidence(
-            &crate::ops::hook_pgid_path(&dir.join("drill.jsonl")), std::time::Duration::from_secs(10));
-        let still = matches!(crate::drill::activity_at(&journal_dir), crate::drill::DrillActivity::Running { .. });
+            &crate::ops::hook_pgid_path(&dir.join("drill.jsonl")),
+            std::time::Duration::from_secs(10),
+        );
+        let still = matches!(
+            crate::drill::activity_at(&journal_dir),
+            crate::drill::DrillActivity::Running { .. }
+        );
         let detail = json!({"journal_dir": journal_dir, "h": h,
             "cancel_file": cancel.as_ref().map(|_| "written".to_string()).unwrap_or_else(|e| e.to_string()),
             "group_kill": match &killed { Ok(Some(d)) => d.clone(), Ok(None) => "no live pipeline group".into(), Err(e) => e.clone() }});
@@ -574,7 +667,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.journal.evidence(self.state, json!({"readiness_drill_not_stopped": detail,
                 "WARNING": "another directory's drill work could not be verified stopped next to a cut in progress; the cut continues"}))?;
         } else {
-            self.journal.evidence(self.state, json!({"readiness_drill_stopped_for_the_cut": detail}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"readiness_drill_stopped_for_the_cut": detail}),
+            )?;
         }
         Ok(())
     }
@@ -608,14 +704,28 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let cancel_file = crate::drill::cancel_path(self.cfg, dh);
         // Round 5 (review R5-5): a fresh inode inside the journal directory, never written through a symlink or a hard
         // link (a planted hard link to this journal must not truncate the journal).
-        let journal_dir = self.cfg.journal_path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        let cancel_written = crate::ops::write_fresh_in(journal_dir, &cancel_file, format!("{}\n", self.ops.now_ms()).as_bytes());
-        let killed = crate::ops::kill_recorded_hook_group_keep_evidence(&crate::drill::pgid_file(self.cfg, dh),
-                                                                         std::time::Duration::from_secs(10));
+        let journal_dir = self
+            .cfg
+            .journal_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let cancel_written = crate::ops::write_fresh_in(
+            journal_dir,
+            &cancel_file,
+            format!("{}\n", self.ops.now_ms()).as_bytes(),
+        );
+        let killed = crate::ops::kill_recorded_hook_group_keep_evidence(
+            &crate::drill::pgid_file(self.cfg, dh),
+            std::time::Duration::from_secs(10),
+        );
         let wait_ms = (self.cfg.poll_ms.max(1) * 120).min(60_000);
         let start = self.ops.now_ms();
-        while matches!(activity(self.cfg), DrillActivity::Running { .. }) && self.ops.now_ms().saturating_sub(start) < wait_ms {
-            std::thread::sleep(std::time::Duration::from_millis(self.cfg.poll_ms.clamp(1, 1000)));
+        while matches!(activity(self.cfg), DrillActivity::Running { .. })
+            && self.ops.now_ms().saturating_sub(start) < wait_ms
+        {
+            std::thread::sleep(std::time::Duration::from_millis(
+                self.cfg.poll_ms.clamp(1, 1000),
+            ));
         }
         if self.drill_root_lock.is_none() {
             if let Ok(f) = Journal::lock(&crate::drill::root_lock_base(self.cfg)) {
@@ -638,7 +748,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.journal.evidence(self.state, json!({"readiness_drill_not_stopped": detail,
                 "WARNING": "a readiness drill could not be verified stopped next to a cut in progress; the cut continues"}))?;
         } else {
-            self.journal.evidence(self.state, json!({"readiness_drill_stopped_for_the_cut": detail}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"readiness_drill_stopped_for_the_cut": detail}),
+            )?;
         }
         Ok(())
     }
@@ -653,7 +766,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(false);
         }
         // r30 round 9 (review R9-F2): a transient read error is retried (bounded) instead of ending the run mid-FROZEN.
-        if !self.read_paused_retrying(PAUSE_READ_RETRY_MS, "checking who paused the source producer")? {
+        if !self.read_paused_retrying(
+            PAUSE_READ_RETRY_MS,
+            "checking who paused the source producer",
+        )? {
             return Ok(false);
         }
         if !self.pause_adopted {
@@ -676,8 +792,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
 
     /// r30 round 9: the number of the next pause episode (journaled on every pause, resume and release record).
     fn next_episode(&self) -> usize {
-        self.pause_events.iter().filter(|e| matches!(e, crate::journal::PauseEvent::Pause { .. })).count()
-            + usize::from(self.legacy_paused) + 1
+        self.pause_events
+            .iter()
+            .filter(|e| matches!(e, crate::journal::PauseEvent::Pause { .. }))
+            .count()
+            + usize::from(self.legacy_paused)
+            + 1
     }
 
     /// r30 round 9: the latest episode number (0 = none).
@@ -689,7 +809,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// re-derive ownership from the episode log.
     fn push_pause_event(&mut self, e: crate::journal::PauseEvent) {
         self.pause_events.push(e);
-        let eps = crate::journal::pause_episodes(&self.pause_events, self.legacy_paused, self.acks_tracked);
+        let eps = crate::journal::pause_episodes(
+            &self.pause_events,
+            self.legacy_paused,
+            self.acks_tracked,
+        );
         self.paused_by_us = eps.ours;
         self.pause_adopted = eps.external;
         self.ever_paused_by_us = eps.ever_ours;
@@ -733,9 +857,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     failures += 1;
                     let now = self.ops.now_ms();
                     let elapsed = now.saturating_sub(start);
-                    if last_journaled.is_none_or(|t| now.saturating_sub(t) >= 1000) || elapsed >= window_ms {
-                        self.journal.evidence(self.state, json!({"producer_state_read_failed": e, "during": what,
-                            "failed_reads": failures, "elapsed_ms": elapsed}))?;
+                    if last_journaled.is_none_or(|t| now.saturating_sub(t) >= 1000)
+                        || elapsed >= window_ms
+                    {
+                        self.journal.evidence(
+                            self.state,
+                            json!({"producer_state_read_failed": e, "during": what,
+                            "failed_reads": failures, "elapsed_ms": elapsed}),
+                        )?;
                         last_journaled = Some(now);
                     }
                     if elapsed >= window_ms {
@@ -759,21 +888,27 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // r30 round 6: journaled BEFORE the pause, so a rollback (even after a crash) knows this ceremony paused it.
             // Round 9: it opens a new pause episode of ours.
             let episode = self.next_episode();
-            self.journal.evidence(self.state, json!({"side_effect": "source_pause", "episode": episode}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"side_effect": "source_pause", "episode": episode}),
+            )?;
             self.push_pause_event(crate::journal::PauseEvent::Pause { ours: true });
         }
         self.ops.pause()?; // ungated: this IS the gate
-        // r30 round 10 (model checker, class B): the intent alone does not make the pause ours: a crash between the
-        // intent and the RPC, then someone else pausing, would otherwise let a rollback resume THEIR pause. Ours only
-        // once the RPC succeeded AND a (retried) read confirms the producer paused: then the ack is journaled.
+                           // r30 round 10 (model checker, class B): the intent alone does not make the pause ours: a crash between the
+                           // intent and the RPC, then someone else pausing, would otherwise let a rollback resume THEIR pause. Ours only
+                           // once the RPC succeeded AND a (retried) read confirms the producer paused: then the ack is journaled.
         if self.pause_unknown && self.acks_tracked {
             // An unreadable or "producing" answer leaves the episode unacknowledged (ownership unknown, never
             // resumed): the callers' own confirmation read decides what happens next.
-            if self.read_paused_retrying(PAUSE_READ_RETRY_MS, "confirming this ceremony's pause before acknowledging it")
-                == Ok(true)
+            if self.read_paused_retrying(
+                PAUSE_READ_RETRY_MS,
+                "confirming this ceremony's pause before acknowledging it",
+            ) == Ok(true)
             {
                 let episode = self.current_episode();
-                self.journal.evidence(self.state, json!({"source_pause_ack": episode}))?;
+                self.journal
+                    .evidence(self.state, json!({"source_pause_ack": episode}))?;
                 self.push_pause_event(crate::journal::PauseEvent::Ack);
             }
         }
@@ -793,7 +928,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(None);
         }
         let read = if retry {
-            self.read_paused_retrying(PAUSE_READ_RETRY_MS, "checking the source produces before reopening writes")
+            self.read_paused_retrying(
+                PAUSE_READ_RETRY_MS,
+                "checking the source produces before reopening writes",
+            )
         } else {
             self.read_paused()
         };
@@ -814,7 +952,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// reopens writes (on_abort) only when this ceremony closed them.
     fn freeze_writes(&mut self, hook: &str) -> Result<String, String> {
         if !self.writes_closed_by_us {
-            self.journal.evidence(self.state, json!({"side_effect": "write_freeze"}))?;
+            self.journal
+                .evidence(self.state, json!({"side_effect": "write_freeze"}))?;
             self.writes_closed_by_us = true;
         }
         self.hook(hook)
@@ -835,14 +974,21 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.shadow_mutation_gate("resuming the source producer")?;
         self.shadow_producer_gate("resuming the source producer")?;
         let episode = self.current_episode();
-        self.journal.evidence(self.state, json!({"side_effect": "source_resume", "episode": episode, "during": what}))?;
+        self.journal.evidence(
+            self.state,
+            json!({"side_effect": "source_resume", "episode": episode, "during": what}),
+        )?;
         self.push_pause_event(crate::journal::PauseEvent::ResumeIntent);
-        let err = match self.ops.resume() { // ungated: this IS the gate
+        let err = match self.ops.resume() {
+            // ungated: this IS the gate
             Ok(()) => {
                 // r30 round 13 (review R12-F1a): an Ok answer is not proof. Only a confirming "producing" read (retried)
                 // closes the episode; a paused or unreadable producer after an Ok resume is ownership UNKNOWN, exactly as
                 // after a failed one (the resume may have been ignored, or applied and someone else paused since).
-                match self.read_paused_retrying(PAUSE_READ_RETRY_MS, "confirming this ceremony's resume took effect") {
+                match self.read_paused_retrying(
+                    PAUSE_READ_RETRY_MS,
+                    "confirming this ceremony's resume took effect",
+                ) {
                     Ok(false) => return Ok(()),
                     Ok(true) => {
                         self.journal.evidence(self.state, json!({"source_resume_outcome_unknown": episode,
@@ -850,7 +996,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                             "note": "the resume RPC answered ok but the producer is still paused: whether the resume was \
                                      ignored or someone else paused it since is unknown; this ceremony will not resume it \
                                      again on its own authority"}))?;
-                        return Err(format!("{RESUME_IGNORED} (ownership of that pause is now unknown)"));
+                        return Err(format!(
+                            "{RESUME_IGNORED} (ownership of that pause is now unknown)"
+                        ));
                     }
                     Err(re) => {
                         self.journal.evidence(self.state, json!({"source_resume_outcome_unknown": episode, "rpc": "ok",
@@ -865,7 +1013,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         };
         match self.read_paused_retrying(PAUSE_READ_RETRY_MS, "settling a resume RPC that failed") {
             Ok(false) => {
-                self.journal.evidence(self.state, json!({"source_resume_applied_despite_error": err, "episode": episode}))?;
+                self.journal.evidence(
+                    self.state,
+                    json!({"source_resume_applied_despite_error": err, "episode": episode}),
+                )?;
                 Ok(())
             }
             Ok(true) => {
@@ -876,7 +1027,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     "producer_paused": true,
                     "note": "the resume RPC failed and the producer is paused: whether that is still this ceremony's pause \
                              or someone else's since is unknown; this ceremony will not resume it again on its own authority"}))?;
-                Err(format!("{err} (the producer is paused: ownership of that pause is now unknown)"))
+                Err(format!(
+                    "{err} (the producer is paused: ownership of that pause is now unknown)"
+                ))
             }
             Err(re) => {
                 self.journal.evidence(self.state, json!({"source_resume_outcome_unknown": episode, "error": err,
@@ -897,7 +1050,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// Round-2 review (D-10): an XPR MAINNET journal continues only with the event its fresh ARM authenticated.
     fn check_mainnet_binding(&self) -> Result<(), String> {
         let state = if self.resumed { Some(self.state) } else { None };
-        match crate::coord::mainnet_binding_problem(self.cfg, self.chain_id.as_deref(), state, self.mainnet_binding.as_ref()) {
+        match crate::coord::mainnet_binding_problem(
+            self.cfg,
+            self.chain_id.as_deref(),
+            state,
+            self.mainnet_binding.as_ref(),
+        ) {
             Some(why) => Err(format!("{why}. Journal: {}", self.journal.path().display())),
             None => Ok(()),
         }
@@ -908,16 +1066,34 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// another H would otherwise authenticate H2 and cut H1. Checked at run start, at authentication, before the snapshot
     /// is scheduled and before the write freeze.
     fn check_mainnet_h(&self) -> Result<(), String> {
-        let Some(h) = self.resolved_h else { return Ok(()) };
-        if !self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet) && self.mainnet_binding.is_none() {
+        let Some(h) = self.resolved_h else {
+            return Ok(());
+        };
+        if !self
+            .chain_id
+            .as_deref()
+            .is_some_and(crate::config::is_xpr_mainnet)
+            && self.mainnet_binding.is_none()
+        {
             return Ok(());
         }
         let config_h = self.cfg.ceremony.freeze_height;
-        if self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet) && config_h != 0 && config_h != h {
+        if self
+            .chain_id
+            .as_deref()
+            .is_some_and(crate::config::is_xpr_mainnet)
+            && config_h != 0
+            && config_h != h
+        {
             return Err(format!("XPR MAINNET: this journal executes H = {h} (its ARMED record) but the config's freeze_height \
                 is {config_h}: refused. Nothing was changed. Journal: {}", self.journal.path().display()));
         }
-        if let Some(bh) = self.mainnet_binding.as_ref().and_then(|b| b.get("h")).and_then(|v| v.as_u64()) {
+        if let Some(bh) = self
+            .mainnet_binding
+            .as_ref()
+            .and_then(|b| b.get("h"))
+            .and_then(|v| v.as_u64())
+        {
             if bh != h {
                 return Err(format!("XPR MAINNET: the signed event authorized H = {bh} but this journal executes H = {h}: \
                     refused. Nothing was changed. Journal: {}", self.journal.path().display()));
@@ -987,7 +1163,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 (docs/DESIGN-shadow.md, manual recovery); a new shadow starts on a fresh journal. Journal: {}",
                 self.journal.path().display()));
         }
-        if self.strand_intent && !matches!(self.state, State::Stranded | State::Aborted | State::Halted | State::Live) {
+        if self.strand_intent
+            && !matches!(
+                self.state,
+                State::Stranded | State::Aborted | State::Halted | State::Live
+            )
+        {
             // r30 round 8 (review R8-6): an abort journaled that it keeps writes frozen and seals, then died before the
             // STRANDED transition. Complete the strand: nothing is resumed or reopened.
             self.strand("an abort decided to keep writes frozen and seal (journaled) before the agent stopped", json!({}),
@@ -1007,10 +1188,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             Ok(None) => {}
             Ok(Some(desc)) => {
                 eprintln!("{desc}");
-                self.journal.evidence(self.state, json!({"orphan_hook_killed": desc, "at": "run resume"}))?;
+                self.journal.evidence(
+                    self.state,
+                    json!({"orphan_hook_killed": desc, "at": "run resume"}),
+                )?;
             }
             Err(e) => {
-                self.journal.evidence(self.state, json!({"orphan_hook_kill_error": e, "resume_blocked": true}))?;
+                self.journal.evidence(
+                    self.state,
+                    json!({"orphan_hook_kill_error": e, "resume_blocked": true}),
+                )?;
                 return Err(format!(
                     "refusing to resume: a hook left running by the previous agent could not be stopped ({e}). \
                      Stop it by hand (see {}), then re-run.",
@@ -1038,14 +1225,26 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         // rc.29: before chain creation and ignition the agent needs the accepted event's payload hash (`await` writes
         // it next to event_id). Refused here, before anything freezes; `rollback`, `status` and `join` still load it.
-        if let Some(co) = self.cfg.coordination.as_ref().filter(|co| co.event_id.is_some() && co.event_hash.is_none()) {
+        if let Some(co) = self
+            .cfg
+            .coordination
+            .as_ref()
+            .filter(|co| co.event_id.is_some() && co.event_hash.is_none())
+        {
             if !self.reached_ignited && !self.create_chain_started && !self.joining {
                 return Err(format!("refusing to run: [coordination] event_id = {:?} has no event_hash. Re-derive this config \
                     with `pulse-cutover await` (rc.29+), which records the accepted event's payload hash",
                     co.event_id.as_deref().unwrap_or("")));
             }
         }
-        if self.resumed && self.reached_ignited && !self.unhalted && matches!(self.state, State::Armed | State::Frozen | State::Snapshotted | State::Verified) {
+        if self.resumed
+            && self.reached_ignited
+            && !self.unhalted
+            && matches!(
+                self.state,
+                State::Armed | State::Frozen | State::Snapshotted | State::Verified
+            )
+        {
             // The previous run journaled `ignite_started` and died before IGNITED: the target may
             // be running. Continuing (re-igniting) or rolling back are both unsafe to decide locally.
             self.halt(
@@ -1053,8 +1252,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 json!({"recovered_state": self.state.as_str()}),
             )?;
         }
-        if self.resumed && self.create_chain_started && self.target_blockchain_id.is_none() && !self.unhalted
-            && matches!(self.state, State::Armed | State::Frozen | State::Snapshotted | State::Verified) {
+        if self.resumed
+            && self.create_chain_started
+            && self.target_blockchain_id.is_none()
+            && !self.unhalted
+            && matches!(
+                self.state,
+                State::Armed | State::Frozen | State::Snapshotted | State::Verified
+            )
+        {
             // create_chain_cmd started and no blockchain id was journaled: a chain may exist (and be
             // starting on validators that already track the subnet). Neither creating another nor
             // resuming the source can be decided locally.
@@ -1070,12 +1276,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let info = self.ops.source_info();
             match info {
                 Ok(info) => self.preflight(&info, true)?,
-                Err(e) if self.reached_ignited || matches!(self.state, State::Ignited | State::Flipped) => {
+                Err(e)
+                    if self.reached_ignited
+                        || matches!(self.state, State::Ignited | State::Flipped) =>
+                {
                     // The source may be stopped by design after the flip; that is not a failure.
                     self.journal.evidence(self.state, json!({"resume_preflight": "source unreachable (expected after IGNITED)", "error": e}))?;
                 }
                 Err(e) => {
-                    self.abort("resume preflight: source chain unreachable", json!({"error": e}))?;
+                    self.abort(
+                        "resume preflight: source chain unreachable",
+                        json!({"error": e}),
+                    )?;
                     return Ok(self.state);
                 }
             }
@@ -1092,8 +1304,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let resolved_h = if self.cfg.ceremony.freeze_height > 0 {
                 self.cfg.ceremony.freeze_height
             } else {
-                info.last_irreversible_block_num
-                    + self.cfg.ceremony.freeze_margin.unwrap_or(0)
+                info.last_irreversible_block_num + self.cfg.ceremony.freeze_margin.unwrap_or(0)
             };
             self.resolved_h = Some(resolved_h);
             self.journal.transition(
@@ -1124,16 +1335,28 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 self.journal.evidence(State::Armed, json!({"SHADOW": crate::shadow::label(&self.cfg),
                     "note": "SHADOW cutover on a private network (docs/DESIGN-shadow.md): not a cutover; the chain carries the \
                              source chain_id, so never sign on it with a real key"}))?;
-                eprintln!("WARNING: SHADOW ceremony ({}): not a cutover", crate::shadow::label(&self.cfg)["label"].as_str().unwrap_or(""));
+                eprintln!(
+                    "WARNING: SHADOW ceremony ({}): not a cutover",
+                    crate::shadow::label(&self.cfg)["label"]
+                        .as_str()
+                        .unwrap_or("")
+                );
             }
             for w in self.cfg.warnings() {
-                self.journal.evidence(State::Armed, json!({"config_warning": w}))?;
+                self.journal
+                    .evidence(State::Armed, json!({"config_warning": w}))?;
                 eprintln!("WARNING: {w}");
             }
             if self.cfg.ceremony.rehearsal {
-                self.journal.evidence(State::Armed, json!({"REHEARSAL": true, "relaxations": self.cfg.production_problems(),
-                    "note": "REHEARSAL ceremony (ceremony.rehearsal = true): not a valid cutover"}))?;
-                eprintln!("WARNING: REHEARSAL ceremony; relaxations: {}", self.cfg.production_problems().join("; "));
+                self.journal.evidence(
+                    State::Armed,
+                    json!({"REHEARSAL": true, "relaxations": self.cfg.production_problems(),
+                    "note": "REHEARSAL ceremony (ceremony.rehearsal = true): not a valid cutover"}),
+                )?;
+                eprintln!(
+                    "WARNING: REHEARSAL ceremony; relaxations: {}",
+                    self.cfg.production_problems().join("; ")
+                );
             }
             if !self.cfg.rehearsal_overrides().is_empty() && self.cfg.is_shadow() {
                 self.journal.evidence(State::Armed, json!({"SHADOW_OVERRIDES_ACTIVE": self.cfg.rehearsal_overrides(),
@@ -1142,13 +1365,19 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             if !self.cfg.rehearsal_overrides().is_empty() {
                 self.journal.evidence(State::Armed, json!({"REHEARSAL_OVERRIDES_ACTIVE": self.cfg.rehearsal_overrides(),
                     "note": "REHEARSAL ONLY: gates a real cut depends on are relaxed; this ceremony is not a valid cutover"}))?;
-                eprintln!("WARNING: rehearsal overrides active: {}", self.cfg.rehearsal_overrides().join("; "));
+                eprintln!(
+                    "WARNING: rehearsal overrides active: {}",
+                    self.cfg.rehearsal_overrides().join("; ")
+                );
             }
             self.preflight(&info, false)?;
         }
         loop {
             // r30 round 13: between two states nothing is in flight: honour a SIGTERM / SIGINT here.
-            if !matches!(self.state, State::Live | State::Aborted | State::Halted | State::Stranded) {
+            if !matches!(
+                self.state,
+                State::Live | State::Aborted | State::Halted | State::Stranded
+            ) {
                 self.stop_point()?;
             }
             match self.state {
@@ -1173,7 +1402,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     fn preflight(&mut self, info: &crate::ops::ChainInfo, resumed: bool) -> Result<(), String> {
         let mut problems = Vec::new();
         let h = self.h();
-        let pre_verify = matches!(self.state, State::Armed | State::Frozen | State::Snapshotted);
+        let pre_verify = matches!(
+            self.state,
+            State::Armed | State::Frozen | State::Snapshotted
+        );
         // "H is in the future" means different things per mode: a producer
         // freezes at head >= H, an api node proceeds at LIB >= H (H is a
         // FINALITY target there — on a live DPoS chain head runs ~2*21*6
@@ -1186,7 +1418,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             problems.push(format!(
                 "freeze height {} is not in the future ({} {})",
                 h,
-                if self.cfg.ceremony.mode == Mode::Api { "lib" } else { "head" },
+                if self.cfg.ceremony.mode == Mode::Api {
+                    "lib"
+                } else {
+                    "head"
+                },
                 reference
             ));
         }
@@ -1205,10 +1441,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 if pre_freeze {
                     problems.push(crate::config::MAINNET_LOCK_DIR_REQUIRED.to_string());
                 } else {
-                    eprintln!("WARNING: {} (this cut is past its write freeze, so it continues)",
-                              crate::config::MAINNET_LOCK_DIR_REQUIRED);
-                    self.journal.evidence(self.state, json!({"mainnet_lock_dir_missing": crate::config::MAINNET_LOCK_DIR_REQUIRED,
-                        "note": "past the write freeze: the cut continues"}))?;
+                    eprintln!(
+                        "WARNING: {} (this cut is past its write freeze, so it continues)",
+                        crate::config::MAINNET_LOCK_DIR_REQUIRED
+                    );
+                    self.journal.evidence(
+                        self.state,
+                        json!({"mainnet_lock_dir_missing": crate::config::MAINNET_LOCK_DIR_REQUIRED,
+                        "note": "past the write freeze: the cut continues"}),
+                    )?;
                 }
             } else if !resumed {
                 let eff = crate::drill::lock_dir(&self.cfg);
@@ -1286,12 +1527,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         // Rehearsal overrides are refused at config load for a configured mainnet chain_id; a
         // config that leaves chain_id to discovery is caught here, before anything freezes.
-        if self.cfg.mainnet_refusals_apply(Some(&info.chain_id)) && (!self.cfg.rehearsal_overrides().is_empty() || self.cfg.ceremony.rehearsal) {
+        if self.cfg.mainnet_refusals_apply(Some(&info.chain_id))
+            && (!self.cfg.rehearsal_overrides().is_empty() || self.cfg.ceremony.rehearsal)
+        {
             let mut what = self.cfg.rehearsal_overrides();
             if self.cfg.ceremony.rehearsal {
                 what.push("ceremony.rehearsal = true".into());
             }
-            problems.push(format!("the source is XPR MAINNET and rehearsal overrides are active ({}): refused", what.join("; ")));
+            problems.push(format!(
+                "the source is XPR MAINNET and rehearsal overrides are active ({}): refused",
+                what.join("; ")
+            ));
         }
         // SHADOW (docs/DESIGN-shadow.md): before anything freezes, prove the target is the configured private
         // network and the source signs only with shadow keys (a shadow config on a real mainnet node refuses here).
@@ -1306,31 +1552,47 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // section only) or discovered here; at ARM the signed event, roster and quorum must be in place.
         if crate::config::is_xpr_mainnet(&info.chain_id) {
             let missing = self.cfg.mainnet_coordination_problems(true);
-            let has_event = self.cfg.coordination.as_ref().is_some_and(|co| co.event_id.is_some());
+            let has_event = self
+                .cfg
+                .coordination
+                .as_ref()
+                .is_some_and(|co| co.event_id.is_some());
             // D-10, review: field presence is not authorization. On a fresh ARM the relay must serve the
             // signed event this config was derived from, and its payload must bind this chain, H, roster and
             // quorum. A relay that does not answer refuses (unknown is never yes). On a resume the event was
             // authenticated at the fresh ARM (journaled), and a relay outage must not strand a running cut.
             // Round-2 review: ARMED is journaled before this check, so a crash in between must not let the next run skip
             // it: a resume still at ARMED without the binding authenticates again (later states refuse at run start).
-            let authenticate = !resumed || (self.mainnet_binding.is_none() && self.state == State::Armed);
+            let authenticate =
+                !resumed || (self.mainnet_binding.is_none() && self.state == State::Armed);
             if missing.is_empty() && has_event && authenticate {
                 let co = self.cfg.coordination.as_ref().expect("checked above");
                 let url = format!("{}/api/coord/{}", co.url.trim_end_matches('/'), co.network);
                 let doc = self.ops.get_json(&url).ok().flatten();
-                let mut bound = crate::coord::mainnet_event_problems(doc.as_ref(), &self.cfg, &info.chain_id);
+                let mut bound =
+                    crate::coord::mainnet_event_problems(doc.as_ref(), &self.cfg, &info.chain_id);
                 // Round-3 review: the authenticated H must be the H this journal executes (recovered on a resume).
-                if let Some(h) = self.resolved_h.filter(|h| *h != self.cfg.ceremony.freeze_height) {
-                    bound.push(format!("the event and config authorize H = {} but this journal executes H = {h}",
-                        self.cfg.ceremony.freeze_height));
+                if let Some(h) = self
+                    .resolved_h
+                    .filter(|h| *h != self.cfg.ceremony.freeze_height)
+                {
+                    bound.push(format!(
+                        "the event and config authorize H = {} but this journal executes H = {h}",
+                        self.cfg.ceremony.freeze_height
+                    ));
                 }
                 if bound.is_empty() {
                     // The bindings later runs compare offline (coord::mainnet_binding_problem), journaled before any freeze.
                     let binding = crate::coord::mainnet_binding(self.cfg, &info.chain_id);
-                    self.journal.evidence(State::Armed, json!({"mainnet_event_verified": binding}))?;
+                    self.journal
+                        .evidence(State::Armed, json!({"mainnet_event_verified": binding}))?;
                     self.mainnet_binding = Some(binding);
                 }
-                problems.extend(bound.into_iter().map(|p| format!("XPR MAINNET signed event: {p}")));
+                problems.extend(
+                    bound
+                        .into_iter()
+                        .map(|p| format!("XPR MAINNET signed event: {p}")),
+                );
             }
             problems.extend(missing);
         }
@@ -1340,18 +1602,28 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             Ok(paused) => {
                 // r30 round 8 (review R8-4): a run resumed while still ARMED that never froze writes is a fresh ARM for
                 // this purpose: a producer someone else paused is refused before anything freezes.
-                let fresh_arm = !resumed || (self.state == State::Armed && !self.writes_closed_by_us && !self.paused_by_us);
+                let fresh_arm = !resumed
+                    || (self.state == State::Armed
+                        && !self.writes_closed_by_us
+                        && !self.paused_by_us);
                 if fresh_arm && paused && self.cfg.ceremony.mode == Mode::Producer {
                     problems.push("producer already paused at arm time".into());
                 }
             }
-            Err(e) if !(resumed && self.reached_ignited) => problems.push(format!("producer_api unreachable: {e}")),
+            Err(e) if !(resumed && self.reached_ignited) => {
+                problems.push(format!("producer_api unreachable: {e}"))
+            }
             Err(_) => {}
         }
         // api mode: the public URL must be serving the SOURCE chain now —
         // proves the nginx -> nodeos path the ceremony will flip actually
         // works before anything is committed.
-        if let Some(flip) = self.cfg.flip.as_ref().filter(|_| !self.flip_ran && !self.reached_ignited) {
+        if let Some(flip) = self
+            .cfg
+            .flip
+            .as_ref()
+            .filter(|_| !self.flip_ran && !self.reached_ignited)
+        {
             match self.ops.public_info(&flip.public_url) {
                 Ok(Some(pubinfo)) if pubinfo.chain_id == info.chain_id => {}
                 Ok(Some(pubinfo)) => problems.push(format!(
@@ -1366,9 +1638,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         // rc.27: the new chain's protocol upgrade schedule must be valid and keep every activation clear of the
         // cut (checked again at verification, where its hash becomes evidence).
-        if let Some(up) = self.cfg.upstream.as_ref().filter(|_| pre_verify && self.cfg.ceremony.import_backend == ImportBackend::Upstream) {
+        if let Some(up) =
+            self.cfg.upstream.as_ref().filter(|_| {
+                pre_verify && self.cfg.ceremony.import_backend == ImportBackend::Upstream
+            })
+        {
             match upstream::ProtocolSchedule::load(up.protocol_upgrades_file.as_deref())
-                .and_then(|s| s.check_against_cut(h, up.protocol_upgrade_margin_blocks)) {
+                .and_then(|s| s.check_against_cut(h, up.protocol_upgrade_margin_blocks))
+            {
                 Ok(()) => {}
                 Err(e) => problems.push(format!("protocol upgrade schedule: {e}")),
             }
@@ -1391,9 +1668,23 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if !(resumed && self.reached_ignited) {
             problems.extend(self.signer_material_problems());
         }
-        for p in [self.cfg.ceremony.boundary_path.as_ref(), self.cfg.hyperion.as_ref().and_then(|h| h.boundary_path.as_ref())].into_iter().flatten() {
-            if p.parent().is_some_and(|d| !d.as_os_str().is_empty() && !d.is_dir()) {
-                problems.push(format!("history boundary_path {}: its directory does not exist", p.display()));
+        for p in [
+            self.cfg.ceremony.boundary_path.as_ref(),
+            self.cfg
+                .hyperion
+                .as_ref()
+                .and_then(|h| h.boundary_path.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if p.parent()
+                .is_some_and(|d| !d.as_os_str().is_empty() && !d.is_dir())
+            {
+                problems.push(format!(
+                    "history boundary_path {}: its directory does not exist",
+                    p.display()
+                ));
             }
         }
         // Stage-path hygiene (R12): the pre-staged target imports whatever sits
@@ -1408,7 +1699,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     .map(|(got, _)| got.eq_ignore_ascii_case(want))
                     .unwrap_or(false)
             });
-        if pre_verify && resumed && self.cfg.snapshot.staged_path.exists() && self.staged_sha256.is_some() && !staged_is_ours {
+        if pre_verify
+            && resumed
+            && self.cfg.snapshot.staged_path.exists()
+            && self.staged_sha256.is_some()
+            && !staged_is_ours
+        {
             // This ceremony journaled a staging intent and died mid-copy: the file is our own
             // partial artifact (the target only imports it at ignition, which has not started).
             // It is re-staged when the SNAPSHOTTED step re-runs.
@@ -1429,10 +1725,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
         if let (true, Some(ev)) = (problems.is_empty(), producer_key_ok) {
-            self.journal.evidence(self.state, json!({"producer_key_check": ev}))?;
+            self.journal
+                .evidence(self.state, json!({"producer_key_check": ev}))?;
         }
         if problems.is_empty() && resumed {
-            self.journal.evidence(self.state, json!({"resume_preflight": "ok"}))?;
+            self.journal
+                .evidence(self.state, json!({"resume_preflight": "ok"}))?;
             return Ok(());
         }
         if problems.is_empty() {
@@ -1454,7 +1752,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             Ok(())
         } else {
-            let what = if resumed { "resume preflight failed" } else { "preflight failed" };
+            let what = if resumed {
+                "resume preflight failed"
+            } else {
+                "preflight failed"
+            };
             if problems.iter().any(|p| p.starts_with("SHADOW identity:")) {
                 // A shadow that cannot prove it is a shadow may be pointed at a REAL node: touch nothing.
                 self.shadow_refuse(what, json!({"problems": problems}))?;
@@ -1480,10 +1782,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 if let Some(dir) = self.cfg.journal_path.parent() {
                     let _ = std::fs::write(dir.join("scan-contracts.txt"), &table);
                 }
-                let rows = serde_json::to_value(
-                    report.rows.iter().take(100).collect::<Vec<_>>(),
-                )
-                .unwrap_or(serde_json::Value::Null);
+                let rows = serde_json::to_value(report.rows.iter().take(100).collect::<Vec<_>>())
+                    .unwrap_or(serde_json::Value::Null);
                 self.journal.evidence(
                     stage,
                     json!({
@@ -1521,10 +1821,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.cfg.is_shadow() {
             let shadow_problems = crate::shadow::identity_problems(&self.cfg, self.ops);
             if !shadow_problems.is_empty() {
-                self.shadow_refuse("SHADOW identity not verified before the freeze", json!({"problems": shadow_problems}))?;
+                self.shadow_refuse(
+                    "SHADOW identity not verified before the freeze",
+                    json!({"problems": shadow_problems}),
+                )?;
                 return Ok(false);
             }
-            self.journal.evidence(State::Armed, json!({"shadow_identity": "verified before the freeze"}))?;
+            self.journal.evidence(
+                State::Armed,
+                json!({"shadow_identity": "verified before the freeze"}),
+            )?;
         }
         if self.cfg.ceremony.rehearsal && !mainnet {
             return Ok(true);
@@ -1536,7 +1842,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             )?;
             return Ok(false);
         }
-        self.journal.evidence(State::Armed, json!({"production_profile": "met (checked before the freeze)"}))?;
+        self.journal.evidence(
+            State::Armed,
+            json!({"production_profile": "met (checked before the freeze)"}),
+        )?;
         Ok(true)
     }
 
@@ -1555,7 +1864,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// cannot be reached is "unknown", never "no abort": retried for up to 30 s, then the step is
     /// refused. Ok(true) = go; Ok(false) = aborted (or halted, past the point of no return) inside.
     fn require_no_abort(&mut self, before: &str) -> Result<bool, String> {
-        let event = self.cfg.coordination.as_ref().and_then(|c| c.event_id.clone());
+        let event = self
+            .cfg
+            .coordination
+            .as_ref()
+            .and_then(|c| c.event_id.clone());
         if event.is_none() {
             return Ok(true);
         }
@@ -1566,11 +1879,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.last_coord_check_ms = last;
             match st {
                 AbortPoll::Clear => {
-                    self.journal.evidence(self.state, json!({"abort_check": "clear", "before": before, "event_id": event}))?;
+                    self.journal.evidence(
+                        self.state,
+                        json!({"abort_check": "clear", "before": before, "event_id": event}),
+                    )?;
                     return Ok(true);
                 }
                 AbortPoll::Aborted => {
-                    self.abort(&format!("coordinator aborted the event (signed) before {before}"), json!({"event_id": event}))?;
+                    self.abort(
+                        &format!("coordinator aborted the event (signed) before {before}"),
+                        json!({"event_id": event}),
+                    )?;
                     return Ok(false);
                 }
                 AbortPoll::Unknown if self.ops.now_ms() > deadline => {
@@ -1589,7 +1908,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// VERIFIED-or-later with the same snapshot sha256 and fingerprint digest as ours.
     /// Returns Ok(false) after aborting (signed abort or timeout).
     fn fleet_gate(&mut self) -> Result<bool, String> {
-        let Some(co) = self.cfg.coordination.clone() else { return Ok(true) };
+        let Some(co) = self.cfg.coordination.clone() else {
+            return Ok(true);
+        };
         if co.fleet_quorum == 0 && co.event_id.is_none() && co.roster.is_empty() {
             return Ok(true);
         }
@@ -1600,7 +1921,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let mut last_excluded: Vec<serde_json::Value> = vec![json!("none yet")];
         loop {
             if self.coordinator_aborted(true) {
-                self.abort("coordinator aborted the event (signed) before ignition", json!({"event_id": co.event_id}))?;
+                self.abort(
+                    "coordinator aborted the event (signed) before ignition",
+                    json!({"event_id": co.event_id}),
+                )?;
                 return Ok(false);
             }
             if co.fleet_quorum == 0 && co.roster.is_empty() {
@@ -1612,7 +1936,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 let c = &r["ceremony"];
                 // Absent evidence never "agrees" (null == null must not count), and with an event
                 // the report must be about THIS event.
-                let same = |k: &str| !ours[k].is_null() && !c["evidence"][k].is_null() && c["evidence"][k] == ours[k];
+                let same = |k: &str| {
+                    !ours[k].is_null() && !c["evidence"][k].is_null() && c["evidence"][k] == ours[k]
+                };
                 let event_ok = match &event_id {
                     Some(id) => r["coord"]["event_id"].as_str() == Some(id.as_str()),
                     None => true,
@@ -1631,8 +1957,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     && event_ok
             };
             let producers = match self.ops.get_json(&status_url) {
-                Ok(Some(st)) => st["networks"].as_array()
-                    .and_then(|nets| nets.iter().find(|n| n["id"].as_str() == Some(co.network.as_str())))
+                Ok(Some(st)) => st["networks"]
+                    .as_array()
+                    .and_then(|nets| {
+                        nets.iter()
+                            .find(|n| n["id"].as_str() == Some(co.network.as_str()))
+                    })
                     .and_then(|n| n["producers"].as_array().cloned())
                     .unwrap_or_default(),
                 _ => vec![],
@@ -1644,53 +1974,105 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let max_age_ms = co.report_max_age_secs * 1000;
             // Why a report does not count (journaled: an excluded producer costs quorum, and the
             // operator must be able to see why).
-            let exclusion = |r: &serde_json::Value, age: Option<u64>, conflict: bool| -> Option<String> {
-                // Every applicable reason (review: an early return for conflict/staleness hid an evidence mismatch).
-                let mut reasons: Vec<String> = vec![];
-                if conflict {
-                    reasons.push("identity conflict (one token, two machines)".into());
-                }
-                if !age.map(|a| a <= max_age_ms).unwrap_or(false) {
-                    // A reason CLASS, not the changing age: the record is journaled only when the set
-                    // of (report, reason) changes, not on every poll of a steadily stale report.
-                    reasons.push(format!("stale report (older than {} s)", co.report_max_age_secs));
-                }
-                let failing: Vec<String> = r["checks"].as_array().map(|cs| cs.iter()
-                    .filter(|c| c["ok"].as_bool() == Some(false)
-                        && !c["name"].as_str().map(|n| crate::beacon::SETUP_CHECKS.contains(&n)).unwrap_or(false))
-                    .map(|c| c["name"].as_str().unwrap_or("?").to_string())
-                    .collect()).unwrap_or_default();
-                // (rc.28, fleet run g1b: a health failure hid the schedule mismatch an operator has to act on.)
-                if !failing.is_empty() {
-                    reasons.push(format!("failing health check(s): {}", failing.join("; ")));
-                }
-                // rc.27 review HIGH-2: a verified report for this event whose evidence differs names the key (a peer on
-                // an older agent has no protocol_schedule_hash: that costs quorum, and the operator must see why).
-                let c = &r["ceremony"];
-                let this_event = event_id.as_deref().is_none_or(|id| r["coord"]["event_id"].as_str() == Some(id));
-                if this_event && matches!(c["state"].as_str(), Some("VERIFIED" | "IGNITED" | "FLIPPED" | "LIVE")) {
-                    let diff: Vec<String> = ["snapshot_sha256", "fingerprints_digest", "protocol_schedule_hash"].into_iter()
-                        .filter(|k| !ours[*k].is_null() && c["evidence"][*k] != ours[*k])
-                        .map(|k| if c["evidence"][k].is_null() { format!("{k} missing (the peer's agent may predate this release)") } else { k.to_string() })
-                        .collect();
-                    if !diff.is_empty() {
-                        reasons.push(format!("evidence differs from ours: {}", diff.join(", ")));
+            let exclusion =
+                |r: &serde_json::Value, age: Option<u64>, conflict: bool| -> Option<String> {
+                    // Every applicable reason (review: an early return for conflict/staleness hid an evidence mismatch).
+                    let mut reasons: Vec<String> = vec![];
+                    if conflict {
+                        reasons.push("identity conflict (one token, two machines)".into());
                     }
-                }
-                (!reasons.is_empty()).then(|| reasons.join("; "))
-            };
+                    if !age.map(|a| a <= max_age_ms).unwrap_or(false) {
+                        // A reason CLASS, not the changing age: the record is journaled only when the set
+                        // of (report, reason) changes, not on every poll of a steadily stale report.
+                        reasons.push(format!(
+                            "stale report (older than {} s)",
+                            co.report_max_age_secs
+                        ));
+                    }
+                    let failing: Vec<String> = r["checks"]
+                        .as_array()
+                        .map(|cs| {
+                            cs.iter()
+                                .filter(|c| {
+                                    c["ok"].as_bool() == Some(false)
+                                        && !c["name"]
+                                            .as_str()
+                                            .map(|n| crate::beacon::SETUP_CHECKS.contains(&n))
+                                            .unwrap_or(false)
+                                })
+                                .map(|c| c["name"].as_str().unwrap_or("?").to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // (rc.28, fleet run g1b: a health failure hid the schedule mismatch an operator has to act on.)
+                    if !failing.is_empty() {
+                        reasons.push(format!("failing health check(s): {}", failing.join("; ")));
+                    }
+                    // rc.27 review HIGH-2: a verified report for this event whose evidence differs names the key (a peer on
+                    // an older agent has no protocol_schedule_hash: that costs quorum, and the operator must see why).
+                    let c = &r["ceremony"];
+                    let this_event = event_id
+                        .as_deref()
+                        .is_none_or(|id| r["coord"]["event_id"].as_str() == Some(id));
+                    if this_event
+                        && matches!(
+                            c["state"].as_str(),
+                            Some("VERIFIED" | "IGNITED" | "FLIPPED" | "LIVE")
+                        )
+                    {
+                        let diff: Vec<String> = [
+                            "snapshot_sha256",
+                            "fingerprints_digest",
+                            "protocol_schedule_hash",
+                        ]
+                        .into_iter()
+                        .filter(|k| !ours[*k].is_null() && c["evidence"][*k] != ours[*k])
+                        .map(|k| {
+                            if c["evidence"][k].is_null() {
+                                format!("{k} missing (the peer's agent may predate this release)")
+                            } else {
+                                k.to_string()
+                            }
+                        })
+                        .collect();
+                        if !diff.is_empty() {
+                            reasons
+                                .push(format!("evidence differs from ours: {}", diff.join(", ")));
+                        }
+                    }
+                    (!reasons.is_empty()).then(|| reasons.join("; "))
+                };
             let mut excluded: Vec<serde_json::Value> = vec![];
             for p in &producers {
                 // Only the event's roster is named (a non-roster producer is simply not counted).
                 if !co.roster.is_empty()
-                    && !co.roster.iter().any(|m| p["name"].as_str() == Some(m.producer.as_str())) {
+                    && !co
+                        .roster
+                        .iter()
+                        .any(|m| p["name"].as_str() == Some(m.producer.as_str()))
+                {
                     continue;
                 }
-                let mut v: Vec<(serde_json::Value, Option<u64>, bool)> = p["beacons"].as_array().map(|bs| bs.iter()
-                    .map(|b| (b["report"].clone(), b["age_ms"].as_u64(), b["conflict"].as_bool().unwrap_or(false)))
-                    .collect()).unwrap_or_default();
+                let mut v: Vec<(serde_json::Value, Option<u64>, bool)> = p["beacons"]
+                    .as_array()
+                    .map(|bs| {
+                        bs.iter()
+                            .map(|b| {
+                                (
+                                    b["report"].clone(),
+                                    b["age_ms"].as_u64(),
+                                    b["conflict"].as_bool().unwrap_or(false),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 if v.is_empty() && !p["report"].is_null() {
-                    v.push((p["report"].clone(), p["age_ms"].as_u64(), p["conflict"].as_bool().unwrap_or(false)));
+                    v.push((
+                        p["report"].clone(),
+                        p["age_ms"].as_u64(),
+                        p["conflict"].as_bool().unwrap_or(false),
+                    ));
                 }
                 for (r, age, conflict) in v {
                     if let Some(why) = exclusion(&r, age, conflict) {
@@ -1699,33 +2081,70 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 }
             }
             let reports_of = |p: &serde_json::Value| -> Vec<serde_json::Value> {
-                let mut v: Vec<(serde_json::Value, Option<u64>, bool)> = p["beacons"].as_array().map(|bs| bs.iter()
-                    .map(|b| (b["report"].clone(), b["age_ms"].as_u64(), b["conflict"].as_bool().unwrap_or(false)))
-                    .collect()).unwrap_or_default();
+                let mut v: Vec<(serde_json::Value, Option<u64>, bool)> = p["beacons"]
+                    .as_array()
+                    .map(|bs| {
+                        bs.iter()
+                            .map(|b| {
+                                (
+                                    b["report"].clone(),
+                                    b["age_ms"].as_u64(),
+                                    b["conflict"].as_bool().unwrap_or(false),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 if v.is_empty() && !p["report"].is_null() {
-                    v.push((p["report"].clone(), p["age_ms"].as_u64(), p["conflict"].as_bool().unwrap_or(false)));
+                    v.push((
+                        p["report"].clone(),
+                        p["age_ms"].as_u64(),
+                        p["conflict"].as_bool().unwrap_or(false),
+                    ));
                 }
                 v.into_iter()
-                    .filter(|(r, age, conflict)| !conflict && age.map(|a| a <= max_age_ms).unwrap_or(false)
-                        && !crate::beacon::has_failing_health(r))
+                    .filter(|(r, age, conflict)| {
+                        !conflict
+                            && age.map(|a| a <= max_age_ms).unwrap_or(false)
+                            && !crate::beacon::has_failing_health(r)
+                    })
                     .map(|(r, _, _)| r)
                     .collect()
             };
             let agreeing = if co.roster.is_empty() {
                 // Legacy gate: any producer the relay lists (unbound roster — see coord.rs), one count
                 // per producer, only with a fresh, non-conflicted agreeing report.
-                producers.iter().filter(|p| reports_of(p).iter().any(|r| agrees(r))).count()
+                producers
+                    .iter()
+                    .filter(|p| reports_of(p).iter().any(|r| agrees(r)))
+                    .count()
             } else {
                 // Roster gate: only the event's required members.
-                co.roster.iter().filter(|m| {
-                    let Some(p) = producers.iter().find(|p| p["name"].as_str() == Some(m.producer.as_str())) else { return false };
-                    reports_of(p).iter().any(|r| {
-                        let id_ok = m.instance_id.as_deref().map(|id| r["instance_id"].as_str() == Some(id)).unwrap_or(true);
-                        id_ok && agrees(r)
+                co.roster
+                    .iter()
+                    .filter(|m| {
+                        let Some(p) = producers
+                            .iter()
+                            .find(|p| p["name"].as_str() == Some(m.producer.as_str()))
+                        else {
+                            return false;
+                        };
+                        reports_of(p).iter().any(|r| {
+                            let id_ok = m
+                                .instance_id
+                                .as_deref()
+                                .map(|id| r["instance_id"].as_str() == Some(id))
+                                .unwrap_or(true);
+                            id_ok && agrees(r)
+                        })
                     })
-                }).count()
+                    .count()
             };
-            let quorum = if co.fleet_quorum > 0 { co.fleet_quorum } else { co.roster.len() };
+            let quorum = if co.fleet_quorum > 0 {
+                co.fleet_quorum
+            } else {
+                co.roster.len()
+            };
             if agreeing != last_seen || excluded != last_excluded {
                 self.journal.evidence(State::Verified, json!({"fleet_gate": {"agreeing": agreeing, "quorum": quorum,
                     "roster": if co.roster.is_empty() { json!("unbound (any producer)") } else { json!(co.roster.len()) }},
@@ -1755,16 +2174,22 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // an error and then the transition; a crash between the two left a journal that replayed as
         // still-IGNITED and a restart ran on. Replay also still honours that older shape.)
         self.state = State::Halted;
-        self.journal.transition(State::Halted, json!({
+        self.journal.transition(
+            State::Halted,
+            json!({
             "halted_from": from.as_str(), "reason": reason, "message": format!("HALTED: {reason}"),
             "detail": detail, "sealed": true, "source_resumed": false,
             "public_routing_reverted": false, "writes_reopened": false,
             "why": "ignition may have started; a local failure must not resume the source",
-            "clear_with": "pulse-cutover unhalt --config <file> --i-understand"}))?;
+            "clear_with": "pulse-cutover unhalt --config <file> --i-understand"}),
+        )?;
         eprintln!("HALTED at {from}: {reason}");
         if let Some(hook) = &self.cfg.hooks.on_halt {
             let result = self.ops.run_hook(hook); // ungated: on_halt only pages a human (shadow gate exempt)
-            self.journal.evidence(State::Halted, json!({"on_halt_hook": format!("{result:?}")}))?;
+            self.journal.evidence(
+                State::Halted,
+                json!({"on_halt_hook": format!("{result:?}")}),
+            )?;
         }
         Err(format!("HALTED at {from}: {reason}"))
     }
@@ -1774,7 +2199,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// already-tracking validator starts, and its outcome may be unknown (lost answer, crash), so
     /// from the moment it starts a local failure halts instead of resuming the source.
     fn past_point_of_no_return(&self) -> bool {
-        self.reached_ignited || self.create_chain_started || matches!(self.state, State::Ignited | State::Flipped | State::Live | State::Halted)
+        self.reached_ignited
+            || self.create_chain_started
+            || matches!(
+                self.state,
+                State::Ignited | State::Flipped | State::Live | State::Halted
+            )
     }
 
     /// `pulse-cutover rollback` (what `cutover.sh abort` runs), holding the journal lock: undo
@@ -1791,7 +2221,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// `operator_rollback`, plus rc.23's STRANDED rule: a stranded journal is rolled back (the old chain
     /// resumed) only if the resume guard passes now, or with
     /// `force_stranded` (an operator's record of a fleet-wide decision, journaled).
-    pub fn operator_rollback_opts(&mut self, force: bool, force_stranded: bool) -> Result<RollbackOutcome, String> {
+    pub fn operator_rollback_opts(
+        &mut self,
+        force: bool,
+        force_stranded: bool,
+    ) -> Result<RollbackOutcome, String> {
         self.ensure_legacy_takeover("roll back")?;
         self.check_shadow_binding()?;
         self.check_mainnet_binding()?;
@@ -1804,11 +2238,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         match self.ops.kill_orphan_hooks() {
             Ok(None) => {}
             Ok(Some(desc)) => {
-                self.journal.evidence(self.state, json!({"orphan_hook_killed": desc}))?;
+                self.journal
+                    .evidence(self.state, json!({"orphan_hook_killed": desc}))?;
                 notes.push(desc);
             }
             Err(e) => {
-                self.journal.evidence(self.state, json!({"orphan_hook_kill_error": e, "rollback_blocked": true}))?;
+                self.journal.evidence(
+                    self.state,
+                    json!({"orphan_hook_kill_error": e, "rollback_blocked": true}),
+                )?;
                 return Err(format!(
                     "refusing to roll back: a hook left running by a killed agent could not be stopped ({e}). \
                      Nothing was rolled back. Stop that process group by hand, then re-run."
@@ -1817,10 +2255,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         if self.shadow_refused {
             // Round-2 review: the journaled shadow refusal stays authoritative, whatever came after it.
-            self.finish_shadow_refusal("operator rollback of a shadow journal whose identity was refused")?;
+            self.finish_shadow_refusal(
+                "operator rollback of a shadow journal whose identity was refused",
+            )?;
             notes.push("SHADOW identity was refused on this journal: nothing was resumed and no hook ran (the source may be \
                         a real node). Resume it by hand only after checking which chain it belongs to (docs/DESIGN-shadow.md)".into());
-            return Ok(RollbackOutcome { state: self.state, failed: vec![], notes, already: true });
+            return Ok(RollbackOutcome {
+                state: self.state,
+                failed: vec![],
+                notes,
+                already: true,
+            });
         }
         // r30 round 7/8: a pause someone else made (a fresh read; not this journal's) is released only by an explicit
         // operator decision, and only matters when this rollback would reopen writes this journal froze.
@@ -1831,17 +2276,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // attempt followed by a paused read) is never resumed and never left in place under a "rolled back" verdict:
         // it needs the same explicit release, whether or not writes would reopen.
         let unknown_pause_held = self.pause_unknown;
-        let candidate = self.cfg.ceremony.mode == Mode::Producer && !self.paused_by_us
+        let candidate = self.cfg.ceremony.mode == Mode::Producer
+            && !self.paused_by_us
             && (unknown_pause_held
-                || (self.writes_closed_by_us && self.cfg.hooks.on_abort.is_some() && !self.step_done("on_abort")))
+                || (self.writes_closed_by_us
+                    && self.cfg.hooks.on_abort.is_some()
+                    && !self.step_done("on_abort")))
             && !(self.state == State::Aborted && self.aborted_rollback_complete);
         // r30 round 13 (review R12-F1b): a failed read can never bypass the unknown-pause refusal. The read is retried;
         // for an unknown pause anything but a confirmed "producing" holds it (paused, or unreadable).
-        let held = candidate && match self.read_paused_retrying(PAUSE_READ_RETRY_MS, "checking the producer before an operator rollback") {
-            Ok(true) => true,
-            Ok(false) => false,
-            Err(_) => unknown_pause_held,
-        };
+        let held = candidate
+            && match self.read_paused_retrying(
+                PAUSE_READ_RETRY_MS,
+                "checking the producer before an operator rollback",
+            ) {
+                Ok(true) => true,
+                Ok(false) => false,
+                Err(_) => unknown_pause_held,
+            };
         if held {
             if !force_stranded {
                 if unknown_pause_held {
@@ -1851,7 +2303,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         producer, then release it explicitly with `pulse-cutover rollback --force-stranded \
                         --i-understand`. Nothing was changed.".into());
                 }
-                return Err(format!("refusing to roll back: {EXTERNAL_PAUSE_HELD}. Nothing was changed."));
+                return Err(format!(
+                    "refusing to roll back: {EXTERNAL_PAUSE_HELD}. Nothing was changed."
+                ));
             }
             release_pending = true;
         }
@@ -1890,12 +2344,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 // as the agent's own abort: peers of this event may already have created or ignited the target.
                 // A failed guard strands the node (sealed, writes stay frozen), as the automatic path does.
                 let reason = "operator rollback (pulse-cutover rollback)";
-                let detail = json!({"by": "operator_rollback", "state_before": self.state.as_str()});
+                let detail =
+                    json!({"by": "operator_rollback", "state_before": self.state.as_str()});
                 if let Err(why) = self.resume_guard()? {
                     self.strand(reason, detail.clone(), &why)?;
                     return Err(self.operator_strand_message(&why));
                 }
-                self.journal.evidence(self.state, json!({"rollback_requested": true, "by": "operator_rollback"}))?;
+                self.journal.evidence(
+                    self.state,
+                    json!({"rollback_requested": true, "by": "operator_rollback"}),
+                )?;
                 self.rollback_pending = true;
                 self.journal.evidence(self.state, json!({"abort_intent": true, "reason": reason,
                     "note": "withdrawing this node's VERIFIED report before resuming the old chain"}))?;
@@ -1913,7 +2371,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let mut failed = vec![];
             self.unstage(true, &mut failed, &mut notes)?;
             notes.push("already rolled back (the journal proves every rollback step completed): nothing done again".into());
-            return Ok(RollbackOutcome { state: self.state, failed, notes, already: true });
+            return Ok(RollbackOutcome {
+                state: self.state,
+                failed,
+                notes,
+                already: true,
+            });
         }
         if past && !force {
             return Err(format!(
@@ -1934,14 +2397,25 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 }
                 self.shadow_refuse("operator rollback: SHADOW identity not re-proven, so the source is NOT resumed",
                     json!({"identity_problems": problems}))?;
-                return Ok(RollbackOutcome { state: self.state, failed: vec![msg], notes, already: false });
+                return Ok(RollbackOutcome {
+                    state: self.state,
+                    failed: vec![msg],
+                    notes,
+                    already: false,
+                });
             }
             self.shadow_proven = true;
-            self.journal.evidence(self.state, json!({"shadow_identity": "re-proven before an operator rollback"}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"shadow_identity": "re-proven before an operator rollback"}),
+            )?;
         }
         // Intent first: if this rollback dies before its ABORTED transition, a later `run` must not
         // resume the ceremony (see `rollback_pending`); re-running `rollback` finishes the job.
-        self.journal.evidence(self.state, json!({"rollback_requested": true, "force_after_ignite": force && past}))?;
+        self.journal.evidence(
+            self.state,
+            json!({"rollback_requested": true, "force_after_ignite": force && past}),
+        )?;
         self.rollback_pending = true;
         if release_pending {
             let episode = self.current_episode().max(1);
@@ -1960,10 +2434,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // Local fence FIRST: resuming the source while this box's target still runs would
             // create two writable histories under one chain_id, by our own hand.
             let fence = self.cfg.target.fence_cmd();
-            self.journal.evidence(self.state, json!({"side_effect": "target_fence", "cmd": fence}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"side_effect": "target_fence", "cmd": fence}),
+            )?;
             match self.hook(&fence) {
                 Ok(out) => {
-                    self.journal.evidence(self.state, json!({"target_fenced": true, "output": out}))?;
+                    self.journal
+                        .evidence(self.state, json!({"target_fenced": true, "output": out}))?;
                     self.mark_step("target_fence")?;
                     notes.push("this box's target was stopped first (local fence only: other producers' targets are unaffected)".into());
                 }
@@ -1982,7 +2460,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         let detail = json!({"by": "operator_rollback", "force_after_ignite": force && past,
                             "ignition_started": past, "state_before": self.state.as_str()});
-        let (mut failed, mut more) = self.rollback_steps("operator rollback (pulse-cutover rollback)", detail, true, true)?;
+        let (mut failed, mut more) = self.rollback_steps(
+            "operator rollback (pulse-cutover rollback)",
+            detail,
+            true,
+            true,
+        )?;
         notes.append(&mut more);
         if self.state == State::Stranded {
             // Round 9 (review R9-4): the rollback could not finish: writes were kept frozen (the source was paused or
@@ -1991,7 +2474,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 reopened, so writes stay FROZEN and the journal is now STRANDED (on_halt paged). Check the producer by hand \
                 (who paused it, is it producing?), then re-run `pulse-cutover rollback`. Journal: {}", self.journal.path().display()));
         }
-        Ok(RollbackOutcome { state: self.state, failed, notes, already: false })
+        Ok(RollbackOutcome {
+            state: self.state,
+            failed,
+            notes,
+            already: false,
+        })
     }
 
     fn step_done(&self, name: &str) -> bool {
@@ -2000,7 +2488,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
 
     /// Journal that a rollback step completed (a rollback that dies later redoes only the rest).
     fn mark_step(&mut self, name: &str) -> Result<(), String> {
-        self.journal.evidence(self.state, json!({"rollback_step": name, "ok": true}))?;
+        self.journal
+            .evidence(self.state, json!({"rollback_step": name, "ok": true}))?;
         if !self.step_done(name) {
             self.rollback_steps_done.push(name.to_string());
         }
@@ -2010,12 +2499,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// Move the staged snapshot aside (never delete it): left in place it makes the next preflight
     /// refuse and, worse, a metalgo restart would import the abandoned cut. `any`: the operator's
     /// rollback moves any staged file; the agent's own abort only the one this ceremony staged.
-    fn unstage(&mut self, any: bool, failed: &mut Vec<String>, notes: &mut Vec<String>) -> Result<(), String> {
+    fn unstage(
+        &mut self,
+        any: bool,
+        failed: &mut Vec<String>,
+        notes: &mut Vec<String>,
+    ) -> Result<(), String> {
         let staged = self.cfg.snapshot.staged_path.clone();
         // r30 round 6: undo only what this ceremony did. "Any" file at the staged path is moved aside only for a
         // ceremony that got far enough to stage one (it froze writes); one refused at ARM never staged anything, and
         // the file there may belong to another ceremony on this box.
-        if !staged.exists() || !(self.staged_sha256.is_some() || (any && self.writes_closed_by_us)) {
+        if !staged.exists() || !(self.staged_sha256.is_some() || (any && self.writes_closed_by_us))
+        {
             return Ok(());
         }
         self.shadow_mutation_gate("moving the staged snapshot aside")?;
@@ -2024,12 +2519,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let to = std::path::PathBuf::from(to);
         match std::fs::rename(&staged, &to) {
             Ok(()) => {
-                self.journal.evidence(self.state, json!({"unstaged": {"from": staged, "to": to}}))?;
+                self.journal
+                    .evidence(self.state, json!({"unstaged": {"from": staged, "to": to}}))?;
                 notes.push(format!("staged snapshot moved aside to {}", to.display()));
             }
             Err(e) => {
                 let msg = format!("unstage {} failed: {e}", staged.display());
-                self.journal.evidence(self.state, json!({"unstage_error": msg}))?;
+                self.journal
+                    .evidence(self.state, json!({"unstage_error": msg}))?;
                 failed.push(msg);
             }
         }
@@ -2045,7 +2542,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.shadow_refused {
             return self.shadow_refuse(reason, detail);
         }
-        if !self.shadow_reprove_before_resume("an abort", &json!({"reason": reason, "detail": detail}))? {
+        if !self.shadow_reprove_before_resume(
+            "an abort",
+            &json!({"reason": reason, "detail": detail}),
+        )? {
             return Ok(());
         }
         let perform = self.cfg.target.auto_rollback;
@@ -2064,10 +2564,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             // rc.29: the decision to go back is journaled before the node tells its peers it is aborting: a crash in
             // the withdrawal wait must not replay as a ceremony still in progress.
-            self.journal.evidence(self.state, json!({"rollback_requested": true, "by": "agent_abort"}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"rollback_requested": true, "by": "agent_abort"}),
+            )?;
             self.rollback_pending = true;
-            self.journal.evidence(self.state, json!({"abort_intent": true, "reason": reason,
-                "note": "withdrawing this node's VERIFIED report before resuming the old chain"}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"abort_intent": true, "reason": reason,
+                "note": "withdrawing this node's VERIFIED report before resuming the old chain"}),
+            )?;
             self.wait_own_report_withdrawn()?;
             if let Err(why) = self.resume_guard()? {
                 return self.strand(reason, detail, &why);
@@ -2076,12 +2582,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if perform && !self.rollback_pending {
             // rc.29: intent before the first step, as the operator path does: an agent that dies between resuming
             // the source and the ABORTED transition must not replay as a ceremony still in progress.
-            self.journal.evidence(self.state, json!({"rollback_requested": true, "by": "agent_abort"}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"rollback_requested": true, "by": "agent_abort"}),
+            )?;
             self.rollback_pending = true;
         }
         let (failed, _notes) = self.rollback_steps(reason, detail, perform, false)?;
         if !failed.is_empty() {
-            eprintln!("ABORTED, but the rollback is INCOMPLETE: {}", failed.join("; "));
+            eprintln!(
+                "ABORTED, but the rollback is INCOMPLETE: {}",
+                failed.join("; ")
+            );
         }
         Ok(())
     }
@@ -2093,14 +2605,21 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// forced path fences the target instead.
     fn operator_rollback_needs_guard(&self) -> bool {
         self.cfg.ceremony.mode == Mode::Producer
-            && self.cfg.coordination.as_ref().is_some_and(|c| c.event_id.is_some())
+            && self
+                .cfg
+                .coordination
+                .as_ref()
+                .is_some_and(|c| c.event_id.is_some())
             && !self.past_point_of_no_return()
             && !self.step_done("resume")
             && match self.state {
                 State::Stranded | State::Frozen | State::Snapshotted | State::Verified => true,
                 // An abort after this ceremony froze (the FROZEN transition is durable; the pause head is only
                 // journaled at SNAPSHOTTED, so an abort during quiescence or the burn-off audit has none).
-                State::Aborted => !self.aborted_rollback_complete && (self.frozen_ts_ms.is_some() || self.head_at_pause.is_some()),
+                State::Aborted => {
+                    !self.aborted_rollback_complete
+                        && (self.frozen_ts_ms.is_some() || self.head_at_pause.is_some())
+                }
                 _ => false,
             }
     }
@@ -2109,13 +2628,23 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// VERIFIED): peers of the same event may be creating or igniting the target.
     fn needs_resume_guard(&self) -> bool {
         self.cfg.ceremony.mode == Mode::Producer
-            && self.cfg.coordination.as_ref().is_some_and(|c| c.event_id.is_some())
-            && matches!(self.state, State::Frozen | State::Snapshotted | State::Verified)
+            && self
+                .cfg
+                .coordination
+                .as_ref()
+                .is_some_and(|c| c.event_id.is_some())
+            && matches!(
+                self.state,
+                State::Frozen | State::Snapshotted | State::Verified
+            )
     }
 
     /// This node as the relay knows it: (beacon producer, beacon instance id).
     fn me(&self) -> Option<(String, String)> {
-        self.cfg.beacon.as_ref().map(|b| (b.producer.clone(), crate::beacon::instance_id(self.cfg)))
+        self.cfg
+            .beacon
+            .as_ref()
+            .map(|b| (b.producer.clone(), crate::beacon::instance_id(self.cfg)))
     }
 
     /// The relay's `/api/status`, retried for up to ~10 s (None = it did not answer).
@@ -2131,7 +2660,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     // `evidence.h`), not the cut height (an inexact rehearsal cut would drop every peer).
                     if let Some(h) = self.resolved_h {
                         crate::fleet::drop_foreign_ceremonies(&mut doc, &co.network, h);
-                        crate::fleet::annotate_evidence(&mut doc, &co.network, co.event_id.as_deref(), h);
+                        crate::fleet::annotate_evidence(
+                            &mut doc,
+                            &co.network,
+                            co.event_id.as_deref(),
+                            h,
+                        );
                     }
                     return Some(doc);
                 }
@@ -2147,33 +2681,59 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// VERIFIED (state moved on, or `aborting`), at most `report_max_age_secs` (after that no peer's gate
     /// counts the old report anyway: it is stale).
     fn wait_own_report_withdrawn(&mut self) -> Result<(), String> {
-        let co = self.cfg.coordination.clone().expect("checked by needs_resume_guard");
+        let co = self
+            .cfg
+            .coordination
+            .clone()
+            .expect("checked by needs_resume_guard");
         let me = self.me();
         let event = co.event_id.clone().unwrap_or_default();
         let deadline = self.ops.now_ms() + co.report_max_age_secs * 1000;
         let url = format!("{}/api/status", co.url.trim_end_matches('/'));
         loop {
             if let (Some((prod, inst)), Ok(Some(doc))) = (me.as_ref(), self.ops.get_json(&url)) {
-                let mine = doc["networks"].as_array().into_iter().flatten()
+                let mine = doc["networks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
                     .filter(|n| n["id"].as_str() == Some(co.network.as_str()))
                     .flat_map(|n| n["producers"].as_array().cloned().unwrap_or_default())
                     .filter(|p| p["name"].as_str() == Some(prod.as_str()))
                     .flat_map(|p| p["beacons"].as_array().cloned().unwrap_or_default())
                     .map(|b| b["report"].clone())
-                    .filter(|r| r["coord"]["event_id"].as_str() == Some(event.as_str()) && r["instance_id"].as_str().is_none_or(|i| i == inst))
+                    .filter(|r| {
+                        r["coord"]["event_id"].as_str() == Some(event.as_str())
+                            && r["instance_id"].as_str().is_none_or(|i| i == inst)
+                    })
                     .collect::<Vec<_>>();
-                if !mine.is_empty() && mine.iter().all(|r| r["ceremony"]["state"].as_str() != Some("VERIFIED")
-                    || r["ceremony"]["aborting"].as_bool() == Some(true) || r["ceremony"]["rollback_pending"].as_bool() == Some(true)) {
-                    self.journal.evidence(self.state, json!({"own_report_withdrawn": "the relay shows this node aborting"}))?;
+                if !mine.is_empty()
+                    && mine.iter().all(|r| {
+                        r["ceremony"]["state"].as_str() != Some("VERIFIED")
+                            || r["ceremony"]["aborting"].as_bool() == Some(true)
+                            || r["ceremony"]["rollback_pending"].as_bool() == Some(true)
+                    })
+                {
+                    self.journal.evidence(
+                        self.state,
+                        json!({"own_report_withdrawn": "the relay shows this node aborting"}),
+                    )?;
                     // Re-check #2: a peer that journaled create_chain just before may not have REPORTED it yet.
                     // Wait one beacon cycle (its interval, at least 10 s) before the second guard pass.
-                    let interval = self.cfg.beacon.as_ref().map(|b| b.interval_secs).unwrap_or(5);
+                    let interval = self
+                        .cfg
+                        .beacon
+                        .as_ref()
+                        .map(|b| b.interval_secs)
+                        .unwrap_or(5);
                     let settle_ms = interval.max(10) * 1000;
                     let until = self.ops.now_ms() + settle_ms;
                     while self.ops.now_ms() < until {
                         self.ops.sleep_ms(1000);
                     }
-                    self.journal.evidence(self.state, json!({"settle_before_second_guard_ms": settle_ms}))?;
+                    self.journal.evidence(
+                        self.state,
+                        json!({"settle_before_second_guard_ms": settle_ms}),
+                    )?;
                     return Ok(());
                 }
             }
@@ -2188,7 +2748,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
 
     /// rc.27: compare the target's `getInfo` protocol fields with this event's schedule. Ok(Ok(note)) = matches or
     /// not reported (an older PulseVM; noted), Ok(Err(detail)) = mismatch.
-    fn target_protocol_problem(&mut self) -> Result<Result<serde_json::Value, serde_json::Value>, String> {
+    fn target_protocol_problem(
+        &mut self,
+    ) -> Result<Result<serde_json::Value, serde_json::Value>, String> {
         let up = match self.cfg.upstream.as_ref() {
             Some(up) if self.cfg.ceremony.import_backend == ImportBackend::Upstream => up,
             _ => return Ok(Ok(json!("not applicable (not the upstream backend)"))),
@@ -2198,7 +2760,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let sched = match journaled_protocol_schedule(&self.cfg.journal_path) {
             Some(Ok(s)) => s,
             Some(Err(e)) => return Ok(Err(json!({"error": e}))),
-            None => return Ok(Err(json!({"error": "no protocol upgrade schedule journaled at VERIFIED (a journal from an agent before rc.27)"}))),
+            None => {
+                return Ok(Err(
+                    json!({"error": "no protocol upgrade schedule journaled at VERIFIED (a journal from an agent before rc.27)"}),
+                ))
+            }
         };
         let _ = up;
         let want = sched.hash.clone();
@@ -2208,7 +2774,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let mut last_err = None;
         for i in 0..5 {
             match self.ops.target_protocol() {
-                Ok(v) => { reported = Some(v); break; }
+                Ok(v) => {
+                    reported = Some(v);
+                    break;
+                }
                 Err(e) => last_err = Some(e),
             }
             if i < 4 {
@@ -2220,12 +2789,20 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             Some(None) if sched.max_version() <= 1 => {
                 return Ok(Ok(json!("UNVERIFIED: the target does not report protocol fields (empty schedule: nothing to activate)")));
             }
-            Some(None) => return Ok(Err(json!({"max_scheduled_version": sched.max_version(),
-                "fix": "the target's PulseVM does not report protocol fields, so it predates protocol schedules and cannot run the scheduled version: upgrade it"}))),
-            None if sched.max_version() <= 1 => {
-                return Ok(Ok(json!({"UNVERIFIED": "the target's getInfo could not be read", "error": last_err})));
+            Some(None) => {
+                return Ok(Err(json!({"max_scheduled_version": sched.max_version(),
+                "fix": "the target's PulseVM does not report protocol fields, so it predates protocol schedules and cannot run the scheduled version: upgrade it"})))
             }
-            None => return Ok(Err(json!({"error": last_err, "fix": "the target's getInfo could not be read: its protocol schedule is unknown"}))),
+            None if sched.max_version() <= 1 => {
+                return Ok(Ok(
+                    json!({"UNVERIFIED": "the target's getInfo could not be read", "error": last_err}),
+                ));
+            }
+            None => {
+                return Ok(Err(
+                    json!({"error": last_err, "fix": "the target's getInfo could not be read: its protocol schedule is unknown"}),
+                ))
+            }
         };
         let theirs = t["protocol_upgrade_schedule_hash"].as_str().unwrap_or("");
         let supported = t["supported_protocol_version"].as_u64().unwrap_or(0);
@@ -2234,16 +2811,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "fix": format!("the validator loaded another upgrade.json than this event's (expected {} entries)", sched.entries.len())})));
         }
         if supported < sched.max_version() as u64 {
-            return Ok(Err(json!({"max_scheduled_version": sched.max_version(), "target": t,
-                "fix": "this PulseVM binary cannot execute the scheduled protocol version: upgrade it before the activation height"})));
+            return Ok(Err(
+                json!({"max_scheduled_version": sched.max_version(), "target": t,
+                "fix": "this PulseVM binary cannot execute the scheduled protocol version: upgrade it before the activation height"}),
+            ));
         }
-        Ok(Ok(json!({"schedule_hash": want, "supported_protocol_version": supported, "verified": true})))
+        Ok(Ok(
+            json!({"schedule_hash": want, "supported_protocol_version": supported, "verified": true}),
+        ))
     }
 
     /// rc.27: install the new chain's protocol upgrade schedule as `<chain_config_dir>/<bid>/upgrade.json` (MetalGo
     /// hands it to PulseVM as upgrade_bytes). The file must still hash to what VERIFIED journaled (the fleet
     /// compared that); an empty schedule installs nothing, and refuses a stale upgrade.json already there.
-    fn install_protocol_schedule(&mut self, dir: &std::path::Path, bid: &str) -> Result<Result<(), serde_json::Value>, String> {
+    fn install_protocol_schedule(
+        &mut self,
+        dir: &std::path::Path,
+        bid: &str,
+    ) -> Result<Result<(), serde_json::Value>, String> {
         let up = match self.cfg.upstream.as_ref() {
             Some(up) if self.cfg.ceremony.import_backend == ImportBackend::Upstream => up,
             _ => return Ok(Ok(())),
@@ -2251,19 +2836,29 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let sched = match journaled_protocol_schedule(&self.cfg.journal_path) {
             Some(Ok(s)) => s,
             Some(Err(e)) => return Ok(Err(json!({"error": e}))),
-            None => return Ok(Err(json!({"error": "no protocol upgrade schedule journaled at VERIFIED (a journal from an agent before rc.27): \
-                                          the fleet never compared this node's schedule"}))),
+            None => {
+                return Ok(Err(
+                    json!({"error": "no protocol upgrade schedule journaled at VERIFIED (a journal from an agent before rc.27): \
+                                          the fleet never compared this node's schedule"}),
+                ))
+            }
         };
         // The file must still be what was verified (an edit after VERIFIED is refused, not silently installed).
         match upstream::ProtocolSchedule::load(up.protocol_upgrades_file.as_deref()) {
             Ok(now) if now.hash == sched.hash => {}
-            Ok(now) => return Ok(Err(json!({"error": "upstream.protocol_upgrades_file changed since VERIFIED", "verified": sched.hash, "now": now.hash}))),
+            Ok(now) => {
+                return Ok(Err(
+                    json!({"error": "upstream.protocol_upgrades_file changed since VERIFIED", "verified": sched.hash, "now": now.hash}),
+                ))
+            }
             Err(e) => return Ok(Err(json!({"error": e}))),
         }
         let dest = dir.join(bid).join("upgrade.json");
         if sched.entries.is_empty() {
             if dest.exists() {
-                return Ok(Err(json!({"error": format!("{} exists but this event's schedule is empty: remove it", dest.display())})));
+                return Ok(Err(
+                    json!({"error": format!("{} exists but this event's schedule is empty: remove it", dest.display())}),
+                ));
             }
             self.journal.evidence(self.state, json!({"protocol_schedule_installed": "empty (protocol version 1)", "hash": sched.hash}))?;
             return Ok(Ok(()));
@@ -2272,30 +2867,55 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // Atomic (review LOW-3): a crash mid-write must not leave a truncated schedule for metalgo to load.
         let tmp = dest.with_extension("json.tmp");
         if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &dest)) {
-            return Ok(Err(json!({"error": format!("write {}: {e}", dest.display())})));
+            return Ok(Err(
+                json!({"error": format!("write {}: {e}", dest.display())}),
+            ));
         }
-        self.journal.evidence(self.state, json!({"protocol_schedule_installed": dest.display().to_string(), "hash": sched.hash,
-            "protocol_upgrades": sched.to_json()["protocol_upgrades"]}))?;
+        self.journal.evidence(
+            self.state,
+            json!({"protocol_schedule_installed": dest.display().to_string(), "hash": sched.hash,
+            "protocol_upgrades": sched.to_json()["protocol_upgrades"]}),
+        )?;
         Ok(Ok(()))
     }
 
     /// May the old chain be resumed? Ok(Ok(())) after journaling why; Ok(Err(why)) = no (fleet::resume_guard).
     fn resume_guard(&mut self) -> Result<Result<(), String>, String> {
-        let co = self.cfg.coordination.clone().expect("checked by needs_resume_guard");
+        let co = self
+            .cfg
+            .coordination
+            .clone()
+            .expect("checked by needs_resume_guard");
         let event = co.event_id.clone().unwrap_or_default();
         let status = self.fleet_status();
         let signed_abort = crate::coord::is_tombstoned(self.cfg, &event)
-            || self.ops.get_json(&format!("{}/api/coord/{}", co.url.trim_end_matches('/'), co.network)).ok().flatten()
-                .is_some_and(|d| crate::coord::aborted(&d, &co.coordinator_keys, &co.network, &event));
+            || self
+                .ops
+                .get_json(&format!(
+                    "{}/api/coord/{}",
+                    co.url.trim_end_matches('/'),
+                    co.network
+                ))
+                .ok()
+                .flatten()
+                .is_some_and(|d| {
+                    crate::coord::aborted(&d, &co.coordinator_keys, &co.network, &event)
+                });
         let me = self.me();
         let me_ref = me.as_ref().map(|(p, i)| (p.as_str(), i.as_str()));
         match crate::fleet::resume_guard(status.as_ref(), &co, me_ref, signed_abort) {
             Ok(ev) => {
-                self.journal.evidence(self.state, json!({"resume_guard": "clear", "signed_abort": signed_abort, "fleet": ev}))?;
+                self.journal.evidence(
+                    self.state,
+                    json!({"resume_guard": "clear", "signed_abort": signed_abort, "fleet": ev}),
+                )?;
                 Ok(Ok(()))
             }
             Err(why) => {
-                self.journal.evidence(self.state, json!({"resume_guard": "refused", "signed_abort": signed_abort, "why": why}))?;
+                self.journal.evidence(
+                    self.state,
+                    json!({"resume_guard": "refused", "signed_abort": signed_abort, "why": why}),
+                )?;
                 Ok(Err(why))
             }
         }
@@ -2310,7 +2930,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if matches!(self.read_paused(), Ok(true)) {
             if self.state == State::Stranded {
                 // Record the confirmation: an UNSEALED strand paused by hand is reported sealed again.
-                self.journal.evidence(self.state, json!({"source_pause_enforced": true, "result": "already paused"}))?;
+                self.journal.evidence(
+                    self.state,
+                    json!({"source_pause_enforced": true, "result": "already paused"}),
+                )?;
             }
             return Ok(true);
         }
@@ -2319,7 +2942,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             Err(e) => Err(e),
         };
         let ok = matches!(r, Ok(true));
-        self.journal.evidence(self.state, json!({"source_pause_enforced": ok, "result": format!("{r:?}")}))?;
+        self.journal.evidence(
+            self.state,
+            json!({"source_pause_enforced": ok, "result": format!("{r:?}")}),
+        )?;
         Ok(ok)
     }
 
@@ -2333,16 +2959,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         match self.read_paused() {
             Ok(true) => {}
             Ok(false) => return Ok(Some("the source producer is not paused".into())),
-            Err(e) => return Ok(Some(format!("cannot confirm the source producer is paused ({e})"))),
+            Err(e) => {
+                return Ok(Some(format!(
+                    "cannot confirm the source producer is paused ({e})"
+                )))
+            }
         }
         let Some(paused) = self.head_at_pause else {
-            return Ok(Some("no journaled pause head (the cut was not audited by this journal)".into()));
+            return Ok(Some(
+                "no journaled pause head (the cut was not audited by this journal)".into(),
+            ));
         };
         // Strict: even an empty block from a peer after the audited quiescence window refuses (conservative; the
         // fleet's pause should have stopped every producer).
         match self.ops.source_info() {
             Ok(i) if i.head_block_num > paused => Ok(Some(format!(
-                "the source head moved past the pause head ({} > {paused})", i.head_block_num))),
+                "the source head moved past the pause head ({} > {paused})",
+                i.head_block_num
+            ))),
             Ok(_) => Ok(None),
             Err(e) => Ok(Some(format!("cannot read the source head ({e})"))),
         }
@@ -2350,7 +2984,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
 
     /// The operator rollback's refusal after it stranded the node: sealed only if the pause is confirmed.
     fn operator_strand_message(&self, why: &str) -> String {
-        let sealed = self.cfg.ceremony.mode != Mode::Producer || matches!(self.ops.producer_paused(), Ok(true));
+        let sealed = self.cfg.ceremony.mode != Mode::Producer
+            || matches!(self.ops.producer_paused(), Ok(true));
         format!("refusing to resume the old chain: {why}. The node is now STRANDED ({}). If the fleet went LIVE, use \
             `pulse-cutover join`; after a fleet-wide decision to resume the old chain, re-run with --force-stranded --i-understand.",
             if sealed { "sealed: producer paused, writes stay frozen" }
@@ -2380,7 +3015,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             None => None,
         };
         let writes_kept_frozen = self.strand_intent;
-        let external = self.cfg.ceremony.mode == Mode::Producer && !self.paused_by_us && observed == Some(true);
+        let external = self.cfg.ceremony.mode == Mode::Producer
+            && !self.paused_by_us
+            && observed == Some(true);
         self.journal.error(self.state, reason, detail.clone())?;
         // rc.29: sealed means not producing old-chain blocks either (a strand before the pause, e.g. an operator
         // rollback from FROZEN, would otherwise keep producing past H and trip every peer's quiescence window).
@@ -2413,7 +3050,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         if let Some(hook) = &self.cfg.hooks.on_halt {
             let result = self.ops.run_hook(hook); // ungated: on_halt only pages a human (shadow gate exempt)
-            self.journal.evidence(State::Stranded, json!({"on_halt_hook": format!("{result:?}")}))?;
+            self.journal.evidence(
+                State::Stranded,
+                json!({"on_halt_hook": format!("{result:?}")}),
+            )?;
         }
         Ok(())
     }
@@ -2422,8 +3062,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// succeeds is journaled (`rollback_step`) and skipped if the rollback is re-run, and the
     /// rollback is only recorded as finished (`rollback_done`) AFTER every step, on_abort and the
     /// unstage included, succeeded. Returns (failed steps, notes). `unstage_any`: see `unstage`.
-    fn rollback_steps(&mut self, reason: &str, detail: serde_json::Value, perform: bool, unstage_any: bool)
-        -> Result<(Vec<String>, Vec<String>), String> {
+    fn rollback_steps(
+        &mut self,
+        reason: &str,
+        detail: serde_json::Value,
+        perform: bool,
+        unstage_any: bool,
+    ) -> Result<(Vec<String>, Vec<String>), String> {
         self.journal.error(self.state, reason, detail.clone())?;
         let mut failed: Vec<String> = vec![];
         let mut notes: Vec<String> = vec![];
@@ -2501,7 +3146,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         }
                     }
                     if self.hyperion_flip_ran && !self.step_done("hyperion_revert") {
-                        if let Some(cmd) = self.cfg.hyperion.as_ref().and_then(|h| h.revert_cmd.clone()) {
+                        if let Some(cmd) = self
+                            .cfg
+                            .hyperion
+                            .as_ref()
+                            .and_then(|h| h.revert_cmd.clone())
+                        {
                             match self.hook(&cmd) {
                                 Ok(o) => {
                                     rollback["hyperion_flip_reverted"] = json!(o);
@@ -2515,7 +3165,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         }
                     }
                     if self.flip_ran && !self.step_done("flip_revert") {
-                        if let Some(cmd) = self.cfg.flip.as_ref().and_then(|f| f.revert_cmd.clone()) {
+                        if let Some(cmd) = self.cfg.flip.as_ref().and_then(|f| f.revert_cmd.clone())
+                        {
                             match self.hook(&cmd) {
                                 Ok(o) => {
                                     rollback["flip_reverted"] = json!(o);
@@ -2536,7 +3187,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // fresh right here (after the resume above). If the producer is paused (someone else's pause, or ours left
         // paused) or unreadable, a performed rollback keeps writes frozen and seals: STRANDED, on_halt pages. The
         // intent is journaled first, so a crash before the transition completes the strand on the next run.
-        let reopen_pending = self.cfg.hooks.on_abort.is_some() && self.writes_closed_by_us && !self.step_done("on_abort");
+        let reopen_pending = self.cfg.hooks.on_abort.is_some()
+            && self.writes_closed_by_us
+            && !self.step_done("on_abort");
         let resume_failed = rollback.get("source_producer_resume_error").is_some();
         // r30 round 13 (review R12-F1): a producer rollback that resumed, or that met a pause whose ownership is unknown,
         // is confirmed by a fresh "producing" read whatever hooks are configured: without it, a config with no on_abort
@@ -2544,8 +3197,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // r30 round 14 (model F1-A): writes this journal froze (its on_freeze ran or started, even if it failed) are
         // never left behind a rollback that reports completion while the producer is paused or unreadable, whatever
         // hooks are configured: without an on_abort hook nothing reopens them, so a paused producer seals instead.
-        let froze_writes = perform && self.cfg.ceremony.mode == Mode::Producer && self.writes_closed_by_us;
-        let must_confirm = perform && self.cfg.ceremony.mode == Mode::Producer
+        let froze_writes =
+            perform && self.cfg.ceremony.mode == Mode::Producer && self.writes_closed_by_us;
+        let must_confirm = perform
+            && self.cfg.ceremony.mode == Mode::Producer
             && (resumed_now || self.pause_unknown || froze_writes);
         let keep_frozen = if reopen_pending || must_confirm {
             self.writes_may_reopen(resumed_now || froze_writes)?
@@ -2554,9 +3209,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         };
         // A resume that answered ok while the producer stays paused seals (it did not take effect, or someone else paused
         // it since); a resume RPC that failed stays an INCOMPLETE rollback (exit 4), as before.
-        let resume_ignored = rollback.get("source_producer_resume_error").and_then(|v| v.as_str())
+        let resume_ignored = rollback
+            .get("source_producer_resume_error")
+            .and_then(|v| v.as_str())
             .is_some_and(|e| e.starts_with(RESUME_IGNORED));
-        let seal = perform && (!resume_failed || (resume_ignored && self.observed_paused == Some(true)));
+        let seal =
+            perform && (!resume_failed || (resume_ignored && self.observed_paused == Some(true)));
         if let (true, Some(why)) = (seal, keep_frozen.as_ref()) {
             self.journal.evidence(self.state, json!({"strand_intent": true, "writes_kept_frozen": why, "reason": reason,
                 "note": "writes are not reopened into a chain that is not producing; sealing instead"}))?;
@@ -2573,15 +3231,25 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.journal.transition(State::Aborted, rollback)?;
         // rc.29 / r30 round 8: a producer's writes reopen only into a producing chain (R2, a fresh read; auto_rollback =
         // false or a failed resume leave it paused); the operator's `rollback` reopens them later.
-        let source_back = keep_frozen.is_none() && (self.cfg.ceremony.mode != Mode::Producer || !resume_failed);
+        let source_back =
+            keep_frozen.is_none() && (self.cfg.ceremony.mode != Mode::Producer || !resume_failed);
         // r30 round 6: writes are reopened only if this ceremony closed them (its on_freeze ran or started).
-        if self.cfg.hooks.on_abort.is_some() && !self.writes_closed_by_us && !self.step_done("on_abort") {
+        if self.cfg.hooks.on_abort.is_some()
+            && !self.writes_closed_by_us
+            && !self.step_done("on_abort")
+        {
             self.journal.evidence(State::Aborted, json!({"on_abort_skipped": "writes were not closed by this ceremony: nothing to reopen"}))?;
         }
         if self.cfg.hooks.on_abort.is_some() && !source_back && !self.step_done("on_abort") {
             self.journal.evidence(State::Aborted, json!({"on_abort_deferred": "the source producer was not resumed: writes stay frozen until `pulse-cutover rollback`"}))?;
         }
-        if let Some(hook) = self.cfg.hooks.on_abort.clone().filter(|_| source_back && self.writes_closed_by_us) {
+        if let Some(hook) = self
+            .cfg
+            .hooks
+            .on_abort
+            .clone()
+            .filter(|_| source_back && self.writes_closed_by_us)
+        {
             if !self.step_done("on_abort") {
                 // r30 round 13 (review R12-F2): read again immediately before reopening, after the ABORTED record, to
                 // narrow the window in which someone else pauses the producer between the R2 read and the reopen. A
@@ -2591,19 +3259,28 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 if self.cfg.ceremony.mode == Mode::Producer {
                     let last = self.read_paused();
                     if !matches!(last, Ok(false)) {
-                        let why = match &last { Ok(_) => "producer paused".to_string(), Err(e) => format!("producer state unknown ({e})") };
+                        let why = match &last {
+                            Ok(_) => "producer paused".to_string(),
+                            Err(e) => format!("producer state unknown ({e})"),
+                        };
                         self.journal.evidence(State::Aborted, json!({"on_abort_withheld": why,
                             "note": "the source stopped producing between the reopen check and the reopen: writes stay frozen"}))?;
                         failed.push(format!("on_abort withheld: {why} right before reopening writes; re-run \
                             `pulse-cutover rollback` once the producer produces (or release a pause someone else made with \
                             --force-stranded --i-understand)"));
                         self.unstage(unstage_any, &mut failed, &mut notes)?;
-                        self.journal.evidence(State::Aborted, json!({"rollback_incomplete": failed, "rollback_complete": false}))?;
+                        self.journal.evidence(
+                            State::Aborted,
+                            json!({"rollback_incomplete": failed, "rollback_complete": false}),
+                        )?;
                         return Ok((failed, notes));
                     }
                 }
                 let result = self.hook(&hook);
-                self.journal.evidence(State::Aborted, json!({"on_abort_hook": format!("{result:?}")}))?;
+                self.journal.evidence(
+                    State::Aborted,
+                    json!({"on_abort_hook": format!("{result:?}")}),
+                )?;
                 match result {
                     Ok(_) => self.mark_step("on_abort")?,
                     Err(e) => failed.push(format!("on_abort hook: {e}")),
@@ -2620,11 +3297,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         if failed.is_empty() {
             if perform || nothing_to_undo {
-                self.journal.evidence(State::Aborted, json!({"rollback_done": true, "rollback_complete": true}))?;
+                self.journal.evidence(
+                    State::Aborted,
+                    json!({"rollback_done": true, "rollback_complete": true}),
+                )?;
                 self.aborted_rollback_complete = true;
             }
         } else {
-            self.journal.evidence(State::Aborted, json!({"rollback_incomplete": failed, "rollback_complete": false}))?;
+            self.journal.evidence(
+                State::Aborted,
+                json!({"rollback_incomplete": failed, "rollback_complete": false}),
+            )?;
         }
         Ok((failed, notes))
     }
@@ -2642,13 +3325,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // writes it when H becomes irreversible. (Falls back to the
             // immediate create_snapshot path if the scheduler is missing.)
             self.check_mainnet_h()?;
-            match self.ops.schedule_snapshot(self.h()) { // ungated: source snapshot request (writes a file at H, no chain-state change); shadow identity proven at ARM and before the freeze
+            match self.ops.schedule_snapshot(self.h()) {
+                // ungated: source snapshot request (writes a file at H, no chain-state change); shadow identity proven at ARM and before the freeze
                 Ok(()) => {
                     self.scheduled = true;
-                    self.journal.evidence(
-                        State::Armed,
-                        json!({"snapshot_scheduled_at": self.h()}),
-                    )?;
+                    self.journal
+                        .evidence(State::Armed, json!({"snapshot_scheduled_at": self.h()}))?;
                 }
                 Err(e) => {
                     // No fallback: an immediate snapshot would cut at whatever head is current,
@@ -2666,7 +3348,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // transactions land at or before the cut, not in H+1.. (the cut
         // itself stays pinned to exactly H by the scheduled snapshot).
         let freeze_at = if self.scheduled {
-            self.h().saturating_sub(self.cfg.ceremony.freeze_lead_blocks)
+            self.h()
+                .saturating_sub(self.cfg.ceremony.freeze_lead_blocks)
         } else {
             self.h()
         };
@@ -2677,7 +3360,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 break info;
             }
             if self.coordinator_aborted(false) {
-                self.abort("coordinator aborted the event (signed) before the freeze", json!({"head": info.head_block_num}))?;
+                self.abort(
+                    "coordinator aborted the event (signed) before the freeze",
+                    json!({"head": info.head_block_num}),
+                )?;
                 return Ok(());
             }
             let now = self.ops.now_ms();
@@ -2738,10 +3424,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // its snapshot to H with the scheduler — never "whatever head is when LIB passes H".
         if !self.cfg.ceremony.simulate_freeze && !self.scheduled {
             self.check_mainnet_h()?;
-            match self.ops.schedule_snapshot(self.h()) { // ungated: source snapshot request (writes a file at H, no chain-state change); shadow identity proven at ARM and before the freeze
+            match self.ops.schedule_snapshot(self.h()) {
+                // ungated: source snapshot request (writes a file at H, no chain-state change); shadow identity proven at ARM and before the freeze
                 Ok(()) => {
                     self.scheduled = true;
-                    self.journal.evidence(State::Armed, json!({"snapshot_scheduled_at": self.h()}))?;
+                    self.journal
+                        .evidence(State::Armed, json!({"snapshot_scheduled_at": self.h()}))?;
                 }
                 Err(e) => {
                     self.abort(
@@ -2827,7 +3515,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         } else {
             // simulate_freeze only (validated): a live chain, an inexact cut, journaled as such.
-            match self.ops.create_snapshot() { // ungated: source snapshot file only (no chain-state change); shadow identity proven at ARM and before the freeze
+            match self.ops.create_snapshot() {
+                // ungated: source snapshot file only (no chain-state change); shadow identity proven at ARM and before the freeze
                 Ok(s) => s,
                 Err(e) => {
                     self.abort("create_snapshot failed", json!({"error": e}))?;
@@ -2929,8 +3618,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 break;
             }
             if self.coordinator_aborted(false) {
-                self.abort("coordinator aborted the event (signed) while waiting for H to finalize",
-                    json!({"h": h, "lib": info.last_irreversible_block_num}))?;
+                self.abort(
+                    "coordinator aborted the event (signed) while waiting for H to finalize",
+                    json!({"h": h, "lib": info.last_irreversible_block_num}),
+                )?;
                 return Ok(None);
             }
             let now = self.ops.now_ms();
@@ -2997,7 +3688,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // still frozen by the hook, so re-produced blocks stay empty).
         // r30 round 9 (review R9-F2): this read decides ownership; a transient error is retried (bounded), never the
         // end of the run mid-FROZEN.
-        if self.read_paused_retrying(PAUSE_READ_RETRY_MS, "checking the source producer at the start of FROZEN")? {
+        if self.read_paused_retrying(
+            PAUSE_READ_RETRY_MS,
+            "checking the source producer at the start of FROZEN",
+        )? {
             // r30 round 7/8: ownership is decided FIRST, whether or not H is already final. A pause this journal did
             // not record as its own, found after this ceremony froze writes (an operator pausing by hand near H, a
             // hook, a scheduler), is ADOPTED for the cut: journaled as evidence, never re-paused (which would turn it
@@ -3007,7 +3701,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // every peer's quiescence window and abort the whole event).
             if self.adopt_external_pause()? {
                 // Adopted: stays paused (the scheduled snapshot finalizes on the other producers' blocks).
-            } else if self.scheduled && self.ops.source_info()?.last_irreversible_block_num >= self.h() {
+            } else if self.scheduled
+                && self.ops.source_info()?.last_irreversible_block_num >= self.h()
+            {
                 self.journal.evidence(State::Frozen, json!({"kept_paused_on_resume": true,
                     "note": "H is already final: the scheduled snapshot needs no more blocks from this producer"}))?;
             } else {
@@ -3016,13 +3712,19 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 // someone else makes later is adopted, never taken for ours.
                 let episode = self.current_episode();
                 self.src_resume("resuming production for the snapshot")?;
-                if self.read_paused_retrying(PAUSE_READ_RETRY_MS, "confirming the resume for the snapshot")? {
+                if self.read_paused_retrying(
+                    PAUSE_READ_RETRY_MS,
+                    "confirming the resume for the snapshot",
+                )? {
                     // r30 round 12 (model R10-2): the RPC answered but the producer is paused. That is either our resume
                     // not applying or someone else pausing right after it; ownership is unknown (the episode stays
                     // closing). A re-run adopts the pause for the cut; a rollback never resumes it on its own authority.
-                    self.journal.evidence(State::Frozen, json!({"source_resume_outcome_unknown": episode,
+                    self.journal.evidence(
+                        State::Frozen,
+                        json!({"source_resume_outcome_unknown": episode,
                         "producer_paused": true,
-                        "error": "the resume RPC succeeded but the producer is paused"}))?;
+                        "error": "the resume RPC succeeded but the producer is paused"}),
+                    )?;
                     return Err("resuming production for the snapshot: the producer is still paused after the resume, and \
                                 whose pause that is is now unknown (a re-run adopts it for the cut and never resumes it)".into());
                 }
@@ -3040,7 +3742,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 None => return Ok(()), // aborted inside, with evidence
             }
         } else {
-            match self.ops.create_snapshot() { // ungated: source snapshot file only (no chain-state change); shadow identity proven at ARM and before the freeze
+            match self.ops.create_snapshot() {
+                // ungated: source snapshot file only (no chain-state change); shadow identity proven at ARM and before the freeze
                 Ok(s) => s,
                 Err(e) => {
                     self.abort("create_snapshot failed", json!({"error": e}))?;
@@ -3058,7 +3761,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // r30 round 8 (review R8-1): src_pause decides by a fresh read: a pause someone else made (also during the
         // snapshot wait above) is adopted, never paused again or recorded as ours.
         self.src_pause()?;
-        if !self.read_paused_retrying(PAUSE_READ_RETRY_MS, "confirming the source producer paused")? {
+        if !self
+            .read_paused_retrying(PAUSE_READ_RETRY_MS, "confirming the source producer paused")?
+        {
             self.abort("pause did not take effect", json!({}))?;
             return Ok(());
         }
@@ -3079,7 +3784,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let mut head = 0u64;
         let mut late = 0u64;
         let quiesce_from = self.ops.now_ms();
-        let quiesce_deadline = quiesce_from.saturating_add(self.cfg.ceremony.quiescence_timeout_secs.saturating_mul(1000));
+        let quiesce_deadline = quiesce_from.saturating_add(
+            self.cfg
+                .ceremony
+                .quiescence_timeout_secs
+                .saturating_mul(1000),
+        );
         let at_pause = loop {
             self.ops.sleep_ms(self.cfg.poll_ms);
             let i = self.ops.source_info()?;
@@ -3225,25 +3935,43 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// The upstream verification of the journaled cut snapshot: sha256, the #61 pipeline, the advisory scan, the fork
     /// audit and the boot artifacts, journaled as evidence under `stage`. `Ok(Err((reason, detail)))` changed no state:
     /// the caller aborts (SNAPSHOTTED) or refuses (`join --reverify`, rc.25 F5). Outer Err = journal failure.
-    fn upstream_verify(&mut self, stage: State) -> Result<Result<UpstreamVerified, (String, serde_json::Value)>, String> {
+    fn upstream_verify(
+        &mut self,
+        stage: State,
+    ) -> Result<Result<UpstreamVerified, (String, serde_json::Value)>, String> {
         let Some(file) = self.snapshot_file.clone() else {
             return Ok(Err(("no cut snapshot journaled".into(), json!({}))));
         };
         let path = std::path::PathBuf::from(file);
-        let up = self.cfg.upstream.clone().expect("validated: upstream section");
+        let up = self
+            .cfg
+            .upstream
+            .clone()
+            .expect("validated: upstream section");
         let started = self.ops.now_ms();
         let (sha256, file_size) = match verify::sha256_file(&path) {
             Ok(v) => v,
-            Err(e) => return Ok(Err(("cannot hash cut snapshot".into(), json!({"error": e})))),
+            Err(e) => {
+                return Ok(Err((
+                    "cannot hash cut snapshot".into(),
+                    json!({"error": e}),
+                )))
+            }
         };
         if let Some(expected) = &self.cfg.snapshot.expected_sha256 {
             if !sha256.eq_ignore_ascii_case(expected) {
-                return Ok(Err(("snapshot sha256 mismatch vs ceremony manifest".into(),
-                    json!({"computed": sha256, "expected": expected}))));
+                return Ok(Err((
+                    "snapshot sha256 mismatch vs ceremony manifest".into(),
+                    json!({"computed": sha256, "expected": expected}),
+                )));
             }
         }
-        let (Some(cut_height), Some(cut_block_id)) = (self.cut_height, self.cut_block_id.clone()) else {
-            return Ok(Err(("no cut height / cut block id journaled".into(), json!({}))));
+        let (Some(cut_height), Some(cut_block_id)) = (self.cut_height, self.cut_block_id.clone())
+        else {
+            return Ok(Err((
+                "no cut height / cut block id journaled".into(),
+                json!({}),
+            )));
         };
         let chain_id = self.chain_id.clone().unwrap_or_default();
         let outcome = {
@@ -3271,20 +3999,37 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let outcome = match outcome {
             Ok(o) => o,
             Err(upstream::PipelineError::Aborted { during }) => {
-                let event_id = self.cfg.coordination.as_ref().and_then(|c| c.event_id.clone());
-                return Ok(Err(("coordinator aborted the event (signed) before ignition".into(),
+                let event_id = self
+                    .cfg
+                    .coordination
+                    .as_ref()
+                    .and_then(|c| c.event_id.clone());
+                return Ok(Err((
+                    "coordinator aborted the event (signed) before ignition".into(),
                     json!({"event_id": event_id, "during": format!("upstream verification ({during})"),
-                           "verify_wall_ms": self.ops.now_ms().saturating_sub(started)}))));
+                           "verify_wall_ms": self.ops.now_ms().saturating_sub(started)}),
+                )));
             }
             Err(upstream::PipelineError::Failed(e)) => {
-                return Ok(Err(("upstream verification failed".into(), json!({"error": e}))));
+                return Ok(Err((
+                    "upstream verification failed".into(),
+                    json!({"error": e}),
+                )));
             }
         };
         // rc.27: the protocol upgrade schedule the new chain will run under (its hash is fleet evidence).
         let protocol = match upstream::ProtocolSchedule::load(up.protocol_upgrades_file.as_deref())
-            .and_then(|s| s.check_against_cut(cut_height, up.protocol_upgrade_margin_blocks).map(|_| s)) {
+            .and_then(|s| {
+                s.check_against_cut(cut_height, up.protocol_upgrade_margin_blocks)
+                    .map(|_| s)
+            }) {
             Ok(p) => p,
-            Err(e) => return Ok(Err(("protocol upgrade schedule refused".into(), json!({"error": e})))),
+            Err(e) => {
+                return Ok(Err((
+                    "protocol upgrade schedule refused".into(),
+                    json!({"error": e}),
+                )))
+            }
         };
         // Advisory stubbed-intrinsic scan of the actual cut (read-only audit
         // over the deployed code objects; backend-independent).
@@ -3307,10 +4052,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         }}),
                     )?;
                 }
-                Err(e) => self.journal.evidence(
-                    stage,
-                    json!({"fork_audit_error": e, "advisory": true}),
-                )?,
+                Err(e) => self
+                    .journal
+                    .evidence(stage, json!({"fork_audit_error": e, "advisory": true}))?,
             }
         }
         // Boot artifacts for ignition from the checkpoint (only when ignition is configured; a
@@ -3323,12 +4067,22 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let block = match self.ops.source_block(cut_height, rpc) {
                 Ok(b) => b,
                 Err(e) => {
-                    return Ok(Err(("cannot fetch the full source cut block for the boot manifest anchor".into(),
+                    return Ok(Err((
+                        "cannot fetch the full source cut block for the boot manifest anchor"
+                            .into(),
                         json!({"error": e, "cut_height": cut_height,
-                               "fix": "the source RPC (or upstream.source_block_rpc_url) must serve get_block at the cut"}))));
+                               "fix": "the source RPC (or upstream.source_block_rpc_url) must serve get_block at the cut"}),
+                    )));
                 }
             };
-            match upstream::build_boot_artifacts(&up, &outcome, &block, cut_height, &cut_block_id, &chain_id) {
+            match upstream::build_boot_artifacts(
+                &up,
+                &outcome,
+                &block,
+                cut_height,
+                &cut_block_id,
+                &chain_id,
+            ) {
                 Ok(a) => {
                     boot = json!({
                         "manifest": a.manifest.display().to_string(),
@@ -3338,9 +4092,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         "source_block_receipts": a.source_block_receipts,
                         "anchor": "full packed source cut block (all receipts); computed id == cut block id",
                     });
-                    boot_hashes = (Some(a.manifest_sha256), Some(a.genesis_sha256), Some(a.chain_config_sha256));
+                    boot_hashes = (
+                        Some(a.manifest_sha256),
+                        Some(a.genesis_sha256),
+                        Some(a.chain_config_sha256),
+                    );
                 }
-                Err(e) => return Ok(Err(("cannot build the upstream boot artifacts".into(), json!({"error": e})))),
+                Err(e) => {
+                    return Ok(Err((
+                        "cannot build the upstream boot artifacts".into(),
+                        json!({"error": e}),
+                    )))
+                }
             }
         }
         self.boot_hashes = boot_hashes.clone();
@@ -3352,7 +4115,19 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 outcome.compare_allowed_mismatch.join(", ")
             ),
         };
-        Ok(Ok(UpstreamVerified { sha256, file_size, outcome, boot, boot_hashes, table_compare, cut_height, cut_block_id, chain_id, started, protocol }))
+        Ok(Ok(UpstreamVerified {
+            sha256,
+            file_size,
+            outcome,
+            boot,
+            boot_hashes,
+            table_compare,
+            cut_height,
+            cut_block_id,
+            chain_id,
+            started,
+            protocol,
+        }))
     }
 
     fn step_snapshotted_upstream(&mut self) -> Result<(), String> {
@@ -3363,9 +4138,25 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 return Ok(());
             }
         };
-        let UpstreamVerified { sha256, file_size, outcome, boot, boot_hashes, table_compare, cut_height, cut_block_id, chain_id, started, protocol } = v;
+        let UpstreamVerified {
+            sha256,
+            file_size,
+            outcome,
+            boot,
+            boot_hashes,
+            table_compare,
+            cut_height,
+            cut_block_id,
+            chain_id,
+            started,
+            protocol,
+        } = v;
         if self.coordinator_aborted(true) {
-            let event_id = self.cfg.coordination.as_ref().and_then(|c| c.event_id.clone());
+            let event_id = self
+                .cfg
+                .coordination
+                .as_ref()
+                .and_then(|c| c.event_id.clone());
             self.abort(
                 "coordinator aborted the event (signed) before ignition",
                 json!({"event_id": event_id, "during": "upstream verification (boot artifacts)"}),
@@ -3413,9 +4204,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.cfg.ceremony.import_backend == ImportBackend::Upstream {
             return self.step_snapshotted_upstream();
         }
-        let path = std::path::PathBuf::from(
-            self.snapshot_file.clone().expect("snapshot file recorded"),
-        );
+        let path =
+            std::path::PathBuf::from(self.snapshot_file.clone().expect("snapshot file recorded"));
         let started = self.ops.now_ms();
         let outcome = match verify::verify_snapshot(&path, self.cfg.ceremony.import_cpu_scale) {
             Ok(o) => o,
@@ -3464,8 +4254,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // State-level goldens: verify (multi-BP) or capture (first node).
         let mut golden_mode = "none";
         if let Some(golden_path) = &self.cfg.snapshot.golden_roots {
-            let text = std::fs::read_to_string(golden_path)
-                .map_err(|e| format!("read goldens: {e}"))?;
+            let text =
+                std::fs::read_to_string(golden_path).map_err(|e| format!("read goldens: {e}"))?;
             let goldens = verify::parse_goldens(&text)?;
             if let Err(e) = verify::compare_goldens(&outcome.roots, &goldens) {
                 self.abort("fingerprints do not match goldens", json!({"diff": e}))?;
@@ -3482,9 +4272,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         // Stage the verified file where the pulsevm chain config expects it. The artifact's
         // identity is journaled FIRST, so a crash mid-copy is recognizable as our own file.
-        self.journal.evidence(State::Snapshotted, json!({"staged_artifact": {
+        self.journal.evidence(
+            State::Snapshotted,
+            json!({"staged_artifact": {
             "sha256": outcome.sha256, "cut_height": outcome.head_block_num,
-            "path": self.cfg.snapshot.staged_path.display().to_string()}}))?;
+            "path": self.cfg.snapshot.staged_path.display().to_string()}}),
+        )?;
         self.staged_sha256 = Some(outcome.sha256.clone());
         if path != self.cfg.snapshot.staged_path {
             std::fs::copy(&path, &self.cfg.snapshot.staged_path)
@@ -3549,7 +4342,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
 
     /// The `{name}` placeholders the upstream ignition binds once the chain exists.
     fn bind_target_vars(&mut self) {
-        let (Some(bid), Some(up), Some(h)) = (self.target_blockchain_id.clone(), self.cfg.upstream.as_ref(), self.cut_height) else {
+        let (Some(bid), Some(up), Some(h)) = (
+            self.target_blockchain_id.clone(),
+            self.cfg.upstream.as_ref(),
+            self.cut_height,
+        ) else {
             return;
         };
         let (manifest, genesis, chain_config) = upstream::boot_paths(up, h);
@@ -3582,13 +4379,20 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return None;
         }
         let read = |p: &std::path::Path, what: &str| -> Result<serde_json::Value, String> {
-            let t = std::fs::read_to_string(p).map_err(|e| format!("read {what} {}: {e}", p.display()))?;
+            let t = std::fs::read_to_string(p)
+                .map_err(|e| format!("read {what} {}: {e}", p.display()))?;
             serde_json::from_str(&t).map_err(|e| format!("{what} {} is not JSON: {e}", p.display()))
         };
         Some((|| {
-            let genesis = read(up.genesis_base.as_ref().expect("ignite configured"), "upstream.genesis_base")?;
-            let initial = genesis["initial_key"].as_str().ok_or("upstream.genesis_base has no initial_key")?;
-            let initial = crate::keys::parse_public_k1(initial).map_err(|e| format!("upstream.genesis_base initial_key: {e}"))?;
+            let genesis = read(
+                up.genesis_base.as_ref().expect("ignite configured"),
+                "upstream.genesis_base",
+            )?;
+            let initial = genesis["initial_key"]
+                .as_str()
+                .ok_or("upstream.genesis_base has no initial_key")?;
+            let initial = crate::keys::parse_public_k1(initial)
+                .map_err(|e| format!("upstream.genesis_base initial_key: {e}"))?;
             let cc = match &up.chain_config_base {
                 Some(p) => read(p, "upstream.chain_config_base")?,
                 None => json!({}),
@@ -3597,7 +4401,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "upstream.chain_config_base has no producer_name: cannot tell which producer this node signs as                  (the migrated chain re-elects producers from eosio/producers at the first onblock)")?;
             let signing = match cc["producer_key"].as_str() {
                 Some(k) => {
-                    let p = crate::keys::public_of_private_k1(k).map_err(|e| format!("upstream.chain_config_base producer_key: {e}"))?;
+                    let p = crate::keys::public_of_private_k1(k)
+                        .map_err(|e| format!("upstream.chain_config_base producer_key: {e}"))?;
                     if p != initial {
                         return Err(format!(
                             "the chain config producer_key (public {}) is not the genesis initial_key {}: PulseVM seeds                              schedule v0 with initial_key and signs with producer_key, so it could not produce at all",
@@ -3609,7 +4414,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 // schedule v0 with the genesis initial key, so that is what must be registered.
                 None => initial,
             };
-            let row = self.ops.source_producer(producer).map_err(|e| format!("cannot read eosio/producers for {producer} on the source: {e}"))?;
+            let row = self.ops.source_producer(producer).map_err(|e| {
+                format!("cannot read eosio/producers for {producer} on the source: {e}")
+            })?;
             crate::keys::check_registered_producer_key(row.as_ref(), producer, &signing)
         })())
     }
@@ -3619,19 +4426,43 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// none. Checked at ARM, before anything freezes.
     fn signer_material_problems(&self) -> Vec<String> {
         let mut out = vec![];
-        let Some(up) = self.cfg.upstream.as_ref().filter(|u| u.ignite_configured(&self.cfg.target)) else { return out };
-        let read = |p: &std::path::Path| std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+        let Some(up) = self
+            .cfg
+            .upstream
+            .as_ref()
+            .filter(|u| u.ignite_configured(&self.cfg.target))
+        else {
+            return out;
+        };
+        let read = |p: &std::path::Path| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        };
         if let Some(g) = up.genesis_base.as_ref().and_then(|p| read(p)) {
             if crate::secrets::has_private_key(&g) {
                 out.push("upstream.genesis_base contains a private key: the migration genesis is shared with every validator and chain creation (initial_key must be a PUBLIC key)".into());
             }
         }
-        let holds_key = up.chain_config_base.as_ref().and_then(|p| read(p)).map(|v| crate::secrets::has_private_key(&v)).unwrap_or(false);
+        let holds_key = up
+            .chain_config_base
+            .as_ref()
+            .and_then(|p| read(p))
+            .map(|v| crate::secrets::has_private_key(&v))
+            .unwrap_or(false);
         if holds_key {
-            for dir in [Some(up.work_dir.clone()), self.cfg.target.chain_config_dir.clone()].into_iter().flatten() {
+            for dir in [
+                Some(up.work_dir.clone()),
+                self.cfg.target.chain_config_dir.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 if dir.exists() {
                     if let Err(e) = crate::secrets::check_private_dir(&dir) {
-                        out.push(format!("the chain config will hold this node's signing key: {e}"));
+                        out.push(format!(
+                            "the chain config will hold this node's signing key: {e}"
+                        ));
                     }
                 }
             }
@@ -3643,10 +4474,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// stays unsolved for mainnet, and re-check the boot artifacts against their VERIFIED hashes.
     /// Ok(false) after aborting (pre-ignition: the source is resumed).
     fn upstream_ignite_preflight(&mut self) -> Result<bool, String> {
-        let up = self.cfg.upstream.clone().expect("validated: upstream section");
+        let up = self
+            .cfg
+            .upstream
+            .clone()
+            .expect("validated: upstream section");
         let source_chain = self.chain_id.clone().unwrap_or_default();
         let pending = upstream::ignite_pending_reasons();
-        if crate::config::is_xpr_mainnet(&source_chain) && !pending.is_empty() && self.cfg.is_shadow() && self.shadow_verified {
+        if crate::config::is_xpr_mainnet(&source_chain)
+            && !pending.is_empty()
+            && self.cfg.is_shadow()
+            && self.shadow_verified
+        {
             self.journal.evidence(self.state, json!({"shadow_ignite_pending": pending,
                 "note": "SHADOW: a real mainnet ignition is refused for these; the shadow goes on to find out what happens"}))?;
         } else if crate::config::is_xpr_mainnet(&source_chain) && !pending.is_empty() {
@@ -3666,9 +4505,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(false);
         }
         match self.producer_key_check() {
-            Some(Ok(ev)) => self.journal.evidence(State::Verified, json!({"producer_key_check": ev}))?,
+            Some(Ok(ev)) => self
+                .journal
+                .evidence(State::Verified, json!({"producer_key_check": ev}))?,
             Some(Err(problem)) => {
-                self.abort("producer signing key check failed (pre-ignition)", json!({"problem": problem}))?;
+                self.abort(
+                    "producer signing key check failed (pre-ignition)",
+                    json!({"problem": problem}),
+                )?;
                 return Ok(false);
             }
             None => {}
@@ -3678,7 +4522,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             "note": "unsolved for a same-chain-id MAINNET cutover; acceptable only on a rehearsal/test chain",
             "rehearsal_overrides": self.cfg.rehearsal_overrides(),
         }))?;
-        eprintln!("WARNING (upstream ignite, not mainnet-ready): {}", pending.join(" | "));
+        eprintln!(
+            "WARNING (upstream ignite, not mainnet-ready): {}",
+            pending.join(" | ")
+        );
         // The artifacts the target boots from must be exactly the ones verification produced.
         let h = self.cut_height.expect("cut pinned");
         let (manifest, genesis, chain_config) = upstream::boot_paths(&up, h);
@@ -3694,7 +4541,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
         if !changed.is_empty() {
-            self.abort("upstream boot artifacts missing or changed since VERIFIED", json!({"artifacts": changed}))?;
+            self.abort(
+                "upstream boot artifacts missing or changed since VERIFIED",
+                json!({"artifacts": changed}),
+            )?;
             return Ok(false);
         }
         Ok(true)
@@ -3704,7 +4554,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// on Metal (once: its id is journaled the moment it is known), bind the placeholders and
     /// install the chain config. Ok(false) after aborting (pre-ignition).
     fn upstream_create_chain(&mut self) -> Result<bool, String> {
-        let up = self.cfg.upstream.clone().expect("validated: upstream section");
+        let up = self
+            .cfg
+            .upstream
+            .clone()
+            .expect("validated: upstream section");
         let h = self.cut_height.expect("cut pinned");
         let (manifest, genesis, chain_config) = upstream::boot_paths(&up, h);
         if let Some(bid) = self.target_blockchain_id.clone() {
@@ -3726,18 +4580,38 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // rc.29: the old chain must still be sealed at the cut at the creation boundary itself (the fleet gate and
             // the authorization wait before it can take minutes).
             if let Some(why) = self.source_sealed_problem()? {
-                self.abort(&format!("refusing to create the target: {why}"), json!({"head_at_pause": self.head_at_pause}))?;
+                self.abort(
+                    &format!("refusing to create the target: {why}"),
+                    json!({"head_at_pause": self.head_at_pause}),
+                )?;
                 return Ok(false);
             }
-            let cmd = self.cfg.target.create_chain_cmd.clone().expect("validated: ignite configured");
-            let cmd = crate::ops::expand_placeholders(&cmd, &[
-                ("genesis".into(), genesis.display().to_string()),
-                ("genesis_sha256".into(), self.boot_hashes.1.clone().unwrap_or_default()),
-                ("chain_config".into(), chain_config.display().to_string()),
-                ("manifest".into(), manifest.display().to_string()),
-                ("checkpoint".into(), up.work_dir.join(format!("checkpoint-{h}.bin")).display().to_string()),
-                ("cut_height".into(), h.to_string()),
-            ]);
+            let cmd = self
+                .cfg
+                .target
+                .create_chain_cmd
+                .clone()
+                .expect("validated: ignite configured");
+            let cmd = crate::ops::expand_placeholders(
+                &cmd,
+                &[
+                    ("genesis".into(), genesis.display().to_string()),
+                    (
+                        "genesis_sha256".into(),
+                        self.boot_hashes.1.clone().unwrap_or_default(),
+                    ),
+                    ("chain_config".into(), chain_config.display().to_string()),
+                    ("manifest".into(), manifest.display().to_string()),
+                    (
+                        "checkpoint".into(),
+                        up.work_dir
+                            .join(format!("checkpoint-{h}.bin"))
+                            .display()
+                            .to_string(),
+                    ),
+                    ("cut_height".into(), h.to_string()),
+                ],
+            );
             // Intent FIRST, and it is the point of no return: from here every outcome (failure, an
             // answer without an id, a lost answer, a crash) halts for an operator decision.
             self.journal.evidence(State::Verified, json!({"side_effect": "create_chain", "cmd": cmd,
@@ -3754,12 +4628,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let (bid, subnet) = match upstream::parse_create_chain_output(&out) {
                 Ok(v) => v,
                 Err(e) => {
-                    self.abort("create_chain_cmd output has no blockchain id", json!({"error": e, "output": out}))?;
+                    self.abort(
+                        "create_chain_cmd output has no blockchain id",
+                        json!({"error": e, "output": out}),
+                    )?;
                     return Ok(false);
                 }
             };
-            self.journal.evidence(State::Verified, json!({"target_blockchain_id": bid, "target_subnet_id": subnet,
-                "create_chain_output": out}))?;
+            self.journal.evidence(
+                State::Verified,
+                json!({"target_blockchain_id": bid, "target_subnet_id": subnet,
+                "create_chain_output": out}),
+            )?;
             self.target_blockchain_id = Some(bid);
             self.target_subnet_id = subnet;
         }
@@ -3785,21 +4665,31 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                             b.mode(0o700);
                         }
                     }
-                    b.create(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+                    b.create(parent)
+                        .map_err(|e| format!("create {}: {e}", parent.display()))?;
                     crate::secrets::write_file(&dest, &bytes, private)
                 })
                 .and_then(|_| verify::sha256_file(&dest).map(|(h, _)| h));
             match installed {
                 Ok(h) if Some(&h) == self.boot_hashes.2.as_ref() => {
-                    self.journal.evidence(State::Verified, json!({"chain_config_installed": dest.display().to_string(), "sha256": h}))?;
+                    self.journal.evidence(
+                        State::Verified,
+                        json!({"chain_config_installed": dest.display().to_string(), "sha256": h}),
+                    )?;
                     if let Err(e) = self.install_protocol_schedule(&dir, &bid)? {
-                        self.abort("could not install the protocol upgrade schedule for the target", e)?;
+                        self.abort(
+                            "could not install the protocol upgrade schedule for the target",
+                            e,
+                        )?;
                         return Ok(false);
                     }
                 }
                 other => {
-                    self.abort("could not install the chain config for the target", json!({
-                        "dest": dest.display().to_string(), "result": format!("{other:?}")}))?;
+                    self.abort(
+                        "could not install the chain config for the target",
+                        json!({
+                        "dest": dest.display().to_string(), "result": format!("{other:?}")}),
+                    )?;
                     return Ok(false);
                 }
             }
@@ -3831,14 +4721,30 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 real node); a new shadow starts on a fresh journal. Journal: {}", self.journal.path().display()));
         }
         self.cfg.ensure_ceremony_profile()?;
-        let co = self.cfg.coordination.clone().ok_or("join needs the event's [coordination] config (the one `await` derived)")?;
+        let co = self
+            .cfg
+            .coordination
+            .clone()
+            .ok_or("join needs the event's [coordination] config (the one `await` derived)")?;
         if co.event_id.as_deref() != Some(event_id) {
-            return Err(format!("this config is for event {:?}, not {event_id}", co.event_id));
+            return Err(format!(
+                "this config is for event {:?}, not {event_id}",
+                co.event_id
+            ));
         }
-        if self.cfg.ceremony.import_backend != ImportBackend::Upstream || self.cfg.ceremony.mode != Mode::Producer
-            || !self.cfg.upstream.as_ref().is_some_and(|u| u.ignite_configured(&self.cfg.target)) {
-            return Err("join supports producer mode on the upstream backend with ignition configured \
-                        (upstream.genesis_base + target.create_chain_cmd)".into());
+        if self.cfg.ceremony.import_backend != ImportBackend::Upstream
+            || self.cfg.ceremony.mode != Mode::Producer
+            || !self
+                .cfg
+                .upstream
+                .as_ref()
+                .is_some_and(|u| u.ignite_configured(&self.cfg.target))
+        {
+            return Err(
+                "join supports producer mode on the upstream backend with ignition configured \
+                        (upstream.genesis_base + target.create_chain_cmd)"
+                    .into(),
+            );
         }
         if self.rollback_pending {
             return Err("an operator rollback is pending on this journal: finish it first".into());
@@ -3854,17 +4760,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // rc.26 review M1: the mainnet refusal of rehearsal configs runs at load (configured chain_id) and at ARM; a
         // config edited after ARM must not bring one into a join either. The journal knows the source chain.
         if self.cfg.mainnet_refusals_apply(self.chain_id.as_deref())
-            && (self.cfg.ceremony.rehearsal || !self.cfg.rehearsal_overrides().is_empty()) {
+            && (self.cfg.ceremony.rehearsal || !self.cfg.rehearsal_overrides().is_empty())
+        {
             return Err("join refused: this journal's source is XPR MAINNET and the config is a rehearsal or carries rehearsal \
                         overrides: refused for mainnet. Nothing was changed.".into());
         }
         if self.reached_ignited || self.target_blockchain_id.is_some() {
             return Err("this node already started its own ignition or chain creation: not a join (operator decision)".into());
         }
-        let verified = self.sha256.is_some() && self.boot_hashes.0.is_some() && self.boot_hashes.1.is_some() && self.boot_hashes.2.is_some();
+        let verified = self.sha256.is_some()
+            && self.boot_hashes.0.is_some()
+            && self.boot_hashes.1.is_some()
+            && self.boot_hashes.2.is_some();
         // rc.27 review (review #3): a VERIFIED journal from an agent before rc.27 carries no protocol schedule hash, so it
         // cannot prove the same schedule as the LIVE quorum: it must re-verify (which records one) before joining.
-        let legacy = verified && crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"]["protocol_schedule_hash"].is_null();
+        let legacy = verified
+            && crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"]
+                ["protocol_schedule_hash"]
+                .is_null();
         if legacy && !reverify {
             return Err("join refused: this ceremony VERIFIED with an agent before rc.27 (no protocol upgrade schedule hash \
                         journaled), so it cannot prove the LIVE quorum's schedule: run `join --reverify`".into());
@@ -3895,11 +4808,21 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             e
         };
-        let (Some(h), Some(cut_id), Some(sha)) = (self.cut_height, self.cut_block_id.clone(), self.sha256.clone()) else {
+        let (Some(h), Some(cut_id), Some(sha)) = (
+            self.cut_height,
+            self.cut_block_id.clone(),
+            self.sha256.clone(),
+        ) else {
             return Err("this ceremony never reached VERIFIED (no cut / snapshot hash journaled): nothing to join with".into());
         };
-        if self.boot_hashes.0.is_none() || self.boot_hashes.1.is_none() || self.boot_hashes.2.is_none() {
-            return Err(forget(self, "no boot artifacts journaled at VERIFIED: nothing to join with".into()));
+        if self.boot_hashes.0.is_none()
+            || self.boot_hashes.1.is_none()
+            || self.boot_hashes.2.is_none()
+        {
+            return Err(forget(
+                self,
+                "no boot artifacts journaled at VERIFIED: nothing to join with".into(),
+            ));
         }
         // 0. Writes frozen again (review #4): an ABORTED ceremony's on_abort reopened them on the old chain.
         //    on_freeze is re-run (it must be idempotent, like every hook) before any other join step;
@@ -3914,22 +4837,30 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // segment's completed rollback can never cover this freeze (or a pause the join makes).
             self.start_segment("join")?;
             match self.freeze_writes(&hook) {
-                Ok(o) => self.journal.evidence(self.state, json!({"join_refreeze": o, "note": "writes frozen again before the join"}))?,
+                Ok(o) => self.journal.evidence(
+                    self.state,
+                    json!({"join_refreeze": o, "note": "writes frozen again before the join"}),
+                )?,
                 Err(e) => {
-                    self.journal.evidence(self.state, json!({"join_refreeze_error": e}))?;
-                    let e = forget(self, format!("join refused: re-running on_freeze to close writes failed: {e}"));
+                    self.journal
+                        .evidence(self.state, json!({"join_refreeze_error": e}))?;
+                    let e = forget(
+                        self,
+                        format!("join refused: re-running on_freeze to close writes failed: {e}"),
+                    );
                     return Err(self.join_refused_after_refreeze(e)?);
                 }
             }
         }
-        let (bid, sid, members, info, paused_head, paused, ours) = match self.join_checks(&co, h, ours_override) {
-            Ok(x) => x,
-            Err(e) if refrozen => {
-                let e = forget(self, e);
-                return Err(self.join_refused_after_refreeze(e)?);
-            }
-            Err(e) => return Err(forget(self, e)),
-        };
+        let (bid, sid, members, info, paused_head, paused, ours) =
+            match self.join_checks(&co, h, ours_override) {
+                Ok(x) => x,
+                Err(e) if refrozen => {
+                    let e = forget(self, e);
+                    return Err(self.join_refused_after_refreeze(e)?);
+                }
+                Err(e) => return Err(forget(self, e)),
+            };
         if let Some(record) = reverified {
             self.journal.evidence(self.state, record)?;
         }
@@ -3942,13 +4873,20 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             "burnoff_transactions": 0, "source_paused": paused, "evidence": ours}}))?;
         if !paused {
             self.src_pause()?;
-            self.journal.evidence(self.state, json!({"join_paused_source": true}))?;
+            self.journal
+                .evidence(self.state, json!({"join_paused_source": true}))?;
         }
-        self.journal.evidence(self.state, json!({"side_effect": "join",
-            "point_of_no_return": "joining an existing target chain: any failure from here halts"}))?;
+        self.journal.evidence(
+            self.state,
+            json!({"side_effect": "join",
+            "point_of_no_return": "joining an existing target chain: any failure from here halts"}),
+        )?;
         self.joining = true;
         self.create_chain_started = true;
-        self.journal.evidence(self.state, json!({"target_blockchain_id": bid, "target_subnet_id": sid}))?;
+        self.journal.evidence(
+            self.state,
+            json!({"target_blockchain_id": bid, "target_subnet_id": sid}),
+        )?;
         self.target_blockchain_id = Some(bid);
         self.target_subnet_id = sid;
         let _ = (sha, cut_id);
@@ -3983,7 +4921,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let v = match self.upstream_verify(self.state)? {
             Ok(v) => v,
             Err((reason, detail)) => {
-                self.journal.evidence(self.state, json!({"reverify_failed": {"reason": reason, "detail": detail}}))?;
+                self.journal.evidence(
+                    self.state,
+                    json!({"reverify_failed": {"reason": reason, "detail": detail}}),
+                )?;
                 self.boot_hashes = (None, None, None);
                 return Err(format!("join refused: re-verification failed: {reason} ({detail}). Nothing was changed on either chain \
                                     (only this node's verification work files were rewritten)."));
@@ -4005,8 +4946,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if let Some(dg) = crate::beacon::compare_allowed_digest(&allowed) {
             ours["compare_allowed_digest"] = json!(dg);
         }
-        if ["snapshot_sha256", "fingerprints_digest", "boot_genesis_sha256"].iter().any(|k| ours[*k].is_null()) {
-            self.journal.evidence(self.state, json!({"reverify_failed": {"reason": "incomplete evidence", "evidence": ours}}))?;
+        if [
+            "snapshot_sha256",
+            "fingerprints_digest",
+            "boot_genesis_sha256",
+        ]
+        .iter()
+        .any(|k| ours[*k].is_null())
+        {
+            self.journal.evidence(
+                self.state,
+                json!({"reverify_failed": {"reason": "incomplete evidence", "evidence": ours}}),
+            )?;
             self.boot_hashes = (None, None, None);
             return Err(format!("join refused: the re-verification did not produce all of snapshot sha256, state fingerprints and \
                                 migration genesis ({ours}): the LIVE quorum's state cannot be matched. Nothing was changed on either chain."));
@@ -4027,26 +4978,63 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// Steps 1-3 of a join: unchanged boot artifacts, a unique LIVE quorum with our evidence, a source
     /// that did not move on after H. Changes nothing.
     #[allow(clippy::type_complexity)]
-    fn join_checks(&mut self, co: &crate::config::Coordination, h: u64, ours_override: Option<serde_json::Value>)
-        -> Result<(String, Option<String>, Vec<String>, crate::ops::ChainInfo, u64, bool, serde_json::Value), String> {
+    fn join_checks(
+        &mut self,
+        co: &crate::config::Coordination,
+        h: u64,
+        ours_override: Option<serde_json::Value>,
+    ) -> Result<
+        (
+            String,
+            Option<String>,
+            Vec<String>,
+            crate::ops::ChainInfo,
+            u64,
+            bool,
+            serde_json::Value,
+        ),
+        String,
+    > {
         let up = self.cfg.upstream.clone().expect("checked");
         let (manifest, genesis, chain_config) = upstream::boot_paths(&up, h);
-        for (what, path, want) in [("boot manifest", &manifest, &self.boot_hashes.0), ("migration genesis", &genesis, &self.boot_hashes.1),
-                                   ("chain config", &chain_config, &self.boot_hashes.2)] {
+        for (what, path, want) in [
+            ("boot manifest", &manifest, &self.boot_hashes.0),
+            ("migration genesis", &genesis, &self.boot_hashes.1),
+            ("chain config", &chain_config, &self.boot_hashes.2),
+        ] {
             let got = verify::sha256_file(path).map(|(x, _)| x).ok();
             if got.as_deref() != want.as_deref() {
-                return Err(format!("join refused: the {what} ({}) changed since VERIFIED", path.display()));
+                return Err(format!(
+                    "join refused: the {what} ({}) changed since VERIFIED",
+                    path.display()
+                ));
             }
         }
-        let ours = ours_override.unwrap_or_else(|| crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"].clone());
+        let ours = ours_override.unwrap_or_else(|| {
+            crate::beacon::journal_summary(&self.cfg.journal_path)["evidence"].clone()
+        });
         // Review LOW-1: the comparison only checks keys WE have; every one of the three that bind the state must be ours.
-        if let Some(k) = ["snapshot_sha256", "fingerprints_digest", "boot_genesis_sha256", "protocol_schedule_hash"].into_iter().find(|k| ours[*k].is_null()) {
+        if let Some(k) = [
+            "snapshot_sha256",
+            "fingerprints_digest",
+            "boot_genesis_sha256",
+            "protocol_schedule_hash",
+        ]
+        .into_iter()
+        .find(|k| ours[*k].is_null())
+        {
             return Err(format!("join refused: this node's verified evidence lacks {k}: the LIVE quorum's state cannot be matched"));
         }
         let status = self.fleet_status();
-        let (bid, sid, members) = crate::fleet::join_view(status.as_ref(), co, &ours).map_err(|e| format!("join refused: {e}"))?;
-        let info = self.ops.source_info().map_err(|e| format!("join refused: cannot read the source chain: {e}"))?;
-        let paused_head = self.head_at_pause.ok_or("join refused: no journaled pause head (the source was never paused at the cut)")?;
+        let (bid, sid, members) = crate::fleet::join_view(status.as_ref(), co, &ours)
+            .map_err(|e| format!("join refused: {e}"))?;
+        let info = self
+            .ops
+            .source_info()
+            .map_err(|e| format!("join refused: cannot read the source chain: {e}"))?;
+        let paused_head = self.head_at_pause.ok_or(
+            "join refused: no journaled pause head (the source was never paused at the cut)",
+        )?;
         if info.head_block_num > paused_head {
             return Err(format!(
                 "join refused: the source produced {} block(s) past the journaled pause head {paused_head} (head now {}): this node's \
@@ -4057,13 +5045,21 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         for n in (h + 1)..=info.head_block_num {
             match self.ops.source_block_tx_count(n) {
                 Ok(c) => txs += c,
-                Err(e) => return Err(format!("join refused: the burn-off audit cannot read block {n}: {e}")),
+                Err(e) => {
+                    return Err(format!(
+                        "join refused: the burn-off audit cannot read block {n}: {e}"
+                    ))
+                }
             }
         }
         if txs > 0 {
-            return Err(format!("join refused: {txs} transaction(s) on the source after H {h}"));
+            return Err(format!(
+                "join refused: {txs} transaction(s) on the source after H {h}"
+            ));
         }
-        let paused = self.read_paused().map_err(|e| format!("join refused: producer API: {e}"))?;
+        let paused = self
+            .read_paused()
+            .map_err(|e| format!("join refused: producer API: {e}"))?;
         Ok((bid, sid, members, info, paused_head, paused, ours))
     }
 
@@ -4071,7 +5067,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// the old chain. Journaled as an incomplete rollback whose on_abort must run again, so `pulse-cutover
     /// rollback` reopens them; the message says so.
     fn join_refused_after_refreeze(&mut self, why: String) -> Result<String, String> {
-        self.journal.evidence(self.state, json!({"join_refused_after_refreeze": why, "writes_frozen": true}))?;
+        self.journal.evidence(
+            self.state,
+            json!({"join_refused_after_refreeze": why, "writes_frozen": true}),
+        )?;
         self.journal.evidence(self.state, json!({"rollback_incomplete": [
             "a refused join froze writes on the old chain again (on_freeze): `pulse-cutover rollback` reopens them (re-runs on_abort)"],
             "rollback_complete": false}))?;
@@ -4114,12 +5113,21 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// target chain's id was journaled, the id is read again from the fleet (the same LIVE-quorum rule);
     /// then the VERIFIED transition (if missing) and the run continue. Never resumes the old chain.
     fn resume_join(&mut self, event_id: &str) -> Result<State, String> {
-        self.journal.evidence(self.state, json!({"join_resumed": true, "state": self.state.as_str()}))?;
+        self.journal.evidence(
+            self.state,
+            json!({"join_resumed": true, "state": self.state.as_str()}),
+        )?;
         if self.target_blockchain_id.is_none() {
             // The `join` record (journaled before the point of no return) names the chain: use it (re-check #3).
             if let Some((bid, sid)) = journaled_join_ids(self.journal.path()) {
-                self.journal.evidence(self.state, json!({"join_resumed_ids_from": "the journaled join record"}))?;
-                self.journal.evidence(self.state, json!({"target_blockchain_id": bid, "target_subnet_id": sid}))?;
+                self.journal.evidence(
+                    self.state,
+                    json!({"join_resumed_ids_from": "the journaled join record"}),
+                )?;
+                self.journal.evidence(
+                    self.state,
+                    json!({"target_blockchain_id": bid, "target_subnet_id": sid}),
+                )?;
                 self.target_blockchain_id = Some(bid);
                 self.target_subnet_id = sid;
             }
@@ -4131,8 +5139,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let (bid, sid, members) = crate::fleet::join_view(status.as_ref(), &co, &ours)
                 .map_err(|e| format!("join resume: the target chain id was not journaled and cannot be re-read from the fleet ({e}); \
                                       this ceremony is past its join (it will not resume the old chain): retry when the relay shows the LIVE quorum"))?;
-            self.journal.evidence(self.state, json!({"join_resumed_ids_from": members}))?;
-            self.journal.evidence(self.state, json!({"target_blockchain_id": bid, "target_subnet_id": sid}))?;
+            self.journal
+                .evidence(self.state, json!({"join_resumed_ids_from": members}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"target_blockchain_id": bid, "target_subnet_id": sid}),
+            )?;
             self.target_blockchain_id = Some(bid);
             self.target_subnet_id = sid;
         }
@@ -4156,12 +5168,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let problems = crate::shadow::identity_problems(&self.cfg, self.ops);
             if !problems.is_empty() {
                 // shadow_refuse() halts instead when chain creation or ignition already started.
-                self.shadow_refuse("SHADOW identity not verified before chain creation / ignition", json!({"problems": problems}))?;
+                self.shadow_refuse(
+                    "SHADOW identity not verified before chain creation / ignition",
+                    json!({"problems": problems}),
+                )?;
                 return Ok(());
             }
             self.shadow_verified = true;
             self.shadow_proven = true;
-            self.journal.evidence(self.state, json!({"shadow_identity": "verified before chain creation / ignition"}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"shadow_identity": "verified before chain creation / ignition"}),
+            )?;
         }
         if upstream_backend && !self.upstream_ignite_preflight()? {
             return Ok(()); // aborted inside, with evidence
@@ -4170,16 +5188,32 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             // The same-chain-id gaps are PulseVM's, whatever imported the state: the fork backend
             // gets the same hard XPR-mainnet refusal as the upstream one.
             let pending = upstream::ignite_pending_reasons();
-            if self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet) && !pending.is_empty() && self.cfg.is_shadow() && self.shadow_verified {
-                self.journal.evidence(self.state, json!({"shadow_ignite_pending": pending}))?;
-            } else if self.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet) && !pending.is_empty() {
+            if self
+                .chain_id
+                .as_deref()
+                .is_some_and(crate::config::is_xpr_mainnet)
+                && !pending.is_empty()
+                && self.cfg.is_shadow()
+                && self.shadow_verified
+            {
+                self.journal
+                    .evidence(self.state, json!({"shadow_ignite_pending": pending}))?;
+            } else if self
+                .chain_id
+                .as_deref()
+                .is_some_and(crate::config::is_xpr_mainnet)
+                && !pending.is_empty()
+            {
                 self.abort("ignite refused for XPR MAINNET (fork backend): a same-chain-id mainnet cutover still has unsolved prerequisites",
                     json!({"remaining": pending}))?;
                 return Ok(());
             }
         }
         if let Some(why) = self.source_sealed_problem()? {
-            self.abort(&format!("refusing to create or ignite the target: {why}"), json!({"head_at_pause": self.head_at_pause}))?;
+            self.abort(
+                &format!("refusing to create or ignite the target: {why}"),
+                json!({"head_at_pause": self.head_at_pause}),
+            )?;
             return Ok(());
         }
         if !self.joining && !self.fleet_gate()? {
@@ -4196,7 +5230,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(());
         }
         if let Some(why) = self.source_sealed_problem()? {
-            self.abort(&format!("refusing to ignite the target: {why}"), json!({"head_at_pause": self.head_at_pause}))?;
+            self.abort(
+                &format!("refusing to ignite the target: {why}"),
+                json!({"head_at_pause": self.head_at_pause}),
+            )?;
             return Ok(());
         }
         if !upstream_backend {
@@ -4219,20 +5256,32 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.cfg.is_shadow() {
             // Round-2 review (N5): the chain about to be ignited must exist on the PROVEN private metalgo, not merely on
             // whatever create_chain_cmd talked to (upstream: after creation, so a failure halts).
-            let problems = crate::shadow::target_chain_problems(self.cfg, self.ops, self.target_blockchain_id.as_deref());
+            let problems = crate::shadow::target_chain_problems(
+                self.cfg,
+                self.ops,
+                self.target_blockchain_id.as_deref(),
+            );
             if !problems.is_empty() {
-                self.shadow_refuse("SHADOW: the target chain is not on the proven private network", json!({"problems": problems}))?;
+                self.shadow_refuse(
+                    "SHADOW: the target chain is not on the proven private network",
+                    json!({"problems": problems}),
+                )?;
                 return Ok(());
             }
-            self.journal.evidence(self.state, json!({"shadow_target_chain": "exists on the proven private metalgo"}))?;
+            self.journal.evidence(
+                self.state,
+                json!({"shadow_target_chain": "exists on the proven private metalgo"}),
+            )?;
         }
         let started = self.ops.now_ms();
         // Point of no return (locally): journaled BEFORE the command runs. From here any failure
         // (ignite error, timeout, wrong or unverifiable lineage) seals instead of resuming the
         // source, because the target may already be running; recovery reads this record too.
-        self.journal.evidence(State::Verified, json!({"side_effect": "ignite_started"}))?;
+        self.journal
+            .evidence(State::Verified, json!({"side_effect": "ignite_started"}))?;
         self.reached_ignited = true;
-        let output = match self.ops.ignite() { // ungated: TARGET side; on a shadow journal reachable only after step_verified set shadow_verified (fresh in-run proof)
+        let output = match self.ops.ignite() {
+            // ungated: TARGET side; on a shadow journal reachable only after step_verified set shadow_verified (fresh in-run proof)
             Ok(o) => o,
             Err(e) => {
                 self.abort("ignition command failed", json!({"error": e}))?;
@@ -4276,7 +5325,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                             "allowed_by": "ceremony.rehearsal_allow_chain_id_change",
                             "REHEARSAL_ONLY": "transactions must be signed for the TARGET chain_id; a real cut keeps the source chain_id",
                         }}))?;
-                    eprintln!("WARNING (rehearsal override): target chain_id {} != source {chain_id}", info.chain_id);
+                    eprintln!(
+                        "WARNING (rehearsal override): target chain_id {} != source {chain_id}",
+                        info.chain_id
+                    );
                     self.accepted_target_chain_id = Some(info.chain_id.clone());
                 } else {
                     self.abort(
@@ -4359,52 +5411,98 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// answer), `degraded_patience_secs` since the first symptom ran out, or an operator created
     /// `operator-halt` next to the journal (the explicit decision). Never reopens anything itself.
     fn degraded_continue(&mut self, site: &str, symptom: &str) -> Result<bool, String> {
-        let Some(co) = self.cfg.coordination.clone().filter(|c| c.event_id.is_some()) else { return Ok(false) };
+        let Some(co) = self
+            .cfg
+            .coordination
+            .clone()
+            .filter(|c| c.event_id.is_some())
+        else {
+            return Ok(false);
+        };
         let state = self.state;
         let end = |m: &mut Self, why: String| -> Result<bool, String> {
-            m.journal.evidence(state, json!({"degraded_end": why, "site": site, "symptom": symptom}))?;
+            m.journal.evidence(
+                state,
+                json!({"degraded_end": why, "site": site, "symptom": symptom}),
+            )?;
             Ok(false)
         };
-        let halt_file = self.cfg.journal_path.parent().unwrap_or(std::path::Path::new(".")).join("operator-halt");
+        let halt_file = self
+            .cfg
+            .journal_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("operator-halt");
         if halt_file.exists() {
-            return end(self, format!("operator decision ({} exists)", halt_file.display()));
+            return end(
+                self,
+                format!("operator decision ({} exists)", halt_file.display()),
+            );
         }
         let now = self.ops.now_ms();
         let since = match self.degraded_since_ms {
             Some(t) => t,
             None => {
                 // Journaled: a crash and resume does not restart the patience (review #7).
-                self.journal.evidence(state, json!({"degraded_since_ms": now}))?;
+                self.journal
+                    .evidence(state, json!({"degraded_since_ms": now}))?;
                 self.degraded_since_ms = Some(now);
                 now
             }
         };
         if now.saturating_sub(since) > co.degraded_patience_secs * 1000 {
-            return end(self, format!("patience exhausted ({} s since the first symptom)", co.degraded_patience_secs));
+            return end(
+                self,
+                format!(
+                    "patience exhausted ({} s since the first symptom)",
+                    co.degraded_patience_secs
+                ),
+            );
         }
-        let Some(cut) = self.cut_height else { return Ok(false) };
+        let Some(cut) = self.cut_height else {
+            return Ok(false);
+        };
         // Retried like every other fleet read: one transient relay error is not "the fleet does not vouch".
         let status = self.fleet_status();
         let ours = self.ops.target_block_id(cut + 1).ok().flatten();
-        let v = crate::fleet::live_view(status.as_ref(), &co, cut, self.target_blockchain_id.as_deref(), ours.as_deref());
+        let v = crate::fleet::live_view(
+            status.as_ref(),
+            &co,
+            cut,
+            self.target_blockchain_id.as_deref(),
+            ours.as_deref(),
+        );
         if !v.healthy {
             // rc.24 fleet rehearsal (c2): one peer's node still at the cut, or one beacon missing a slow target read,
             // ended the wait at once and halted. A view that is merely short of a quorum gets the same grace as a
             // stalled fleet head (`fleet_stall_secs`, at most 120 s); a split or this node on a fork never does.
             let grace = co.fleet_stall_secs.min(120) * 1000;
             if v.is_hard() || grace == 0 {
-                return end(self, format!("the fleet view does not vouch for the chain: {}", v.why));
+                return end(
+                    self,
+                    format!("the fleet view does not vouch for the chain: {}", v.why),
+                );
             }
             let short_since = match self.fleet_unhealthy_since {
                 Some(t) => t,
                 None => {
                     self.fleet_unhealthy_since = Some(now);
-                    self.journal.evidence(state, json!({"degraded_fleet_short": v.why, "grace_secs": grace / 1000}))?;
+                    self.journal.evidence(
+                        state,
+                        json!({"degraded_fleet_short": v.why, "grace_secs": grace / 1000}),
+                    )?;
                     now
                 }
             };
             if now.saturating_sub(short_since) > grace {
-                return end(self, format!("the fleet view does not vouch for the chain ({} s): {}", grace / 1000, v.why));
+                return end(
+                    self,
+                    format!(
+                        "the fleet view does not vouch for the chain ({} s): {}",
+                        grace / 1000,
+                        v.why
+                    ),
+                );
             }
             return Ok(true);
         }
@@ -4415,7 +5513,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.fleet_head.1 = now;
         }
         if now.saturating_sub(self.fleet_head.1) > co.fleet_stall_secs * 1000 {
-            return end(self, format!("the fleet's target head has not moved for {} s (head {})", co.fleet_stall_secs, v.max_head));
+            return end(
+                self,
+                format!(
+                    "the fleet's target head has not moved for {} s (head {})",
+                    co.fleet_stall_secs, v.max_head
+                ),
+            );
         }
         let note = format!("{site}: {symptom}");
         if note != self.degraded_note {
@@ -4423,7 +5527,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "max_head": v.max_head, "after_cut_id": v.after_cut_id, "why": v.why},
                 "patience_left_secs": (co.degraded_patience_secs * 1000).saturating_sub(now.saturating_sub(since)) / 1000,
                 "note": "a quorum of the roster is on the same target chain: waiting out a local symptom instead of halting"}}))?;
-            eprintln!("DEGRADED ({site}): {symptom}; the fleet is live ({}): waiting", v.why);
+            eprintln!(
+                "DEGRADED ({site}): {symptom}; the fleet is live ({}): waiting",
+                v.why
+            );
             self.degraded_note = note;
         }
         Ok(true)
@@ -4432,7 +5539,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// A degraded wait ended well (the symptom cleared): journaled once.
     fn degraded_cleared(&mut self, site: &str) -> Result<(), String> {
         if !self.degraded_note.is_empty() {
-            self.journal.evidence(self.state, json!({"degraded_cleared": true, "site": site}))?;
+            self.journal
+                .evidence(self.state, json!({"degraded_cleared": true, "site": site}))?;
             self.degraded_note.clear();
         }
         Ok(())
@@ -4440,7 +5548,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
 
     /// Retry delay while degraded: `degraded_retry_secs`, doubling per attempt, at most 120 s.
     fn degraded_backoff_ms(&self, attempt: u32) -> u64 {
-        let base = self.cfg.coordination.as_ref().map(|c| c.degraded_retry_secs).unwrap_or(10).max(1);
+        let base = self
+            .cfg
+            .coordination
+            .as_ref()
+            .map(|c| c.degraded_retry_secs)
+            .unwrap_or(10)
+            .max(1);
         base.saturating_mul(1u64 << attempt.min(6)).min(120) * 1000
     }
 
@@ -4452,7 +5566,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             match self.hook(hook) {
                 Ok(o) => {
                     if attempt > 0 {
-                        self.journal.evidence(self.state, json!({"hook_retry_succeeded": site, "attempts": attempt + 1}))?;
+                        self.journal.evidence(
+                            self.state,
+                            json!({"hook_retry_succeeded": site, "attempts": attempt + 1}),
+                        )?;
                         self.degraded_cleared(site)?;
                     }
                     return Ok(Some(o));
@@ -4463,7 +5580,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         attempt += 1;
                         continue;
                     }
-                    let reason = if site == "on_live" { "on_live hook failed (writes may not be open on the new chain)" } else { "post_ignite hook failed" };
+                    let reason = if site == "on_live" {
+                        "on_live hook failed (writes may not be open on the new chain)"
+                    } else {
+                        "post_ignite hook failed"
+                    };
                     self.abort(reason, json!({"error": e, "attempts": attempt + 1}))?;
                     return Ok(None);
                 }
@@ -4475,10 +5596,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// carried on" (run 5: a non-executable hook let the ceremony continue without its checks).
     /// rc.23: while the fleet is live on this chain, retried with backoff first (degraded).
     fn run_post_ignite(&mut self) -> Result<bool, String> {
-        let Some(hook) = self.cfg.hooks.post_ignite.clone() else { return Ok(true) };
+        let Some(hook) = self.cfg.hooks.post_ignite.clone() else {
+            return Ok(true);
+        };
         match self.run_required_hook("post_ignite", &hook)? {
             Some(o) => {
-                self.journal.evidence(State::Ignited, json!({"post_ignite_hook": o}))?;
+                self.journal
+                    .evidence(State::Ignited, json!({"post_ignite_hook": o}))?;
                 Ok(true)
             }
             None => Ok(false),
@@ -4510,9 +5634,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 gap = gap.max(poll_ms);
             }
             if gap > max_gap_ms {
-                self.journal.evidence(state, json!({"live_stall": {"head": last_head, "gap_ms": gap,
-                    "poll_ms": poll_ms, "max_gap_ms": max_gap_ms, "into_sustain_ms": t1 - start}}))?;
-                if self.degraded_continue("sustain", &format!("no new target block for {} s (head {last_head})", gap / 1000))? {
+                self.journal.evidence(
+                    state,
+                    json!({"live_stall": {"head": last_head, "gap_ms": gap,
+                    "poll_ms": poll_ms, "max_gap_ms": max_gap_ms, "into_sustain_ms": t1 - start}}),
+                )?;
+                if self.degraded_continue(
+                    "sustain",
+                    &format!(
+                        "no new target block for {} s (head {last_head})",
+                        gap / 1000
+                    ),
+                )? {
                     // The fleet is live on this chain: start the sustained window over.
                     start = t1;
                     last_change = t1;
@@ -4548,7 +5681,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// runs BEFORE LIVE is journaled; a failure halts (sealed) instead of recording a LIVE that
     /// never reached users.
     fn run_on_live(&mut self, state: State) -> Result<Option<serde_json::Value>, String> {
-        let Some(hook) = self.cfg.hooks.on_live.clone() else { return Ok(Some(serde_json::Value::Null)) };
+        let Some(hook) = self.cfg.hooks.on_live.clone() else {
+            return Ok(Some(serde_json::Value::Null));
+        };
         match self.run_required_hook("on_live", &hook)? {
             Some(o) => {
                 self.journal.evidence(state, json!({"on_live_hook": o}))?;
@@ -4572,7 +5707,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let mut last_why = String::from("no poll yet");
         loop {
             if self.ops.now_ms() > deadline {
-                self.journal.evidence(self.state, json!({"public_route_check_last": last_why}))?;
+                self.journal
+                    .evidence(self.state, json!({"public_route_check_last": last_why}))?;
                 return Ok(None);
             }
             let target = self.ops.target_info()?;
@@ -4590,14 +5726,28 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         last_why = format!("public chain_id {}", p.chain_id);
                         None
                     } else if t.head_block_num.abs_diff(p.head_block_num) > flip.head_tolerance {
-                        last_why = format!("heads apart: target {} public {}", t.head_block_num, p.head_block_num);
+                        last_why = format!(
+                            "heads apart: target {} public {}",
+                            t.head_block_num, p.head_block_num
+                        );
                         None
                     } else if common <= cut {
-                        last_why = format!("no block above the cut on both yet (target {}, public {})", t.head_block_num, p.head_block_num);
+                        last_why = format!(
+                            "no block above the cut on both yet (target {}, public {})",
+                            t.head_block_num, p.head_block_num
+                        );
                         None
                     } else {
-                        let tid = if common == t.head_block_num { Some(t.head_block_id.clone()) } else { self.ops.target_block_id(common)? };
-                        let pid = if common == p.head_block_num { Some(p.head_block_id.clone()) } else { self.ops.public_block_id(&flip.public_url, common)? };
+                        let tid = if common == t.head_block_num {
+                            Some(t.head_block_id.clone())
+                        } else {
+                            self.ops.target_block_id(common)?
+                        };
+                        let pid = if common == p.head_block_num {
+                            Some(p.head_block_id.clone())
+                        } else {
+                            self.ops.public_block_id(&flip.public_url, common)?
+                        };
                         match (tid, pid) {
                             (Some(a), Some(b)) if a.eq_ignore_ascii_case(&b) => Some((common, a)),
                             (a, b) => {
@@ -4653,7 +5803,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         let started = self.ops.now_ms();
         let flip_cmd = self.cfg.flip.as_ref().expect("validated").cmd.clone();
-        self.journal.evidence(State::Ignited, json!({"side_effect": "flip_cmd"}))?;
+        self.journal
+            .evidence(State::Ignited, json!({"side_effect": "flip_cmd"}))?;
         self.flip_ran = true; // even a failing cmd may have half-applied
         let flip_out = match self.hook(&flip_cmd) {
             Ok(o) => o,
@@ -4666,7 +5817,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // federating router — one user-visible moment for both surfaces.
         let mut v2_flip_out = serde_json::Value::Null;
         if let Some(hyp) = self.cfg.hyperion.clone() {
-            self.journal.evidence(State::Ignited, json!({"side_effect": "hyperion_flip_cmd"}))?;
+            self.journal
+                .evidence(State::Ignited, json!({"side_effect": "hyperion_flip_cmd"}))?;
             self.hyperion_flip_ran = true;
             match self.hook(&hyp.flip_cmd) {
                 Ok(o) => v2_flip_out = json!(o),
@@ -4725,10 +5877,16 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         });
         let text = serde_json::to_string_pretty(&boundary).expect("boundary json") + "\n";
         if let Err(e) = crate::secrets::write_file(path, text.as_bytes(), false) {
-            self.abort("could not write history boundary file", json!({"path": path.display().to_string(), "error": e}))?;
+            self.abort(
+                "could not write history boundary file",
+                json!({"path": path.display().to_string(), "error": e}),
+            )?;
             return Ok(false);
         }
-        self.journal.evidence(State::Ignited, json!({key: path.display().to_string(), "boundary": boundary}))?;
+        self.journal.evidence(
+            State::Ignited,
+            json!({key: path.display().to_string(), "boundary": boundary}),
+        )?;
         Ok(true)
     }
 
@@ -4811,7 +5969,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let Some(url) = hyp.public_health_url.clone() else {
             return Ok(Ok(serde_json::Value::Null));
         };
-        let timeout = self.cfg.flip.as_ref().expect("validated").health_timeout_secs;
+        let timeout = self
+            .cfg
+            .flip
+            .as_ref()
+            .expect("validated")
+            .health_timeout_secs;
         let deadline = self.ops.now_ms() + timeout * 1000;
         loop {
             if self.ops.now_ms() > deadline {
@@ -4841,7 +6004,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         }
         let stop_cmd = self.cfg.source.stop_cmd.clone().expect("validated");
         let started = self.ops.now_ms();
-        self.journal.evidence(State::Flipped, json!({"side_effect": "source_stop_cmd"}))?;
+        self.journal
+            .evidence(State::Flipped, json!({"side_effect": "source_stop_cmd"}))?;
         self.source_stopped = true; // even a failing stop may have half-applied
         let stop_out = match self.hook(&stop_cmd) {
             Ok(o) => o,
@@ -4873,7 +6037,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         };
         let sustained = self.sustain_live(State::Flipped)?;
-        let Some(on_live) = self.run_on_live(State::Flipped)? else { return Ok(()) };
+        let Some(on_live) = self.run_on_live(State::Flipped)? else {
+            return Ok(());
+        };
         let live_ts = self.ops.now_ms();
         let write_gap_ms = self.frozen_ts_ms.map(|f| live_ts.saturating_sub(f));
         self.state = State::Live;
@@ -4922,7 +6088,13 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let mut waits = 0u32;
         let info = loop {
             if self.ops.now_ms() > deadline {
-                if self.degraded_continue("live_gate", &format!("head not past {goal} within {} s", self.cfg.target.quorum_timeout_secs))? {
+                if self.degraded_continue(
+                    "live_gate",
+                    &format!(
+                        "head not past {goal} within {} s",
+                        self.cfg.target.quorum_timeout_secs
+                    ),
+                )? {
                     deadline = self.ops.now_ms() + self.degraded_backoff_ms(waits);
                     waits += 1;
                     continue;
@@ -4943,7 +6115,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         self.degraded_cleared("live_gate")?;
         let reached_goal_ts = self.ops.now_ms();
         let sustained = self.sustain_live(State::Ignited)?;
-        let Some(on_live) = self.run_on_live(State::Ignited)? else { return Ok(()) };
+        let Some(on_live) = self.run_on_live(State::Ignited)? else {
+            return Ok(());
+        };
         let live_ts = self.ops.now_ms();
         // Outage = freeze to LIVE declared (after the sustain window and on_live). The older
         // "first progress" figure is kept for comparison with runs 1-6.

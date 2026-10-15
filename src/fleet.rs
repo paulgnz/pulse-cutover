@@ -41,18 +41,34 @@ pub struct MemberView {
 
 /// The beacons the relay lists for one producer: (report, age_ms, conflict).
 fn beacons(p: &Value) -> Vec<(Value, Option<u64>, bool)> {
-    let mut v: Vec<(Value, Option<u64>, bool)> = p["beacons"].as_array().map(|bs| bs.iter()
-        .map(|b| (b["report"].clone(), b["age_ms"].as_u64(), b["conflict"].as_bool().unwrap_or(false)))
-        .collect()).unwrap_or_default();
+    let mut v: Vec<(Value, Option<u64>, bool)> = p["beacons"]
+        .as_array()
+        .map(|bs| {
+            bs.iter()
+                .map(|b| {
+                    (
+                        b["report"].clone(),
+                        b["age_ms"].as_u64(),
+                        b["conflict"].as_bool().unwrap_or(false),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     if v.is_empty() && !p["report"].is_null() {
-        v.push((p["report"].clone(), p["age_ms"].as_u64(), p["conflict"].as_bool().unwrap_or(false)));
+        v.push((
+            p["report"].clone(),
+            p["age_ms"].as_u64(),
+            p["conflict"].as_bool().unwrap_or(false),
+        ));
     }
     v
 }
 
 /// The network's producer list from a `/api/status` document.
 fn producers<'a>(status: &'a Value, network: &str) -> Vec<&'a Value> {
-    status["networks"].as_array()
+    status["networks"]
+        .as_array()
         .and_then(|nets| nets.iter().find(|n| n["id"].as_str() == Some(network)))
         .and_then(|n| n["producers"].as_array())
         .map(|a| a.iter().collect())
@@ -67,80 +83,159 @@ pub fn members(status: &Value, co: &Coordination) -> Vec<MemberView> {
     let prods = producers(status, &co.network);
     let for_event = |r: &Value| event.is_none_or(|e| r["coord"]["event_id"].as_str() == Some(e));
     let wanted: Vec<(String, Option<String>)> = if co.roster.is_empty() {
-        prods.iter().filter(|p| beacons(p).iter().any(|(r, _, _)| for_event(r)))
-            .filter_map(|p| p["name"].as_str().map(|n| (n.to_string(), None))).collect()
+        prods
+            .iter()
+            .filter(|p| beacons(p).iter().any(|(r, _, _)| for_event(r)))
+            .filter_map(|p| p["name"].as_str().map(|n| (n.to_string(), None)))
+            .collect()
     } else {
-        co.roster.iter().map(|m| (m.producer.clone(), m.instance_id.clone())).collect()
+        co.roster
+            .iter()
+            .map(|m| (m.producer.clone(), m.instance_id.clone()))
+            .collect()
     };
-    wanted.into_iter().map(|(producer, instance_id)| {
-        let entry = prods.iter().find(|p| p["name"].as_str() == Some(producer.as_str()));
-        // The relay's mark for THIS event: {event_id: {past_create, state}} (rc.23 first shape: {event_id, past_create, state}).
-        let mark = entry.map(|p| &p["event_max"]).and_then(|m| match (m["event_id"].as_str(), event) {
-            (Some(id), Some(e)) => (id == e).then_some(m),
-            (None, Some(e)) => m.get(e),
-            _ => None,
-        });
-        let max_past = mark.filter(|m| m["past_create"].as_bool() == Some(true))
-            .map(|m| format!("{}; relay high-water mark", m["state"].as_str().unwrap_or("past creation")))
-            // rc.27 review: the relay's DURABLE record of a past-creation report for another H (it survives the report
-            // being replaced; only an operator clears it after fencing that target).
-            .or_else(|| mark.and_then(|m| {
-                // A list of observations (rc.27; an older single object is read as one), or the overflow flag.
-                let list: Vec<&Value> = match &m["foreign_past"] {
-                    Value::Array(a) => a.iter().collect(),
-                    o @ Value::Object(_) => vec![o],
-                    _ => vec![],
-                };
-                if list.is_empty() && m["foreign_overflow"].as_bool() != Some(true) {
-                    return None;
+    wanted
+        .into_iter()
+        .map(|(producer, instance_id)| {
+            let entry = prods
+                .iter()
+                .find(|p| p["name"].as_str() == Some(producer.as_str()));
+            // The relay's mark for THIS event: {event_id: {past_create, state}} (rc.23 first shape: {event_id, past_create, state}).
+            let mark = entry.map(|p| &p["event_max"]).and_then(|m| {
+                match (m["event_id"].as_str(), event) {
+                    (Some(id), Some(e)) => (id == e).then_some(m),
+                    (None, Some(e)) => m.get(e),
+                    _ => None,
                 }
-                let hs: Vec<String> = list.iter().map(|o| o["h"].as_u64().map(|h| h.to_string()).unwrap_or_else(|| "?".into())).collect();
-                Some(format!("{}; {} report(s) for another H ({}), relay record",
-                    list.first().and_then(|o| o["state"].as_str()).unwrap_or("past creation"), list.len().max(1), hs.join(", ")))
-            }));
-        // rc.28: the relay's creation-evidence log (never trimmed; every instance, every H, published event or not):
-        // any observation for THIS event, or an overflowed log, is past-creation evidence until an operator retires it.
-        let max_past = max_past.or_else(|| {
-            let log = entry.map(|p| &p["creation_evidence"])?;
-            // `blocking` (set by annotate_evidence with this event's H) when present: same event, same H, or no event
-            // at the same/unknown H. Otherwise this event's observations.
-            let obs: Vec<&Value> = match log["blocking"].as_array() {
-                Some(b) => b.iter().collect(),
-                None => log["obs"].as_array().map(|a| a.iter()
-                    .filter(|o| o["event_id"].is_null() || o["h"].as_u64().is_none() || event.is_none_or(|e| o["event_id"].as_str() == Some(e)))
-                    .collect()).unwrap_or_default(),
-            };
-            if let Some(o) = obs.first() {
-                return Some(format!("{}; creation evidence #{} at H {}{}, relay log", o["state"].as_str().unwrap_or("past creation"),
-                    o["id"].as_u64().unwrap_or(0), o["h"].as_u64().map(|h| h.to_string()).unwrap_or_else(|| "?".into()),
-                    if obs.len() > 1 { format!(" (+{} more)", obs.len() - 1) } else { String::new() }));
+            });
+            let max_past = mark
+                .filter(|m| m["past_create"].as_bool() == Some(true))
+                .map(|m| {
+                    format!(
+                        "{}; relay high-water mark",
+                        m["state"].as_str().unwrap_or("past creation")
+                    )
+                })
+                // rc.27 review: the relay's DURABLE record of a past-creation report for another H (it survives the report
+                // being replaced; only an operator clears it after fencing that target).
+                .or_else(|| {
+                    mark.and_then(|m| {
+                        // A list of observations (rc.27; an older single object is read as one), or the overflow flag.
+                        let list: Vec<&Value> = match &m["foreign_past"] {
+                            Value::Array(a) => a.iter().collect(),
+                            o @ Value::Object(_) => vec![o],
+                            _ => vec![],
+                        };
+                        if list.is_empty() && m["foreign_overflow"].as_bool() != Some(true) {
+                            return None;
+                        }
+                        let hs: Vec<String> = list
+                            .iter()
+                            .map(|o| {
+                                o["h"]
+                                    .as_u64()
+                                    .map(|h| h.to_string())
+                                    .unwrap_or_else(|| "?".into())
+                            })
+                            .collect();
+                        Some(format!(
+                            "{}; {} report(s) for another H ({}), relay record",
+                            list.first()
+                                .and_then(|o| o["state"].as_str())
+                                .unwrap_or("past creation"),
+                            list.len().max(1),
+                            hs.join(", ")
+                        ))
+                    })
+                });
+            // rc.28: the relay's creation-evidence log (never trimmed; every instance, every H, published event or not):
+            // any observation for THIS event, or an overflowed log, is past-creation evidence until an operator retires it.
+            let max_past = max_past.or_else(|| {
+                let log = entry.map(|p| &p["creation_evidence"])?;
+                // `blocking` (set by annotate_evidence with this event's H) when present: same event, same H, or no event
+                // at the same/unknown H. Otherwise this event's observations.
+                let obs: Vec<&Value> = match log["blocking"].as_array() {
+                    Some(b) => b.iter().collect(),
+                    None => log["obs"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter(|o| {
+                                    o["event_id"].is_null()
+                                        || o["h"].as_u64().is_none()
+                                        || event.is_none_or(|e| o["event_id"].as_str() == Some(e))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                };
+                if let Some(o) = obs.first() {
+                    return Some(format!(
+                        "{}; creation evidence #{} at H {}{}, relay log",
+                        o["state"].as_str().unwrap_or("past creation"),
+                        o["id"].as_u64().unwrap_or(0),
+                        o["h"]
+                            .as_u64()
+                            .map(|h| h.to_string())
+                            .unwrap_or_else(|| "?".into()),
+                        if obs.len() > 1 {
+                            format!(" (+{} more)", obs.len() - 1)
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+                (log["overflow"].as_bool() == Some(true))
+                    .then(|| "creation evidence log overflowed, relay log".to_string())
+            });
+            let bs: Vec<_> = entry
+                .map(|p| beacons(p))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(r, _, _)| for_event(r))
+                .filter(|(r, _, _)| {
+                    instance_id
+                        .as_deref()
+                        .is_none_or(|id| r["instance_id"].as_str() == Some(id))
+                })
+                .collect();
+            // rc.27 review (review blocker): a blocking fact from ANY of this producer's instances counts, not only from
+            // the freshest report: another instance's newer ABORTED must not hide a past-creation report (same H, or a
+            // `foreign_past_create` kept from a report for another H).
+            let max_past = max_past.or_else(|| {
+                bs.iter().find_map(|(r, _, _)| {
+                    if let Some(st) = r["foreign_past_create"].as_str() {
+                        return Some(format!("{st}; a report for another H"));
+                    }
+                    past_create(r).then(|| {
+                        format!(
+                            "{}; a beacon report",
+                            r["ceremony"]["state"].as_str().unwrap_or("past creation")
+                        )
+                    })
+                })
+            });
+            let usable: Vec<_> = bs.iter().filter(|(_, _, c)| !c).collect();
+            let fresh = usable
+                .iter()
+                .filter(|(_, age, _)| age.is_some_and(|a| a <= max_age))
+                .min_by_key(|(_, age, _)| age.unwrap_or(u64::MAX));
+            let last = usable
+                .iter()
+                .min_by_key(|(_, age, _)| age.unwrap_or(u64::MAX))
+                .map(|(r, _, _)| r.clone());
+            MemberView {
+                producer,
+                instance_id,
+                max_past,
+                last,
+                report: fresh.map(|(r, _, _)| r.clone()),
+                missing: bs.is_empty(),
+                stale: !bs.is_empty() && !usable.is_empty() && fresh.is_none(),
+                conflict: !bs.is_empty() && usable.is_empty(),
             }
-            (log["overflow"].as_bool() == Some(true)).then(|| "creation evidence log overflowed, relay log".to_string())
-        });
-        let bs: Vec<_> = entry.map(|p| beacons(p)).unwrap_or_default().into_iter()
-            .filter(|(r, _, _)| for_event(r))
-            .filter(|(r, _, _)| instance_id.as_deref().is_none_or(|id| r["instance_id"].as_str() == Some(id)))
-            .collect();
-        // rc.27 review (review blocker): a blocking fact from ANY of this producer's instances counts, not only from
-        // the freshest report: another instance's newer ABORTED must not hide a past-creation report (same H, or a
-        // `foreign_past_create` kept from a report for another H).
-        let max_past = max_past.or_else(|| bs.iter().find_map(|(r, _, _)| {
-            if let Some(st) = r["foreign_past_create"].as_str() {
-                return Some(format!("{st}; a report for another H"));
-            }
-            past_create(r).then(|| format!("{}; a beacon report", r["ceremony"]["state"].as_str().unwrap_or("past creation")))
-        }));
-        let usable: Vec<_> = bs.iter().filter(|(_, _, c)| !c).collect();
-        let fresh = usable.iter().filter(|(_, age, _)| age.is_some_and(|a| a <= max_age)).min_by_key(|(_, age, _)| age.unwrap_or(u64::MAX));
-        let last = usable.iter().min_by_key(|(_, age, _)| age.unwrap_or(u64::MAX)).map(|(r, _, _)| r.clone());
-        MemberView {
-            producer, instance_id, max_past, last,
-            report: fresh.map(|(r, _, _)| r.clone()),
-            missing: bs.is_empty(),
-            stale: !bs.is_empty() && !usable.is_empty() && fresh.is_none(),
-            conflict: !bs.is_empty() && usable.is_empty(),
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 /// rc.24 fleet rehearsal: a beacon pairs `await`'s coordination state (the event id) with whatever journal its
@@ -151,9 +246,16 @@ pub fn members(status: &Value, co: &Coordination) -> Vec<MemberView> {
 /// resume guard (more conservative), never LIVE / ABORTED / past creation. Returns how many were dropped.
 pub fn drop_foreign_ceremonies(status: &mut Value, network: &str, h: u64) -> usize {
     let mut dropped = 0;
-    let Some(nets) = status["networks"].as_array_mut() else { return 0 };
-    for net in nets.iter_mut().filter(|n| n["id"].as_str() == Some(network)) {
-        let Some(prods) = net["producers"].as_array_mut() else { continue };
+    let Some(nets) = status["networks"].as_array_mut() else {
+        return 0;
+    };
+    for net in nets
+        .iter_mut()
+        .filter(|n| n["id"].as_str() == Some(network))
+    {
+        let Some(prods) = net["producers"].as_array_mut() else {
+            continue;
+        };
         for p in prods.iter_mut() {
             let mut fix = |r: &mut Value| {
                 // `evidence.h` only (every beacon since rc.10 reports it): a cut-height fallback made a correctly
@@ -165,7 +267,8 @@ pub fn drop_foreign_ceremonies(status: &mut Value, network: &str, h: u64) -> usi
                     // `foreign_past_create`, which `past_create` honours: a peer whose H differs from ours (our
                     // config may be the wrong one) and that ignited must still stop a resume.
                     if past_create(r) {
-                        r["foreign_past_create"] = json!(r["ceremony"]["state"].as_str().unwrap_or("past creation"));
+                        r["foreign_past_create"] =
+                            json!(r["ceremony"]["state"].as_str().unwrap_or("past creation"));
                     }
                     r["ceremony"] = Value::Null;
                     dropped += 1;
@@ -188,18 +291,34 @@ pub fn drop_foreign_ceremonies(status: &mut Value, network: &str, h: u64) -> usi
 /// event's (any H), any event's at the SAME H (an unfenced target from an aborted earlier event at this cut competes
 /// with this one), and those without an event id at the same or an unknown H. Written as `creation_evidence.blocking`.
 pub fn annotate_evidence(status: &mut Value, network: &str, event: Option<&str>, h: u64) {
-    let Some(nets) = status["networks"].as_array_mut() else { return };
-    for net in nets.iter_mut().filter(|n| n["id"].as_str() == Some(network)) {
-        let Some(prods) = net["producers"].as_array_mut() else { continue };
+    let Some(nets) = status["networks"].as_array_mut() else {
+        return;
+    };
+    for net in nets
+        .iter_mut()
+        .filter(|n| n["id"].as_str() == Some(network))
+    {
+        let Some(prods) = net["producers"].as_array_mut() else {
+            continue;
+        };
         for p in prods.iter_mut() {
             let log = &mut p["creation_evidence"];
-            let Some(obs) = log["obs"].as_array() else { continue };
-            let blocking: Vec<Value> = obs.iter().filter(|o| {
-                let (oe, oh) = (o["event_id"].as_str(), o["h"].as_u64());
-                // Unattributed (no event id) is quarantined: blocks every event until retired (rc.28 review).
-                // rc.29: so is an unknown H (`h: null`, e.g. migrated marks): it may be this H.
-                (event.is_some() && oe == event) || oh == Some(h) || oh.is_none() || oe.is_none()
-            }).cloned().collect();
+            let Some(obs) = log["obs"].as_array() else {
+                continue;
+            };
+            let blocking: Vec<Value> = obs
+                .iter()
+                .filter(|o| {
+                    let (oe, oh) = (o["event_id"].as_str(), o["h"].as_u64());
+                    // Unattributed (no event id) is quarantined: blocks every event until retired (rc.28 review).
+                    // rc.29: so is an unknown H (`h: null`, e.g. migrated marks): it may be this H.
+                    (event.is_some() && oe == event)
+                        || oh == Some(h)
+                        || oh.is_none()
+                        || oe.is_none()
+                })
+                .cloned()
+                .collect();
             log["blocking"] = Value::Array(blocking);
         }
     }
@@ -212,19 +331,27 @@ pub fn past_create(report: &Value) -> bool {
         return true;
     }
     let c = &report["ceremony"];
-    matches!(c["state"].as_str(), Some("IGNITED" | "FLIPPED" | "LIVE" | "HALTED"))
-        || c["create_started"].as_bool() == Some(true)
+    matches!(
+        c["state"].as_str(),
+        Some("IGNITED" | "FLIPPED" | "LIVE" | "HALTED")
+    ) || c["create_started"].as_bool() == Some(true)
         || c["ignition_started"].as_bool() == Some(true)
         || c["joined"].as_bool() == Some(true)
 }
 
 fn quorum_of(co: &Coordination) -> usize {
-    if co.fleet_quorum > 0 { co.fleet_quorum } else { co.roster.len() }
+    if co.fleet_quorum > 0 {
+        co.fleet_quorum
+    } else {
+        co.roster.len()
+    }
 }
 
 /// Is `m` this node? (Matched by beacon producer and, when the roster pins one, instance id.)
 fn is_self(m: &MemberView, me: Option<(&str, &str)>) -> bool {
-    me.is_some_and(|(prod, inst)| m.producer == prod && m.instance_id.as_deref().is_none_or(|i| i == inst))
+    me.is_some_and(|(prod, inst)| {
+        m.producer == prod && m.instance_id.as_deref().is_none_or(|i| i == inst)
+    })
 }
 
 /// This node's OWN fresh report for the event, from THIS instance (rc.25 review #2): another box reporting under the
@@ -232,11 +359,22 @@ fn is_self(m: &MemberView, me: Option<(&str, &str)>) -> bool {
 /// without an instance id (an older beacon) matches by producer.
 fn own_report_visible(status: &Value, co: &Coordination, me: (&str, &str)) -> bool {
     let max_age = co.report_max_age_secs * 1000;
-    producers(status, &co.network).iter().filter(|p| p["name"].as_str() == Some(me.0)).any(|p| {
-        beacons(p).into_iter().any(|(r, age, conflict)| !conflict && age.is_some_and(|a| a <= max_age)
-            && co.event_id.as_deref().is_none_or(|e| r["coord"]["event_id"].as_str() == Some(e))
-            && r["instance_id"].as_str().is_none_or(|i| i.eq_ignore_ascii_case(me.1)))
-    })
+    producers(status, &co.network)
+        .iter()
+        .filter(|p| p["name"].as_str() == Some(me.0))
+        .any(|p| {
+            beacons(p).into_iter().any(|(r, age, conflict)| {
+                !conflict
+                    && age.is_some_and(|a| a <= max_age)
+                    && co
+                        .event_id
+                        .as_deref()
+                        .is_none_or(|e| r["coord"]["event_id"].as_str() == Some(e))
+                    && r["instance_id"]
+                        .as_str()
+                        .is_none_or(|i| i.eq_ignore_ascii_case(me.1))
+            })
+        })
 }
 
 /// May an agent that froze writes resume the old chain? Err(why) unless (unknown is never "no"):
@@ -253,7 +391,12 @@ fn own_report_visible(status: &Value, co: &Coordination, me: (&str, &str)) -> bo
 ///   alone strands (the rest can still reach quorum and ignite: the r4 split).
 ///
 /// `me` = (beacon producer, instance id) of this node, left out (its own state is known locally).
-pub fn resume_guard(status: Option<&Value>, co: &Coordination, me: Option<(&str, &str)>, signed_abort: bool) -> Result<Value, String> {
+pub fn resume_guard(
+    status: Option<&Value>,
+    co: &Coordination,
+    me: Option<(&str, &str)>,
+    signed_abort: bool,
+) -> Result<Value, String> {
     let q = quorum_of(co);
     if co.roster.is_empty() || q == 0 {
         return Err("the event has no roster or quorum: whether the fleet can still commit without this node cannot be judged".into());
@@ -266,36 +409,64 @@ pub fn resume_guard(status: Option<&Value>, co: &Coordination, me: Option<(&str,
     // it may resume. Otherwise its peers cannot account for it (they strand, since it "may have ignited unseen")
     // while it alone resumes: the one silent member deciding for everyone, backwards.
     let mine: Vec<&MemberView> = all.iter().filter(|m| is_self(m, me)).collect();
-    if me.is_none() || mine.is_empty() || mine.iter().any(|m| m.missing || m.conflict || m.report.is_none())
-        || !me.is_some_and(|me| own_report_visible(status, co, me)) {
+    if me.is_none()
+        || mine.is_empty()
+        || mine
+            .iter()
+            .any(|m| m.missing || m.conflict || m.report.is_none())
+        || !me.is_some_and(|me| own_report_visible(status, co, me))
+    {
         return Err("own beacon not visible on the relay (this node's report for the event is missing, stale or identity-conflicted): \
                     peers cannot account for this node, so it must not resume the old chain".into());
     }
     let (mut seen, mut in_ceremony) = (vec![], vec![]);
-    if let Some((m, st)) = all.iter().filter(|m| !is_self(m, me))
-        .find_map(|m| m.report.as_ref().or(m.last.as_ref())?["foreign_past_create"].as_str().map(|st| (m, st))) {
+    if let Some((m, st)) = all.iter().filter(|m| !is_self(m, me)).find_map(|m| {
+        m.report.as_ref().or(m.last.as_ref())?["foreign_past_create"]
+            .as_str()
+            .map(|st| (m, st))
+    }) {
         return Err(format!("{} reports a ceremony for another H that is past chain creation or ignition ({st}): this node's \
             event config may be the wrong one; unknown, so no resume", m.producer));
     }
     // First the strongest evidence: anyone ever reported past creation for this event.
-    if let Some(m) = all.iter().filter(|m| !is_self(m, me)).find(|m| m.max_past.is_some()) {
-        return Err(format!("{} was reported past chain creation or ignition for this event ({})",
-            m.producer, m.max_past.as_deref().unwrap_or("?")));
+    if let Some(m) = all
+        .iter()
+        .filter(|m| !is_self(m, me))
+        .find(|m| m.max_past.is_some())
+    {
+        return Err(format!(
+            "{} was reported past chain creation or ignition for this event ({})",
+            m.producer,
+            m.max_past.as_deref().unwrap_or("?")
+        ));
     }
     for m in all.iter().filter(|m| !is_self(m, me)) {
         if m.missing {
             return Err(format!("{} has no report for this event on the relay (missing or replaced instance): it may have ignited unseen", m.producer));
         }
         if m.conflict {
-            return Err(format!("{}'s report is identity-conflicted: its state is unknown", m.producer));
+            return Err(format!(
+                "{}'s report is identity-conflicted: its state is unknown",
+                m.producer
+            ));
         }
-        let r = if signed_abort { m.last.as_ref() } else { m.report.as_ref() };
+        let r = if signed_abort {
+            m.last.as_ref()
+        } else {
+            m.report.as_ref()
+        };
         let Some(r) = r else {
-            return Err(format!("{}'s last report is stale (older than {} s): it may have ignited since", m.producer, co.report_max_age_secs));
+            return Err(format!(
+                "{}'s last report is stale (older than {} s): it may have ignited since",
+                m.producer, co.report_max_age_secs
+            ));
         };
         let st = r["ceremony"]["state"].as_str().unwrap_or("none");
         if past_create(r) {
-            return Err(format!("{} is past chain creation or ignition ({st})", m.producer));
+            return Err(format!(
+                "{} is past chain creation or ignition ({st})",
+                m.producer
+            ));
         }
         if !matches!(st, "ABORTED" | "STRANDED") {
             in_ceremony.push(m.producer.clone());
@@ -306,13 +477,18 @@ pub fn resume_guard(status: Option<&Value>, co: &Coordination, me: Option<(&str,
         return Err(format!("{} other members ({}) are still in the ceremony, quorum {q}: they can reach it without this node and ignite",
             in_ceremony.len(), in_ceremony.join(", ")));
     }
-    Ok(json!({"members": seen, "still_in_ceremony": in_ceremony, "quorum": q,
-        "by": if signed_abort { "signed coordinator abort, every member accounted for" } else { "quorum unreachable without this node" }}))
+    Ok(
+        json!({"members": seen, "still_in_ceremony": in_ceremony, "quorum": q,
+        "by": if signed_abort { "signed coordinator abort, every member accounted for" } else { "quorum unreachable without this node" }}),
+    )
 }
 
 /// The largest group and whether it is the ONLY one that reaches `q` (rc.23 review #9: two groups on
 /// different chains each with a quorum is a split, never a decision).
-fn unique_best<K: Clone, V: Clone>(groups: Vec<(K, Vec<String>, V)>, q: usize) -> Option<(K, Vec<String>, V, bool)> {
+fn unique_best<K: Clone, V: Clone>(
+    groups: Vec<(K, Vec<String>, V)>,
+    q: usize,
+) -> Option<(K, Vec<String>, V, bool)> {
     let mut g = groups;
     g.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
     let second = g.get(1).map(|x| x.1.len()).unwrap_or(0);
@@ -349,9 +525,24 @@ pub const UNREAD_GRACE_MS: u64 = 60_000;
 /// head past it? `our_bid` = this node's Metal blockchain id (members on another chain do not count);
 /// `our_after_cut` = this node's own block at cut + 1, if it has one (a different one = this node is
 /// on a fork: never healthy).
-pub fn live_view(status: Option<&Value>, co: &Coordination, cut: u64, our_bid: Option<&str>, our_after_cut: Option<&str>) -> LiveView {
-    let none = |why: &str| LiveView { healthy: false, why: why.into(), members: vec![], after_cut_id: None, max_head: 0, hard: false };
-    let Some(status) = status else { return none("the coordinator relay did not answer") };
+pub fn live_view(
+    status: Option<&Value>,
+    co: &Coordination,
+    cut: u64,
+    our_bid: Option<&str>,
+    our_after_cut: Option<&str>,
+) -> LiveView {
+    let none = |why: &str| LiveView {
+        healthy: false,
+        why: why.into(),
+        members: vec![],
+        after_cut_id: None,
+        max_head: 0,
+        hard: false,
+    };
+    let Some(status) = status else {
+        return none("the coordinator relay did not answer");
+    };
     let q = quorum_of(co);
     if q == 0 {
         return none("the event has no roster or quorum: the fleet cannot vouch for the chain");
@@ -362,17 +553,27 @@ pub fn live_view(status: Option<&Value>, co: &Coordination, cut: u64, our_bid: O
         let c = &r["ceremony"];
         // HALTED counts too (rc.24 fleet rehearsal c3a): a halted agent's validator still runs the target chain, and
         // excluding it made one peer's halt shrink every other peer's view below quorum, so the halts cascaded.
-        if !matches!(c["state"].as_str(), Some("IGNITED" | "FLIPPED" | "LIVE" | "HALTED")) {
+        if !matches!(
+            c["state"].as_str(),
+            Some("IGNITED" | "FLIPPED" | "LIVE" | "HALTED")
+        ) {
             continue;
         }
         let t = &c["target"];
-        let Some(first) = t["after_cut_id"].as_str() else { continue };
+        let Some(first) = t["after_cut_id"].as_str() else {
+            continue;
+        };
         // rc.25 F4: a failed head read keeps the member's (immutable) block after the cut for UNREAD_GRACE_MS: one
         // timed-out read is not a member leaving the chain. Older beacons report no block after the cut then.
         let head = match t["head"].as_u64() {
             Some(h) if h <= cut => continue,
             Some(h) => h,
-            None if t["unread_for_ms"].as_u64().is_some_and(|ms| ms <= UNREAD_GRACE_MS) => 0,
+            None if t["unread_for_ms"]
+                .as_u64()
+                .is_some_and(|ms| ms <= UNREAD_GRACE_MS) =>
+            {
+                0
+            }
             None => continue,
         };
         if let (Some(ours), Some(theirs)) = (our_bid, t["blockchain_id"].as_str()) {
@@ -384,12 +585,20 @@ pub fn live_view(status: Option<&Value>, co: &Coordination, cut: u64, our_bid: O
         e.0.push(m.producer.clone());
         e.1 = e.1.max(head);
     }
-    let Some((first, members, max_head, unique)) = unique_best(groups.into_iter().map(|(k, (m, h))| (k, m, h)).collect(), q) else {
+    let Some((first, members, max_head, unique)) =
+        unique_best(groups.into_iter().map(|(k, (m, h))| (k, m, h)).collect(), q)
+    else {
         return none("no roster member reports a target block after the cut");
     };
     if !unique {
-        return LiveView { healthy: false, members, after_cut_id: Some(first), max_head, hard: true,
-            why: "more than one target chain or fork has a quorum: split, not a decision".into() };
+        return LiveView {
+            healthy: false,
+            members,
+            after_cut_id: Some(first),
+            max_head,
+            hard: true,
+            why: "more than one target chain or fork has a quorum: split, not a decision".into(),
+        };
     }
     if let Some(ours) = our_after_cut {
         if !ours.eq_ignore_ascii_case(&first) {
@@ -402,21 +611,40 @@ pub fn live_view(status: Option<&Value>, co: &Coordination, cut: u64, our_bid: O
     let why = if healthy {
         format!("{} of quorum {q} members on the same target chain (common block after the cut, head {max_head})", members.len())
     } else {
-        format!("only {} member(s) on one target chain, quorum {q}", members.len())
+        format!(
+            "only {} member(s) on one target chain, quorum {q}",
+            members.len()
+        )
     };
-    LiveView { healthy, why, members, after_cut_id: Some(first), max_head, hard: false }
+    LiveView {
+        healthy,
+        why,
+        members,
+        after_cut_id: Some(first),
+        max_head,
+        hard: false,
+    }
 }
 
 /// The chain a `join` may track: a quorum of fresh members LIVE on one target chain (Metal blockchain
 /// id + one block after the cut), every one of them reporting OUR snapshot hash, fingerprints and
 /// migration genesis hash. Ok((blockchain_id, subnet_id, members)); Err(why).
-pub fn join_view(status: Option<&Value>, co: &Coordination, ours: &Value) -> Result<(String, Option<String>, Vec<String>), String> {
-    let Some(status) = status else { return Err("the coordinator relay did not answer".into()) };
+pub fn join_view(
+    status: Option<&Value>,
+    co: &Coordination,
+    ours: &Value,
+) -> Result<(String, Option<String>, Vec<String>), String> {
+    let Some(status) = status else {
+        return Err("the coordinator relay did not answer".into());
+    };
     let q = quorum_of(co);
     if q == 0 {
         return Err("the event has no roster or quorum: there is no fleet decision to join".into());
     }
-    let mut groups: std::collections::BTreeMap<(String, String), (Vec<String>, Option<String>, Vec<String>)> = Default::default();
+    let mut groups: std::collections::BTreeMap<
+        (String, String),
+        (Vec<String>, Option<String>, Vec<String>),
+    > = Default::default();
     for m in members(status, co) {
         let Some(r) = m.report else { continue };
         let c = &r["ceremony"];
@@ -424,36 +652,78 @@ pub fn join_view(status: Option<&Value>, co: &Coordination, ours: &Value) -> Res
             continue;
         }
         let t = &c["target"];
-        let (Some(bid), Some(first)) = (t["blockchain_id"].as_str(), t["after_cut_id"].as_str()) else { continue };
-        let e = groups.entry((bid.to_string(), first.to_ascii_lowercase())).or_default();
+        let (Some(bid), Some(first)) = (t["blockchain_id"].as_str(), t["after_cut_id"].as_str())
+        else {
+            continue;
+        };
+        let e = groups
+            .entry((bid.to_string(), first.to_ascii_lowercase()))
+            .or_default();
         e.0.push(m.producer.clone());
         if e.1.is_none() {
             e.1 = t["subnet_id"].as_str().map(str::to_string);
         }
-        for k in ["snapshot_sha256", "fingerprints_digest", "boot_genesis_sha256", "compare_allowed_digest", "protocol_schedule_hash"] {
+        for k in [
+            "snapshot_sha256",
+            "fingerprints_digest",
+            "boot_genesis_sha256",
+            "compare_allowed_digest",
+            "protocol_schedule_hash",
+        ] {
             let (mine, theirs) = (&ours[k], &c["evidence"][k]);
             if !mine.is_null() && mine != theirs {
-                e.2.push(format!("{}: {k} {} ≠ ours", m.producer, theirs.as_str().map(|s| format!("{}…", &s[..12.min(s.len())])).unwrap_or_else(|| "missing".into())));
+                e.2.push(format!(
+                    "{}: {k} {} ≠ ours",
+                    m.producer,
+                    theirs
+                        .as_str()
+                        .map(|s| format!("{}…", &s[..12.min(s.len())]))
+                        .unwrap_or_else(|| "missing".into())
+                ));
             }
         }
     }
-    let Some(((bid, _), members, (subnet, mismatches), unique)) = unique_best(groups.into_iter().map(|(k, (m, s, x))| (k, m, (s, x))).collect(), q) else {
+    let Some(((bid, _), members, (subnet, mismatches), unique)) = unique_best(
+        groups
+            .into_iter()
+            .map(|(k, (m, s, x))| (k, m, (s, x)))
+            .collect(),
+        q,
+    ) else {
         return Err("no roster member reports LIVE on a target chain".into());
     };
     if !unique {
-        return Err("more than one target chain or fork has a LIVE quorum: split, not a decision to join".into());
+        return Err(
+            "more than one target chain or fork has a LIVE quorum: split, not a decision to join"
+                .into(),
+        );
     }
     if members.len() < q {
-        return Err(format!("only {} member(s) LIVE on one target chain ({}), quorum {q}", members.len(), members.join(", ")));
+        return Err(format!(
+            "only {} member(s) LIVE on one target chain ({}), quorum {q}",
+            members.len(),
+            members.join(", ")
+        ));
     }
     if !mismatches.is_empty() {
-        let hint = if mismatches.iter().any(|m| m.contains("compare_allowed_digest missing")) {
+        let hint = if mismatches
+            .iter()
+            .any(|m| m.contains("compare_allowed_digest missing"))
+        {
             " (compare_allowed_digest missing: the LIVE members' beacons or the relay may predate rc.26, which a rehearsal \
              join under the compare allowlist needs)"
-        } else if mismatches.iter().any(|m| m.contains("protocol_schedule_hash missing")) {
+        } else if mismatches
+            .iter()
+            .any(|m| m.contains("protocol_schedule_hash missing"))
+        {
             " (protocol_schedule_hash missing: the LIVE members' beacons or the relay may predate rc.27)"
-        } else { "" };
-        return Err(format!("the LIVE members' evidence differs from this node's: {}{hint}", mismatches.join("; ")));
+        } else {
+            ""
+        };
+        return Err(format!(
+            "the LIVE members' evidence differs from this node's: {}{hint}",
+            mismatches.join("; ")
+        ));
     }
     Ok((bid, subnet, members))
 }
@@ -465,16 +735,34 @@ mod tests {
 
     fn co(roster: &[&str], quorum: usize) -> Coordination {
         Coordination {
-            url: "http://mc".into(), network: "rehearsal".into(), coordinator_keys: vec![], auto_arm: false, min_lead_blocks: 1,
-            fleet_quorum: quorum, fleet_timeout_secs: 1, event_id: Some("e1".into()), event_hash: None,
-            roster: roster.iter().map(|p| RosterMember { producer: p.to_string(), instance_id: None }).collect(),
-            report_max_age_secs: 60, degraded_patience_secs: 900, degraded_retry_secs: 10, fleet_stall_secs: 300,
+            url: "http://mc".into(),
+            network: "rehearsal".into(),
+            coordinator_keys: vec![],
+            auto_arm: false,
+            min_lead_blocks: 1,
+            fleet_quorum: quorum,
+            fleet_timeout_secs: 1,
+            event_id: Some("e1".into()),
+            event_hash: None,
+            roster: roster
+                .iter()
+                .map(|p| RosterMember {
+                    producer: p.to_string(),
+                    instance_id: None,
+                })
+                .collect(),
+            report_max_age_secs: 60,
+            degraded_patience_secs: 900,
+            degraded_retry_secs: 10,
+            fleet_stall_secs: 300,
         }
     }
     fn rep(state: &str, extra: Value) -> Value {
         let mut c = json!({"state": state, "evidence": {"snapshot_sha256": "aa", "fingerprints_digest": "ff"}});
         if let (Some(o), Some(e)) = (c.as_object_mut(), extra.as_object()) {
-            for (k, v) in e { o.insert(k.clone(), v.clone()); }
+            for (k, v) in e {
+                o.insert(k.clone(), v.clone());
+            }
         }
         json!({"coord": {"event_id": "e1"}, "ceremony": c})
     }
@@ -494,14 +782,36 @@ mod tests {
         let c = co(&["bp1", "bp2", "bp3"], 3);
         let live = |head: Value, unread: Option<u64>| {
             let mut t = json!({"blockchain_id": "X", "head": head, "after_cut_id": "a".repeat(64)});
-            if let Some(ms) = unread { t["unread_for_ms"] = json!(ms); }
+            if let Some(ms) = unread {
+                t["unread_for_ms"] = json!(ms);
+            }
             rep("LIVE", json!({"target": t}))
         };
-        let view = |third: Value| live_view(Some(&status(&[("bp1", live(json!(130), None), 1000),
-            ("bp2", live(json!(131), None), 1000), ("bp3", third, 1000)])), &c, 120, Some("X"), None);
-        assert!(view(live(json!(null), Some(5_000))).healthy, "a single timeout keeps the quorum");
-        assert!(!view(live(json!(null), Some(UNREAD_GRACE_MS + 1))).healthy, "a target down for longer drops out");
-        assert!(!view(live(json!(null), None)).healthy, "no read age (older beacon): not counted");
+        let view = |third: Value| {
+            live_view(
+                Some(&status(&[
+                    ("bp1", live(json!(130), None), 1000),
+                    ("bp2", live(json!(131), None), 1000),
+                    ("bp3", third, 1000),
+                ])),
+                &c,
+                120,
+                Some("X"),
+                None,
+            )
+        };
+        assert!(
+            view(live(json!(null), Some(5_000))).healthy,
+            "a single timeout keeps the quorum"
+        );
+        assert!(
+            !view(live(json!(null), Some(UNREAD_GRACE_MS + 1))).healthy,
+            "a target down for longer drops out"
+        );
+        assert!(
+            !view(live(json!(null), None)).healthy,
+            "no read age (older beacon): not counted"
+        );
     }
 
     #[test]
@@ -509,35 +819,88 @@ mod tests {
         let me = Some(("bp1", "i"));
         // q = N (3 of 3): one peer's abort makes the quorum unreachable without me.
         let c = co(&["bp1", "bp2", "bp3"], 3);
-        let one_aborted = status_me(&[("bp2", rep("ABORTED", json!({})), 1000), ("bp3", rep("VERIFIED", json!({})), 1000)]);
+        let one_aborted = status_me(&[
+            ("bp2", rep("ABORTED", json!({})), 1000),
+            ("bp3", rep("VERIFIED", json!({})), 1000),
+        ]);
         assert!(resume_guard(Some(&one_aborted), &c, me, false).is_ok());
         // Review #1: a LOCAL abort while peers are still before VERIFIED. With q < N (2 of 3) the two peers can
         // still reach quorum without me and ignite: the old behaviour resumed here (the common split).
         let c2 = co(&["bp1", "bp2", "bp3"], 2);
-        let early = status_me(&[("bp2", rep("FROZEN", json!({})), 1000), ("bp3", rep("ARMED", json!({})), 1000)]);
-        assert!(resume_guard(Some(&early), &c2, me, false).unwrap_err().contains("can reach it without this node"));
+        let early = status_me(&[
+            ("bp2", rep("FROZEN", json!({})), 1000),
+            ("bp3", rep("ARMED", json!({})), 1000),
+        ]);
+        assert!(resume_guard(Some(&early), &c2, me, false)
+            .unwrap_err()
+            .contains("can reach it without this node"));
         // ... and with q = N the same peers cannot (they need me): resume.
         assert!(resume_guard(Some(&early), &c, me, false).is_ok());
         // A minority that aborts alone strands; once enough peers aborted too, it may resume.
         let c5 = co(&["bp1", "bp2", "bp3", "bp4", "bp5"], 4);
-        let four_on = status_me(&[("bp2", rep("VERIFIED", json!({})), 1000), ("bp3", rep("VERIFIED", json!({})), 1000),
-            ("bp4", rep("SNAPSHOTTED", json!({})), 1000), ("bp5", rep("FROZEN", json!({})), 1000)]);
+        let four_on = status_me(&[
+            ("bp2", rep("VERIFIED", json!({})), 1000),
+            ("bp3", rep("VERIFIED", json!({})), 1000),
+            ("bp4", rep("SNAPSHOTTED", json!({})), 1000),
+            ("bp5", rep("FROZEN", json!({})), 1000),
+        ]);
         assert!(resume_guard(Some(&four_on), &c5, me, false).is_err());
-        let two_off = status_me(&[("bp2", rep("VERIFIED", json!({})), 1000), ("bp3", rep("ABORTED", json!({})), 1000),
-            ("bp4", rep("STRANDED", json!({})), 1000), ("bp5", rep("FROZEN", json!({})), 1000)]);
+        let two_off = status_me(&[
+            ("bp2", rep("VERIFIED", json!({})), 1000),
+            ("bp3", rep("ABORTED", json!({})), 1000),
+            ("bp4", rep("STRANDED", json!({})), 1000),
+            ("bp5", rep("FROZEN", json!({})), 1000),
+        ]);
         assert!(resume_guard(Some(&two_off), &c5, me, false).is_ok());
         // Unknown is never "no": relay down, a peer past creation, stale, missing, no roster.
-        assert!(resume_guard(None, &c, me, false).unwrap_err().contains("did not answer"));
-        let past = status_me(&[("bp2", rep("HALTED", json!({})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
-        assert!(resume_guard(Some(&past), &c, me, false).unwrap_err().contains("bp2 was reported past chain creation"), "any-instance rule (rc.27 review)");
-        let creating = status_me(&[("bp2", rep("VERIFIED", json!({"create_started": true})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
-        assert!(resume_guard(Some(&creating), &c, me, false).unwrap_err().contains("bp2 was reported past chain creation"), "any-instance rule (rc.27 review)");
-        let stale = status_me(&[("bp2", rep("ABORTED", json!({})), 999_000), ("bp3", rep("ABORTED", json!({})), 1000)]);
-        assert!(resume_guard(Some(&stale), &c, me, false).unwrap_err().contains("stale"));
+        assert!(resume_guard(None, &c, me, false)
+            .unwrap_err()
+            .contains("did not answer"));
+        let past = status_me(&[
+            ("bp2", rep("HALTED", json!({})), 1000),
+            ("bp3", rep("ABORTED", json!({})), 1000),
+        ]);
+        assert!(
+            resume_guard(Some(&past), &c, me, false)
+                .unwrap_err()
+                .contains("bp2 was reported past chain creation"),
+            "any-instance rule (rc.27 review)"
+        );
+        let creating = status_me(&[
+            (
+                "bp2",
+                rep("VERIFIED", json!({"create_started": true})),
+                1000,
+            ),
+            ("bp3", rep("ABORTED", json!({})), 1000),
+        ]);
+        assert!(
+            resume_guard(Some(&creating), &c, me, false)
+                .unwrap_err()
+                .contains("bp2 was reported past chain creation"),
+            "any-instance rule (rc.27 review)"
+        );
+        let stale = status_me(&[
+            ("bp2", rep("ABORTED", json!({})), 999_000),
+            ("bp3", rep("ABORTED", json!({})), 1000),
+        ]);
+        assert!(resume_guard(Some(&stale), &c, me, false)
+            .unwrap_err()
+            .contains("stale"));
         let missing = status_me(&[("bp2", rep("ABORTED", json!({})), 1000)]);
-        assert!(resume_guard(Some(&missing), &c, me, false).unwrap_err().contains("bp3 has no report"));
-        assert!(resume_guard(Some(&missing), &c, None, false).is_err(), "without knowing who we are, our own (missing) report blocks");
-        assert!(resume_guard(Some(&one_aborted), &co(&[], 0), me, false).unwrap_err().contains("no roster"), "review #8");
+        assert!(resume_guard(Some(&missing), &c, me, false)
+            .unwrap_err()
+            .contains("bp3 has no report"));
+        assert!(
+            resume_guard(Some(&missing), &c, None, false).is_err(),
+            "without knowing who we are, our own (missing) report blocks"
+        );
+        assert!(
+            resume_guard(Some(&one_aborted), &co(&[], 0), me, false)
+                .unwrap_err()
+                .contains("no roster"),
+            "review #8"
+        );
     }
 
     /// Review #2: the signed-abort path trusted omission. Every member must have SOME report for the event (stale
@@ -548,20 +911,37 @@ mod tests {
         let me = Some(("bp1", "i"));
         let c = co(&["bp1", "bp2", "bp3", "bp4"], 3);
         let three_missing = status_me(&[("bp2", rep("VERIFIED", json!({})), 1000)]);
-        assert!(resume_guard(Some(&three_missing), &c, me, true).unwrap_err().contains("no report"));
-        assert!(resume_guard(None, &c, me, true).unwrap_err().contains("did not answer"));
-        let all = status_me(&[("bp2", rep("VERIFIED", json!({})), 1000), ("bp3", rep("FROZEN", json!({})), 999_000),
-            ("bp4", rep("VERIFIED", json!({})), 1000)]);
-        assert!(resume_guard(Some(&all), &c, me, true).is_ok(), "stale accepted under a signed abort; quorum rule not applied");
+        assert!(resume_guard(Some(&three_missing), &c, me, true)
+            .unwrap_err()
+            .contains("no report"));
+        assert!(resume_guard(None, &c, me, true)
+            .unwrap_err()
+            .contains("did not answer"));
+        let all = status_me(&[
+            ("bp2", rep("VERIFIED", json!({})), 1000),
+            ("bp3", rep("FROZEN", json!({})), 999_000),
+            ("bp4", rep("VERIFIED", json!({})), 1000),
+        ]);
+        assert!(
+            resume_guard(Some(&all), &c, me, true).is_ok(),
+            "stale accepted under a signed abort; quorum rule not applied"
+        );
         let mut replaced = all.clone();
-        replaced["networks"][0]["producers"][2]["event_max"] = json!({"e1": {"past_create": true, "state": "IGNITED"}, "e0": {"past_create": false}});
-        assert!(resume_guard(Some(&replaced), &c, me, true).unwrap_err().contains("high-water mark"));
-        assert!(resume_guard(Some(&replaced), &c, me, false).unwrap_err().contains("high-water mark"));
+        replaced["networks"][0]["producers"][2]["event_max"] =
+            json!({"e1": {"past_create": true, "state": "IGNITED"}, "e0": {"past_create": false}});
+        assert!(resume_guard(Some(&replaced), &c, me, true)
+            .unwrap_err()
+            .contains("high-water mark"));
+        assert!(resume_guard(Some(&replaced), &c, me, false)
+            .unwrap_err()
+            .contains("high-water mark"));
         // A mark for another event does not count.
-        replaced["networks"][0]["producers"][2]["event_max"] = json!({"e0": {"past_create": true, "state": "LIVE"}});
+        replaced["networks"][0]["producers"][2]["event_max"] =
+            json!({"e0": {"past_create": true, "state": "LIVE"}});
         assert!(resume_guard(Some(&replaced), &c, me, true).is_ok());
         // The rc.23 first shape is still read.
-        replaced["networks"][0]["producers"][2]["event_max"] = json!({"event_id": "e1", "past_create": true, "state": "IGNITED"});
+        replaced["networks"][0]["producers"][2]["event_max"] =
+            json!({"event_id": "e1", "past_create": true, "state": "IGNITED"});
         assert!(resume_guard(Some(&replaced), &c, me, true).is_err());
     }
 
@@ -570,20 +950,52 @@ mod tests {
         let c = co(&["bp1", "bp2", "bp3", "bp4"], 3);
         let t = |head: u64, first: &str| json!({"target": {"blockchain_id": "X", "head": head, "after_cut_id": first}});
         let a = "a".repeat(64);
-        let st = status(&[("bp1", rep("LIVE", t(105, &a)), 1000), ("bp2", rep("LIVE", t(107, &a)), 1000),
-            ("bp3", rep("IGNITED", t(103, &a)), 1000), ("bp4", rep("HALTED", t(103, &a)), 1000)]);
+        let st = status(&[
+            ("bp1", rep("LIVE", t(105, &a)), 1000),
+            ("bp2", rep("LIVE", t(107, &a)), 1000),
+            ("bp3", rep("IGNITED", t(103, &a)), 1000),
+            ("bp4", rep("HALTED", t(103, &a)), 1000),
+        ]);
         let v = live_view(Some(&st), &c, 100, Some("X"), None);
         assert!(v.healthy, "{}", v.why);
         assert_eq!(v.max_head, 107);
-        assert!(!live_view(Some(&st), &c, 100, Some("Y"), None).healthy, "members on another chain do not count");
-        assert!(!live_view(Some(&st), &c, 100, Some("X"), Some(&"b".repeat(64))).healthy, "this node on a fork");
+        assert!(
+            !live_view(Some(&st), &c, 100, Some("Y"), None).healthy,
+            "members on another chain do not count"
+        );
+        assert!(
+            !live_view(Some(&st), &c, 100, Some("X"), Some(&"b".repeat(64))).healthy,
+            "this node on a fork"
+        );
         // rc.24 rehearsal fix: the HALTED bp4 still runs the chain and counts toward 4; a STRANDED one does not.
-        assert!(live_view(Some(&st), &co(&["bp1", "bp2", "bp3", "bp4"], 4), 100, Some("X"), None).healthy);
+        assert!(
+            live_view(
+                Some(&st),
+                &co(&["bp1", "bp2", "bp3", "bp4"], 4),
+                100,
+                Some("X"),
+                None
+            )
+            .healthy
+        );
         let mut stranded = st.clone();
-        stranded["networks"][0]["producers"][3]["beacons"][0]["report"]["ceremony"]["state"] = json!("STRANDED");
-        assert!(!live_view(Some(&stranded), &co(&["bp1", "bp2", "bp3", "bp4"], 4), 100, Some("X"), None).healthy);
+        stranded["networks"][0]["producers"][3]["beacons"][0]["report"]["ceremony"]["state"] =
+            json!("STRANDED");
+        assert!(
+            !live_view(
+                Some(&stranded),
+                &co(&["bp1", "bp2", "bp3", "bp4"], 4),
+                100,
+                Some("X"),
+                None
+            )
+            .healthy
+        );
         assert!(!live_view(None, &c, 100, Some("X"), None).healthy);
-        assert!(!live_view(Some(&st), &c, 107, Some("X"), None).healthy, "heads must be past the cut");
+        assert!(
+            !live_view(Some(&st), &c, 107, Some("X"), None).healthy,
+            "heads must be past the cut"
+        );
     }
 
     #[test]
@@ -592,12 +1004,19 @@ mod tests {
         let a = "a".repeat(64);
         let t = json!({"target": {"blockchain_id": "X", "subnet_id": "S", "head": 120, "after_cut_id": a}});
         let ours = json!({"snapshot_sha256": "aa", "fingerprints_digest": "ff"});
-        let live: Vec<(&str, Value, u64)> = ["bp1", "bp2", "bp3", "bp4"].iter().map(|p| (*p, rep("LIVE", t.clone()), 1000)).collect();
+        let live: Vec<(&str, Value, u64)> = ["bp1", "bp2", "bp3", "bp4"]
+            .iter()
+            .map(|p| (*p, rep("LIVE", t.clone()), 1000))
+            .collect();
         let (bid, sid, m) = join_view(Some(&status(&live)), &c, &ours).unwrap();
         assert_eq!((bid.as_str(), sid.as_deref(), m.len()), ("X", Some("S"), 4));
-        assert!(join_view(Some(&status(&live[..3])), &c, &ours).unwrap_err().contains("quorum 4"));
+        assert!(join_view(Some(&status(&live[..3])), &c, &ours)
+            .unwrap_err()
+            .contains("quorum 4"));
         let other = json!({"snapshot_sha256": "bb", "fingerprints_digest": "ff"});
-        assert!(join_view(Some(&status(&live)), &c, &other).unwrap_err().contains("differs"));
+        assert!(join_view(Some(&status(&live)), &c, &other)
+            .unwrap_err()
+            .contains("differs"));
     }
 
     /// rc.24 fleet run c5 (F6): under a signed abort, the one member whose own beacon was silent resumed while
@@ -606,14 +1025,24 @@ mod tests {
     fn a_node_whose_own_beacon_is_not_visible_strands_instead_of_resuming() {
         let me = Some(("bp1", "i"));
         let c = co(&["bp1", "bp2", "bp3"], 3);
-        let peers = [("bp2", rep("STRANDED", json!({})), 1000), ("bp3", rep("STRANDED", json!({})), 1000)];
+        let peers = [
+            ("bp2", rep("STRANDED", json!({})), 1000),
+            ("bp3", rep("STRANDED", json!({})), 1000),
+        ];
         // Own report missing (c5): strand, on both paths.
         let without_me = status(&peers);
-        assert!(resume_guard(Some(&without_me), &c, me, true).unwrap_err().contains("own beacon not visible"));
-        assert!(resume_guard(Some(&without_me), &c, me, false).unwrap_err().contains("own beacon not visible"));
+        assert!(resume_guard(Some(&without_me), &c, me, true)
+            .unwrap_err()
+            .contains("own beacon not visible"));
+        assert!(resume_guard(Some(&without_me), &c, me, false)
+            .unwrap_err()
+            .contains("own beacon not visible"));
         // Own report stale: strand.
-        let mut v = vec![("bp1", rep("ABORTED", json!({})), 999_000)]; v.extend(peers.iter().cloned());
-        assert!(resume_guard(Some(&status(&v)), &c, me, true).unwrap_err().contains("own beacon not visible"));
+        let mut v = vec![("bp1", rep("ABORTED", json!({})), 999_000)];
+        v.extend(peers.iter().cloned());
+        assert!(resume_guard(Some(&status(&v)), &c, me, true)
+            .unwrap_err()
+            .contains("own beacon not visible"));
         // Own report visible and fresh: the normal rules apply (here: signed abort, everyone accounted for).
         assert!(resume_guard(Some(&status_me(&peers)), &c, me, true).is_ok());
     }
@@ -623,24 +1052,42 @@ mod tests {
     fn a_journal_armed_for_another_h_is_not_this_events_evidence() {
         let me = Some(("bp1", "i"));
         let c = co(&["bp1", "bp2", "bp3"], 2);
-        let foreign = |st: &str| { let mut r = rep(st, json!({"source_resumed": true})); r["ceremony"]["evidence"]["h"] = json!(999); r };
-        let mut ours = rep("VERIFIED", json!({})); ours["ceremony"]["evidence"]["h"] = json!(100);
-        let mut st = status_me(&[("bp2", foreign("ABORTED"), 1000), ("bp3", ours.clone(), 1000)]);
+        let foreign = |st: &str| {
+            let mut r = rep(st, json!({"source_resumed": true}));
+            r["ceremony"]["evidence"]["h"] = json!(999);
+            r
+        };
+        let mut ours = rep("VERIFIED", json!({}));
+        ours["ceremony"]["evidence"]["h"] = json!(100);
+        let mut st = status_me(&[
+            ("bp2", foreign("ABORTED"), 1000),
+            ("bp3", ours.clone(), 1000),
+        ]);
         // Before: bp2's stale ABORTED journal counts it out of the ceremony and the guard lets bp1 resume.
         assert!(resume_guard(Some(&st), &c, me, false).is_ok());
         assert_eq!(drop_foreign_ceremonies(&mut st, "rehearsal", 100), 1);
         assert!(st["networks"][0]["producers"][1]["beacons"][0]["report"]["ceremony"].is_null());
-        assert!(st["networks"][0]["producers"][2]["beacons"][0]["report"]["ceremony"].is_object(), "a journal for this H stays");
+        assert!(
+            st["networks"][0]["producers"][2]["beacons"][0]["report"]["ceremony"].is_object(),
+            "a journal for this H stays"
+        );
         // After: bp2 has a report for the event but no known state: still in the ceremony, the quorum is reachable.
-        assert!(resume_guard(Some(&st), &c, me, false).unwrap_err().contains("still in the ceremony"));
+        assert!(resume_guard(Some(&st), &c, me, false)
+            .unwrap_err()
+            .contains("still in the ceremony"));
         // Review #5: no cut_height fallback (an inexact cut is not another event); another network is untouched.
-        let mut r = rep("LIVE", json!({})); r["ceremony"]["evidence"]["h"] = json!(7);
+        let mut r = rep("LIVE", json!({}));
+        r["ceremony"]["evidence"]["h"] = json!(7);
         let mut st2 = status_me(&[("bp2", r, 1000)]);
         assert_eq!(drop_foreign_ceremonies(&mut st2, "other", 100), 0);
         assert_eq!(drop_foreign_ceremonies(&mut st2, "rehearsal", 7), 0);
         assert_eq!(drop_foreign_ceremonies(&mut st2, "rehearsal", 100), 1);
-        let mut inexact = rep("VERIFIED", json!({})); inexact["ceremony"]["evidence"]["cut_height"] = json!(103);
-        assert_eq!(drop_foreign_ceremonies(&mut status_me(&[("bp2", inexact, 1000)]), "rehearsal", 100), 0);
+        let mut inexact = rep("VERIFIED", json!({}));
+        inexact["ceremony"]["evidence"]["cut_height"] = json!(103);
+        assert_eq!(
+            drop_foreign_ceremonies(&mut status_me(&[("bp2", inexact, 1000)]), "rehearsal", 100),
+            0
+        );
     }
 
     /// rc.26 review M2: the rehearsal compare allowlist digest is part of the joined evidence: a different allowed
@@ -650,14 +1097,27 @@ mod tests {
         let c = co(&["bp1", "bp2", "bp3", "bp4", "bp5"], 4);
         let t = |dg: Option<&str>| {
             let mut x = json!({"target": {"blockchain_id": "X", "subnet_id": "S", "head": 120, "after_cut_id": "a".repeat(64)}});
-            if let Some(dg) = dg { x["evidence"] = json!({"snapshot_sha256": "aa", "fingerprints_digest": "ff", "compare_allowed_digest": dg}); }
+            if let Some(dg) = dg {
+                x["evidence"] = json!({"snapshot_sha256": "aa", "fingerprints_digest": "ff", "compare_allowed_digest": dg});
+            }
             rep("LIVE", x)
         };
         let ours = json!({"snapshot_sha256": "aa", "fingerprints_digest": "ff", "compare_allowed_digest": "d1"});
-        let live = |dg: Option<&str>| status(&["bp2", "bp3", "bp4", "bp5"].iter().map(|p| (*p, t(dg), 1000)).collect::<Vec<_>>());
+        let live = |dg: Option<&str>| {
+            status(
+                &["bp2", "bp3", "bp4", "bp5"]
+                    .iter()
+                    .map(|p| (*p, t(dg), 1000))
+                    .collect::<Vec<_>>(),
+            )
+        };
         assert!(join_view(Some(&live(Some("d1"))), &c, &ours).is_ok());
-        assert!(join_view(Some(&live(Some("d2"))), &c, &ours).unwrap_err().contains("compare_allowed_digest"));
-        assert!(join_view(Some(&live(None)), &c, &ours).unwrap_err().contains("may predate rc.26"));
+        assert!(join_view(Some(&live(Some("d2"))), &c, &ours)
+            .unwrap_err()
+            .contains("compare_allowed_digest"));
+        assert!(join_view(Some(&live(None)), &c, &ours)
+            .unwrap_err()
+            .contains("may predate rc.26"));
     }
 
     /// Review #1: with quorum = N the quorum rule always passes, so a peer's past-creation state is the one fact that
@@ -666,13 +1126,23 @@ mod tests {
     fn a_foreign_report_past_creation_still_blocks_a_resume() {
         let me = Some(("bp1", "i"));
         let c = co(&["bp1", "bp2", "bp3"], 3);
-        let mut ignited = rep("IGNITED", json!({"ignition_started": true})); ignited["ceremony"]["evidence"]["h"] = json!(999);
-        let mut st = status_me(&[("bp2", ignited, 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
+        let mut ignited = rep("IGNITED", json!({"ignition_started": true}));
+        ignited["ceremony"]["evidence"]["h"] = json!(999);
+        let mut st = status_me(&[
+            ("bp2", ignited, 1000),
+            ("bp3", rep("ABORTED", json!({})), 1000),
+        ]);
         assert_eq!(drop_foreign_ceremonies(&mut st, "rehearsal", 100), 1);
         assert!(st["networks"][0]["producers"][1]["beacons"][0]["report"]["ceremony"].is_null());
         let e = resume_guard(Some(&st), &c, me, false).unwrap_err();
-        assert!(e.contains("bp2 reports a ceremony for another H that is past chain creation"), "{e}");
-        assert!(resume_guard(Some(&st), &c, me, true).is_err(), "a signed abort does not override it either");
+        assert!(
+            e.contains("bp2 reports a ceremony for another H that is past chain creation"),
+            "{e}"
+        );
+        assert!(
+            resume_guard(Some(&st), &c, me, true).is_err(),
+            "a signed abort does not override it either"
+        );
     }
 
     /// rc.27 review (review blocker): an unpinned member with two instances, one LIVE for another H (kept as
@@ -681,8 +1151,10 @@ mod tests {
     fn a_fresher_instance_does_not_hide_another_instances_past_creation() {
         let me = Some(("bp1", "i"));
         let c = co(&["bp1", "bp2", "bp3"], 3);
-        let mut foreign_live = rep("LIVE", json!({"ignition_started": true})); foreign_live["ceremony"]["evidence"]["h"] = json!(999);
-        let mut aborted = rep("ABORTED", json!({})); aborted["ceremony"]["evidence"]["h"] = json!(100);
+        let mut foreign_live = rep("LIVE", json!({"ignition_started": true}));
+        foreign_live["ceremony"]["evidence"]["h"] = json!(999);
+        let mut aborted = rep("ABORTED", json!({}));
+        aborted["ceremony"]["evidence"]["h"] = json!(100);
         let mut st = json!({"networks": [{"id": "rehearsal", "producers": [
             {"name": "bp1", "beacons": [{"age_ms": 1000, "report": rep("ABORTED", json!({}))}]},
             {"name": "bp2", "beacons": [{"age_ms": 5000, "report": foreign_live}, {"age_ms": 1000, "report": aborted}]},
@@ -691,10 +1163,18 @@ mod tests {
         let e = resume_guard(Some(&st), &c, me, true).unwrap_err();
         assert!(e.contains("bp2") && e.contains("another H"), "{e}");
         // Same H, older instance past creation, newer instance ABORTED: also blocks.
-        let st2 = status_me(&[("bp2", rep("IGNITED", json!({})), 9000), ("bp3", rep("ABORTED", json!({})), 1000)]);
+        let st2 = status_me(&[
+            ("bp2", rep("IGNITED", json!({})), 9000),
+            ("bp3", rep("ABORTED", json!({})), 1000),
+        ]);
         let mut st2 = st2;
-        st2["networks"][0]["producers"][1]["beacons"].as_array_mut().unwrap().push(json!({"age_ms": 1000, "report": rep("ABORTED", json!({}))}));
-        assert!(resume_guard(Some(&st2), &c, me, true).unwrap_err().contains("bp2 was reported past chain creation"));
+        st2["networks"][0]["producers"][1]["beacons"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"age_ms": 1000, "report": rep("ABORTED", json!({}))}));
+        assert!(resume_guard(Some(&st2), &c, me, true)
+            .unwrap_err()
+            .contains("bp2 was reported past chain creation"));
     }
 
     /// rc.27 review: the relay's durable foreign-H record blocks a resume even after the report itself was replaced
@@ -703,7 +1183,10 @@ mod tests {
     fn the_relays_durable_foreign_record_blocks_after_the_report_is_replaced() {
         let me = Some(("bp1", "i"));
         let c = co(&["bp1", "bp2", "bp3"], 3);
-        let mut st = status_me(&[("bp2", rep("ABORTED", json!({})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
+        let mut st = status_me(&[
+            ("bp2", rep("ABORTED", json!({})), 1000),
+            ("bp3", rep("ABORTED", json!({})), 1000),
+        ]);
         assert!(resume_guard(Some(&st), &c, me, true).is_ok());
         st["networks"][0]["producers"][1]["event_max"] = json!({"e1": {"past_create": false, "state": null,
             "foreign_past": {"state": "LIVE", "h": 999, "instance_id": null, "at": 1}}});
@@ -712,8 +1195,11 @@ mod tests {
         // The list shape (several observations) and the overflow flag block too.
         st["networks"][0]["producers"][1]["event_max"] = json!({"e1": {"past_create": false, "state": null,
             "foreign_past": [{"state": "LIVE", "h": 999, "instance_id": null, "at": 1}, {"state": "IGNITED", "h": 888, "instance_id": null, "at": 2}]}});
-        assert!(resume_guard(Some(&st), &c, me, true).unwrap_err().contains("2 report(s) for another H (999, 888)"));
-        st["networks"][0]["producers"][1]["event_max"] = json!({"e1": {"past_create": false, "state": null, "foreign_overflow": true}});
+        assert!(resume_guard(Some(&st), &c, me, true)
+            .unwrap_err()
+            .contains("2 report(s) for another H (999, 888)"));
+        st["networks"][0]["producers"][1]["event_max"] =
+            json!({"e1": {"past_create": false, "state": null, "foreign_overflow": true}});
         assert!(resume_guard(Some(&st), &c, me, true).is_err());
     }
 
@@ -723,17 +1209,31 @@ mod tests {
     fn the_relays_creation_evidence_log_blocks_its_event() {
         let me = Some(("bp1", "i"));
         let c = co(&["bp1", "bp2", "bp3"], 3);
-        let mut st = status_me(&[("bp2", rep("ABORTED", json!({})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
+        let mut st = status_me(&[
+            ("bp2", rep("ABORTED", json!({})), 1000),
+            ("bp3", rep("ABORTED", json!({})), 1000),
+        ]);
         assert!(resume_guard(Some(&st), &c, me, true).is_ok());
         st["networks"][0]["producers"][1]["creation_evidence"] = json!({"seq": 2, "overflow": false, "obs": [
             {"id": 2, "event_id": "other", "h": 5, "state": "LIVE"}]});
-        assert!(resume_guard(Some(&st), &c, me, true).is_ok(), "another event's evidence is not this event's");
-        st["networks"][0]["producers"][1]["creation_evidence"]["obs"].as_array_mut().unwrap()
+        assert!(
+            resume_guard(Some(&st), &c, me, true).is_ok(),
+            "another event's evidence is not this event's"
+        );
+        st["networks"][0]["producers"][1]["creation_evidence"]["obs"]
+            .as_array_mut()
+            .unwrap()
             .push(json!({"id": 3, "event_id": "e1", "h": 999, "state": "IGNITED"}));
         let e = resume_guard(Some(&st), &c, me, true).unwrap_err();
-        assert!(e.contains("bp2") && e.contains("creation evidence #3 at H 999"), "{e}");
-        st["networks"][0]["producers"][1]["creation_evidence"] = json!({"seq": 9, "overflow": true, "obs": []});
-        assert!(resume_guard(Some(&st), &c, me, true).unwrap_err().contains("overflowed"));
+        assert!(
+            e.contains("bp2") && e.contains("creation evidence #3 at H 999"),
+            "{e}"
+        );
+        st["networks"][0]["producers"][1]["creation_evidence"] =
+            json!({"seq": 9, "overflow": true, "obs": []});
+        assert!(resume_guard(Some(&st), &c, me, true)
+            .unwrap_err()
+            .contains("overflowed"));
     }
 
     /// rc.28 review: an observation from ANOTHER event at the same H blocks (an unfenced earlier target at this cut);
@@ -742,20 +1242,70 @@ mod tests {
     fn evidence_at_the_same_h_blocks_across_events() {
         let me = Some(("bp1", "i"));
         let c = co(&["bp1", "bp2", "bp3"], 3);
-        let base = status_me(&[("bp2", rep("ABORTED", json!({})), 1000), ("bp3", rep("ABORTED", json!({})), 1000)]);
+        let base = status_me(&[
+            ("bp2", rep("ABORTED", json!({})), 1000),
+            ("bp3", rep("ABORTED", json!({})), 1000),
+        ]);
         let with = |obs: Value| {
             let mut st = base.clone();
-            st["networks"][0]["producers"][1]["creation_evidence"] = json!({"seq": 1, "overflow": false, "obs": [obs]});
+            st["networks"][0]["producers"][1]["creation_evidence"] =
+                json!({"seq": 1, "overflow": false, "obs": [obs]});
             annotate_evidence(&mut st, "rehearsal", Some("e1"), 100);
             st
         };
-        assert!(resume_guard(Some(&with(json!({"id": 1, "event_id": "ev-0", "h": 100, "state": "IGNITED"}))), &c, me, true).is_err());
-        assert!(resume_guard(Some(&with(json!({"id": 1, "event_id": "ev-0", "h": 50, "state": "IGNITED"}))), &c, me, true).is_ok());
-        assert!(resume_guard(Some(&with(json!({"id": 1, "event_id": null, "h": null, "state": "LIVE"}))), &c, me, true).is_err());
-        assert!(resume_guard(Some(&with(json!({"id": 1, "event_id": null, "h": 50, "state": "LIVE"}))), &c, me, true).is_err(), "unattributed: quarantined");
+        assert!(resume_guard(
+            Some(&with(
+                json!({"id": 1, "event_id": "ev-0", "h": 100, "state": "IGNITED"})
+            )),
+            &c,
+            me,
+            true
+        )
+        .is_err());
+        assert!(resume_guard(
+            Some(&with(
+                json!({"id": 1, "event_id": "ev-0", "h": 50, "state": "IGNITED"})
+            )),
+            &c,
+            me,
+            true
+        )
+        .is_ok());
+        assert!(resume_guard(
+            Some(&with(
+                json!({"id": 1, "event_id": null, "h": null, "state": "LIVE"})
+            )),
+            &c,
+            me,
+            true
+        )
+        .is_err());
+        assert!(
+            resume_guard(
+                Some(&with(
+                    json!({"id": 1, "event_id": null, "h": 50, "state": "LIVE"})
+                )),
+                &c,
+                me,
+                true
+            )
+            .is_err(),
+            "unattributed: quarantined"
+        );
         // rc.29: another event's observation with an unknown H (a migrated mark) may be at this H: it blocks too.
-        assert!(resume_guard(Some(&with(json!({"id": 1, "event_id": "ev-0", "h": null, "state": "LIVE",
-            "migrated": "rc.27 past_create mark"}))), &c, me, true).is_err(), "unknown H: blocks until retired");
+        assert!(
+            resume_guard(
+                Some(&with(
+                    json!({"id": 1, "event_id": "ev-0", "h": null, "state": "LIVE",
+            "migrated": "rc.27 past_create mark"})
+                )),
+                &c,
+                me,
+                true
+            )
+            .is_err(),
+            "unknown H: blocks until retired"
+        );
     }
 
     /// Review #2: another box reporting under this producer name (its own instance) does not stand in for this
@@ -763,13 +1313,23 @@ mod tests {
     #[test]
     fn another_instance_under_my_name_is_not_my_own_report() {
         let c = co(&["bp1", "bp2"], 2);
-        let mut other_box = rep("ABORTED", json!({})); other_box["instance_id"] = json!("b".repeat(32));
-        let st = status(&[("bp1", other_box.clone(), 1000), ("bp2", rep("ABORTED", json!({})), 1000)]);
+        let mut other_box = rep("ABORTED", json!({}));
+        other_box["instance_id"] = json!("b".repeat(32));
+        let st = status(&[
+            ("bp1", other_box.clone(), 1000),
+            ("bp2", rep("ABORTED", json!({})), 1000),
+        ]);
         let me = Some(("bp1", "a".repeat(32)));
         let me = me.as_ref().map(|(p, i)| (*p, i.as_str()));
-        assert!(resume_guard(Some(&st), &c, me, false).unwrap_err().contains("own beacon not visible"));
-        let mut mine = other_box; mine["instance_id"] = json!("a".repeat(32));
-        let st = status(&[("bp1", mine, 1000), ("bp2", rep("ABORTED", json!({})), 1000)]);
+        assert!(resume_guard(Some(&st), &c, me, false)
+            .unwrap_err()
+            .contains("own beacon not visible"));
+        let mut mine = other_box;
+        mine["instance_id"] = json!("a".repeat(32));
+        let st = status(&[
+            ("bp1", mine, 1000),
+            ("bp2", rep("ABORTED", json!({})), 1000),
+        ]);
         assert!(resume_guard(Some(&st), &c, me, false).is_ok());
     }
 
@@ -779,13 +1339,24 @@ mod tests {
         let c = co(&["bp1", "bp2", "bp3", "bp4"], 4);
         let t = |head: u64, first: &str| json!({"target": {"blockchain_id": "X", "head": head, "after_cut_id": first}});
         let a = "a".repeat(64);
-        let st = status(&[("bp1", rep("IGNITED", t(105, &a)), 1000), ("bp2", rep("HALTED", t(104, &a)), 1000),
-            ("bp3", rep("HALTED", t(103, &a)), 1000), ("bp4", rep("LIVE", t(105, &a)), 1000)]);
+        let st = status(&[
+            ("bp1", rep("IGNITED", t(105, &a)), 1000),
+            ("bp2", rep("HALTED", t(104, &a)), 1000),
+            ("bp3", rep("HALTED", t(103, &a)), 1000),
+            ("bp4", rep("LIVE", t(105, &a)), 1000),
+        ]);
         let v = live_view(Some(&st), &c, 100, Some("X"), None);
         assert!(v.healthy, "{}", v.why);
-        let lag = status(&[("bp1", rep("IGNITED", t(105, &a)), 1000), ("bp2", rep("IGNITED", t(100, &a)), 1000)]);
+        let lag = status(&[
+            ("bp1", rep("IGNITED", t(105, &a)), 1000),
+            ("bp2", rep("IGNITED", t(100, &a)), 1000),
+        ]);
         let v = live_view(Some(&lag), &c, 100, Some("X"), None);
-        assert!(!v.healthy && !v.is_hard(), "a peer at the cut is not yet a quorum, but not a split: {}", v.why);
+        assert!(
+            !v.healthy && !v.is_hard(),
+            "a peer at the cut is not yet a quorum, but not a split: {}",
+            v.why
+        );
         let v = live_view(Some(&st), &c, 100, Some("X"), Some(&"b".repeat(64)));
         assert!(!v.healthy && v.is_hard(), "{}", v.why);
     }
@@ -797,9 +1368,15 @@ mod tests {
         let ours = json!({"snapshot_sha256": "aa", "fingerprints_digest": "ff"});
         let t = |bid: &str, first: &str| json!({"target": {"blockchain_id": bid, "subnet_id": "S", "head": 120, "after_cut_id": first}});
         let (a, b) = ("a".repeat(64), "b".repeat(64));
-        let st = status(&[("bp1", rep("LIVE", t("X", &a)), 1000), ("bp2", rep("LIVE", t("X", &a)), 1000),
-            ("bp3", rep("LIVE", t("X", &b)), 1000), ("bp4", rep("LIVE", t("X", &b)), 1000)]);
-        assert!(join_view(Some(&st), &c, &ours).unwrap_err().contains("split"));
+        let st = status(&[
+            ("bp1", rep("LIVE", t("X", &a)), 1000),
+            ("bp2", rep("LIVE", t("X", &a)), 1000),
+            ("bp3", rep("LIVE", t("X", &b)), 1000),
+            ("bp4", rep("LIVE", t("X", &b)), 1000),
+        ]);
+        assert!(join_view(Some(&st), &c, &ours)
+            .unwrap_err()
+            .contains("split"));
         let v = live_view(Some(&st), &c, 100, Some("X"), None);
         assert!(!v.healthy && v.why.contains("split"), "{}", v.why);
     }

@@ -23,10 +23,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde::Serialize;
-use serde_json::{
-    Value,
-    json,
-};
+use serde_json::{json, Value};
 
 use crate::ops::run_shell;
 
@@ -457,9 +454,7 @@ pub fn parse_nginx_dump(dump: &str) -> WebInfo {
                 let mut in_upstream: Option<String> = None;
                 for ctx in stack.iter().rev() {
                     match ctx {
-                        Ctx::Location(p) if in_location.is_none() => {
-                            in_location = Some(p.clone())
-                        }
+                        Ctx::Location(p) if in_location.is_none() => in_location = Some(p.clone()),
                         Ctx::Upstream(u) => {
                             in_upstream = Some(u.clone());
                             break;
@@ -699,7 +694,11 @@ pub fn parse_haproxy_cfg(text: &str) -> HaproxyInfo {
             .uses
             .iter()
             .map(|(b, c)| {
-                let rule = if c.trim().is_empty() { "always".into() } else { expand(c) };
+                let rule = if c.trim().is_empty() {
+                    "always".into()
+                } else {
+                    expand(c)
+                };
                 (b.clone(), rule)
             })
             .collect();
@@ -779,7 +778,9 @@ pub fn classify_parent_chain(chain: &[String]) -> Option<String> {
     match lower.first().map(String::as_str) {
         // Direct child of init: the launcher (nohup ./start.sh &, setsid,
         // an rc.local one-shot, an exited wrapper script) is gone.
-        None => Some("orphaned (nohup/setsid — parent is init; started by a script that has exited)".into()),
+        None => Some(
+            "orphaned (nohup/setsid — parent is init; started by a script that has exited)".into(),
+        ),
         Some(shell) if matches!(shell, "bash" | "sh" | "dash" | "zsh" | "ksh") => {
             Some(format!("shell script ({})", chain[0]))
         }
@@ -835,7 +836,11 @@ pub fn compute_verdicts(r: &DoctorReport) -> BTreeMap<String, Verdict> {
         }
 
         // Resources.
-        let mainnet = r.nodeos.chain_id.as_deref().is_some_and(crate::config::is_xpr_mainnet);
+        let mainnet = r
+            .nodeos
+            .chain_id
+            .as_deref()
+            .is_some_and(crate::config::is_xpr_mainnet);
         // RISK-REGISTER D-11: an unknown is reported, never read as "enough". Memory that cannot be read is
         // a need; so is a node whose chain_id cannot be read when the host is below the mainnet bar
         // (the smaller testnet threshold would otherwise pass it silently).
@@ -845,7 +850,10 @@ pub fn compute_verdicts(r: &DoctorReport) -> BTreeMap<String, Verdict> {
                  32GB+ RAM"
                     .into(),
             );
-        } else if r.nodeos.detected && r.nodeos.chain_id.is_none() && r.host.ram_mb < RAM_MIN_XPR_MAINNET_MB {
+        } else if r.nodeos.detected
+            && r.nodeos.chain_id.is_none()
+            && r.host.ram_mb < RAM_MIN_XPR_MAINNET_MB
+        {
             needs.push(format!(
                 "could not read the node's chain_id, so the RAM bar is unknown (found {:.1}GB): an XPR mainnet \
                  cutover needs 32GB+ RAM; check which chain this node follows",
@@ -893,8 +901,7 @@ pub fn compute_verdicts(r: &DoctorReport) -> BTreeMap<String, Verdict> {
                 );
             } else {
                 needs.push(
-                    "a running, synced nodeos (native or docker) serving /v1/chain/get_info"
-                        .into(),
+                    "a running, synced nodeos (native or docker) serving /v1/chain/get_info".into(),
                 );
             }
         } else {
@@ -1172,7 +1179,8 @@ pub fn survey() -> DoctorReport {
     r.host.virtualization =
         sh("systemd-detect-virt 2>/dev/null").unwrap_or_else(|| "unknown".into());
     r.systemd_present = sh("test -d /run/systemd/system && echo yes").is_some();
-    r.docker_present = sh("command -v docker >/dev/null 2>&1 && docker info --format ok 2>/dev/null").is_some();
+    r.docker_present =
+        sh("command -v docker >/dev/null 2>&1 && docker info --format ok 2>/dev/null").is_some();
 
     // ---- nodeos ----
     survey_nodeos(&mut r);
@@ -1203,9 +1211,10 @@ pub fn survey() -> DoctorReport {
     }
 
     // ---- ports ----
-    let listeners = sh("ss -ltnpH 2>/dev/null || ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null")
-        .map(|t| parse_ss_listeners(&t))
-        .unwrap_or_default();
+    let listeners =
+        sh("ss -ltnpH 2>/dev/null || ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null")
+            .map(|t| parse_ss_listeners(&t))
+            .unwrap_or_default();
     for (port, needed_by) in port_plan() {
         let hit = listeners.iter().find(|(p, _)| *p == port);
         r.ports.push(PortInfo {
@@ -1234,8 +1243,9 @@ fn survey_nodeos(r: &mut DoctorReport) {
     // nodeos ALSO shows up in host ps (its cmdline is just `nodeos ...`),
     // so the pid's cgroup decides: docker/containerd/kubepods there means
     // it is NOT native — the docker pass below (or the kubelet flag) owns it.
-    if let Some(ps) = sh("ps axo pid=,comm=,args= 2>/dev/null | awk '$2==\"nodeos\"{$2=\"\";print}'")
-        .or_else(|| sh("ps axo pid=,command= 2>/dev/null | grep -E '[n]odeos( |$)'"))
+    if let Some(ps) =
+        sh("ps axo pid=,comm=,args= 2>/dev/null | awk '$2==\"nodeos\"{$2=\"\";print}'")
+            .or_else(|| sh("ps axo pid=,command= 2>/dev/null | grep -E '[n]odeos( |$)'"))
     {
         let native_line = ps.lines().find(|l| !l.contains("docker")).filter(|l| {
             let pid = l.split_whitespace().next().unwrap_or("");
@@ -1264,7 +1274,11 @@ fn survey_nodeos(r: &mut DoctorReport) {
                 n.config_dir = Some(cfg);
             }
             n.config_path = arg_value(&cmdline, "--config")
-                .or_else(|| n.config_dir.as_ref().map(|d| format!("{}/config.ini", d.trim_end_matches('/'))))
+                .or_else(|| {
+                    n.config_dir
+                        .as_ref()
+                        .map(|d| format!("{}/config.ini", d.trim_end_matches('/')))
+                })
                 .map(|p| resolve_against_cwd(&p, n.cwd.as_deref()));
             n.data_dir = arg_value(&cmdline, "--data-dir")
                 .or_else(|| arg_value(&cmdline, "-d"))
@@ -1435,8 +1449,10 @@ fn survey_nodeos(r: &mut DoctorReport) {
 }
 
 fn survey_web(r: &mut DoctorReport) {
-    let running = |name: &str| sh(&format!("ps axo comm= 2>/dev/null | grep -x '{name}'")).is_some()
-        || sh(&format!("pgrep -x {name} >/dev/null 2>&1 && echo yes")).is_some();
+    let running = |name: &str| {
+        sh(&format!("ps axo comm= 2>/dev/null | grep -x '{name}'")).is_some()
+            || sh(&format!("pgrep -x {name} >/dev/null 2>&1 && echo yes")).is_some()
+    };
     r.web.server = if running("nginx") {
         "nginx".into()
     } else if running("caddy") {
@@ -1460,8 +1476,7 @@ fn survey_web(r: &mut DoctorReport) {
                         "openssl x509 -enddate -noout -in '{}' 2>/dev/null",
                         cert.cert_path
                     )) {
-                        cert.not_after =
-                            Some(end.trim_start_matches("notAfter=").to_string());
+                        cert.not_after = Some(end.trim_start_matches("notAfter=").to_string());
                         cert.expired = Some(
                             sh(&format!(
                                 "openssl x509 -checkend 0 -noout -in '{}' >/dev/null 2>&1 && echo ok",
@@ -1508,7 +1523,9 @@ fn survey_haproxy(r: &mut DoctorReport) {
         });
     }
     // The config path the process was started with (-f).
-    let cmdline_cfg = ps.as_ref().and_then(|t| t.lines().find_map(|l| arg_value(l, "-f")));
+    let cmdline_cfg = ps
+        .as_ref()
+        .and_then(|t| t.lines().find_map(|l| arg_value(l, "-f")));
 
     // systemd unit (present even if currently stopped).
     if r.systemd_present
@@ -1525,8 +1542,7 @@ fn survey_haproxy(r: &mut DoctorReport) {
         if let Some(rows) = sh("docker ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null") {
             for row in rows.lines() {
                 let cols: Vec<&str> = row.split('\t').collect();
-                if cols.len() == 2 && (cols[0].contains("haproxy") || cols[1].contains("haproxy"))
-                {
+                if cols.len() == 2 && (cols[0].contains("haproxy") || cols[1].contains("haproxy")) {
                     hap.container_name = Some(cols[0].to_string());
                     hap.running = true;
                     break;
@@ -1598,7 +1614,10 @@ fn survey_hyperion_es(r: &mut DoctorReport) {
             for app in apps {
                 if let Some(name) = app.get("name").and_then(|v| v.as_str()) {
                     let lower = name.to_lowercase();
-                    if lower.contains("hyperion") || lower.contains("indexer") || lower.contains("api") {
+                    if lower.contains("hyperion")
+                        || lower.contains("indexer")
+                        || lower.contains("api")
+                    {
                         r.hyperion_legacy.detected = true;
                         r.hyperion_legacy.manager = Some("pm2".into());
                         r.hyperion_legacy.processes.push(name.to_string());
@@ -1615,8 +1634,7 @@ fn survey_hyperion_es(r: &mut DoctorReport) {
         ) {
             r.hyperion_legacy.detected = true;
             r.hyperion_legacy.manager = Some("systemd".into());
-            r.hyperion_legacy.processes =
-                units.lines().map(|s| s.trim().to_string()).collect();
+            r.hyperion_legacy.processes = units.lines().map(|s| s.trim().to_string()).collect();
         }
     }
     for port in [7000u16, 7010] {
@@ -1729,26 +1747,65 @@ pub fn render_human(r: &DoctorReport) -> String {
         r.agent_version, r.hostname, r.generated_at
     ));
     o.push_str("HOST\n");
-    line(&mut o, "os", &format!("{} {} ({}, {})", r.host.os, r.host.os_version, r.host.arch, r.host.kernel));
-    line(&mut o, "cpu", &format!("{} x {}", r.host.cpu_cores, r.host.cpu_model));
-    line(&mut o, "ram", &format!("{:.1} GB", r.host.ram_mb as f64 / 1024.0));
+    line(
+        &mut o,
+        "os",
+        &format!(
+            "{} {} ({}, {})",
+            r.host.os, r.host.os_version, r.host.arch, r.host.kernel
+        ),
+    );
+    line(
+        &mut o,
+        "cpu",
+        &format!("{} x {}", r.host.cpu_cores, r.host.cpu_model),
+    );
+    line(
+        &mut o,
+        "ram",
+        &format!("{:.1} GB", r.host.ram_mb as f64 / 1024.0),
+    );
     for d in &r.host.disks {
-        line(&mut o, &format!("disk {}", d.mount), &format!("{} GB free / {} GB", d.avail_gb, d.total_gb));
+        line(
+            &mut o,
+            &format!("disk {}", d.mount),
+            &format!("{} GB free / {} GB", d.avail_gb, d.total_gb),
+        );
     }
-    line(&mut o, "systemd / docker", &format!("{} / {}", yn(r.systemd_present), yn(r.docker_present)));
+    line(
+        &mut o,
+        "systemd / docker",
+        &format!("{} / {}", yn(r.systemd_present), yn(r.docker_present)),
+    );
 
     o.push_str("\nNODEOS (source chain — yours, untouched)\n");
     if r.nodeos.detected {
-        line(&mut o, "runtime", &match r.nodeos.runtime.as_str() {
-            "docker" => format!(
-                "docker container `{}` ({})",
-                opt(&r.nodeos.container_name),
-                opt(&r.nodeos.container_image)
-            ),
-            "native" => format!("native (pid {}, {})", r.nodeos.pid.unwrap_or(0), opt(&r.nodeos.binary)),
-            _ => "answering on the API but process not identified".into(),
-        });
-        line(&mut o, "systemd unit(s)", &if r.nodeos.systemd_units.is_empty() { "-".into() } else { r.nodeos.systemd_units.join(", ") });
+        line(
+            &mut o,
+            "runtime",
+            &match r.nodeos.runtime.as_str() {
+                "docker" => format!(
+                    "docker container `{}` ({})",
+                    opt(&r.nodeos.container_name),
+                    opt(&r.nodeos.container_image)
+                ),
+                "native" => format!(
+                    "native (pid {}, {})",
+                    r.nodeos.pid.unwrap_or(0),
+                    opt(&r.nodeos.binary)
+                ),
+                _ => "answering on the API but process not identified".into(),
+            },
+        );
+        line(
+            &mut o,
+            "systemd unit(s)",
+            &if r.nodeos.systemd_units.is_empty() {
+                "-".into()
+            } else {
+                r.nodeos.systemd_units.join(", ")
+            },
+        );
         if let Some(mgr) = &r.nodeos.script_manager {
             line(
                 &mut o,
@@ -1775,13 +1832,31 @@ pub fn render_human(r: &DoctorReport) -> String {
         line(&mut o, "chain api", &opt(&r.nodeos.chain_api_url));
         line(&mut o, "version", &opt(&r.nodeos.server_version_string));
         line(&mut o, "chain_id", &opt(&r.nodeos.chain_id));
-        line(&mut o, "head", &r.nodeos.head_block_num.map(|h| h.to_string()).unwrap_or_else(|| "-".into()));
+        line(
+            &mut o,
+            "head",
+            &r.nodeos
+                .head_block_num
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "-".into()),
+        );
         line(&mut o, "producer_api", &r.nodeos.producer_api);
-        line(&mut o, "state_history", &r.nodeos.state_history.map(yn2).unwrap_or_else(|| "unknown".into()));
+        line(
+            &mut o,
+            "state_history",
+            &r.nodeos
+                .state_history
+                .map(yn2)
+                .unwrap_or_else(|| "unknown".into()),
+        );
     } else {
         line(&mut o, "detected", "NO");
         if r.nodeos.host_kubelet {
-            line(&mut o, "note", "kubelet present — kube-managed nodeos is not yet supported");
+            line(
+                &mut o,
+                "note",
+                "kubelet present — kube-managed nodeos is not yet supported",
+            );
         }
     }
 
@@ -1789,10 +1864,18 @@ pub fn render_human(r: &DoctorReport) -> String {
     if r.web.server == "nginx" {
         line(&mut o, "version", &opt(&r.web.version));
         if r.web.dump_failed {
-            line(&mut o, "routes", "nginx -T failed — run doctor as root to map routes");
+            line(
+                &mut o,
+                "routes",
+                "nginx -T failed — run doctor as root to map routes",
+            );
         }
         for route in &r.web.routes {
-            let names = if route.server_names.is_empty() { "_".to_string() } else { route.server_names.join(" ") };
+            let names = if route.server_names.is_empty() {
+                "_".to_string()
+            } else {
+                route.server_names.join(" ")
+            };
             line(
                 &mut o,
                 &format!("route {names}"),
@@ -1800,7 +1883,11 @@ pub fn render_human(r: &DoctorReport) -> String {
                     "{} -> {}{}",
                     route.location,
                     route.backends.join(","),
-                    route.upstream_name.as_ref().map(|u| format!(" (upstream {u})")).unwrap_or_default()
+                    route
+                        .upstream_name
+                        .as_ref()
+                        .map(|u| format!(" (upstream {u})"))
+                        .unwrap_or_default()
                 ),
             );
         }
@@ -1813,26 +1900,45 @@ pub fn render_human(r: &DoctorReport) -> String {
             line(
                 &mut o,
                 &format!("tls {}", cert.server_names.join(" ")),
-                &format!("{} (until {}){status}", cert.cert_path, opt(&cert.not_after)),
+                &format!(
+                    "{} (until {}){status}",
+                    cert.cert_path,
+                    opt(&cert.not_after)
+                ),
             );
         }
     }
 
     if r.haproxy.detected {
         o.push_str("\nWEB EDGE (haproxy)\n");
-        line(&mut o, "state", &match (r.haproxy.running, r.haproxy.runtime.as_str()) {
-            (true, "docker") => format!("running (docker container `{}`)", opt(&r.haproxy.container_name)),
-            (true, "native") => format!(
-                "running (native{})",
-                r.haproxy.systemd_unit.as_ref().map(|u| format!(", unit {u}")).unwrap_or_default()
-            ),
-            (true, _) => "running".into(),
-            (false, _) => "installed but not running".into(),
-        });
+        line(
+            &mut o,
+            "state",
+            &match (r.haproxy.running, r.haproxy.runtime.as_str()) {
+                (true, "docker") => format!(
+                    "running (docker container `{}`)",
+                    opt(&r.haproxy.container_name)
+                ),
+                (true, "native") => format!(
+                    "running (native{})",
+                    r.haproxy
+                        .systemd_unit
+                        .as_ref()
+                        .map(|u| format!(", unit {u}"))
+                        .unwrap_or_default()
+                ),
+                (true, _) => "running".into(),
+                (false, _) => "installed but not running".into(),
+            },
+        );
         line(&mut o, "version", &opt(&r.haproxy.version));
         line(&mut o, "config", &opt(&r.haproxy.cfg_path));
         if r.haproxy.parse_failed {
-            line(&mut o, "routes", "config unreadable — run doctor as root to map routes");
+            line(
+                &mut o,
+                "routes",
+                "config unreadable — run doctor as root to map routes",
+            );
         }
         for route in &r.haproxy.routes {
             let servers = route
@@ -1843,7 +1949,13 @@ pub fn render_human(r: &DoctorReport) -> String {
                         "{} {}{}",
                         s.name,
                         s.addr,
-                        if s.disabled { " (disabled)" } else if s.backup { " (backup)" } else { "" }
+                        if s.disabled {
+                            " (disabled)"
+                        } else if s.backup {
+                            " (backup)"
+                        } else {
+                            ""
+                        }
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1857,49 +1969,111 @@ pub fn render_human(r: &DoctorReport) -> String {
                     if route.tls { " ssl" } else { "" },
                     route.rule,
                     route.backend,
-                    if servers.is_empty() { "-".to_string() } else { servers }
+                    if servers.is_empty() {
+                        "-".to_string()
+                    } else {
+                        servers
+                    }
                 ),
             );
         }
-        line(&mut o, "admin socket", &match &r.haproxy.admin_socket {
-            Some(path) => format!(
-                "{path} (level admin) — zero-reload runtime flip{}",
-                match &r.haproxy.socket_tool {
-                    Some(tool) => format!(" via {tool}"),
-                    None => " (needs socat: apt-get install -y socat)".into(),
-                }
-            ),
-            None => "none — flips fall back to cfg edit + validate + graceful reload".into(),
-        });
+        line(
+            &mut o,
+            "admin socket",
+            &match &r.haproxy.admin_socket {
+                Some(path) => format!(
+                    "{path} (level admin) — zero-reload runtime flip{}",
+                    match &r.haproxy.socket_tool {
+                        Some(tool) => format!(" via {tool}"),
+                        None => " (needs socat: apt-get install -y socat)".into(),
+                    }
+                ),
+                None => "none — flips fall back to cfg edit + validate + graceful reload".into(),
+            },
+        );
     }
 
     o.push_str("\nHISTORY STACK\n");
-    line(&mut o, "hyperion", &if r.hyperion_legacy.detected {
-        format!(
-            "{} ({}) {}",
-            r.hyperion_legacy.processes.join(", "),
-            r.hyperion_legacy.manager.clone().unwrap_or_else(|| "?".into()),
-            r.hyperion_legacy.api_url.clone().map(|u| format!("api {u}")).unwrap_or_default()
-        )
-    } else {
-        "not detected".into()
-    });
-    line(&mut o, "elasticsearch", &if r.elasticsearch.detected {
-        format!(
-            "{}{}{}",
-            r.elasticsearch.version.clone().map(|v| format!("v{v} ")).unwrap_or_default(),
-            r.elasticsearch.heap.clone().map(|h| format!("heap {h} ")).unwrap_or_default(),
-            if r.elasticsearch.in_docker { "(docker)" } else { "" }
-        )
-    } else {
-        "not detected".into()
-    });
+    line(
+        &mut o,
+        "hyperion",
+        &if r.hyperion_legacy.detected {
+            format!(
+                "{} ({}) {}",
+                r.hyperion_legacy.processes.join(", "),
+                r.hyperion_legacy
+                    .manager
+                    .clone()
+                    .unwrap_or_else(|| "?".into()),
+                r.hyperion_legacy
+                    .api_url
+                    .clone()
+                    .map(|u| format!("api {u}"))
+                    .unwrap_or_default()
+            )
+        } else {
+            "not detected".into()
+        },
+    );
+    line(
+        &mut o,
+        "elasticsearch",
+        &if r.elasticsearch.detected {
+            format!(
+                "{}{}{}",
+                r.elasticsearch
+                    .version
+                    .clone()
+                    .map(|v| format!("v{v} "))
+                    .unwrap_or_default(),
+                r.elasticsearch
+                    .heap
+                    .clone()
+                    .map(|h| format!("heap {h} "))
+                    .unwrap_or_default(),
+                if r.elasticsearch.in_docker {
+                    "(docker)"
+                } else {
+                    ""
+                }
+            )
+        } else {
+            "not detected".into()
+        },
+    );
 
     o.push_str("\nPULSEVM TARGET\n");
-    line(&mut o, "metalgo binary", &if r.metalgo.binary_present { opt(&r.metalgo.binary_path) } else { "not installed (install.sh stages it)".into() });
-    line(&mut o, "metalgo node", &if r.metalgo.node_running { format!("running {}", opt(&r.metalgo.version)) } else { "not running".into() });
+    line(
+        &mut o,
+        "metalgo binary",
+        &if r.metalgo.binary_present {
+            opt(&r.metalgo.binary_path)
+        } else {
+            "not installed (install.sh stages it)".into()
+        },
+    );
+    line(
+        &mut o,
+        "metalgo node",
+        &if r.metalgo.node_running {
+            format!("running {}", opt(&r.metalgo.version))
+        } else {
+            "not running".into()
+        },
+    );
     if let Some(dir) = &r.metalgo.plugins_dir {
-        line(&mut o, "plugins", &format!("{dir}: {}", if r.metalgo.plugins.is_empty() { "-".into() } else { r.metalgo.plugins.join(", ") }));
+        line(
+            &mut o,
+            "plugins",
+            &format!(
+                "{dir}: {}",
+                if r.metalgo.plugins.is_empty() {
+                    "-".into()
+                } else {
+                    r.metalgo.plugins.join(", ")
+                }
+            ),
+        );
     }
     for (unit, state) in &r.pulse_services {
         line(&mut o, &format!("service {unit}"), state);
@@ -1911,7 +2085,10 @@ pub fn render_human(r: &DoctorReport) -> String {
             &mut o,
             &format!("{} ({})", p.port, port_role(p.port)),
             &if p.in_use {
-                format!("in use by {}", p.process.clone().unwrap_or_else(|| "?".into()))
+                format!(
+                    "in use by {}",
+                    p.process.clone().unwrap_or_else(|| "?".into())
+                )
             } else {
                 "free".into()
             },
@@ -1934,7 +2111,11 @@ pub fn render_human(r: &DoctorReport) -> String {
 }
 
 fn yn(b: bool) -> &'static str {
-    if b { "yes" } else { "no" }
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
 }
 fn yn2(b: bool) -> String {
     yn(b).to_string()
@@ -1954,7 +2135,10 @@ mod tests {
 
     #[test]
     fn meminfo_parses_mb() {
-        assert_eq!(parse_meminfo_mb("MemTotal:       16265216 kB\n"), Some(15884));
+        assert_eq!(
+            parse_meminfo_mb("MemTotal:       16265216 kB\n"),
+            Some(15884)
+        );
     }
 
     #[test]
@@ -2012,8 +2196,14 @@ server {
         assert_eq!(default.backends, vec!["127.0.0.1:8888"]);
 
         assert_eq!(web.tls.len(), 1);
-        assert_eq!(web.tls[0].cert_path, "/etc/letsencrypt/live/rpc.example.com/fullchain.pem");
-        assert_eq!(web.tls[0].server_names, vec!["rpc.example.com", "api.example.com"]);
+        assert_eq!(
+            web.tls[0].cert_path,
+            "/etc/letsencrypt/live/rpc.example.com/fullchain.pem"
+        );
+        assert_eq!(
+            web.tls[0].server_names,
+            vec!["rpc.example.com", "api.example.com"]
+        );
     }
 
     #[test]
@@ -2023,7 +2213,10 @@ server {
         let dump = "# configuration file /etc/nginx/conf.d/up.conf:\n\
                     upstream gw {\n    server 127.0.0.1:8899;\n    server 127.0.0.1:8898 backup;\n}\n";
         let web = parse_nginx_dump(dump);
-        assert_eq!(web.upstreams["gw"], vec!["127.0.0.1:8899", "127.0.0.1:8898"]);
+        assert_eq!(
+            web.upstreams["gw"],
+            vec!["127.0.0.1:8899", "127.0.0.1:8898"]
+        );
         assert!(web.routes.is_empty());
     }
 
@@ -2046,7 +2239,11 @@ LISTEN 0      4096   *:9650          *:*"#;
                 os_version: "24.04".into(),
                 os_supported: true,
                 ram_mb: 32_000,
-                disks: vec![DiskInfo { mount: "/".into(), avail_gb: 200, total_gb: 300 }],
+                disks: vec![DiskInfo {
+                    mount: "/".into(),
+                    avail_gb: 200,
+                    total_gb: 300,
+                }],
                 ..Default::default()
             },
             nodeos: NodeosInfo {
@@ -2058,7 +2255,10 @@ LISTEN 0      4096   *:9650          *:*"#;
                 producer_api: "enabled".into(),
                 ..Default::default()
             },
-            web: WebInfo { server: "nginx".into(), ..Default::default() },
+            web: WebInfo {
+                server: "nginx".into(),
+                ..Default::default()
+            },
             docker_present: true,
             systemd_present: true,
             ..Default::default()
@@ -2080,7 +2280,10 @@ LISTEN 0      4096   *:9650          *:*"#;
         r.host.ram_mb = 8_000;
         let v = compute_verdicts(&r);
         assert_eq!(v["api"].status, "NEEDS");
-        assert!(v["api"].needs.iter().any(|n| n.contains("producer_api_plugin")));
+        assert!(v["api"]
+            .needs
+            .iter()
+            .any(|n| n.contains("producer_api_plugin")));
         // 8GB clears api mode's RAM bar but not hyperion's.
         assert!(!v["api"].needs.iter().any(|n| n.contains("RAM")));
         assert!(v["hyperion"].needs.iter().any(|n| n.contains("RAM")));
@@ -2094,7 +2297,13 @@ LISTEN 0      4096   *:9650          *:*"#;
         let v = compute_verdicts(&r);
         for mode in ["bp", "api", "hyperion"] {
             assert_eq!(v[mode].status, "NEEDS", "{mode}");
-            assert!(v[mode].needs.iter().any(|n| n.contains("32GB+ RAM for an XPR mainnet cutover")), "{mode}");
+            assert!(
+                v[mode]
+                    .needs
+                    .iter()
+                    .any(|n| n.contains("32GB+ RAM for an XPR mainnet cutover")),
+                "{mode}"
+            );
         }
         r.host.ram_mb = 31_300; // MemTotal of a nominal 32 GB host
         let v = compute_verdicts(&r);
@@ -2113,14 +2322,23 @@ LISTEN 0      4096   *:9650          *:*"#;
         let v = compute_verdicts(&r);
         for mode in ["bp", "api", "hyperion"] {
             assert_eq!(v[mode].status, "NEEDS", "{mode}");
-            assert!(v[mode].needs.iter().any(|n| n.contains("could not read this host's memory")), "{mode}");
+            assert!(
+                v[mode]
+                    .needs
+                    .iter()
+                    .any(|n| n.contains("could not read this host's memory")),
+                "{mode}"
+            );
         }
         // A detected node whose chain_id cannot be read, on a 16 GB host: unknown bar, reported.
         let mut r = ready_report();
         r.nodeos.chain_id = None;
         r.host.ram_mb = 15_884;
         let v = compute_verdicts(&r);
-        assert!(v["bp"].needs.iter().any(|n| n.contains("could not read the node's chain_id")));
+        assert!(v["bp"]
+            .needs
+            .iter()
+            .any(|n| n.contains("could not read the node's chain_id")));
         // ...on a host that already clears the mainnet bar, nothing to report.
         r.host.ram_mb = 31_300;
         assert_eq!(compute_verdicts(&r)["bp"].status, "READY");
@@ -2142,7 +2360,10 @@ LISTEN 0      4096   *:9650          *:*"#;
         assert_eq!(v["bp"].status, "READY");
 
         let mut r = ready_report();
-        r.nodeos = NodeosInfo { host_kubelet: true, ..Default::default() };
+        r.nodeos = NodeosInfo {
+            host_kubelet: true,
+            ..Default::default()
+        };
         let v = compute_verdicts(&r);
         assert_eq!(v["bp"].status, "UNSUPPORTED");
         assert!(v["bp"].unsupported[0].contains("kubernetes"));
@@ -2180,14 +2401,19 @@ LISTEN 0      4096   *:9650          *:*"#;
             .expect("script-managed need");
         assert!(need.contains("start_cmd"));
         assert!(need.contains("screen"));
-        assert!(!v["api"].needs.iter().any(|n| n.contains("stop_cmd must be declared")));
+        assert!(!v["api"]
+            .needs
+            .iter()
+            .any(|n| n.contains("stop_cmd must be declared")));
         // bp mode never stops nodeos — unchanged READY.
         assert_eq!(v["bp"].status, "READY");
     }
 
     #[test]
     fn parent_chain_classification_covers_the_classic_bp_patterns() {
-        let c = |v: &[&str]| classify_parent_chain(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let c = |v: &[&str]| {
+            classify_parent_chain(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
         // screen/tmux anywhere in the chain win (the shell under them is detail).
         assert_eq!(c(&["bash", "SCREEN"]), Some("screen".into()));
         assert_eq!(c(&["bash", "tmux: server"]), Some("tmux".into()));
@@ -2199,7 +2425,10 @@ LISTEN 0      4096   *:9650          *:*"#;
         // Orphan re-parented to init: nohup/setsid/& + logout, or rc.local.
         assert_eq!(
             c(&[]),
-            Some("orphaned (nohup/setsid — parent is init; started by a script that has exited)".into())
+            Some(
+                "orphaned (nohup/setsid — parent is init; started by a script that has exited)"
+                    .into()
+            )
         );
         // Direct child of an ssh session (no wrapper shell fork).
         assert_eq!(c(&["sshd"]), Some("interactive session (sshd)".into()));
@@ -2209,7 +2438,12 @@ LISTEN 0      4096   *:9650          *:*"#;
 
     #[test]
     fn os_gate_accepts_focal_jammy_noble_only() {
-        for (ver, ok) in [("20.04", true), ("22.04", true), ("24.04", true), ("18.04", false)] {
+        for (ver, ok) in [
+            ("20.04", true),
+            ("22.04", true),
+            ("24.04", true),
+            ("18.04", false),
+        ] {
             let mut r = ready_report();
             r.host.os_version = ver.into();
             r.host.os_supported = r.host.os.to_lowercase().contains("ubuntu")
@@ -2224,9 +2458,18 @@ LISTEN 0      4096   *:9650          *:*"#;
 
     #[test]
     fn cwd_resolution_for_relative_config_paths() {
-        assert_eq!(resolve_against_cwd("/opt/x/config.ini", Some("/home/u")), "/opt/x/config.ini");
-        assert_eq!(resolve_against_cwd("cfg/config.ini", Some("/opt/nodeos/")), "/opt/nodeos/cfg/config.ini");
-        assert_eq!(resolve_against_cwd("cfg/config.ini", None), "cfg/config.ini");
+        assert_eq!(
+            resolve_against_cwd("/opt/x/config.ini", Some("/home/u")),
+            "/opt/x/config.ini"
+        );
+        assert_eq!(
+            resolve_against_cwd("cfg/config.ini", Some("/opt/nodeos/")),
+            "/opt/nodeos/cfg/config.ini"
+        );
+        assert_eq!(
+            resolve_against_cwd("cfg/config.ini", None),
+            "cfg/config.ini"
+        );
     }
 
     #[test]
@@ -2239,7 +2482,10 @@ LISTEN 0      4096   *:9650          *:*"#;
             process: Some("python3".into()),
         }];
         let v = compute_verdicts(&r);
-        assert!(v["api"].needs.iter().any(|n| n.contains("9650") && n.contains("python3")));
+        assert!(v["api"]
+            .needs
+            .iter()
+            .any(|n| n.contains("9650") && n.contains("python3")));
         // ...but the staged metalgo itself holding 9650 is expected.
         r.ports[0].process = Some("metalgo".into());
         let v = compute_verdicts(&r);
@@ -2414,7 +2660,10 @@ backend be_history
     /// A report where haproxy (not nginx) is the sole edge, socket flip ready.
     fn haproxy_ready_report(cfg: &str) -> DoctorReport {
         let mut r = ready_report();
-        r.web = WebInfo { server: "none".into(), ..Default::default() };
+        r.web = WebInfo {
+            server: "none".into(),
+            ..Default::default()
+        };
         let parsed = parse_haproxy_cfg(cfg);
         r.haproxy = HaproxyInfo {
             detected: true,
@@ -2468,7 +2717,10 @@ backend be_history
         r.web.server = "nginx".into();
         let v = compute_verdicts(&r);
         assert_eq!(v["api"].status, "NEEDS");
-        assert!(v["api"].needs.iter().any(|n| n.contains("two web edges") && n.contains("flip.edge")));
+        assert!(v["api"]
+            .needs
+            .iter()
+            .any(|n| n.contains("two web edges") && n.contains("flip.edge")));
     }
 
     #[test]
@@ -2485,7 +2737,10 @@ backend be_history
         r.haproxy.parse_failed = true;
         let v = compute_verdicts(&r);
         assert_eq!(v["api"].status, "NEEDS");
-        assert!(v["api"].needs.iter().any(|n| n.contains("could not read its config")));
+        assert!(v["api"]
+            .needs
+            .iter()
+            .any(|n| n.contains("could not read its config")));
     }
 
     #[test]
@@ -2496,7 +2751,10 @@ backend be_history
         assert_eq!(json["haproxy"]["running"], true);
         assert_eq!(json["haproxy"]["admin_socket"], "/run/haproxy/admin.sock");
         assert_eq!(json["haproxy"]["routes"][0]["backend"], "be_v1");
-        assert_eq!(json["haproxy"]["routes"][0]["servers"][0]["addr"], "127.0.0.1:8888");
+        assert_eq!(
+            json["haproxy"]["routes"][0]["servers"][0]["addr"],
+            "127.0.0.1:8888"
+        );
         assert_eq!(json["verdicts"]["api"]["status"], "READY");
     }
 
