@@ -1942,7 +1942,7 @@ dependencies = [
  "pulsevm_snapshot",
  "pulsevm_snapshot_import",
  "regex",
- "ripemd",
+ "ripemd 0.2.0",
  "secp256k1",
  "serde",
  "serde_json",
@@ -2013,7 +2013,7 @@ dependencies = [
  "hex",
  "pulsevm_proc_macros",
  "pulsevm_serialization",
- "ripemd",
+ "ripemd 0.1.3",
  "secp256k1",
  "serde",
  "sha2 0.10.9",
@@ -2261,6 +2261,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bd124222d17ad93a644ed9d011a40f4fb64aa54275c08cc216524a9ea82fb09f"
 dependencies = [
  "digest 0.10.7",
+]
+
+[[package]]
+name = "ripemd"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dd4211456b4172d7e44261920c25acf07367c4f04bb5f5d54fc21b090d9b159"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
