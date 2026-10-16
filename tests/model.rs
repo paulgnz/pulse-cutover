@@ -16,6 +16,9 @@
 //!   never appends another STRANDED transition (no strand loop);
 //! - I7 a journal that ends ABORTED with its rollback provably done (`rollback_done`) leaves the old chain's writes
 //!   open (or never froze them): a rollback that cannot reopen writes must end STRANDED (sealed, paged) instead.
+//! - I8 (rc.32, the admission lock) the producer's own transaction admission (its actor whitelist, locked to the
+//!   sentinel at the freeze) is never restored while the producer is paused, and a journal that ends ABORTED with
+//!   its rollback provably done leaves it restored.
 //!
 //! About half the scenarios use `schedule_at_h` (the mainnet freeze strategy: the snapshot is scheduled at ARM and
 //! the world's scheduler writes `snapshot-<id of H>.bin` once H is final), the rest the `pause_at_h` fallback.
@@ -107,6 +110,8 @@ struct World {
     agent_paused: Cell<bool>,
     /// The old chain's public write edge (hooks freeze-writes / reopen-writes). Starts open.
     writes_open: Cell<bool>,
+    /// rc.32 (I8): the producer's actor whitelist (ground truth). Empty = admission open; the sentinel = locked.
+    whitelist: RefCell<Vec<String>>,
     /// on_live flipped the edge to the new chain: the old edge no longer matters.
     edge_new: Cell<bool>,
     ignited: Cell<bool>,
@@ -211,6 +216,7 @@ impl World {
             owner: Cell::new(None),
             agent_paused: Cell::new(false),
             writes_open: Cell::new(true),
+            whitelist: RefCell::new(vec![]),
             edge_new: Cell::new(false),
             ignited: Cell::new(false),
             target_head: Cell::new(0),
@@ -591,6 +597,31 @@ impl ChainOps for World {
         self.ignited.set(true);
         self.note("ignite");
         Ok("model ignite".into())
+    }
+
+    fn actor_whitelist(&self) -> Result<Option<Vec<String>>, String> {
+        if self.paused_read_fails.get() > 0 {
+            return Err("producer API: connection reset (model)".into());
+        }
+        Ok(Some(self.whitelist.borrow().clone()))
+    }
+
+    fn set_actor_whitelist(&self, actors: &[String]) -> Result<(), String> {
+        self.op("set_actor_whitelist");
+        let sentinel = vec![pulse_cutover::config::ADMISSION_LOCK_SENTINEL.to_string()];
+        let reopening = *self.whitelist.borrow() == sentinel && actors != sentinel.as_slice();
+        if reopening && self.paused.get() && !self.edge_new.get() {
+            self.violate(
+                "I8",
+                format!(
+                    "the producer's admission was restored while it is paused (owner {:?})",
+                    self.owner.get()
+                ),
+            );
+        }
+        *self.whitelist.borrow_mut() = actors.to_vec();
+        self.note(format!("actor whitelist set to {actors:?}"));
+        Ok(())
     }
 
     fn run_hook(&self, cmd: &str) -> Result<String, String> {
@@ -1728,6 +1759,16 @@ fn check_after_step(world: &World, label: &str) {
             {
                 world.violate("I7", format!("journal ABORTED with rollback_done after {label}, but the old chain's writes are \
                     still frozen (a rollback that cannot reopen writes must strand and page)"));
+            }
+            // I8 (rc.32): a rollback that provably finished leaves the producer's own admission restored.
+            if state == Some(State::Aborted)
+                && complete
+                && !world.edge_new.get()
+                && *world.whitelist.borrow()
+                    == vec![pulse_cutover::config::ADMISSION_LOCK_SENTINEL.to_string()]
+            {
+                world.violate("I8", format!("journal ABORTED with rollback_done after {label}, but the producer still refuses \
+                    every transaction (admission lock in place)"));
             }
             // I7 (round 13): a rollback that completed in THIS step never leaves the producer paused, whoever paused it
             // and whatever hooks are configured (an unresolved or unknown pause must strand and page instead).

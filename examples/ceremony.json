@@ -70,7 +70,7 @@
 
   "artifacts": {
     "_about": "Everything determinism-critical is pinned by URL + sha256 and verified before anything is installed (fail closed). The edge and federator pins below are the files of this repository at the release tag; recompute with: git show <tag>:gateway/server.js | sha256sum",
-    "agent_release_tag": "v0.5.0-rc.31",
+    "agent_release_tag": "v0.5.0-rc.32",
     "_agent_release_tag": "The pulse-cutover release to install: static musl binary + sha256sums.txt from that GitHub release. Never 'latest' (refused). Alternatively pin artifacts.agent = {url, sha256} to a coordinator-hosted binary; that wins.",
     "plugin": {
       "url": "REPLACE-ME-https-url-of-the-coordinator-pinned-pulsevm-plugin-binary",
@@ -83,11 +83,11 @@
     },
     "_metalgo": "install.sh expects the extracted metalgo BINARY (installed as /opt/metalgo/metalgo), not Metal's release tarball; the coordinator hosts it. The official release TARBALL checksums for v1.14.2-tahoe are pinned in tools/metal-install.sh, which is the normal way to install metalgo on a producer box.",
     "edge": {
-      "url": "https://raw.githubusercontent.com/paulgnz/pulse-cutover/v0.5.0-rc.31/gateway/server.js",
+      "url": "https://raw.githubusercontent.com/paulgnz/pulse-cutover/v0.5.0-rc.32/gateway/server.js",
       "sha256": "6f0d676dc3649c16c173a7693dcbbb1addb9c31ec3599c5e33b0bc9581d73f7f"
     },
     "federator": {
-      "url": "https://raw.githubusercontent.com/paulgnz/pulse-cutover/v0.5.0-rc.31/federator/server.js",
+      "url": "https://raw.githubusercontent.com/paulgnz/pulse-cutover/v0.5.0-rc.32/federator/server.js",
       "sha256": "bc6ef537445273acae46c13229a1e07a8a0853d1957f3d64cde3bd622d6d91bd"
     },
     "_federator": "hyperion mode only (ignored in api mode). hyperion mode also needs artifacts.hyperion = {url, sha256} (the hyperion-rs binary) and a 'hyperion' section: legacy_url (the /v2 archive that keeps answering pre-cut history), es_heap (default 2g), es_image, ship_ws (default ws://127.0.0.1:9090).",

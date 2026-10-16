@@ -899,7 +899,11 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}, opts 
   // rc.31 (review fix 4): the relay's own view proves the quorum unreachable (the agents' rule: enough members
   // durably marked as exited without verifying, nobody past creation, marks complete). Whether or not the agents' early
   // abort is on, the SAFE path is a signed abort (final, authenticated): say so loudly, with the exact command.
+  // rc.32 (fleet run s1, F3): it is an ALARM (fleet.alarms, added after the verdict so it never reads as a SPLIT), it is
+  // not raised once every member already aborted (nothing left to veto), and a relayed signed abort for this event
+  // (`opts.signedAbort`) resolves it: the one-liner it asks for has been done.
   let quorumUnreachable = null;
+  let quorumAlarm = null;
   if (roster && quorum && !past.length && opts.marksComplete !== false) {
     const out = members.filter((m) => {
       const em = eventMax?.[m.producer];
@@ -913,7 +917,7 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}, opts 
     const atMost = roster.length - out.length;
     if (atMost < quorum) {
       quorumUnreachable = { out, at_most_reachable: atMost, quorum };
-      warnings.unshift(`ALARM QUORUM UNREACHABLE: ${out.join(', ')} ended event ${ev.event_id} without verifying; at most ${atMost} of ${roster.length} can agree (quorum ${quorum}). Sign an abort: node control/coord.mjs abort --url <mission-control-url> --net ${ev.network || '<network>'} --event-id ${ev.event_id} --key <coordinator-key.pem> --event-file ${ev.event_id}.event.json`);
+      quorumAlarm = (`ALARM QUORUM UNREACHABLE: ${out.join(', ')} ended event ${ev.event_id} without verifying; at most ${atMost} of ${roster.length} can agree (quorum ${quorum}). Sign an abort: node control/coord.mjs abort --url <mission-control-url> --net ${ev.network || '<network>'} --event-id ${ev.event_id} --key <coordinator-key.pem> --event-file ${ev.event_id}.event.json`);
     }
   }
   // rc.31 (review M1): a member that exited this event without verifying and then reported progress again.
@@ -959,6 +963,11 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}, opts 
   // rc.29: like STRANDED, a fleet-wide ABORTED needs every member present and fresh.
   else if (members.length && !members.some((m) => m.foreign_past) && members.every((m) => !m.missing && m.fresh && m.state === 'ABORTED')) verdict = 'ABORTED';
   else verdict = 'PENDING';
+  if (quorumUnreachable && (verdict === 'ABORTED' || opts.signedAbort === true)) {
+    quorumUnreachable = null;
+    quorumAlarm = null;
+  }
+  if (quorumAlarm) alarms.unshift(quorumAlarm);
   // rc.29: a STRANDED member that could not confirm its producer pause may still be producing old-chain blocks (a
   // warning listed first; the movement rule raises a SPLIT if the old chain does move after creation).
   for (const m of members.filter((x) => x.unsealed)) warnings.unshift(`UNSEALED: ${m.producer} is STRANDED but its source producer could NOT be confirmed paused: pause it by hand now`);

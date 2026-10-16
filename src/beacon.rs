@@ -933,6 +933,17 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
                 ),
             ));
         }
+        if cfg.ceremony.mode == crate::config::Mode::Producer {
+            checks.push(check(
+                "admission_lock",
+                cfg.ceremony.admission_lock,
+                if cfg.ceremony.admission_lock {
+                    "the producer refuses every transaction from the freeze on (rc.32)"
+                } else {
+                    "ceremony.admission_lock = false: queued transactions can land after H (rehearsal only)"
+                },
+            ));
+        }
     }
 
     // Rehearsal-only overrides: a failing SETUP check (never excludes the report from a rehearsal

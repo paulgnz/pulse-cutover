@@ -51,6 +51,9 @@ freeze_strategy = "schedule_at_h"
 # cut. Freezing AT H leaked in-flight transfers into H+1 on every producer
 # in the 5-BP rehearsal (the burn-off audit caught it and aborted). [LEAVE]
 freeze_lead_blocks = 24
+# rc.32: at the freeze the producer itself refuses every transaction (subjective actor whitelist = an
+# impossible account), so nothing queued before the freeze can land after H whatever its expiry. Default true.
+admission_lock = true
 
 # After pausing, the chain's head must hold still for this many consecutive
 # polls before the cut is trusted (catches stragglers/late blocks).           [LEAVE]
@@ -140,7 +143,7 @@ auto_arm = false                    # a signed ARM also needs `touch <journal di
 min_lead_blocks = 120               # refuse an event whose H is closer than this to head
 fleet_quorum = 0                    # the signed event's roster + quorum override this at `await`; a typed-in
                                     # roster (below) needs an explicit 1..=roster size
-fleet_timeout_secs = 300
+fleet_timeout_secs = 900   # >= 1.5 x the slowest roster member's drill conversion time (rc.32 default 900)
 report_max_age_secs = 60
 degraded_patience_secs = 900        # after ignition: a local symptom is waited out this long while a quorum
 degraded_retry_secs = 10            # reports the same target chain (hooks retried with backoff)

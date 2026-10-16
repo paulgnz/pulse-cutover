@@ -1,0 +1,38 @@
+# Example systemd unit for a producer's ceremony agent (rc.32). The installers do not write one: copy it to
+# /etc/systemd/system/, adjust the paths, `systemctl daemon-reload`, then start it when the coordinator says so.
+#
+# Resume: `await` starts the ceremony as a child (`run --config ceremony-<event>.toml`). If that child fails (exit 1,
+# e.g. a source RPC that failed for good), `await` exits with its code and Restart=on-failure starts `await` again,
+# which finds the ceremony it started (its tombstone, the derived config and a journal still ARMED..VERIFIED or
+# STRANDED) and runs it again from the journal. A resumed run in FROZEN re-checks the producer's admission lock and
+# re-pauses a producer a nodeos restart un-paused before anything else. Finished journals (LIVE, ABORTED) and HALTED
+# ones are never resumed: `await` stays idle until the next event.
+#
+# Not restarted (RestartPreventExitStatus): 2 usage, 3 refused or missed window, 4 incomplete rollback, 5/7 drill
+# results, 6 stopped by signal. A sealed STRANDED run exits 1 and is resumed, which only re-seals it (re-pause,
+# re-lock; it never appends another STRANDED record); the start limit stops that loop so on_halt is not paged forever.
+#
+# Stop: `systemctl stop` sends SIGTERM to `await` only (KillMode=mixed). `await` forwards it to the running ceremony
+# and waits; the ceremony stops at its next safe point (never inside a pause or resume episode) and exits 6. Hooks run
+# in their own process groups and are not signalled by systemd directly (control-group would SIGTERM them mid-step).
+# Everything left after `await` exits, and everything after TimeoutStopSec, is SIGKILLed: keep TimeoutStopSec above the
+# longest step between safe points (a hook is killed at hooks.timeout_secs, default 300 s).
+[Unit]
+Description=pulse-cutover ceremony agent (await)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pulse-cutover await --config /etc/pulse-cutover/ceremony.toml
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=2 3 4 5 6 7
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=900
+
+[Install]
+WantedBy=multi-user.target

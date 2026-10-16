@@ -54,6 +54,43 @@ pub fn drill_root(cfg: &Config) -> PathBuf {
         .join("drill")
 }
 
+/// rc.32 (F4): the margin the fleet gate needs over this producer's drill-measured conversion time.
+pub const FLEET_TIMEOUT_DRILL_FACTOR: f64 = 1.5;
+
+/// rc.32 (F4): a warning when `coordination.fleet_timeout_secs` is under [`FLEET_TIMEOUT_DRILL_FACTOR`] times the
+/// conversion (verify) time this producer's latest finished drill measured (`timings_ms.conversion_total`). The gate
+/// starts when this node verifies and must outlast every slower member's lag behind it; this node's own conversion
+/// time is the local lower bound for that lag (a member as slow as this node, starting the gate as a fast one
+/// finishes). None without a fleet gate, without a finished drill, or when the timeout is long enough.
+pub fn fleet_timeout_warning(cfg: &Config) -> Option<String> {
+    let co = cfg.coordination.as_ref()?;
+    if co.fleet_quorum == 0 && co.event_id.is_none() && co.roster.is_empty() {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(&std::fs::read(latest_path(cfg)).ok()?).ok()?;
+    fleet_timeout_problem(co.fleet_timeout_secs, &v)
+}
+
+/// The pure half of [`fleet_timeout_warning`]: `drill` is a drill's `latest.json`.
+pub fn fleet_timeout_problem(fleet_timeout_secs: u64, drill: &Value) -> Option<String> {
+    if drill["state"].as_str() != Some("DONE") {
+        return None;
+    }
+    let ms = drill["timings_ms"]["conversion_total"].as_u64()?;
+    let need = ((ms as f64 / 1000.0) * FLEET_TIMEOUT_DRILL_FACTOR).ceil() as u64;
+    if fleet_timeout_secs >= need {
+        return None;
+    }
+    Some(format!(
+        "coordination.fleet_timeout_secs = {fleet_timeout_secs} is under {FLEET_TIMEOUT_DRILL_FACTOR} x this producer's \
+         drill-measured conversion time ({} s, drill at H={}): a peer that verifies that much later than this node makes \
+         the gate abort the whole fleet (8-BP run s1b aborted at 300 s: its slowest box verified 5 m 26 s after the fastest). Set it to at least \
+         {need}, or to 1.5 x the SLOWEST roster member's drill conversion time on the mission control board",
+        ms / 1000,
+        drill["h"].as_u64().map(|h| h.to_string()).unwrap_or_else(|| "?".into())
+    ))
+}
+
 pub fn latest_path(cfg: &Config) -> PathBuf {
     drill_root(cfg).join("latest.json")
 }
@@ -286,6 +323,15 @@ impl<O: ChainOps> ChainOps for DrillGuard<'_, O> {
     }
     fn pause(&self) -> Result<(), String> {
         self.refuse("pause")
+    }
+    fn actor_whitelist(&self) -> Result<Option<Vec<String>>, String> {
+        self.inner.actor_whitelist()
+    }
+    fn set_actor_whitelist(&self, _actors: &[String]) -> Result<(), String> {
+        self.refuse("set_actor_whitelist (the admission lock)")
+    }
+    fn unapplied_transactions(&self) -> Result<Option<Value>, String> {
+        self.inner.unapplied_transactions()
     }
     fn resume(&self) -> Result<(), String> {
         self.refuse("resume")

@@ -22,7 +22,7 @@ Log in to the server that runs your **producer** nodeos. Download the installer 
 read it, then run it:
 
 ```bash
-V=v0.5.0-rc.31
+V=v0.5.0-rc.32
 curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 less beacon-install.sh          # you are about to run this as root: read it
 sudo bash beacon-install.sh
@@ -138,6 +138,12 @@ mission-control operator clears it, once the split is resolved, from a shell on 
 `curl -X POST -H "Authorization: Bearer $(cat /var/lib/pulse-control/admin.token)" 'http://127.0.0.1:8787/api/admin/clear-split?net=testnet'`
 (its own port; accepted on loopback only, never through the public proxy, and from rc.29 only with the admin token). If the condition still holds, it latches again. Details: `control/README.md`.
 
+**SPLIT after `complete`.** `coord.mjs complete` closes the event but does not clear a SPLIT: if the old chain keeps
+advancing after the event went LIVE (for example a rehearsal that resumes the old chain afterwards), the board stays
+SPLIT until the next event is published, or the operator clears it as above. In a real cutover that is the intended
+reading: the old chain must not advance after LIVE, so a moving old chain is a finding, not noise. In rehearsals that
+restart the old chain on purpose, expect it and say so in the run notes.
+
 How it is computed: for each roster member (its pinned instance, if the event names one) the freshest report for this
 event; LIVE members are grouped by target chain (Metal blockchain id, else chain id) and by the id of the first block
 after the cut, which every member of one chain shares and any fork does not. Each beacon reports its target's head,
@@ -205,6 +211,26 @@ name and key (MetalBlockchain/pulsevm#107), so all blocks show the same producer
 `unpaid_blocks`-based pay and tools that assume a rotation will report nonsense. Details: [EXCHANGES.md §5](EXCHANGES.md#5-block-producers-after-the-cut-no-12-block-rotation).
 
 ---
+
+## Running the agent under systemd (rc.32)
+
+The installers do not write a unit for the ceremony agent. If you run `pulse-cutover await` as a service, use
+`examples/pulse-cutover-await.service`. `await` starts the ceremony as a child (`run --config ceremony-<event>.toml`).
+If that child fails, `Restart=on-failure` starts `await` again, and `await` resumes the ceremony it started: it finds
+its tombstone, the derived config and a journal still ARMED through VERIFIED or STRANDED, journals `await_resume` and
+runs it again from the journal. The resumed run in FROZEN re-checks the admission lock and re-pauses a producer that a
+nodeos restart un-paused before anything else. LIVE, ABORTED and HALTED journals are never resumed (`await` waits for
+the next event; a HALTED ceremony needs a human). The designed exits (2 to 7) are not restarted.
+
+`systemctl stop` signals `await` only (`KillMode=mixed`); `await` forwards SIGTERM to the running ceremony and waits
+for its safe stop (exit 6, never inside a pause or resume). Keep `TimeoutStopSec` (900 in the example) above the longest
+step between safe points; a hook is killed at `hooks.timeout_secs` (default 300 s).
+
+In fleet run r3 a nodeos restart in the freeze window killed an rc.32 pre-release agent on a `get_info` "Connection
+reset by peer". Since rc.32 the agent retries transient source errors (connection refused or reset, timeouts, HTTP 5xx
+that is not a nodeos exception) for `source.rpc_retry_secs` (default 180 s, at most half of `snapshot_timeout_secs`; one
+shared deadline per poll tick) and takes the abort path, never a bare exit, when that runs out. From the pause until
+chain creation every tick re-pauses and re-locks a producer that a restart un-paused (fleet run r3b).
 
 ## If something goes wrong
 

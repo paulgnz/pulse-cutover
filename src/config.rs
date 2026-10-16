@@ -208,8 +208,11 @@ fn default_report_max_age() -> u64 {
 fn default_min_lead() -> u64 {
     120
 }
+/// rc.32 (F4): 900 s. The gate starts when THIS node verifies, so it must outlast the slowest roster member's verify
+/// lag behind it: in the 8-BP rehearsal (fleet-step3) the slowest box verified 5 m 31 s after the fastest, and run
+/// s1b aborted the whole fleet at the old 300 s default. Set it from the drills (`drill_fleet_timeout_warning`).
 fn default_fleet_timeout() -> u64 {
-    300
+    900
 }
 
 fn default_beacon_interval() -> u64 {
@@ -315,6 +318,19 @@ pub struct Ceremony {
     /// transfers in H+1 on every producer). 24 blocks = 12s at 0.5s blocks.
     #[serde(default = "default_freeze_lead_blocks")]
     pub freeze_lead_blocks: u64,
+    /// rc.32 (F1, producer mode): close this producer's own transaction admission at the freeze, not just the API
+    /// edge. The agent sets nodeos' SUBJECTIVE actor whitelist (`/v1/producer/set_whitelist_blacklist`) to
+    /// [`ADMISSION_LOCK_SENTINEL`], a 13-character name no account can ever have (native `newaccount` refuses names
+    /// over 12 characters). Every input or deferred transaction has at least one authorizing actor, so from then on
+    /// every transaction this nodeos executes for a block it builds (or speculatively, for its API and p2p) fails
+    /// with `actor_whitelist_exception`: it is dropped from the unapplied queue (whatever its expiry), never relayed,
+    /// and a deferred one stays scheduled (a subjective failure). `onblock` is implicit and not subject to the list,
+    /// and validation of other producers' blocks never applies it, so consensus is unchanged. The original list is
+    /// journaled first and restored when a rollback reopens writes. The fleet-wide guarantee needs every producer
+    /// that produces between the freeze and the pause to run it (docs/DESIGN.md R2); the burn-off audit stays the
+    /// backstop. Default true; false is a rehearsal-only escape (a production-profile problem in producer mode).
+    #[serde(default = "default_true")]
+    pub admission_lock: bool,
     /// Which import stack turns the cut snapshot into PulseVM state:
     /// - "fork": our arena-snapshot-import branch reads the Leap `.bin`
     ///   directly and the target chain boots via `snapshot_path`. This is
@@ -414,6 +430,13 @@ pub struct Source {
     /// final).
     #[serde(default = "default_snapshot_timeout")]
     pub snapshot_timeout_secs: u64,
+    /// rc.32 (fleet run r3): how long a source RPC (get_info, block reads, the producer-paused read, the admission
+    /// lock's whitelist read and set) is retried on a TRANSIENT error (connection refused or reset, timeout, HTTP 5xx)
+    /// from the freeze to the pause and through the snapshot wait, with backoff, before the ceremony takes the abort
+    /// path. A nodeos restart in that window used to kill the agent. Must be > 0 and < `snapshot_timeout_secs`.
+    /// Unset: 180 s, capped at half of `snapshot_timeout_secs`.
+    #[serde(default)]
+    pub rpc_retry_secs: Option<u64>,
     /// api mode: the operator's own stop script for the source nodeos
     /// (arbitrary command — `./stop.sh`, `docker stop nodeos`, `systemctl
     /// stop nodeos`, …). Runs ONLY after FLIPPED health-checks green: the
@@ -919,6 +942,11 @@ fn default_flip_timeout() -> u64 {
 fn default_cpu_scale() -> u64 {
     1
 }
+/// rc.32 (F1): the only actor the admission lock whitelists. 13 characters (the 13th from `.1-5a-j`, so it is a valid
+/// `name`), which `newaccount` refuses ("account names can only be 12 chars long"): no account, and so no
+/// authorization, can ever carry it.
+pub const ADMISSION_LOCK_SENTINEL: &str = "pulse.frozen1";
+
 fn default_freeze_lead_blocks() -> u64 {
     24
 }
@@ -931,6 +959,8 @@ fn default_quiescence_timeout() -> u64 {
 fn default_snapshot_timeout() -> u64 {
     600
 }
+/// rc.32: the default bound of [`Source::rpc_retry_secs`].
+pub const DEFAULT_RPC_RETRY_SECS: u64 = 180;
 fn default_hydration_timeout() -> u64 {
     900
 }
@@ -962,6 +992,14 @@ impl Config {
             .map_err(|e| format!("read config {}: {e}", path.display()))?;
         let config: Config =
             toml::from_str(&text).map_err(|e| format!("parse config {}: {e}", path.display()))?;
+        if let Some(r) = config.source.rpc_retry_secs {
+            if r == 0 || r >= config.source.snapshot_timeout_secs {
+                return Err(format!(
+                    "source.rpc_retry_secs = {r} must be > 0 and below source.snapshot_timeout_secs ({})",
+                    config.source.snapshot_timeout_secs
+                ));
+            }
+        }
         if config.ceremony.quiescence_timeout_secs == 0 {
             return Err("ceremony.quiescence_timeout_secs must be > 0 (0 would abort every ceremony at the pause)".into());
         }
@@ -1186,6 +1224,10 @@ impl Config {
                 self.ceremony.import_cpu_scale
             ));
         }
+        // rc.32 (F4): the fleet gate must outlast the verify lag the drill measured.
+        if let Some(w) = crate::drill::fleet_timeout_warning(self) {
+            out.push(w);
+        }
         // rc.25 F6: the resume guard needs this node's own report visible on the relay. Without a beacon (or with a
         // beacon under a name the roster does not list) peers never see it and every guarded abort strands.
         if let Some(co) = self
@@ -1252,6 +1294,15 @@ impl Config {
         out
     }
 
+    /// rc.32: the effective transient-retry bound for source RPCs in the freeze window, in milliseconds.
+    pub fn rpc_retry_ms(&self) -> u64 {
+        self.source
+            .rpc_retry_secs
+            .unwrap_or_else(|| DEFAULT_RPC_RETRY_SECS.min(self.source.snapshot_timeout_secs / 2))
+            .max(1)
+            * 1000
+    }
+
     /// Everything that makes this config unfit for a REAL cut, one line each, across both import
     /// backends (empty = production profile met). Checked at load (refused unless
     /// `ceremony.rehearsal = true`) and again right before the write freeze.
@@ -1297,6 +1348,9 @@ impl Config {
             }
             if self.source.quiesce_cmd.is_some() {
                 out.push("source.quiesce_cmd is set (a stand-in for \"every producer paused\"; rehearsals only)".into());
+            }
+            if !c.admission_lock {
+                out.push("ceremony.admission_lock = false (the producer must refuse transactions from the freeze on, whatever their expiry)".into());
             }
         }
         match c.import_backend {

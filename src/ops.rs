@@ -57,6 +57,22 @@ pub trait ChainOps {
     fn unschedule_snapshot_request(&self, _id: u64, _height: u64) -> Result<bool, String> {
         Ok(false)
     }
+    /// rc.32 (F1, the admission lock): the source producer's SUBJECTIVE actor whitelist, read with nodeos'
+    /// `/v1/producer/get_whitelist_blacklist`. Ok(None): this ChainOps does not model it (test doubles only; the real
+    /// implementation answers Some or Err).
+    fn actor_whitelist(&self) -> Result<Option<Vec<String>>, String> {
+        Ok(None)
+    }
+    /// rc.32 (F1): replace the source producer's subjective actor whitelist (`/v1/producer/set_whitelist_blacklist`,
+    /// runtime only: a nodeos restart reloads the config file's list). A source mutation: callers are gated.
+    fn set_actor_whitelist(&self, _actors: &[String]) -> Result<(), String> {
+        Ok(())
+    }
+    /// rc.32 (F1): a summary of this node's unapplied transaction queue (`/v1/producer/get_unapplied_transactions`):
+    /// evidence only. Ok(None) when not modelled.
+    fn unapplied_transactions(&self) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
     /// getInfo against the target pulsevm chain; Ok(None) while unreachable
     /// (still bootstrapping / chain not yet initialized).
     fn target_info(&self) -> Result<Option<ChainInfo>, String>;
@@ -1216,6 +1232,36 @@ impl ChainOps for HttpOps {
         })
     }
 
+    fn actor_whitelist(&self) -> Result<Option<Vec<String>>, String> {
+        let v = self.post(
+            &format!("{}/v1/producer/get_whitelist_blacklist", self.producer_api),
+            None,
+            None,
+        )?;
+        parse_actor_whitelist(&v).map(Some)
+    }
+
+    fn set_actor_whitelist(&self, actors: &[String]) -> Result<(), String> {
+        self.post(
+            &format!("{}/v1/producer/set_whitelist_blacklist", self.producer_api),
+            Some(json!({ "actor_whitelist": actors })),
+            None,
+        )
+        .map(|_| ())
+    }
+
+    fn unapplied_transactions(&self) -> Result<Option<Value>, String> {
+        let v = self.post(
+            &format!(
+                "{}/v1/producer/get_unapplied_transactions",
+                self.producer_api
+            ),
+            Some(json!({"limit": 1000, "time_limit_ms": 500})),
+            None,
+        )?;
+        Ok(Some(summarize_unapplied(&v)))
+    }
+
     fn schedule_snapshot(&self, height: u64) -> Result<(), String> {
         self.post(
             &format!("{}/v1/producer/schedule_snapshot", self.producer_api),
@@ -1538,6 +1584,57 @@ impl ChainOps for HttpOps {
 /// block asked for (its `block_num` and the height encoded in its `id`) and carry a `transactions`
 /// array. An error object, another schema or a truncated proxy answer is an error (unknown), never
 /// "0 transactions": the burn-off audit certifies empty blocks with this.
+/// rc.32 (F1): the `actor_whitelist` of a nodeos `get_whitelist_blacklist` answer (missing = empty = no whitelist).
+pub fn parse_actor_whitelist(v: &Value) -> Result<Vec<String>, String> {
+    if !v.is_object() {
+        return Err(format!("get_whitelist_blacklist: bad reply {v}"));
+    }
+    match v.get("actor_whitelist") {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|x| {
+                x.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("get_whitelist_blacklist: non-string actor {x}"))
+            })
+            .collect(),
+        Some(other) => Err(format!(
+            "get_whitelist_blacklist: actor_whitelist is not a list: {other}"
+        )),
+    }
+}
+
+/// rc.32 (F1): count, type mix and the latest expiration of a nodeos `get_unapplied_transactions` answer (evidence:
+/// what this producer still held when the admission lock went on).
+pub fn summarize_unapplied(v: &Value) -> Value {
+    let trxs = v.get("trxs").and_then(|t| t.as_array());
+    let mut by_type = serde_json::Map::new();
+    let mut max_exp: Option<String> = None;
+    for t in trxs.into_iter().flatten() {
+        let ty = t
+            .get("trx_type")
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown");
+        let n = by_type.get(ty).and_then(|x| x.as_u64()).unwrap_or(0);
+        by_type.insert(ty.to_string(), json!(n + 1));
+        if let Some(e) = t.get("expiration").and_then(|x| x.as_str()) {
+            // ISO-8601 without zone, fixed width: lexical order is time order.
+            if max_exp.as_deref().is_none_or(|m| e > m) {
+                max_exp = Some(e.to_string());
+            }
+        }
+    }
+    json!({
+        "size": v.get("size").cloned().unwrap_or(Value::Null),
+        "incoming_size": v.get("incoming_size").cloned().unwrap_or(Value::Null),
+        "listed": trxs.map(|t| t.len()).unwrap_or(0),
+        "by_type": by_type,
+        "max_expiration": max_exp,
+        "more": v.get("more").and_then(|m| m.as_str()).is_some_and(|m| !m.is_empty()),
+    })
+}
+
 pub fn block_tx_count(v: &Value, block_num: u64) -> Result<u64, String> {
     let short = || {
         let t = v.to_string();

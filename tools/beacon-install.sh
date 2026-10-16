@@ -2,7 +2,7 @@
 # beacon-install.sh — connect one server to Cutover Mission Control (readiness beacon).
 #
 #   Download it from a RELEASE TAG (the pulse-cutover version it installs is pinned below), read it, run it:
-#     V=v0.5.0-rc.31
+#     V=v0.5.0-rc.32
 #     curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 #     less beacon-install.sh && sudo bash beacon-install.sh
 #
@@ -30,7 +30,7 @@
 #          [--producer-api <url>] [--snapshots-dir <dir>] [--interval 10] [--force] [--dry-run] [--yes] [--uninstall]
 set -euo pipefail
 
-VERSION_DEFAULT="v0.5.0-rc.31"
+VERSION_DEFAULT="v0.5.0-rc.32"
 URL_DEFAULT="https://control-rehearsal.protonnz.com"
 ETC=/etc/pulse-cutover; VAR=/var/lib/pulse-cutover; STATE=/var/lib/pulse-beacon; BIN=/usr/local/bin/pulse-cutover
 # Version of an installed pulse-cutover binary: rc.16+ prints it; older builds only embed the string.

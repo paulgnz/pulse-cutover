@@ -121,6 +121,20 @@ pub struct Machine<'a, O: ChainOps> {
     /// r30 round 7: the operator released an adopted pause (`rollback --force-stranded --i-understand`).
     adopted_released: bool,
     writes_closed_by_us: bool,
+    /// rc.32 (F1): the actor whitelist to restore while this journal's admission lock may be in place (recovered).
+    admission_lock: Option<Vec<String>>,
+    /// rc.32: the lock this journal holds was confirmed on the producer (false: its set failed or never ran).
+    admission_lock_applied: bool,
+    /// rc.32: lock losses seen by this run (each journaled as `admission_lock_lost`, at most the first 20), for the
+    /// burn-off abort detail.
+    admission_lock_losses: Vec<serde_json::Value>,
+    /// rc.32: transient-retry streaks this run (`src_retry`), so a step can tell an RPC needed retries.
+    rpc_retry_streaks: u64,
+    /// rc.32 (fleet run r3b): `source_unpaused` records this run (journaled at most 20).
+    unpaused_seen: u64,
+    /// rc.32 (review): the deadline every source-RPC retry inside the current tick shares (None outside a tick), so one
+    /// tick never waits longer than `source.rpc_retry_secs` however many retried calls it makes.
+    tick_deadline: Option<u64>,
     /// r30 round 9 (review R9-2): the pause-episode log (journal order, plus this run's records). `paused_by_us` is
     /// derived from it: the LATEST open episode is this ceremony's own.
     pause_events: Vec<crate::journal::PauseEvent>,
@@ -542,8 +556,106 @@ impl UpstreamVerified {
     }
 }
 
+/// rc.32 (fleet run r3b, review): one tick of [`Machine::hold_source_sealed`] for code that holds only the ops and the
+/// journal (the upstream pipeline's poll callback). A source that produces although this ceremony's pause is open gets
+/// the same bookkeeping as [`Machine::src_pause`]: `own_pause_released_externally` closes the episode, a
+/// `side_effect: source_pause` intent opens the next one BEFORE the RPC, and a confirming read journals its
+/// `source_pause_ack`. The pause events are returned in `events` for the machine to replay into memory afterwards.
+/// The admission lock is re-applied. Journal records are capped by `records` (the pause bookkeeping never is).
+#[allow(clippy::too_many_arguments)]
+fn reassert_seal<O: ChainOps>(
+    ops: &O,
+    journal: &mut crate::journal::Journal,
+    stage: State,
+    lock_on: bool,
+    acks_tracked: bool,
+    episode: &mut usize,
+    events: &mut Vec<crate::journal::PauseEvent>,
+    records: &mut u32,
+) {
+    use crate::config::ADMISSION_LOCK_SENTINEL as S;
+    use crate::journal::PauseEvent;
+    if matches!(ops.producer_paused(), Ok(false)) {
+        let _ = journal.evidence(stage, json!({"own_pause_released_externally": true, "episode": *episode,
+            "note": "the producer is producing although this ceremony's pause was open (a nodeos restart clears the runtime pause)"}));
+        events.push(PauseEvent::Resume);
+        *episode += 1;
+        let _ = journal.evidence(
+            stage,
+            json!({"side_effect": "source_pause", "episode": *episode}),
+        );
+        events.push(PauseEvent::Pause { ours: true });
+        let r = ops.pause(); // ungated: this ceremony's own re-pause (the pipeline callback excludes shadow journals)
+        let confirmed = r.is_ok() && matches!(ops.producer_paused(), Ok(true));
+        if confirmed && acks_tracked {
+            let _ = journal.evidence(stage, json!({"source_pause_ack": *episode}));
+            events.push(PauseEvent::Ack);
+        }
+        let head = ops.source_info().ok().map(|i| i.head_block_num);
+        if *records < 20 {
+            *records += 1;
+            let _ = journal.evidence(stage, json!({"source_unpaused": {"at": "verification", "head": head,
+                "repaused": confirmed, "result": format!("{r:?}"),
+                "note": "the source produced although this ceremony paused it (a nodeos restart clears the runtime pause): paused again"}}));
+        }
+    }
+    if lock_on {
+        let sentinel = vec![S.to_string()];
+        if let Ok(Some(l)) = ops.actor_whitelist() {
+            if l != sentinel {
+                let r = ops.set_actor_whitelist(&sentinel); // ungated: re-asserts this ceremony's own lock (no shadow journal)
+                if *records < 20 {
+                    *records += 1;
+                    let head = ops.source_info().ok().map(|i| i.head_block_num);
+                    let mut rec = json!({"admission_lock_lost": {"at": "verification", "head": head, "found": l,
+                        "reapplied": r.is_ok()}});
+                    if r.is_ok() {
+                        rec["admission_lock_reapplied"] = json!(true);
+                    }
+                    let _ = journal.evidence(stage, rec);
+                }
+            }
+        }
+    }
+}
+
 /// r30 round 9 (review R9-F1/F2): how long a producer-paused read that ERRORS is retried before it counts as unknown.
 const PAUSE_READ_RETRY_MS: u64 = 30_000;
+
+/// rc.32 (fleet run r3): the prefix of the error a source RPC returns once its transient-retry bound
+/// (`source.rpc_retry_secs`) ran out. The freeze-window waits turn it into an abort instead of exiting.
+pub const SOURCE_UNREACHABLE: &str = "source unreachable";
+
+/// rc.32 (fleet run r3): an error a nodeos restart or a brief outage produces (connection refused or reset, a timeout,
+/// a broken connection, HTTP 5xx), as opposed to an answer that is wrong.
+pub fn transient_rpc_error(e: &str) -> bool {
+    // nodeos answers HTTP 500 for deterministic chain exceptions too (a JSON body with `code` and `error.name`): that
+    // is a real answer, not an outage, and is never retried.
+    if let Some(i) = e.find("HTTP 500: ") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(e[i + 10..].trim()) {
+            if v.get("code").is_some() && v["error"].get("name").is_some() {
+                return false;
+            }
+        }
+    }
+    let l = e.to_ascii_lowercase();
+    [
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "timed out",
+        "timeout",
+        "broken pipe",
+        "unexpected eof",
+        "network error",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+}
 
 /// r30 round 7: why an abort of a ceremony whose producer someone else paused seals instead of rolling back.
 /// r30 round 13: the error a resume returns when its RPC answered ok but a confirming read still shows the producer
@@ -686,6 +798,12 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             strand_intent,
             adopted_released,
             writes_closed_by_us,
+            admission_lock: recovered.admission_lock.clone(),
+            admission_lock_applied: recovered.admission_lock_applied,
+            admission_lock_losses: vec![],
+            rpc_retry_streaks: 0,
+            unpaused_seen: 0,
+            tick_deadline: None,
             pause_events: recovered.pause_events.clone(),
             legacy_paused,
             legacy_froze,
@@ -964,10 +1082,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(false);
         }
         // r30 round 9 (review R9-F2): a transient read error is retried (bounded) instead of ending the run mid-FROZEN.
-        if !self.read_paused_retrying(
-            PAUSE_READ_RETRY_MS,
-            "checking who paused the source producer",
-        )? {
+        let window = self.pause_read_window_ms();
+        if !self.read_paused_retrying(window, "checking who paused the source producer")? {
             return Ok(false);
         }
         if !self.pause_adopted {
@@ -1092,10 +1208,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             )?;
             self.push_pause_event(crate::journal::PauseEvent::Pause { ours: true });
         }
-        self.ops.pause()?; // ungated: this IS the gate
-                           // r30 round 10 (model checker, class B): the intent alone does not make the pause ours: a crash between the
-                           // intent and the RPC, then someone else pausing, would otherwise let a rollback resume THEIR pause. Ours only
-                           // once the RPC succeeded AND a (retried) read confirms the producer paused: then the ack is journaled.
+        // rc.32 (fleet run r3 follow-up): a nodeos restart at pause time is retried (the RPC is idempotent).
+        self.src_retry("pause", |o| o.pause())?; // ungated: this IS the gate
+                                                 // r30 round 10 (model checker, class B): the intent alone does not make the pause ours: a crash between the
+                                                 // intent and the RPC, then someone else pausing, would otherwise let a rollback resume THEIR pause. Ours only
+                                                 // once the RPC succeeded AND a (retried) read confirms the producer paused: then the ack is journaled.
         if self.pause_unknown && self.acks_tracked {
             // An unreadable or "producing" answer leaves the episode unacknowledged (ownership unknown, never
             // resumed): the callers' own confirmation read decides what happens next.
@@ -1155,6 +1272,348 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.writes_closed_by_us = true;
         }
         self.hook(hook)
+    }
+
+    /// rc.32 (F1): close this producer's own transaction admission (docs/DESIGN.md R2). The original actor whitelist is
+    /// journaled (`side_effect: admission_lock`) BEFORE the RPC, so a crash after it leaves a lock a rollback restores.
+    /// A re-run keeps the original recorded by the first attempt (the node now reports the sentinel). The lock is
+    /// confirmed by a fresh read; a node that keeps another list is an error (the caller aborts).
+    fn lock_admission(&mut self) -> Result<serde_json::Value, String> {
+        use crate::config::ADMISSION_LOCK_SENTINEL as S;
+        self.shadow_mutation_gate("locking transaction admission on the source producer")?;
+        self.shadow_producer_gate("locking transaction admission on the source producer")?;
+        let sentinel = vec![S.to_string()];
+        if self.admission_lock.is_none() {
+            let original = self
+                .ops
+                .actor_whitelist()
+                .map_err(|e| format!("reading the producer's actor whitelist: {e}"))?
+                .unwrap_or_default();
+            if original == sentinel {
+                return Err(format!(
+                    "the producer's actor whitelist is already [{S}] but this journal never set it: another ceremony's \
+                     admission lock may still be in place; restore the original list by hand (set_whitelist_blacklist)"
+                ));
+            }
+            self.journal.evidence(
+                self.state,
+                json!({"side_effect": "admission_lock", "sentinel": S, "original_actor_whitelist": original}),
+            )?;
+            self.admission_lock = Some(original);
+        }
+        let set = self.ops.set_actor_whitelist(&sentinel); // ungated: the shadow gates above ran for this call
+        set.map_err(|e| format!("set_whitelist_blacklist: {e}"))?;
+        self.admission_lock_applied = true;
+        let confirmed = match self.ops.actor_whitelist() {
+            Ok(Some(l)) if l == sentinel => json!(true),
+            Ok(Some(l)) => {
+                return Err(format!(
+                    "set_whitelist_blacklist answered but the producer's actor whitelist is {l:?}, not [{S}]"
+                ))
+            }
+            Ok(None) => json!("not readable by this ChainOps"),
+            Err(e) => return Err(format!("confirming the admission lock: {e}")),
+        };
+        // Evidence only (never fails the lock): what this producer still held. Each of these is dropped at its next
+        // execution attempt instead of landing after H.
+        let queue = match self.ops.unapplied_transactions() {
+            Ok(Some(q)) => q,
+            Ok(None) => serde_json::Value::Null,
+            Err(e) => json!({"error": e}),
+        };
+        let rec =
+            json!({"admission_lock_ack": confirmed, "sentinel": S, "unapplied_at_lock": queue});
+        self.journal.evidence(self.state, rec.clone())?;
+        Ok(rec)
+    }
+
+    /// rc.32 (fleet run r3): run a source RPC, retrying TRANSIENT errors with backoff (poll_ms doubling to 5 s) for up to
+    /// `source.rpc_retry_secs`. The streak is journaled (`source_rpc_retry` when it starts, `source_rpc_recovered` or
+    /// `source_rpc_unreachable` when it ends). Exhaustion returns an error starting with [`SOURCE_UNREACHABLE`]; a
+    /// non-transient error is returned at once, as before.
+    fn src_retry<T>(
+        &mut self,
+        what: &str,
+        f: impl Fn(&O) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let ops = self.ops;
+        let first = match f(ops) {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        if !transient_rpc_error(&first) {
+            return Err(first);
+        }
+        let start = ops.now_ms();
+        let bound = match self.tick_deadline {
+            Some(d) => d.saturating_sub(start).min(self.cfg.rpc_retry_ms()),
+            None => self.cfg.rpc_retry_ms(),
+        };
+        self.rpc_retry_streaks += 1;
+        self.journal.evidence(
+            self.state,
+            json!({"source_rpc_retry": {"what": what, "error": first, "bound_secs": bound / 1000}}),
+        )?;
+        let mut backoff = self.cfg.poll_ms.max(100);
+        let mut attempts = 1u64;
+        let mut last = first;
+        loop {
+            let waited = ops.now_ms().saturating_sub(start);
+            if waited >= bound {
+                self.journal.evidence(
+                    self.state,
+                    json!({"source_rpc_unreachable": {"what": what,
+                    "attempts": attempts, "waited_ms": waited, "error": last}}),
+                )?;
+                return Err(format!(
+                    "{SOURCE_UNREACHABLE}: {what}: {last} (retried {attempts} times over {} s)",
+                    waited / 1000
+                ));
+            }
+            self.stop_point()?;
+            ops.sleep_ms(backoff);
+            backoff = (backoff * 2).min(5_000);
+            attempts += 1;
+            match f(ops) {
+                Ok(v) => {
+                    self.journal.evidence(
+                        self.state,
+                        json!({"source_rpc_recovered": {"what": what,
+                        "attempts": attempts, "waited_ms": ops.now_ms().saturating_sub(start)}}),
+                    )?;
+                    return Ok(v);
+                }
+                Err(e) if transient_rpc_error(&e) => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// rc.32 (fleet run r3): a source RPC in the freeze window, retried; exhaustion takes the abort path (Ok(None) after
+    /// aborting) instead of ending the run.
+    fn src_or_abort<T>(
+        &mut self,
+        what: &str,
+        f: impl Fn(&O) -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        match self.src_retry(what, f) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.starts_with(SOURCE_UNREACHABLE) => {
+                self.abort(
+                    "the source nodeos stayed unreachable longer than source.rpc_retry_secs in the freeze window",
+                    json!({"error": e, "rpc_retry_secs": self.cfg.rpc_retry_ms() / 1000}),
+                )?;
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// rc.32 (review): run `f` as one tick: every `src_retry` inside it shares one deadline (`source.rpc_retry_secs` from
+    /// the tick's start). Nested ticks use the outer deadline. The deadline is always cleared, whatever `f` returns.
+    fn with_tick<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let owns = self.tick_deadline.is_none();
+        if owns {
+            self.tick_deadline = Some(self.ops.now_ms().saturating_add(self.cfg.rpc_retry_ms()));
+        }
+        let r = f(self);
+        if owns {
+            self.tick_deadline = None;
+        }
+        r
+    }
+
+    /// rc.32 (fleet run r3 follow-up): the retry window of the producer-paused reads around the pause: the existing 30 s,
+    /// or `source.rpc_retry_secs` when that is longer.
+    fn pause_read_window_ms(&self) -> u64 {
+        PAUSE_READ_RETRY_MS.max(self.cfg.rpc_retry_ms())
+    }
+
+    /// rc.32 (fleet run r3 follow-up): a producer-paused read or the pause itself failed for good in FROZEN. A transient
+    /// cause (nodeos restarting, unreachable) takes the abort path, which strands when the source cannot be read and
+    /// re-applies the admission lock on an unsealed strand, instead of ending the run with an unpaused producer.
+    /// Ok(None) after aborting; any other error is returned as before.
+    fn frozen_rpc<T>(&mut self, r: Result<T, String>, what: &str) -> Result<Option<T>, String> {
+        match r {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.starts_with(SOURCE_UNREACHABLE) || transient_rpc_error(&e) => {
+                self.abort(
+                    "the source nodeos stayed unreachable longer than source.rpc_retry_secs in the freeze window",
+                    json!({"error": e, "during": what, "rpc_retry_secs": self.cfg.rpc_retry_ms() / 1000}),
+                )?;
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// rc.32 (fleet run r3b): from this ceremony's pause until chain creation the source must stay paused and locked. A
+    /// nodeos restart clears both (the runtime pause and the runtime whitelist). On every tick of the waits after the
+    /// pause (quiescence, verification, the fleet gate) this reads the producer state: a source that produces although
+    /// this ceremony paused it is paused again at once (`source_unpaused`, with the height; a new own pause episode),
+    /// and the lock is re-applied. It never aborts by itself: the existing refusals still decide (the head moved past
+    /// the pause head, burn-off), this only limits how long the producer runs unpaused and unlocked.
+    fn hold_source_sealed(&mut self, at: &str) -> Result<(), String> {
+        self.with_tick(|m| m.hold_source_sealed_tick(at))
+    }
+
+    fn hold_source_sealed_tick(&mut self, at: &str) -> Result<(), String> {
+        if self.cfg.ceremony.mode != Mode::Producer || self.joining || !self.ever_paused_by_us {
+            return Ok(());
+        }
+        if !self.pause_unknown && !self.pause_adopted {
+            if let Ok(false) = self.read_paused() {
+                {
+                    // Pause first, then read the height (the read is not worth a block).
+                    let r = match self.src_pause() {
+                        Ok(()) => self.read_paused(),
+                        Err(e) => Err(e),
+                    };
+                    let head = self.ops.source_info().ok().map(|i| i.head_block_num);
+                    self.unpaused_seen += 1;
+                    if self.unpaused_seen <= 20 {
+                        self.journal.evidence(self.state, json!({"source_unpaused": {"at": at, "head": head,
+                            "head_at_pause": self.head_at_pause, "repaused": matches!(r, Ok(true)),
+                            "result": format!("{r:?}"),
+                            "note": "the source produced although this ceremony paused it (a nodeos restart clears the runtime pause): paused again"}}))?;
+                    }
+                }
+            }
+        }
+        self.check_admission_lock(at, None, true)?;
+        Ok(())
+    }
+
+    /// rc.32 (review): a nodeos restart reloads the config file's whitelist and silently drops the lock. Re-read it
+    /// at the points that matter (`at`): right before the pause (`reapply`: put it back, the producer still builds
+    /// blocks until the pause takes effect) and right before the burn-off audit (evidence for the abort detail).
+    /// Returns the `admission_lock_lost` record when the lock was not in place (journaled). Never fails the ceremony:
+    /// the burn-off audit decides.
+    fn check_admission_lock(
+        &mut self,
+        at: &str,
+        head: Option<u64>,
+        reapply: bool,
+    ) -> Result<Option<serde_json::Value>, String> {
+        self.with_tick(|m| m.check_admission_lock_tick(at, head, reapply))
+    }
+
+    fn check_admission_lock_tick(
+        &mut self,
+        at: &str,
+        head: Option<u64>,
+        reapply: bool,
+    ) -> Result<Option<serde_json::Value>, String> {
+        use crate::config::ADMISSION_LOCK_SENTINEL as S;
+        if !self.cfg.ceremony.admission_lock || self.admission_lock.is_none() {
+            return Ok(None);
+        }
+        let sentinel = vec![S.to_string()];
+        let read = self.src_retry("get_whitelist_blacklist", |o| o.actor_whitelist());
+        let found = match read {
+            Ok(Some(l)) if l == sentinel => return Ok(None),
+            Ok(None) => return Ok(None), // not modelled by this ChainOps
+            Ok(Some(l)) => json!(l),
+            Err(e) => json!({"unreadable": e}),
+        };
+        // The height the loss was seen at (a fresh read only on this rare path when the caller has none).
+        let head = head.or_else(|| self.ops.source_info().ok().map(|i| i.head_block_num));
+        let mut rec = json!({"at": at, "head": head, "found": found,
+            "note": "the producer no longer reports the admission lock (a nodeos restart reloads the configured whitelist)"});
+        if reapply {
+            let set_lock = |o: &O| o.set_actor_whitelist(&sentinel); // ungated: the shadow gates below run before it
+            let res = self
+                .shadow_mutation_gate("re-applying the admission lock")
+                .and_then(|_| self.shadow_producer_gate("re-applying the admission lock"))
+                .and_then(|_| self.src_retry("set_whitelist_blacklist", set_lock)) // ungated: the shadow gates above ran for this call
+                .and_then(|_| {
+                    match self.src_retry("get_whitelist_blacklist", |o| o.actor_whitelist()) {
+                        Ok(Some(l)) if l == sentinel => Ok(()),
+                        Ok(None) => Ok(()),
+                        Ok(Some(l)) => Err(format!("read back {l:?} after re-applying")),
+                        Err(e) => Err(e),
+                    }
+                });
+            match res {
+                Ok(()) => {
+                    rec["reapplied"] = json!(true);
+                    self.admission_lock_applied = true;
+                }
+                Err(e) => rec["reapply_error"] = json!(e),
+            }
+        }
+        let mut journaled = json!({"admission_lock_lost": rec.clone()});
+        if rec["reapplied"] == json!(true) {
+            journaled["admission_lock_reapplied"] = json!(true);
+        }
+        // A node whose re-apply keeps failing would otherwise write a record on every poll tick.
+        if self.admission_lock_losses.len() < 20 {
+            self.journal.evidence(self.state, journaled)?;
+            self.admission_lock_losses.push(rec.clone());
+        } else if rec["reapplied"] == json!(true) {
+            self.admission_lock_applied = true;
+        }
+        Ok(Some(rec))
+    }
+
+    /// rc.32 (F1): restore the actor whitelist this journal's admission lock replaced. Only from the sentinel this
+    /// journal set: a node that reports the original already (the lock never applied, or a restore whose record was
+    /// lost) needs nothing; a node that reports any other list was changed by someone else since, and is left alone
+    /// (journaled). Callers run it only where writes reopen (a producing source, read fresh).
+    fn release_admission(&mut self) -> Result<(), String> {
+        use crate::config::ADMISSION_LOCK_SENTINEL as S;
+        let Some(original) = self.admission_lock.clone() else {
+            return Ok(());
+        };
+        if self.step_done("admission_unlock") {
+            self.admission_lock = None;
+            return Ok(());
+        }
+        self.shadow_mutation_gate("restoring transaction admission on the source producer")?;
+        self.shadow_producer_gate("restoring transaction admission on the source producer")?;
+        let sentinel = vec![S.to_string()];
+        let current = self
+            .ops
+            .actor_whitelist()
+            .map_err(|e| format!("reading the producer's actor whitelist: {e}"))?;
+        let note = match current {
+            Some(l) if l == sentinel => {
+                let set = self.ops.set_actor_whitelist(&original); // ungated: the shadow gates above ran for this call
+                set.map_err(|e| format!("set_whitelist_blacklist (restore): {e}"))?;
+                match self.ops.actor_whitelist() {
+                    Ok(Some(l)) if l == original => "restored",
+                    Ok(Some(l)) => {
+                        return Err(format!(
+                            "the restore answered but the producer's actor whitelist is {l:?}, not {original:?}"
+                        ))
+                    }
+                    Ok(None) => "restored (not readable by this ChainOps)",
+                    Err(e) => return Err(format!("confirming the restore: {e}")),
+                }
+            }
+            Some(l) if l == original && !self.admission_lock_applied => {
+                "the lock was never applied (setting it failed or never ran): nothing to restore"
+            }
+            Some(l) if l == original => "already the original list",
+            Some(l) => {
+                self.journal.evidence(self.state, json!({"admission_lock_changed_externally": l,
+                    "note": "the producer's actor whitelist is neither the lock nor the original: someone else changed it; left as it is"}))?;
+                "changed by someone else: left as it is"
+            }
+            None => "not readable by this ChainOps",
+        };
+        self.journal.evidence(
+            self.state,
+            json!({"rollback_step": "admission_unlock", "ok": true, "result": note, "restored_actor_whitelist": original}),
+        )?;
+        if !self.step_done("admission_unlock") {
+            self.rollback_steps_done.push("admission_unlock".into());
+        }
+        self.admission_lock = None;
+        Ok(())
     }
 
     /// Resumes this ceremony's own pause (the callers resume only when the latest open episode is ours).
@@ -1916,6 +2375,19 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 None => {}
             }
         }
+        // rc.32 (review): the admission lock needs get_whitelist_blacklist / set_whitelist_blacklist on the producer
+        // API. Read it here, so a proxy that exposes only part of /v1/producer fails ARM, not the freeze.
+        if self.cfg.ceremony.admission_lock
+            && self.cfg.ceremony.mode == Mode::Producer
+            && !(resumed && self.reached_ignited)
+        {
+            if let Err(e) = self.ops.actor_whitelist() {
+                problems.push(format!(
+                    "admission lock: the producer API does not answer get_whitelist_blacklist ({e}); the agent needs \
+                     /v1/producer/get_whitelist_blacklist and set_whitelist_blacklist on source.producer_api_url"
+                ));
+            }
+        }
         if let Some(dir) = self.cfg.snapshot.staged_path.parent() {
             if !dir.exists() {
                 problems.push(format!("staged_path dir {} missing", dir.display()));
@@ -1992,6 +2464,15 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if problems.is_empty() {
             self.journal
                 .evidence(State::Armed, json!({"preflight": "ok"}))?;
+            // rc.32 (F4): journaled, never a gate (a drill is not required, and the fleet's slowest member is unknown
+            // here).
+            if let Some(w) = crate::drill::fleet_timeout_warning(self.cfg) {
+                eprintln!("WARNING: {w}");
+                self.journal.evidence(
+                    State::Armed,
+                    json!({"WARNING": w, "check": "fleet_timeout_vs_drill"}),
+                )?;
+            }
             // Advisory stubbed-intrinsic preflight (never a gate): when the
             // operator staged a rehearsal snapshot, put the at-risk contract
             // table in the journal BEFORE anything freezes.
@@ -2249,6 +2730,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     json!({"event_id": co.event_id}),
                 )?;
                 return Ok(false);
+            }
+            // rc.32 (fleet run r3b): every gate tick, the source stays paused and locked (after the abort check, so a
+            // signed abort is honoured at once).
+            if !self.create_chain_started && !self.reached_ignited {
+                self.hold_source_sealed("fleet gate")?;
             }
             if co.fleet_quorum == 0 && co.roster.is_empty() {
                 return Ok(true);
@@ -3496,6 +3982,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     json!({"source_pause_enforced": true, "result": "already paused"}),
                 )?;
             }
+            self.relock_stranded()?;
             return Ok(true);
         }
         let r = match self.src_pause() {
@@ -3507,7 +3994,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.state,
             json!({"source_pause_enforced": ok, "result": format!("{r:?}")}),
         )?;
+        self.relock_stranded()?;
         Ok(ok)
+    }
+
+    /// rc.32 (review): a stranded (or stranding) source keeps its admission lock on: a nodeos restart drops it and a
+    /// restarted node may produce until it is paused again. Best effort: a failure is journaled, never fatal.
+    fn relock_stranded(&mut self) -> Result<(), String> {
+        if let Err(e) = self.check_admission_lock("stranded", None, true) {
+            self.journal
+                .evidence(self.state, json!({"admission_lock_check_failed": e}))?;
+        }
+        Ok(())
     }
 
     /// rc.29: before chain creation and ignition the old chain must still be sealed at the cut: the producer
@@ -3804,14 +4302,21 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.cfg.hooks.on_abort.is_some() && !source_back && !self.step_done("on_abort") {
             self.journal.evidence(State::Aborted, json!({"on_abort_deferred": "the source producer was not resumed: writes stay frozen until `pulse-cutover rollback`"}))?;
         }
-        if let Some(hook) = self
+        // rc.32 (F1): the producer's own admission (the lock this journal set at the freeze) reopens together with the
+        // writes, under the same rule: only into a producing source, read fresh right before (one read serves both).
+        let reopen_hook = self
             .cfg
             .hooks
             .on_abort
             .clone()
-            .filter(|_| source_back && self.writes_closed_by_us)
-        {
-            if !self.step_done("on_abort") {
+            .filter(|_| source_back && self.writes_closed_by_us && !self.step_done("on_abort"));
+        let lock_never_applied = self.admission_lock.is_some() && !self.admission_lock_applied;
+        let unlock_pending = source_back
+            && self.cfg.ceremony.mode == Mode::Producer
+            && self.admission_lock.is_some()
+            && !self.step_done("admission_unlock");
+        if reopen_hook.is_some() || unlock_pending {
+            {
                 // r30 round 13 (review R12-F2): read again immediately before reopening, after the ABORTED record, to
                 // narrow the window in which someone else pauses the producer between the R2 read and the reopen. A
                 // pause or an unreadable producer here withholds the reopen (the rollback stays incomplete; a later
@@ -3837,24 +4342,42 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         return Ok((failed, notes));
                     }
                 }
-                let result = self.hook(&hook);
-                self.journal.evidence(
-                    State::Aborted,
-                    json!({"on_abort_hook": format!("{result:?}")}),
-                )?;
-                match result {
-                    Ok(_) => self.mark_step("on_abort")?,
-                    Err(e) => failed.push(format!("on_abort hook: {e}")),
+                if unlock_pending {
+                    if let Err(e) = self.release_admission() {
+                        failed.push(format!(
+                            "restore the producer's transaction admission (actor whitelist): {e}"
+                        ));
+                    }
+                }
+                if let Some(hook) = reopen_hook {
+                    let result = self.hook(&hook);
+                    self.journal.evidence(
+                        State::Aborted,
+                        json!({"on_abort_hook": format!("{result:?}")}),
+                    )?;
+                    match result {
+                        Ok(_) => self.mark_step("on_abort")?,
+                        Err(e) => failed.push(format!("on_abort hook: {e}")),
+                    }
                 }
             }
         }
         self.unstage(unstage_any, &mut failed, &mut notes)?;
         // Nothing this ceremony did needs undoing (no pause, no freeze): the rollback is complete as it stands,
         // whatever auto_rollback says, so a later `rollback` is a no-op instead of resuming someone else's producer.
-        let nothing_to_undo = !self.ever_paused_by_us && !self.writes_closed_by_us;
+        let nothing_to_undo =
+            !self.ever_paused_by_us && !self.writes_closed_by_us && self.admission_lock.is_none();
         if nothing_to_undo {
-            self.journal.evidence(State::Aborted, json!({"nothing_to_undo": true,
-                "note": "this ceremony neither paused the producer nor froze writes: nothing was resumed or reopened"}))?;
+            let note = if lock_never_applied {
+                "this ceremony neither paused the producer nor froze writes, and its admission lock was never applied \
+                 (setting it failed): nothing was resumed, reopened or restored"
+            } else {
+                "this ceremony neither paused the producer nor froze writes: nothing was resumed or reopened"
+            };
+            self.journal.evidence(
+                State::Aborted,
+                json!({"nothing_to_undo": true, "note": note}),
+            )?;
         }
         if failed.is_empty() {
             if perform || nothing_to_undo {
@@ -3956,6 +4479,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // The write freeze — the moment the write gap starts (R2: an
         // explicit reject at the API edge, never just a producer pause).
         self.check_mainnet_h()?;
+        // rc.32 (F1): the producer itself refuses transactions from here on (its unapplied queue included, whatever
+        // the expiry), before the edge closes: a transaction admitted before the freeze can no longer land after H
+        // from this node's blocks.
+        let admission = if self.cfg.ceremony.admission_lock {
+            match self.lock_admission() {
+                Ok(r) => r["admission_lock_ack"].clone(),
+                Err(e) => {
+                    self.abort(
+                        "admission lock failed: this producer could not be made to refuse transactions before the cut",
+                        json!({"error": e, "fix": "check the producer API (producer_api_plugin with set_whitelist_blacklist) is \
+                               reachable on source.producer_api_url, then re-run"}),
+                    )?;
+                    return Ok(());
+                }
+            }
+        } else {
+            json!("off (ceremony.admission_lock = false: rehearsal only)")
+        };
         let freeze_hook = if let Some(hook) = self.cfg.hooks.on_freeze.clone() {
             let result = self.freeze_writes(&hook);
             if let Err(e) = &result {
@@ -3978,6 +4519,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "lib_at_freeze": info.last_irreversible_block_num,
                 "chain_id": info.chain_id,
                 "on_freeze_hook": freeze_hook,
+                "admission_lock": admission,
                 "note": "writes frozen; production continues so the cut can finalize (R1)",
             }),
         )?;
@@ -4184,7 +4726,18 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let mut last_heartbeat = 0u64;
         let mut first_look = true;
         loop {
-            let info = self.ops.source_info()?;
+            // rc.32 (review): every tick from the lock to the pause, so a nodeos restart (which drops the runtime lock)
+            // is closed again within one tick, not minutes later at the pause. One deadline for the whole tick.
+            let tick = self.with_tick(|m| {
+                let Some(info) = m.src_or_abort("get_info", |o| o.source_info())? else {
+                    return Ok(None);
+                };
+                m.check_admission_lock("freeze window", Some(info.head_block_num), true)?;
+                Ok(Some(info))
+            })?;
+            let Some(info) = tick else {
+                return Ok(None);
+            };
             if info.last_irreversible_block_num >= h {
                 break;
             }
@@ -4218,7 +4771,9 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.stop_point()?; // r30 round 13: a safe stop point (waiting for H to finalize; no pause in flight)
             self.ops.sleep_ms(self.cfg.poll_ms);
         }
-        let (id_h, _ts) = self.ops.source_block_id(h)?;
+        let Some((id_h, _ts)) = self.src_or_abort("get_block(H)", |o| o.source_block_id(h))? else {
+            return Ok(None);
+        };
         let dir = self
             .cfg
             .snapshot
@@ -4228,6 +4783,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let expected = dir.join(format!("snapshot-{id_h}.bin"));
         let waited_from = self.ops.now_ms();
         while !expected.exists() {
+            self.check_admission_lock("freeze window", None, true)?;
             if self.ops.now_ms() > deadline {
                 self.abort(
                     "scheduled snapshot file did not appear before snapshot_timeout",
@@ -4259,15 +4815,31 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if self.cfg.ceremony.mode == Mode::Api {
             return self.step_frozen_api();
         }
+        // rc.32 (fleet run r3): a resumed agent (a crash or a restart by its unit) checks the admission lock before
+        // anything else: the nodeos restart that may have caused the crash also dropped the lock.
+        if self.resumed {
+            self.check_admission_lock("resumed in FROZEN", None, true)?;
+            // Our own pause existed (so H was final when it was made): a restart that cleared it is closed first.
+            if self.ever_paused_by_us {
+                self.hold_source_sealed("resumed in FROZEN")?;
+            }
+        }
         // Idempotent resume: if a crashed run left the producer paused, the
         // chain cannot finalize a snapshot block — unpause first (writes are
         // still frozen by the hook, so re-produced blocks stay empty).
         // r30 round 9 (review R9-F2): this read decides ownership; a transient error is retried (bounded), never the
         // end of the run mid-FROZEN.
-        if self.read_paused_retrying(
-            PAUSE_READ_RETRY_MS,
+        let window = self.pause_read_window_ms();
+        let first = self.read_paused_retrying(
+            window,
             "checking the source producer at the start of FROZEN",
-        )? {
+        );
+        let Some(paused_at_start) =
+            self.frozen_rpc(first, "the producer-paused read at the start of FROZEN")?
+        else {
+            return Ok(());
+        };
+        if paused_at_start {
             // r30 round 7/8: ownership is decided FIRST, whether or not H is already final. A pause this journal did
             // not record as its own, found after this ceremony froze writes (an operator pausing by hand near H, a
             // hook, a scheduler), is ADOPTED for the cut: journaled as evidence, never re-paused (which would turn it
@@ -4336,10 +4908,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // ignored the pause and late blocks arriving over p2p).
         // r30 round 8 (review R8-1): src_pause decides by a fresh read: a pause someone else made (also during the
         // snapshot wait above) is adopted, never paused again or recorded as ours.
-        self.src_pause()?;
-        if !self
-            .read_paused_retrying(PAUSE_READ_RETRY_MS, "confirming the source producer paused")?
-        {
+        // rc.32: the producer builds blocks until the pause takes effect: its admission lock must still be in place.
+        self.check_admission_lock("before the pause", None, true)?;
+        let streaks_before = self.rpc_retry_streaks;
+        let paused = self.src_pause();
+        if self.frozen_rpc(paused, "the pause")?.is_none() {
+            return Ok(());
+        }
+        let window = self.pause_read_window_ms();
+        let confirm = self.read_paused_retrying(window, "confirming the source producer paused");
+        let Some(confirmed) = self.frozen_rpc(confirm, "confirming the pause")? else {
+            return Ok(());
+        };
+        // A nodeos restart around the pause (the pause or its read needed retries) dropped the lock: put it back (the
+        // producer is paused, so this is evidence and belt and braces for a later resume).
+        if self.rpc_retry_streaks > streaks_before {
+            self.check_admission_lock("after the pause", None, true)?;
+        }
+        if !confirmed {
             self.abort("pause did not take effect", json!({}))?;
             return Ok(());
         }
@@ -4368,7 +4954,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         );
         let at_pause = loop {
             self.ops.sleep_ms(self.cfg.poll_ms);
-            let i = self.ops.source_info()?;
+            // rc.32 (fleet run r3b): a restart right after the pause clears it and the lock: re-pause, re-lock.
+            let tick = self.with_tick(|m| {
+                m.hold_source_sealed("quiescence")?;
+                m.src_or_abort("get_info", |o| o.source_info())
+            })?;
+            let Some(i) = tick else {
+                return Ok(());
+            };
             if i.head_block_num == head {
                 stable += 1;
                 if stable >= self.cfg.ceremony.quiescence_polls {
@@ -4438,6 +5031,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         // empty. Fail closed: a transaction here would be accepted on the
         // source chain and missing from the migrated state, and a block we
         // cannot read is not evidence that it was empty.
+        self.check_admission_lock(
+            "before the burn-off audit",
+            Some(at_pause.head_block_num),
+            true,
+        )?;
         let mut burnoff_txs = 0u64;
         let mut burnoff_nonempty: Vec<serde_json::Value> = Vec::new();
         for n in (cut_height + 1)..=at_pause.head_block_num {
@@ -4457,11 +5055,27 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
         if burnoff_txs > 0 {
+            // rc.32 (F1): name the producer that signed each offending block (best effort). With the admission lock on
+            // every participating producer, a transaction after H comes from a producer that did not lock (an agent
+            // that froze late or with `admission_lock = false`, an older agent, or a producer outside the ceremony).
+            for b in burnoff_nonempty.iter_mut() {
+                if let Some(n) = b["block"].as_u64() {
+                    if let Ok(v) = self.ops.source_block(n, None) {
+                        if let Some(p) = v.get("producer").and_then(|p| p.as_str()) {
+                            b["producer"] = json!(p);
+                        }
+                    }
+                }
+            }
             self.abort(
                 "transactions landed after the cut and would be missing from the migrated state",
                 json!({"cut_height": cut_height, "burnoff_transactions": burnoff_txs,
                        "blocks": burnoff_nonempty,
-                       "fix": "close every admission path (API edge, p2p, producer) before the cut, then re-run"}),
+                       "admission_lock": self.cfg.ceremony.admission_lock,
+                       "admission_lock_lost": self.admission_lock_losses,
+                       "fix": "every producer that produces between the freeze and the pause must refuse transactions \
+                               (ceremony.admission_lock, rc.32) and every admission path (API edge, p2p) must be closed; \
+                               find the producer named on the offending block, then re-run with a new event"}),
             )?;
             return Ok(());
         }
@@ -4566,8 +5180,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         };
         let resolved_h = self.resolved_h;
         let mut last_quorum = self.last_quorum_check_ms;
+        // rc.32 (fleet run r3b): while the pipeline's tools run (minutes), re-assert this ceremony's own open pause and
+        // the admission lock on every tick (a nodeos restart clears both). Our pause episode stays ours: the producer is
+        // paused again by the ceremony that paused it. Not on a shadow journal (its pause goes through the shadow gate)
+        // and not for a pause this ceremony did not make.
+        let reassert = stage == State::Snapshotted
+            && self.cfg.ceremony.mode == Mode::Producer
+            && !self.joining
+            && self.paused_by_us
+            && !self.is_shadow_journal();
+        let lock_on = reassert && self.cfg.ceremony.admission_lock && self.admission_lock.is_some();
+        let tick_ms = self.cfg.poll_ms.max(250);
+        let mut last_seal = 0u64;
+        let mut seal_records = 0u32;
+        let acks_tracked = self.acks_tracked;
+        let mut seal_episode = self.current_episode();
+        let mut seal_events: Vec<crate::journal::PauseEvent> = vec![];
         let outcome = {
-            let journal = &mut self.journal;
+            let journal = std::cell::RefCell::new(&mut self.journal);
             let (cfg, ops) = (self.cfg, self.ops);
             let mut last_coord = self.last_coord_check_ms;
             // rc.31: during the ceremony's own verification (not `join --reverify`), a provably unreachable quorum
@@ -4583,11 +5213,24 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 &cut_block_id,
                 &chain_id,
                 |evidence| {
-                    let _ = journal.evidence(stage, evidence);
+                    let _ = journal.borrow_mut().evidence(stage, evidence);
                 },
                 // A signed abort is honoured between steps and while each tool runs (it kills
                 // the tool), not only at the fleet gate after VERIFIED.
                 |force| {
+                    if reassert && ops.now_ms().saturating_sub(last_seal) >= tick_ms {
+                        last_seal = ops.now_ms();
+                        reassert_seal(
+                            ops,
+                            &mut journal.borrow_mut(),
+                            stage,
+                            lock_on,
+                            acks_tracked,
+                            &mut seal_episode,
+                            &mut seal_events,
+                            &mut seal_records,
+                        );
+                    }
                     if coordinator_abort_poll(cfg, ops, &mut last_coord, force) {
                         return true;
                     }
@@ -4613,6 +5256,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             self.last_quorum_check_ms = last_quorum;
             (out, quorum_proof.into_inner())
         };
+        // rc.32 (review): the pipeline callback's re-pauses were journaled with full episode bookkeeping; replay them
+        // into memory so ownership here matches what a recovery would derive from the journal.
+        for e in seal_events {
+            self.push_pause_event(e);
+        }
         let (outcome, quorum_proof) = outcome;
         if let (Err(upstream::PipelineError::Aborted { during }), Some(proof)) =
             (&outcome, &quorum_proof)
@@ -4828,6 +5476,8 @@ impl<'a, O: ChainOps> Machine<'a, O> {
 
     /// SNAPSHOTTED: verify — sha256, dual-import fingerprints, goldens.
     fn step_snapshotted(&mut self) -> Result<(), String> {
+        // rc.32 (fleet run r3b): the source must stay paused and locked through verification.
+        self.hold_source_sealed("verification")?;
         if self.cfg.ceremony.import_backend == ImportBackend::Upstream {
             return self.step_snapshotted_upstream();
         }
@@ -5788,6 +6438,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     /// chain at the cut height.
     fn step_verified(&mut self) -> Result<(), String> {
         let upstream_backend = self.cfg.ceremony.import_backend == ImportBackend::Upstream;
+        // rc.32 (fleet run r3b): before chain creation the source must stay paused and locked (re-paused and re-locked
+        // after a restart; the sealed-at-the-cut refusals below still decide whether the cut can go on).
+        if !self.create_chain_started && !self.reached_ignited {
+            self.hold_source_sealed("VERIFIED")?;
+        }
         // SHADOW: re-prove the identity right before chain creation / ignition (and on every resume or join that comes
         // through here). Only this run's positive proof lets a shadow past the mainnet ignite refusal.
         self.shadow_verified = false;
