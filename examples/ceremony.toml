@@ -68,6 +68,7 @@ import_cpu_scale = 143
 #                   (multi-BP ceremonies — everyone cuts the same block; needs snapshot.dir)
 freeze_strategy = "pause_at_h"
 # freeze_lead_blocks = 24    # schedule_at_h: close writes this many blocks BEFORE H (the cut stays H)
+# admission_lock = true      # producer mode (rc.32): the producer refuses every transaction from the freeze on
 # After pausing: the head must hold still for this many consecutive polls
 # before the cut is trusted (late blocks are detected and absorbed).
 quiescence_polls = 6
@@ -86,6 +87,7 @@ quiescence_timeout_secs = 120   # abort if the source never stops producing afte
 rpc_url = "http://127.0.0.1:8888"            # REQUIRED. nodeos chain API (get_info / get_block)
 producer_api_url = "http://127.0.0.1:8888"   # REQUIRED. pause/snapshot API — keep on 127.0.0.1 ONLY (R10)
 snapshot_timeout_secs = 600                  # max wait for the snapshot write (default 600)
+# rpc_retry_secs = 180     # rc.32: retry transient source errors this long in the freeze window (< snapshot_timeout_secs)
 # stop_cmd = "systemctl stop nodeos"         # api mode (required there): retire nodeos AFTER the flip is healthy
 # start_cmd = "systemctl start nodeos"       # api mode, optional: bring nodeos back if an abort follows the stop
 # quiesce_cmd = "/root/quiesce.sh"           # producer mode, single-node rehearsal only: runs right after the
@@ -262,7 +264,8 @@ on_abort = "echo 'page the operator'"                    # on ABORT after rollba
 # fleet_quorum = 0                             # before igniting, wait until this many producers (this one included)
                                                # report VERIFIED with the same snapshot hash and fingerprints.
                                                # 0 = no fleet gate; with a roster it must be 1..=roster size
-# fleet_timeout_secs = 300                     # give up waiting for the quorum after this (default 300)
+# fleet_timeout_secs = 900                     # give up waiting for the quorum after this (default 900, rc.32;
+#                                              # keep it >= 1.5 x the slowest member's drill conversion time)
 # report_max_age_secs = 60                     # a roster member's report older than this does not count (default 60)
 # degraded_patience_secs = 900                 # after ignition: how long a local liveness symptom is waited out
                                                # as DEGRADED while a quorum reports the same target (default 900)

@@ -6,7 +6,7 @@ ceremony is shaped the way it is: the adversarial review that changed the design
 **R-numbers** that appear in log messages, config comments and the README), the state machine,
 the config format, the failure and rollback table, and a sketch of a faster v2.
 
-It describes the code as of **v0.5.0-rc.31** (§3 and §5 carry the rc.21–rc.28 changes; rc.29's guard, authorization and
+It describes the code as of **v0.5.0-rc.32** (§3 and §5 carry the rc.21–rc.28 changes; rc.29's guard, authorization and
 relay changes are summarised in docs/OPERATOR-QUICKSTART.md §6 and ATOMICITY.md known limit 17; the
 review table in §2 was last re-checked at rc.11 and its "Today" column is dated that way). The
 first version of this design was written in August 2026, before the multi-producer rehearsal and
@@ -56,7 +56,7 @@ behaviour.
 | # | Attack | Finding | Design change | Today (rc.11) |
 |---|---|---|---|---|
 | **R1** | "Pause at H, then snapshot" | Deadlock. Leap writes a snapshot only once its block is irreversible, and a fully paused DPoS chain never finalizes H (LIB needs later confirmations). | Freeze writes at the edge; producers keep producing **empty** blocks through H; the snapshot is scheduled at exactly H and lands when H is final; producers pause **after**. | `freeze_strategy = "schedule_at_h"` (requires `snapshot.dir`). The agent schedules the snapshot at ARM and picks up `snapshot-<id of H>.bin` by exact name. If scheduling fails the ceremony aborts; there is no fallback to an immediate snapshot. |
-| **R2** | Writes "into the void" around the freeze | A paused nodeos still accepts and acknowledges pushed transactions that are never included: silent write loss. | The freeze is an explicit reject at the API edge (HTTP 503 / tx-acceptance off). Pause alone is never the freeze. | `hooks.on_freeze` closes writes `freeze_lead_blocks` (default 24) before H; a failing hook aborts. The **burn-off audit** reads every block from H+1 to the pause head and aborts on any transaction or unreadable block. |
+| **R2** | Writes "into the void" around the freeze | A paused nodeos still accepts and acknowledges pushed transactions that are never included: silent write loss. | The freeze is an explicit reject at the API edge (HTTP 503 / tx-acceptance off). Pause alone is never the freeze. | `hooks.on_freeze` closes writes `freeze_lead_blocks` (default 24) before H; a failing hook aborts. rc.32: at the same moment the producer itself stops admitting transactions (the **admission lock**, §2a). The **burn-off audit** reads every block from H+1 to the pause head and aborts on any transaction or unreadable block (the backstop). |
 | **R3** | nodeos version skew | Snapshot file bytes depend on the snapshot format version (Leap 5 writes v6, later versions v7+), so sha256 goldens are version-fragile. Table fingerprints over imported state are not. | Two tiers: fingerprints are the binding cross-node check; sha256 is a strict extra bound to the pinned nodeos version. | `snapshot.expected_sha256` (optional) and `snapshot.golden_roots`; either mismatch aborts. In the upstream backend the whole-state root from `xpr_state_fingerprint` can be compared to `[upstream] golden_state_root`. |
 | **R4** | Microforks and late blocks at H | "Snapshot the current head" is ambiguous: a straggler block or an unpaused producer moves head; a node on a microfork snapshots a different block H. | Pin the cut by height **and** block id; after the pause, require a quiescence window of unchanged-head polls; assert the snapshot's block id equals the chain's block id at that height. | As designed. `quiescence_polls` (default 6); late blocks are journaled (first 10) and reset the window; since rc.12 the wait is bounded by `quiescence_timeout_secs` (default 120) and aborts on expiry. *Differs from the August design:* the cut is not re-pinned on late blocks (it is always the scheduled H). |
 | **R5** | Partial quorum; the flip racing the target | Half the validators ignite and quorum never forms, or a gateway flips before the target produces. | Ratchet: the user-visible flip happens only after the target serves the source chain_id at the cut **and** its head advances past it. `quorum_timeout` bounds the wait. | LIVE now also needs `live_sustain_secs` (60) of progress with no gap over `live_max_gap_secs` (20). *Corrected since August:* "the source stays authoritative until LIVE" holds only before ignition. From `ignite_started` on, every failure HALTS instead of resuming the source (§3). Fleet-wide, the point of no return is target authorization, which is not implemented ([DESIGN-authority-boundary.md](DESIGN-authority-boundary.md)). |
@@ -67,6 +67,61 @@ behaviour.
 | **R10** | Producer API exposure | `/v1/producer/pause` and `resume` can stop or restart a chain. | The producer API binds to localhost only; the agent runs on the same box; preflight fails at ARM if it is unreachable. | Preflight checks reachability. Since rc.11 the beacon reports `producer_api_private`, from a mission control probe of the node's own public addresses. |
 | **R11** | Who may sign the first post-cut block | The target's producer schedule is seeded from its chain genesis `initial_key`, not from imported state. A `producer_key` that does not pair with it builds no blocks. | Pre-stage check that the staged key pairs with the genesis key; upstream: derive the schedule from imported state. | `install.sh` writes the pair from the manifest. Fork backend: the agent does not check it; the LIVE gate catches it (now as a HALT). Upstream backend, producer mode: checked at ARM and before ignition, together with the key `eosio/producers` registers (the migrated system contract re-elects the schedule from it at the first onblock; stage-2 run 1 halted at H+4 on that). Still open upstream: every validator must share one producer name and key (ATOMICITY Known limits #4). |
 | **R12** | Stale staged snapshot | The target imports whatever sits at its `snapshot_path` when the chain first initializes. A file left from an earlier attempt pins the chain to the wrong cut. | Refuse to ARM if the staged path exists; the path stays empty until VERIFIED copies the verified file in. | As designed. On resume, a file matching this ceremony's journaled `staged_artifact` hash is accepted; every abort moves the staged file aside (never deletes it). |
+
+## 2a. The admission lock (rc.32)
+
+Fleet run s1 (8 BPs) showed what the edge freeze cannot stop: a transaction the producer already holds. nodeos 5.0.3
+keeps a transaction it could not apply yet (block full, its speculative-block deadline, a subjective CPU limit) in its
+unapplied queue, does not relay it, and retries it at the start of every block it builds until the transaction
+expires. Expiry is the only objective limit, and on XPR it can be `max_transaction_lifetime` = 3,600 s away. In s1 one
+producer held 3 transfers (120 s expiry) from before the freeze and put them in the first block of its next slot, H+25.
+
+What nodeos 5.0.3 offers at runtime (Leap v5.0.3 source), and what each would do:
+
+| Option | Verdict |
+|---|---|
+| `pause` + clear the queue | no API clears the unapplied queue; a paused producer keeps it and includes it on resume. Pausing before H also stops the finality the scheduled snapshot needs (R1) |
+| `p2p-accept-transactions` / `api-accept-transactions = false` | startup-only options (chain_plugin, net_plugin): needs a nodeos restart in the middle of the cut, and neither empties the queue |
+| empty blocks after the freeze | no producer option exists; `max_block_cpu_usage` is consensus state (setparams) and would be imported |
+| `update_runtime_options` (`max_transaction_time` …) | a cheap transfer still fits; not a refusal |
+| a freeze lead >= the longest expiry | objective (no producer can include an expired transaction), but only if EVERY admission path in the network is closed for that long: up to an hour more write gap (E-5), and third-party API nodes keep relaying |
+| **subjective actor whitelist** (`set_whitelist_blacklist`) | **chosen**: enforced only for blocks this nodeos builds and its speculative execution (`is_speculative_block`), never when validating others' blocks, so consensus is unchanged |
+
+At the freeze (head >= H − `freeze_lead_blocks`, before `on_freeze`), each producer's agent journals the current actor
+whitelist (`side_effect: admission_lock`), sets it to `pulse.frozen1` and confirms it with a read. That name has 13
+characters: native `newaccount` refuses names over 12, so no account and no authorization can ever carry it. From then
+on every input or deferred transaction this producer would execute has an actor outside the list and fails with
+`actor_whitelist_exception`:
+
+- a queued transaction is a plain failure (not "exhausted"), so it is erased from the unapplied queue, whatever its
+  expiry: it never lands, on either side of H;
+- a new one is refused at this node's API (an explicit error, never a write into the void) and is never relayed;
+- a deferred transaction fails subjectively and stays scheduled (it is in the cut state and the dedupe sidecar);
+- `onblock` is implicit (`enforce_whiteblacklist = false`), so the block's action root is the same for validators.
+
+Transactions between the freeze and H are therefore dropped, not included: the write gap starts at the freeze for the
+producers too. A client must treat any transaction not in an irreversible block as not executed (EXCHANGES.md).
+
+The original list is restored when a rollback reopens writes: only into a producing source (the same fresh read that
+guards `on_abort`), only from the sentinel this journal set (a list someone else set is left alone and journaled), with
+the restore journaled as `rollback_step: admission_unlock`. A STRANDED ceremony keeps it. After LIVE the old chain stays
+locked; a nodeos restart reloads the config file's list.
+
+**Airtight for:** every transaction held by, or sent to, a producer whose rc.32+ agent locked it before it built a
+block after H. Two narrower residuals inside the lock itself, both left to the burn-off audit: nodeos' `check_actor_list` returns
+early when the set of actors it is given is empty (an action with an empty authorization list, e.g. an inline action a
+contract sends without authorization, is not checked on its own); and a deferred transaction whose sender is listed in
+the producer's `sender-bypass-whiteblacklist` config is executed without the list (empty by default). The lock is
+re-read on every poll tick from the lock to the pause, while H finalizes and the snapshot is written, and once more right
+before the pause (a nodeos restart reloads the configured whitelist; the agent re-applies it within one tick and journals
+`admission_lock_lost` with the height), and right before the burn-off audit (journaled, and part of the abort detail), and ARM fails if
+the producer API does not answer `get_whitelist_blacklist`. **Residual:** a producer outside the ceremony (no agent, an older agent, `admission_lock = false`, or an
+agent that froze late) can still include what it holds or receives over p2p; nothing at runtime lets one nodeos stop
+another. The burn-off audit stays the backstop (it now names the producer of each offending block), and the fix is
+procedural: every producer that can produce between the freeze and the pause, standby included, runs the agent. Making
+it airtight without that needs an upstream nodeos change (a producer switch that refuses all input and deferred
+transactions from block N), or a freeze lead of at least the longest expiry with every admission path in the network
+closed for that time. RISK-REGISTER A-22.
 
 ## 3. State machine
 
@@ -357,6 +412,7 @@ chain_id = "…"                     # pinned source chain id
 import_cpu_scale = 143             # fork backend: chain identity, must equal the staged PulseVM chain config; upstream: ignored (warns)
 freeze_strategy = "schedule_at_h"  # R1; "pause_at_h" is single-producer rehearsal only
 freeze_lead_blocks = 24            # writes close this many blocks before H
+admission_lock = true              # producer mode (rc.32): the producer refuses transactions from the freeze on (§2a)
 quiescence_polls = 6               # R4
 quiescence_timeout_secs = 120      # R4: abort if head never stops after the pause
 import_backend = "fork"            # | "upstream" (ignites from the #61 checkpoint when configured, see README)
@@ -451,7 +507,10 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 | This agent opens a journal written by a NEWER agent (a record kind it does not know) | journal replay (rc.30) | any | refused on open, nothing folded or changed; operating rule: never run an older agent version on a journal a newer one wrote |
 | Head keeps moving after the pause | quiescence window | FROZEN | late blocks journaled; the window waits up to `quiescence_timeout_secs` (default 120), then ABORT (before ignition: `on_abort` reopens writes) |
 | Snapshot block id ≠ chain's block id at H (fork at the cut); chain_id changed | block lookup | FROZEN | abort |
-| Any transaction in H+1…pause, or an unreadable block, or an answer that is not that block with a `transactions` array | burn-off audit (fails closed) | FROZEN | abort |
+| A transient source error (connection refused or reset, timeout, HTTP 5xx: a nodeos restart) in the freeze window | `source.rpc_retry_secs` retry with backoff, also for the pause and the producer-paused reads around it (rc.32, fleet run r3: it killed the agent) | FROZEN | retried and journaled (`source_rpc_retry` / `source_rpc_recovered`); the next tick re-applies a dropped admission lock; past the bound, abort (or STRANDED), never a bare exit; the lock is never lifted while the source cannot be read, and a strand re-applies it |
+| A nodeos restart after the pause clears the runtime pause and the lock (fleet run r3b: 234 ms after `pause()`, 14 blocks produced unpaused and unlocked) | `hold_source_sealed` on every tick from the pause to chain creation (quiescence, verification incl. the upstream tools' poll, VERIFIED, the fleet gate) and the burn-off re-check (rc.32) | FROZEN–VERIFIED | re-paused and re-locked at once (`source_unpaused`, `admission_lock_lost`, with the height); the existing refusals still decide: a head past the pause head refuses creation and aborts |
+| The admission lock cannot be set or confirmed (producer API unreachable, a list other than the sentinel read back, the sentinel already in place from another journal) | admission lock (rc.32) | ARMED | abort (before `on_freeze`) |
+| Any transaction in H+1…pause, or an unreadable block, or an answer that is not that block with a `transactions` array | burn-off audit (fails closed) | FROZEN | abort; the detail names the producer of each offending block (rc.32) |
 | sha256 ≠ manifest; imported head, chain_id or block id ≠ the pinned cut; fingerprints ≠ goldens; staged copy hash differs | verify | SNAPSHOTTED | abort |
 | Two imports disagree | dual import (R9) | SNAPSHOTTED | abort; a VM bug to report upstream |
 | Upstream: export/import/fingerprint fails; sidecar missing or inconsistent; artifact not bound to the cut; no `compare_bin`; `xpr_19_table_compare` fails (on a table not in `rehearsal_allow_compare_mismatch`, with a signature other than that table's known difference, or naming no table) or exits 0 without a matching line for every required table; no non-empty `state_root` | upstream pipeline | SNAPSHOTTED | abort |
@@ -461,7 +520,7 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 | Upstream, verify-only config (no `genesis_base` + `create_chain_cmd`); XPR mainnet while `ignite_pending_reasons()` is non-empty | upstream ignite preflight | VERIFIED | abort with the remaining list |
 | Upstream, producer mode: the signing key (chain config `producer_key` = genesis `initial_key`) is not what `eosio/producers` registers for `producer_name`, or that producer is unregistered / inactive | producer key check | ARMED, VERIFIED | abort |
 | Upstream: a boot artifact missing or changed since VERIFIED | re-hash | VERIFIED | abort |
-| Fleet does not agree before `fleet_timeout_secs` | fleet gate | VERIFIED | abort (rc.23, coordinated: only if the resume guard passes; else STRANDED) |
+| Fleet does not agree before `fleet_timeout_secs` (default 900 s since rc.32; warned when under 1.5 x the drill's conversion time) | fleet gate | VERIFIED | abort (rc.23, coordinated: only if the resume guard passes; else STRANDED) |
 | Enough roster members carry the relay's durable exit mark (ended the event without ever verifying) that fewer than `quorum` can still be counted (rc.31) | ARMED wait, right before `on_freeze`, FROZEN finality wait, upstream verification, fleet gate | ARMED–VERIFIED | abort at once (before the freeze: nothing frozen); after it only through the resume guard; guard would refuse: keep waiting (`early_abort: deferred`) |
 | This producer already exited the event without verifying (relay exit mark), e.g. a re-run on a fresh journal under the same event id (rc.31) | preflight (fresh ARM) | — | refused: a new attempt needs a new event id |
 | Any abort after FROZEN in a coordinated producer ceremony, when the event has no roster, the relay does not answer, a roster member is missing, stale, conflicted or ever reported past chain creation, or at least `quorum` other members are still in the ceremony (no signed abort) | resume guard (rc.23, checked twice around the abort intent) | FROZEN–VERIFIED | STRANDED: source stays paused, writes frozen, `on_halt`; `join` or `rollback` (re-checked / `--force-stranded`) |

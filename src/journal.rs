@@ -154,6 +154,12 @@ pub struct Recovered {
     /// r30 round 9 (review R9-3): writes this journal froze in its CURRENT segment (a `write_freeze` intent in it, or a
     /// freeze carried over from the previous segment whose on_abort never reopened them).
     pub writes_closed: bool,
+    /// rc.32 (F1): this journal set the producer's admission lock (`side_effect: admission_lock`, written before the
+    /// RPC) and no rollback has restored it since (`rollback_step: admission_unlock`): the actor whitelist to restore.
+    pub admission_lock: Option<Vec<String>>,
+    /// rc.32: the latest admission lock was confirmed on the producer (`admission_lock_ack` or
+    /// `admission_lock_reapplied` after its intent). False: its set failed or never ran.
+    pub admission_lock_applied: bool,
     /// r30 round 9 (review R9-1/R9-3): the journal segment (0 = the original ceremony). A `join` that re-enters an
     /// ABORTED or STRANDED ceremony journals `segment_start` before its first side effect: undo bookkeeping
     /// (rollback steps, rollback_done, strand intent) belongs to one segment only.
@@ -760,6 +766,21 @@ impl Journal {
                     }
                     "source_resume" => out.pause_events.push(PauseEvent::ResumeIntent),
                     "write_freeze" => out.writes_closed = true,
+                    "admission_lock" => {
+                        out.admission_lock_applied = false;
+                        out.admission_lock = Some(
+                            entry
+                                .data
+                                .get("original_actor_whitelist")
+                                .and_then(|v| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|x| x.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        )
+                    }
                     _ => {}
                 }
                 // r30 round 7: a pause found after the freeze and ADOPTED for the cut (someone else paused the
@@ -805,10 +826,22 @@ impl Journal {
                 out.aborted_rollback_complete = false;
                 out.rollback_steps_done.retain(|x| x != "on_abort");
             }
+            if entry.data.get("admission_lock_ack").is_some()
+                || entry
+                    .data
+                    .get("admission_lock_reapplied")
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+            {
+                out.admission_lock_applied = true;
+            }
             if let Some(step) = entry.data.get("rollback_step").and_then(|v| v.as_str()) {
                 if entry.data.get("ok").and_then(|v| v.as_bool()) == Some(true) {
                     if step == "resume" {
                         out.pause_events.push(PauseEvent::Resume);
+                    }
+                    if step == "admission_unlock" {
+                        out.admission_lock = None;
                     }
                     if !out.rollback_steps_done.iter().any(|x| x == step) {
                         out.rollback_steps_done.push(step.to_string());

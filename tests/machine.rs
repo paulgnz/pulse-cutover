@@ -9385,8 +9385,12 @@ fn rc29_a_verified_restart_with_the_producer_running_never_ignites() {
     let ops = MockOps::new(dir.path(), pause_head);
     let st = run_machine(&cfg, &ops);
     let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+    // rc.32 (fleet run r3b): the VERIFIED tick re-pauses the running producer first (source_unpaused); the blocks it
+    // made while unpaused move the head past the pause head, so creation is still refused.
     assert!(
-        text.contains("refusing to create or ignite the target: the source producer is not paused"),
+        text.contains("refusing to create or ignite the target: the source producer is not paused")
+            || (text.contains("\"source_unpaused\"")
+                && text.contains("refusing to create or ignite the target: the source head moved past the pause head")),
         "{st:?}"
     );
     assert!(!text.contains("ignite_started"));
@@ -10965,7 +10969,7 @@ fn rust_code_mask(text: &str) -> String {
 fn mutation_scan(text: &str) -> Vec<(usize, String)> {
     let code = rust_code_mask(text);
     let lines: Vec<&str> = text.lines().collect();
-    let re = regex::Regex::new(r"(?:\.|::|\b)\s*(pause|resume|run_hook|ignite|create_snapshot|schedule_snapshot\w*|unschedule_snapshot\w*|run_shell)\s*\(").unwrap();
+    let re = regex::Regex::new(r"(?:\.|::|\b)\s*(pause|resume|run_hook|ignite|create_snapshot|schedule_snapshot\w*|unschedule_snapshot\w*|run_shell|set_actor_whitelist)\s*\(").unwrap();
     let mut out = vec![];
     for m in re.captures_iter(&code) {
         let name = m.get(1).unwrap();
@@ -11091,7 +11095,9 @@ fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
     let raw = m
         .lines()
         .filter(|l| {
+            // rc.32: the pause gate retries its RPC through src_retry (`|o| o.pause()`).
             l.contains("self.ops.pause()")
+                || l.contains("|o| o.pause()")
                 || l.contains("self.ops.resume()")
                 || l.contains("self.ops.run_hook(")
         })

@@ -303,7 +303,7 @@ test('rc.31 (review fix 4): mission control raises QUORUM UNREACHABLE with the a
   assert.equal((await send('bpe', exitRep('ABORTED'))).status, 200);
   n = await net(base);
   assert.deepEqual(n.fleet.quorum_unreachable?.out, ['bpe'], JSON.stringify(n.fleet));
-  const w = n.fleet.warnings.find((x) => x.startsWith('ALARM QUORUM UNREACHABLE'));
+  const w = n.fleet.alarms.find((x) => x.startsWith('ALARM QUORUM UNREACHABLE'));
   assert.ok(w && w.includes('control/coord.mjs abort') && w.includes('--event-id ev-1'), w);
   assert.ok(n.events.some((e) => e.text.startsWith('ALARM QUORUM UNREACHABLE')));
   // Someone past creation: not this alarm's call.

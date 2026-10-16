@@ -397,6 +397,14 @@ function validCoordEntry(k, v) {
     if (!m || typeof m !== 'object' || typeof m.event_id !== 'string' || typeof m.state_id !== 'string' || !Number.isSafeInteger(m.gen)) throw new Error(`${k}.marks: invalid`);
     out.marks = { event_id: m.event_id, state_id: m.state_id, gen: m.gen, lost: m.lost === true };
   }
+  // rc.32 (fleet run s1c, F2): the durable "this event went forward" latch {event_id, at, verdict, reason}, written the
+  // first time the relay sees the fleet LIVE / STALLED or a quorum of fresh past-creation reports for the event. A later
+  // signed abort is refused (409) on it even when every report has gone stale.
+  if (v.forward !== undefined && v.forward !== null) {
+    const f = v.forward;
+    if (!f || typeof f !== 'object' || typeof f.event_id !== 'string' || typeof f.at !== 'string') throw new Error(`${k}.forward: invalid`);
+    out.forward = { event_id: f.event_id, at: f.at.slice(0, 40), verdict: String(f.verdict ?? '').slice(0, 20), reason: String(f.reason ?? '').slice(0, 400) };
+  }
   if (v.history !== undefined && !Array.isArray(v.history)) throw new Error(`${k}.history: not an array`);
   out.history = (v.history || []).map((h, i) => { if (!h || typeof h !== 'object' || typeof h.event_id !== 'string') throw new Error(`${k}.history[${i}]: invalid`); return h; });
   if (v.used !== undefined && (!v.used || typeof v.used !== 'object' || Array.isArray(v.used))) throw new Error(`${k}.used: not an object`);
@@ -700,6 +708,7 @@ function coordView(n) {
     arm_at: c.arm ? JSON.parse(c.arm.payload).issued_at_ms : null,
     accepted: [...new Set(reps.filter(([, s]) => mine(s) && s.report.coord.accepted).map(([p]) => p))],
     rejected: reps.filter(([, s]) => mine(s) && s.report.coord.accepted === false).map(([p, s]) => ({ producer: p, reason: s.report.coord.reason })),
+    forward: c.forward && c.forward.event_id === ev.event_id ? c.forward : null,
     history: (c.history || []).slice(-20) };
 }
 
@@ -769,7 +778,42 @@ function fleetVerdictFor(n, ev) {
   for (const [p, m] of Object.entries(eventMax[n.id] || {})) if (m[ev.event_id]) marks[p] = m[ev.event_id];
   const a = coord[n.id]?.marks;
   const marksComplete = !(a && a.event_id === ev.event_id && (a.lost || a.state_id !== serverStateId || a.gen > serverGen));
-  return fleetVerdict(ev, byProducer, marks, evidence[n.id] || {}, { marksComplete });
+  // rc.32 (F3): a signed abort relayed for this event resolves the QUORUM UNREACHABLE alarm.
+  const signedAbort = (() => { try { return JSON.parse(coord[n.id]?.abort?.payload || 'null')?.event_id === ev.event_id; } catch { return false; } })();
+  return fleetVerdict(ev, byProducer, marks, evidence[n.id] || {}, { marksComplete, signedAbort });
+}
+/**
+ * rc.31 / rc.32: has the fleet demonstrably gone forward on event `ev`? Verdict LIVE / STALLED, or at least `quorum`
+ * roster members' FRESH producer reports for this event past chain creation. `v` may be passed when already computed.
+ */
+function forwardCheck(n, ev, v = fleetVerdictFor(n, ev)) {
+  const past = (v?.members || []).filter((m) => m.past_create);
+  const rosterNames = Array.isArray(ev.roster) && ev.roster.length ? ev.roster.map((m) => m.producer) : Object.keys(nodes[n.id] || {});
+  const q = Number.isInteger(ev.quorum) && ev.quorum > 0 ? ev.quorum : rosterNames.length;
+  const nowMs = Date.now();
+  const freshPast = rosterNames.filter((pr) => servers(n.id, pr).some((x) => (x.report.role || 'producer') === 'producer' && !x.conflict
+    && !isSilent(x, nowMs) && x.report.coord?.event_id === ev.event_id && pastCreate(ceremonyFor(x.report, ev))));
+  const forward = ['LIVE', 'STALLED'].includes(v?.verdict) || (q > 0 && freshPast.length >= q);
+  const reason = `verdict ${v?.verdict}; fresh reports past chain creation: ${freshPast.join(', ') || 'none'} (quorum ${q}); any sign of creation: ${past.map((m) => `${m.producer} (${m.state || 'past creation'})`).join(', ') || 'none'}`.slice(0, 400);
+  return { v, past, q, freshPast, forward, reason };
+}
+/** The latch record for `ev` when the relay has durably recorded that it went forward (rc.32 F2), else null. */
+const forwardLatch = (n, ev) => { const f = coord[n.id]?.forward; return f && f.event_id === ev.event_id ? f : null; };
+/**
+ * rc.32 (fleet run s1c, F2): the first time the fleet is seen forward on the active, not aborted, not completed event,
+ * record it durably in the coordination store (same atomic write + fsync as the event, the abort and the history), so
+ * a later abort is still refused once the beacons stop and the verdict decays. Never cleared for that event.
+ */
+function latchForward(n, ev, check) {
+  const c = coord[n.id];
+  if (!c?.event || c.abort || c.complete || forwardLatch(n, ev) || !check.forward) return;
+  if (JSON.parse(c.event.payload).event_id !== ev.event_id) return;
+  const at = new Date().toISOString();
+  const next = clone(coord);
+  next[n.id].forward = { event_id: ev.event_id, at, verdict: String(check.v?.verdict ?? ''), reason: check.reason };
+  next[n.id].history = [...(next[n.id].history || []), { type: 'forward_latched', event_id: ev.event_id, at, verdict: check.v?.verdict, reason: check.reason }].slice(-100);
+  if (commitCoord(next)) pushEvent(n.id, 'coordinator', `event ${ev.event_id} went forward (${check.reason}): recorded durably; a later signed abort is refused (409) even if reports go stale`);
+  else console.error('coord: could not record the forward latch (retried on the next report or status)');
 }
 const lastQuorumAlarm = dict();
 function fleet(n) {
@@ -777,11 +821,17 @@ function fleet(n) {
   const ev = c?.event ? JSON.parse(c.event.payload) : null;
   if (!ev) return null;
   const v = fleetVerdictFor(n, ev);
-  // rc.31 (review fix 4): log the QUORUM UNREACHABLE alarm once per event when it first appears.
+  latchForward(n, ev, forwardCheck(n, ev, v));
+  // rc.31 (review fix 4): log the QUORUM UNREACHABLE alarm once per event when it first appears (rc.32: an alarm).
   if (v.quorum_unreachable && lastQuorumAlarm[n.id] !== ev.event_id) {
     lastQuorumAlarm[n.id] = ev.event_id;
-    pushEvent(n.id, 'fleet', v.warnings.find((w) => w.startsWith('ALARM QUORUM UNREACHABLE')) || 'ALARM QUORUM UNREACHABLE');
+    pushEvent(n.id, 'fleet', v.alarms.find((w) => w.startsWith('ALARM QUORUM UNREACHABLE')) || 'ALARM QUORUM UNREACHABLE');
   }
+  const latched = forwardLatch(n, ev);
+  if (latched && !['LIVE', 'STALLED'].includes(v.verdict)) {
+    v.warnings.push(`event ${ev.event_id} went forward (recorded ${latched.at}: ${latched.verdict}): a signed abort is refused; close it with complete`);
+  }
+  v.forward_latched = latched ? { at: latched.at, verdict: latched.verdict } : null;
   // rc.31: a signed abort refused (or accepted only with an explicit acknowledgement) because members were already
   // past chain creation stays visible on the event as a warning.
   for (const h of (c.history || []).filter((x) => x.event_id === ev.event_id && (x.type === 'abort_refused' || x.after_creation === true))) {
@@ -1063,23 +1113,22 @@ async function handle(req, res) {
       // recorded in the event's history.
       let afterCreation = null;
       if (p.type === 'abort') {
-        const v = fleetVerdictFor(n, cur);
-        const past = (v?.members || []).filter((m) => m.past_create);
-        const rosterNames = Array.isArray(cur.roster) && cur.roster.length ? cur.roster.map((m) => m.producer) : Object.keys(nodes[n.id] || {});
-        const q = Number.isInteger(cur.quorum) && cur.quorum > 0 ? cur.quorum : rosterNames.length;
-        const nowMs = Date.now();
-        const freshPast = rosterNames.filter((pr) => servers(n.id, pr).some((x) => (x.report.role || 'producer') === 'producer' && !x.conflict
-          && !isSilent(x, nowMs) && x.report.coord?.event_id === p.event_id && pastCreate(ceremonyFor(x.report, cur))));
-        const forward = ['LIVE', 'STALLED'].includes(v?.verdict) || (q > 0 && freshPast.length >= q);
-        const reason = `verdict ${v?.verdict}; fresh reports past chain creation: ${freshPast.join(', ') || 'none'} (quorum ${q}); any sign of creation: ${past.map((m) => `${m.producer} (${m.state || 'past creation'})`).join(', ') || 'none'}`.slice(0, 400);
+        const chk = forwardCheck(n, cur);
+        const { v, past, freshPast } = chk;
+        // rc.32 (fleet run s1c, F2): a forward verdict the relay recorded earlier keeps the veto refused after the reports
+        // go stale (the s1c probe: LIVE event, beacons stopped, verdict decayed to DEGRADED, abort relayed with an ALARM).
+        const latched = forwardLatch(n, cur);
+        const forward = chk.forward || !!latched;
+        const reason = (latched && !chk.forward ? `recorded forward at ${latched.at} (${latched.reason}); now: ${chk.reason}` : chk.reason).slice(0, 400);
         if (forward && p.acknowledge_past_creation !== true) {
           const rec = clone(coord);
           const rc = rec[n.id]; rc.history ||= [];
-          rc.history.push({ type: 'abort_refused', event_id: p.event_id, at, reason });
+          if (!latched) rc.forward = { event_id: p.event_id, at, verdict: String(v?.verdict ?? ''), reason: chk.reason };
+          rc.history.push({ type: 'abort_refused', event_id: p.event_id, at, reason, ...(latched ? { forward_latched_at: latched.at } : {}) });
           rc.history = rc.history.slice(-100);
           commitCoord(rec);
           pushEvent(n.id, 'coordinator', `ALARM: signed abort for ${p.event_id} REFUSED, the fleet already went forward (${reason}). This veto was NOT relayed: no member has received it`);
-          return send(res, 409, { error: `event ${p.event_id} already went forward (${reason}): the abort is REFUSED and NOT relayed, so it is a veto no member has received (members before creation or ignition will proceed). Agents never honour an abort after their own ignition; resolve with join / operator-halt and close the event with complete. To relay the abort anyway, sign it with acknowledge_past_creation (coord.mjs --after-creation yes)`, verdict: v?.verdict, past_create: freshPast });
+          return send(res, 409, { error: `event ${p.event_id} already went forward (${reason}): the abort is REFUSED and NOT relayed, so it is a veto no member has received (members before creation or ignition will proceed). Agents never honour an abort after their own ignition; resolve with join / operator-halt and close the event with complete. To relay the abort anyway, sign it with acknowledge_past_creation (coord.mjs --after-creation yes)`, verdict: v?.verdict, past_create: freshPast, forward_latched: latched ? latched.at : null });
         }
         if (forward || past.length) afterCreation = reason;
       }
@@ -1255,6 +1304,8 @@ async function handle(req, res) {
     }
     if (exitNote) pushEvent(r.network, r.producer, exitNote);
     lastTs[key] = ts;
+    // rc.32 (F2): record a forward verdict the moment a report makes it visible, not only when someone reads the board.
+    if (evNow && evNow.event_id === evId) { const nn = cfg.networks.find((x) => x.id === r.network); if (nn) latchForward(nn, evNow, forwardCheck(nn, evNow)); }
     for (const [k, v] of Object.entries(lastTs)) if (v < now - TS_PAST_MS) { tsFloor = Math.max(tsFloor, v); delete lastTs[k]; }
     const label = servers(r.network, r.producer).find((s) => s.key === key)?.label || r.node;
     const who = Object.keys(byKey).length > 1 || r.node ? `${r.producer} · ${label}` : r.producer;

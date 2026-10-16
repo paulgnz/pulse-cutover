@@ -721,6 +721,75 @@ pub fn derived_config(
 }
 
 /// `pulse-cutover await`: wait for a signed event + arm, then run the ceremony with that exact H.
+/// rc.32 (review): the ceremony this node started under `await` and that has not ended: the most recent event with a
+/// tombstone (any kind: a "ran" record can be upgraded to "aborted" by a later signed abort) whose derived config
+/// `ceremony-<id>.toml` exists and whose journal is ARMED through VERIFIED, or STRANDED. Terminal journals (LIVE,
+/// ABORTED) and HALTED stay idle and sealed. Returns (event id, derived config path, journal state).
+pub fn resumable_ceremony(cfg: &Config) -> Option<(String, PathBuf, crate::state::State)> {
+    use crate::state::State;
+    let t = std::fs::read_to_string(tombstone_file(cfg)).ok()?;
+    let all: serde_json::Map<String, Value> = match serde_json::from_str(&t).ok()? {
+        Value::Object(m) => m,
+        _ => return None,
+    };
+    let mut ids: Vec<(String, String)> = all
+        .iter()
+        .map(|(id, v)| (v["at"].as_str().unwrap_or("").to_string(), id.clone()))
+        .collect();
+    ids.sort();
+    let dir = cfg.journal_path.parent().unwrap_or(Path::new("."));
+    for (_, id) in ids.into_iter().rev() {
+        let derived = dir.join(format!("ceremony-{id}.toml"));
+        if !derived.exists() {
+            continue;
+        }
+        let Ok(dcfg) = Config::load(&derived) else {
+            continue;
+        };
+        let Ok(rec) = crate::journal::Journal::replay(&dcfg.journal_path) else {
+            return None;
+        };
+        // The most recent started ceremony decides: an older one is never resumed over it.
+        return match rec.state {
+            Some(
+                st @ (State::Armed
+                | State::Frozen
+                | State::Snapshotted
+                | State::Verified
+                | State::Stranded),
+            ) => Some((id, derived, st)),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// rc.32 (review): run `pulse-cutover run --config <derived>` as a child and return its exit code. SIGTERM / SIGINT
+/// received by `await` (systemd stops the main process first) are forwarded to the child, which stops at its next safe
+/// point (exit 6), and `await` waits for it instead of leaving it to the unit's final SIGKILL.
+pub fn run_ceremony_child(derived: &Path) -> Result<i32, String> {
+    let mut child = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .args(["run", "--config"])
+        .arg(derived)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut forwarded = false;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return Ok(status.code().unwrap_or(1));
+        }
+        if !forwarded && crate::stop::requested() {
+            forwarded = true;
+            eprintln!("await: stop requested: forwarding SIGTERM to the ceremony (pid {}) and waiting for its safe stop", child.id());
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
     let co = cfg
         .coordination
@@ -728,6 +797,26 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
         .ok_or("config has no [coordination] section")?;
     if co.coordinator_keys.is_empty() {
         return Err("[coordination] coordinator_keys is empty: refusing to trust anyone".into());
+    }
+    // rc.32 (review): a restarted `await` (Restart=on-failure after a crashed `run`) resumes the ceremony it started,
+    // from its journal, instead of idling on its own "ran" tombstone. Journaled in the ceremony journal first.
+    if let Some((id, derived, state)) = resumable_ceremony(cfg) {
+        eprintln!(
+            "await: resuming the ceremony for event {id} from its journal ({}, state {})",
+            derived.display(),
+            state.as_str()
+        );
+        if let Ok(dcfg) = Config::load(&derived) {
+            match crate::journal::Journal::open(&dcfg.journal_path) {
+                Ok((mut j, _)) => {
+                    let _ = j.evidence(state, json!({"await_resume": {"event_id": id, "state": state.as_str(),
+                        "derived_config": derived.display().to_string(),
+                        "note": "await restarted with this ceremony unfinished: resuming it with `run`"}}));
+                }
+                Err(e) => eprintln!("await: could not journal the resume ({e}); resuming anyway"),
+            }
+        }
+        return run_ceremony_child(&derived);
     }
     let a = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(5))
@@ -935,18 +1024,18 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
                         "ran",
                         "this node started the ceremony for this event",
                     );
-                    let status = std::process::Command::new(
-                        std::env::current_exe().map_err(|e| e.to_string())?,
-                    )
-                    .args(["run", "--config"])
-                    .arg(&derived)
-                    .status()
-                    .map_err(|e| e.to_string())?;
-                    return Ok(status.code().unwrap_or(1));
+                    return run_ceremony_child(&derived);
                 }
             }
         }
-        std::thread::sleep(Duration::from_secs(3));
+        // rc.32 (review): a stop while waiting for an event or an ARM ends `await` cleanly (nothing is running).
+        for _ in 0..15 {
+            if crate::stop::requested() {
+                eprintln!("await: stop requested while waiting: exiting (no ceremony running)");
+                return Ok(crate::stop::EXIT_STOPPED);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 }
 

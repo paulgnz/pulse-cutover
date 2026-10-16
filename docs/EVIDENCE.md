@@ -430,6 +430,22 @@ relay reports); anything with per-BP producer keys, the source chain_id kept for
 rehearsal patch and allowlist; mainnet state or a mainnet-sized validator set; rc.28 and rc.29 changes, which were
 tested in CI and review, not on the fleet.
 
+### 8-BP fleet, rc.31 (fleet-step3, 2026-10-15)
+
+Eight BPs on a private mesh restored from rekeyed testnet state (21 producer names over 8 boxes), the released PulseVM
+v1.0.0 plugin, a private Metal network, signed events with a roster of 8 and quorum 8.
+
+| Run | Scenario | Result |
+|---|---|---|
+| s1 | happy path, test traffic with the default 120 s expiry | all 8 **ABORTED** at the burn-off audit: 3 transfers admitted before the freeze, held in one producer's unapplied queue, landed in the first block of its next slot (H+25, signed by `eosusa`, the `bpams` box). Safe, but a failed ceremony. Mission control raised ALARM QUORUM UNREACHABLE in `warnings` after all 8 had self-aborted, and it stayed after the signed abort |
+| s1b | test traffic expiry 10 s (harness workaround), fleet timeout 300 s | all 8 ABORTED at the fleet gate: the slowest box's verify lag (5 m 26 s) exceeded the timeout |
+| s1c | as s1b, fleet timeout 900 s | **8/8 LIVE**, identical state root, write gap 806 to 846 s per BP: freeze to SNAPSHOTTED 177 s, VERIFIED 108 s (fastest) to 439 s (slowest) after that, creation once the slowest verified, ignition 29 to 59 s. After teardown (beacons stopped), a signed abort for this LIVE event was relayed with an ALARM instead of refused |
+
+rc.32 answers the three findings: the producer admission lock (RISK-REGISTER A-22; `tests/admission.rs` reproduces s1
+and shows the lock holding for expiries up to 24 h), the durable forward record behind the D-14 veto, the quorum alarm
+moved to `alarms` and resolved by the signed abort (D-17), and a 900 s fleet-timeout default with a drill-based
+warning (E-4). None of rc.32 has run on the fleet yet.
+
 ---
 
 ## Model checking the ceremony state machine (2026-10-14)

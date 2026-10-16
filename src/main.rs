@@ -397,7 +397,8 @@ fn main() {
     }
     // r30 round 13: a ceremony stops on SIGTERM / SIGINT only at a safe point (never inside a pause or resume
     // episode), journals `stopped_by_signal` and exits 6; `cutover.sh abort` waits for that before `rollback`.
-    if matches!(command, "run" | "join" | "loop") {
+    // rc.32 (review): `await` too: it forwards the stop to the `run` child it started and waits for its safe stop.
+    if matches!(command, "run" | "join" | "loop" | "await") {
         pulse_cutover::stop::install();
     }
     let result = match command {
