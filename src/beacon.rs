@@ -1597,6 +1597,75 @@ token_file = "{t}/beacon.token"
         Config::load_for_report(&p).unwrap()
     }
 
+    /// rc.33: the beacon reports what the all-producers gate reads: the lock probe (a setup check, from the producer API),
+    /// the gate hash of an ARMED journal, and whether a signed arm would start this node (`coord.arm_ready`).
+    #[test]
+    fn rc33_report_carries_the_lock_probe_the_gate_hash_and_arm_ready() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut st in listener.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let n = st.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = if req.contains("get_whitelist_blacklist") {
+                    r#"{"actor_whitelist":["pulse.frozen1"],"actor_blacklist":[]}"#
+                } else {
+                    "{}"
+                };
+                let _ = write!(st, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let j = dir.path().join("run");
+        std::fs::create_dir_all(&j).unwrap();
+        let cfg = beacon_cfg(dir.path(), &j, &dir.path().join("etc"), "");
+        let probe = |cfg: &Config| {
+            build_report(cfg, "bp1", "rehearsal")["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == "admission_lock_probe")
+                .cloned()
+                .unwrap()
+        };
+        let c = probe(&cfg);
+        assert_eq!(c["ok"], false, "nothing answers on port 9: {c}");
+        assert!(SETUP_CHECKS.contains(&"admission_lock_probe"));
+        let p = dir.path().join("b-run.toml");
+        let t = std::fs::read_to_string(&p).unwrap().replace(
+            "producer_api_url = \"http://127.0.0.1:9\"",
+            &format!("producer_api_url = \"http://127.0.0.1:{port}\""),
+        ) + "[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\n";
+        std::fs::write(&p, t).unwrap();
+        let cfg = Config::load_for_report(&p).unwrap();
+        let c = probe(&cfg);
+        assert_eq!(c["ok"], true, "{c}");
+        assert!(c["detail"].as_str().unwrap().contains("lock is ON"));
+        // An ARMED journal under a gate; coord state for the event, without and with the confirm file.
+        std::fs::write(
+            j.join("journal.jsonl"),
+            r#"{"seq":1,"kind":"transition","state":"ARMED","ts":"2026-10-19T00:00:00Z","ts_ms":1,"data":{"resolved_h":500,"agent_version":"0.5.0-rc.33","producer_gate_sha256":"ab"}}
+"#,
+        )
+        .unwrap();
+        crate::coord::try_write_state(
+            &cfg,
+            &json!({"event_id": "e1", "accepted": true, "producer_gate_sha256": "ab"}),
+        )
+        .unwrap();
+        let r = build_report(&cfg, "bp1", "rehearsal");
+        assert_eq!(r["ceremony"]["evidence"]["producer_gate_sha256"], "ab");
+        assert_eq!(r["coord"]["producer_gate_sha256"], "ab");
+        assert_eq!(r["coord"]["arm_ready"], false);
+        std::fs::write(j.join("confirm-e1"), "").unwrap();
+        assert_eq!(
+            build_report(&cfg, "bp1", "rehearsal")["coord"]["arm_ready"],
+            true
+        );
+    }
+
     /// Fleet rehearsal §4.1: each new run directory created a new instance id for the same token
     /// (it was persisted in the journal directory), and the relay flagged the token as conflicted.
     #[test]
