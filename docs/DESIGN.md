@@ -6,7 +6,7 @@ ceremony is shaped the way it is: the adversarial review that changed the design
 **R-numbers** that appear in log messages, config comments and the README), the state machine,
 the config format, the failure and rollback table, and a sketch of a faster v2.
 
-It describes the code as of **v0.5.0-rc.32** (§3 and §5 carry the rc.21–rc.28 changes; rc.29's guard, authorization and
+It describes the code as of **v0.5.0-rc.33** (§2b is the rc.33 all-producers gate; §3 and §5 carry the rc.21–rc.28 changes; rc.29's guard, authorization and
 relay changes are summarised in docs/OPERATOR-QUICKSTART.md §6 and ATOMICITY.md known limit 17; the
 review table in §2 was last re-checked at rc.11 and its "Today" column is dated that way). The
 first version of this design was written in August 2026, before the multi-producer rehearsal and
@@ -56,7 +56,7 @@ behaviour.
 | # | Attack | Finding | Design change | Today (rc.11) |
 |---|---|---|---|---|
 | **R1** | "Pause at H, then snapshot" | Deadlock. Leap writes a snapshot only once its block is irreversible, and a fully paused DPoS chain never finalizes H (LIB needs later confirmations). | Freeze writes at the edge; producers keep producing **empty** blocks through H; the snapshot is scheduled at exactly H and lands when H is final; producers pause **after**. | `freeze_strategy = "schedule_at_h"` (requires `snapshot.dir`). The agent schedules the snapshot at ARM and picks up `snapshot-<id of H>.bin` by exact name. If scheduling fails the ceremony aborts; there is no fallback to an immediate snapshot. |
-| **R2** | Writes "into the void" around the freeze | A paused nodeos still accepts and acknowledges pushed transactions that are never included: silent write loss. | The freeze is an explicit reject at the API edge (HTTP 503 / tx-acceptance off). Pause alone is never the freeze. | `hooks.on_freeze` closes writes `freeze_lead_blocks` (default 24) before H; a failing hook aborts. rc.32: at the same moment the producer itself stops admitting transactions (the **admission lock**, §2a). The **burn-off audit** reads every block from H+1 to the pause head and aborts on any transaction or unreadable block (the backstop). |
+| **R2** | Writes "into the void" around the freeze | A paused nodeos still accepts and acknowledges pushed transactions that are never included: silent write loss. | The freeze is an explicit reject at the API edge (HTTP 503 / tx-acceptance off). Pause alone is never the freeze. | `hooks.on_freeze` closes writes `freeze_lead_blocks` (default 24) before H; a failing hook aborts. rc.32: at the same moment the producer itself stops admitting transactions (the **admission lock**, §2a); rc.33: the freeze is refused unless every producer that can produce before the pause has an armed agent with that lock (the **all-producers gate**, §2b). The **burn-off audit** reads every block from H+1 to the pause head and aborts on any transaction or unreadable block (the backstop). |
 | **R3** | nodeos version skew | Snapshot file bytes depend on the snapshot format version (Leap 5 writes v6, later versions v7+), so sha256 goldens are version-fragile. Table fingerprints over imported state are not. | Two tiers: fingerprints are the binding cross-node check; sha256 is a strict extra bound to the pinned nodeos version. | `snapshot.expected_sha256` (optional) and `snapshot.golden_roots`; either mismatch aborts. In the upstream backend the whole-state root from `xpr_state_fingerprint` can be compared to `[upstream] golden_state_root`. |
 | **R4** | Microforks and late blocks at H | "Snapshot the current head" is ambiguous: a straggler block or an unpaused producer moves head; a node on a microfork snapshots a different block H. | Pin the cut by height **and** block id; after the pause, require a quiescence window of unchanged-head polls; assert the snapshot's block id equals the chain's block id at that height. | As designed. `quiescence_polls` (default 6); late blocks are journaled (first 10) and reset the window; since rc.12 the wait is bounded by `quiescence_timeout_secs` (default 120) and aborts on expiry. *Differs from the August design:* the cut is not re-pinned on late blocks (it is always the scheduled H). |
 | **R5** | Partial quorum; the flip racing the target | Half the validators ignite and quorum never forms, or a gateway flips before the target produces. | Ratchet: the user-visible flip happens only after the target serves the source chain_id at the cut **and** its head advances past it. `quorum_timeout` bounds the wait. | LIVE now also needs `live_sustain_secs` (60) of progress with no gap over `live_max_gap_secs` (20). *Corrected since August:* "the source stays authoritative until LIVE" holds only before ignition. From `ignite_started` on, every failure HALTS instead of resuming the source (§3). Fleet-wide, the point of no return is target authorization, which is not implemented ([DESIGN-authority-boundary.md](DESIGN-authority-boundary.md)). |
@@ -121,7 +121,120 @@ another. The burn-off audit stays the backstop (it now names the producer of eac
 procedural: every producer that can produce between the freeze and the pause, standby included, runs the agent. Making
 it airtight without that needs an upstream nodeos change (a producer switch that refuses all input and deferred
 transactions from block N), or a freeze lead of at least the longest expiry with every admission path in the network
-closed for that time. RISK-REGISTER A-22.
+closed for that time. RISK-REGISTER A-22. rc.33 closes the procedural part with a gate (§2b).
+
+## 2b. The all-producers gate (rc.33)
+
+The admission lock (§2a) protects only the producers whose agent applies it. A producer that is not running an
+rc.32+ agent with the lock on (no agent, an older one, the lock turned off, an agent that arms late) can still put
+transactions into its blocks between the freeze and the pause. The burn-off audit catches that and aborts, which is
+safe, but the cut fails. rc.33 makes the ceremony unable to reach the freeze unless every producer that could produce a
+block before the pause has an rc.33+ agent ARMED for this event, with `admission_lock = true` and a working lock probe.
+If that stops being true after ARM (a schedule change, a member that disarms or goes stale), every agent aborts before
+it freezes. Code: `src/producer_gate.rs`, `control/coordlib.mjs`, `control/lib.mjs` `producerGateView`.
+
+**1. The set, bound into the signed event.** `coord.mjs event --producer-gate yes --source-rpc <nodeos>` reads the source's
+`get_producer_schedule` and binds, as `producer_gate` in the signed payload:
+
+- `required`: every producer that could produce before the pause: active ∪ pending ∪ proposed, plus the standbys the
+  coordinator names (`--standby`);
+- `cover`: the roster member (beacon producer account) that runs each one's agent. By default the name itself (one
+  producer, one agent). Rehearsals where one server signs for several schedule names map them (`--cover name:member`);
+- the bound `active`, `pending` and `proposed` schedules (version and order), `min_agent_version` (at least
+  `0.5.0-rc.33`), and a sha256 over a canonical text that both sides compute. A shared vector checks they agree:
+  `control/test/fixtures/producer-gate-vector.json`.
+
+The coordinator refuses to sign when a required producer has no roster member. The arm binds the event's hash, so it
+binds the set too. Mission control and every agent check the same set and hash.
+
+**2. Each agent, at `await`.** An event whose gate is malformed, whose hash does not match, whose producers are not all
+covered by its roster, or whose `min_agent_version` is newer than the agent, is refused. In producer mode outside a
+rehearsal, an event without a gate is refused too: the production profile requires it, and XPR mainnet requires it at
+ARM (D-10). The derived config carries the gate as `[coordination.producer_gate]`. The mainnet binding journaled at ARM
+includes its hash. `coord-state.json` (the beacon's `coord`) records the accepted gate's hash, and the beacon adds
+`arm_ready`: `auto_arm`, or the operator's `confirm-<event>` file.
+
+**3. Mission control** refuses to relay the arm (409, not relayed, history `arm_refused`) until every required
+producer's member has a fresh (≤ 60 s) producer-role report that:
+
+- accepted this event under this gate;
+- will start on the arm (`arm_ready`);
+- runs an agent at least `min_agent_version`;
+- shows the `admission_lock` check and the new `admission_lock_probe` check green.
+
+The probe is a setup check: the beacon reads `get_whitelist_blacklist` on the producer API. It is a setup check so it
+never excludes a report from the ignition fleet gate. A schedule mission control has read that is not the bound one
+blocks the arm too. An unknown schedule does not, because the agents check the schedule themselves. The 409, the event
+log and `fleet.producer_gate` name each producer that is not ready, and why. After the arm, the board shows
+`PRODUCER GATE NOT READY (agents abort before the freeze)` while any member is not ARMED or FROZEN under the gate.
+`coord.mjs arm --source-rpc` also refuses to sign when the live schedule has changed since the event.
+
+**4. Each agent, at ARM and right before the freeze.**
+
+- At ARM (and on a run resumed before the freeze), producer mode under a gate refuses when:
+  - the lock is off;
+  - the agent is older than `min_agent_version`;
+  - the live schedule is not the bound one: the active or pending schedule changed, or a name in the active, pending or
+    proposed schedule is outside `required`. A proposal among required producers only is tolerated, because it cannot
+    bring in anyone else.
+- At the freeze tick (head ≥ H − `freeze_lead_blocks`, after the production profile check, before the lock and
+  `on_freeze`), the agent re-reads the schedule against the same rules. It then reads `/api/status` and needs every
+  required producer's member to have a fresh report for this event:
+  - in ARMED or FROZEN;
+  - journaled under this gate (`producer_gate_sha256` in the ARMED evidence);
+  - from an agent at least the minimum version;
+  - with `admission_lock` and `admission_lock_probe` green.
+- Each read is retried briefly (3 tries, 1 s apart), and an unanswered one counts as a failure: unknown is never yes.
+- On any gap the agent aborts before it freezes or locks anything. The journal names the missing producers and why
+  (`producer gate not met before the freeze`), with the schedule problems. A pass is journaled
+  (`producer_gate: checked before the freeze`).
+
+Every agent checks the same inputs (the chain's schedule and the relay's view), so the fleet normally decides the same
+way. One agent that aborts while its peers freeze resumes its producer with admission open. Its transactions after H then
+abort everyone at the burn-off audit: safe, and the same outcome the gate exists to avoid. That is why the relay
+refuses the arm early.
+
+**Limits (honest).**
+
+- **Mission control is an unsigned relay.** The signed event fixes WHO must be ready, and the relay cannot change that.
+  But "ready" comes from the relay's `/api/status`. A compromised or buggy relay can make the gate pass when it should
+  not (then the burn-off audit decides), or fail when it should not (safe: no freeze). Per-producer signed
+  acknowledgements would remove this trust (RISK-REGISTER D-1).
+- **A producer can lie in its own report.** Reports are authenticated per producer by a bearer token (hashed on the
+  relay), not signed, and they describe what that producer's agent says. A producer can report ARMED with the lock on
+  while its signing node is not locked. Its agent may run on another box than the one that signs, or the coordinator's
+  `cover` mapping may be wrong. The gate cannot tell. If the node is in fact locked the lie is harmless; if it is not,
+  the burn-off audit aborts and names the producer (`tests/admission.rs`
+  `rc33_gate_a_lying_producer_passes_the_gate_and_burn_off_stays_the_backstop`).
+- **The burn-off audit stays the final backstop** and is unchanged: any transaction in H+1…pause, or an unreadable block,
+  aborts.
+- **Standbys** matter only if the schedule can change before the pause. A producer outside the schedule cannot produce.
+  A new schedule must be proposed, become pending when its proposal block is irreversible, and become active when that
+  block is irreversible: two finality delays (about 325 blocks each on XPR). The pause comes about one finality delay
+  after H. So a schedule proposed after the freeze tick cannot become active before the pause, and anything that could
+  is already visible as pending or proposed at the freeze tick, which the check refuses. This timing argument is
+  analytical, not measured. The governance halt (no votes, no `regproducer` in the window) removes the proposals in the
+  first place, and standbys are bound so that the gate also holds when the coordinator expects a schedule change. After
+  the freeze the schedule is not watched again: that window is covered by the timing argument and the burn-off audit.
+- **Every producer must upgrade** to rc.33+ and run its beacon. The gate is optional for rehearsals
+  (`ceremony.rehearsal = true`), so fleets can still rehearse rc.32-style failures.
+
+**Interaction with finality (LIB).** Leap 5.0 (legacy DPoS) makes a block irreversible once 2/3+1 of the active
+producers have built on it. Participants pause only after H is irreversible. So:
+
+- Blocks in H+1 … LIB-at-pause became irreversible while the participants were still producing. A transaction a
+  non-participant put there is final on the old chain and absent from the new one: a real atomicity violation. This is
+  exactly the window where every producer is still producing, which is why the gate has to act before the freeze and
+  cannot rely on finality.
+- Once more than 1/3 of the active producers are paused (the gate's case: all of them), LIB stops. Blocks after
+  LIB-at-pause can never become irreversible on the old chain, so a transaction a non-participant or a liar put there is
+  never final. A client that waits for irreversibility (EXCHANGES.md) sees it as not executed, which is also what the
+  new chain says. It also cannot become final later unless the old chain resumes, and the old chain resumes only on an
+  abort (when the old chain is the live one again).
+
+So finality narrows the harmful window to H+1 … LIB-at-pause (the LIB advance during the snapshot wait and the pause),
+and it explains why the after-pause tail is benign. It does not let the burn-off rule relax (unchanged: any
+transaction in H+1…pause aborts), and it does not help before the pause, which is where the gate works.
 
 ## 3. State machine
 
@@ -459,6 +572,7 @@ coordinator_keys = ["<ed25519 hex>"]
 auto_arm = false                   # a signed ARM also needs confirm-<event_id> next to the journal
 fleet_quorum = 3                   # roster/quorum come from the signed event; await writes them,
                                    # event_id and event_hash into the derived config
+# [coordination.producer_gate]     # rc.33 (§2b): written by await from the signed event, never by hand
 # [flip] / [hyperion]: api and hyperion modes. [upstream]: the #61 pipeline. [loop]: loop harness.
 # Every field, with its default: examples/ceremony.toml.
 ```
@@ -510,6 +624,7 @@ designed in [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md).
 | A transient source error (connection refused or reset, timeout, HTTP 5xx: a nodeos restart) in the freeze window | `source.rpc_retry_secs` retry with backoff, also for the pause and the producer-paused reads around it (rc.32, fleet run r3: it killed the agent) | FROZEN | retried and journaled (`source_rpc_retry` / `source_rpc_recovered`); the next tick re-applies a dropped admission lock; past the bound, abort (or STRANDED), never a bare exit; the lock is never lifted while the source cannot be read, and a strand re-applies it |
 | A nodeos restart after the pause clears the runtime pause and the lock (fleet run r3b: 234 ms after `pause()`, 14 blocks produced unpaused and unlocked) | `hold_source_sealed` on every tick from the pause to chain creation (quiescence, verification incl. the upstream tools' poll, VERIFIED, the fleet gate) and the burn-off re-check (rc.32) | FROZEN–VERIFIED | re-paused and re-locked at once (`source_unpaused`, `admission_lock_lost`, with the height); the existing refusals still decide: a head past the pause head refuses creation and aborts |
 | The admission lock cannot be set or confirmed (producer API unreachable, a list other than the sentinel read back, the sentinel already in place from another journal) | admission lock (rc.32) | ARMED | abort (before `on_freeze`) |
+| A producer that could produce before the pause has no ready agent (missing, stale, disarmed, older than the event's minimum, lock off or probe red), the schedule changed since the event, or the schedule or relay cannot be read at the freeze tick | all-producers gate (rc.33, §2b) | ARMED | abort before the freeze (nothing frozen or locked); the journal names each producer and why. At ARM the same schedule problems refuse ARM |
 | Any transaction in H+1…pause, or an unreadable block, or an answer that is not that block with a `transactions` array | burn-off audit (fails closed) | FROZEN | abort; the detail names the producer of each offending block (rc.32) |
 | sha256 ≠ manifest; imported head, chain_id or block id ≠ the pinned cut; fingerprints ≠ goldens; staged copy hash differs | verify | SNAPSHOTTED | abort |
 | Two imports disagree | dual import (R9) | SNAPSHOTTED | abort; a VM bug to report upstream |

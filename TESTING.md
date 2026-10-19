@@ -57,6 +57,16 @@ run with the early abort ON. CI runs 300 + 60 scenarios. Long runs: `MODEL_SCENA
 `MODEL_SEED=<seed>` / `JOIN_MODEL_SEED=<seed>`. The classes found earlier (A, B, R10-1, R10-2, R11-A) are fixed and
 kept as regression tests in `tests/model.rs`.
 
+rc.33 adds a model of the all-producers gate (docs/DESIGN.md §2b) in `tests/admission.rs`:
+`rc33_gate_model_never_freezes_with_a_visible_gap_and_never_goes_live_with_a_late_transaction` (`PGATE_MODEL_SCENARIOS`,
+default 40; `PGATE_MODEL_SEED` replays one) runs the real state machine in seeded random coordinated worlds: 3 to 5
+scheduled producers and sometimes a standby, members that are absent, go stale or disarm before the freeze tick, run an
+older agent or show a red lock probe, members that lie (report ready, never lock), schedule changes after ARM (a pending
+schedule bringing in an outsider, an active change, a harmless proposal), and long-expiry transfers held by random
+producers. Oracles: I10a no freeze and no lock while the gate can see a gap or a disallowed schedule change, and the run
+ends ABORTED; I10b never LIVE with a transaction after H; I10c a ready, honest fleet with an unchanged schedule goes LIVE
+with nothing after H; I10d FROZEN only after a journaled gate pass. 2,000 scenarios: clean.
+
 Round 13 tightened the oracles to the code's exact rules: I3 is run-local (a release authorizes one resume attempt,
 successful or not, by the run that journaled it, for a pause that began before it) and I7 also fails when a rollback
 completes over a paused producer in a ceremony that froze writes. New generators: someone else un-pausing the agent's
