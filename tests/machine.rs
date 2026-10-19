@@ -146,8 +146,9 @@ struct MockOps {
     fleet_polls: Cell<u32>,
     /// Override for GET /api/status (roster fleet-gate tests).
     status_doc: RefCell<Option<serde_json::Value>>,
-    /// rc.33: while this node's journal is ARMED under a producer gate, /api/status shows every member (bp0..bp9)
-    /// ARMED for e1 under the same gate, lock on and probed (default true: the fleet is ready at the freeze tick).
+    /// rc.33: OPT-IN per test (`gate_world`): while this node's journal is ARMED under a producer gate, /api/status shows
+    /// every member (bp0..bp9) ARMED for e1 under the same gate at the journal's H, lock on and probed. Default false, so
+    /// no other test's /api/status (status_doc, status_fail_times) is masked.
     gate_ready: Cell<bool>,
     /// rc.31: generated (agreeing) relay docs carry a durable exit mark for event e1 on these producers.
     exit_marked: RefCell<Vec<String>>,
@@ -348,7 +349,7 @@ impl MockOps {
             scheduled_h: Cell::new(0),
             freeze_head: Cell::new(0),
             coord_doc: RefCell::new(None),
-            gate_ready: Cell::new(true),
+            gate_ready: Cell::new(false),
             coord_down: Cell::new(false),
             public_stale_source: Cell::new(false),
             fleet_agree: Cell::new(0),
@@ -511,11 +512,7 @@ impl ChainOps for MockOps {
         }
     }
     fn source_producer_schedule(&self) -> Result<Option<serde_json::Value>, String> {
-        // rc.33: unless a test sets one, the schedule the test producer gate binds (bp1, bp2).
-        Ok(Some(self.shadow_schedule.borrow().clone().unwrap_or_else(|| {
-            serde_json::json!({"active": {"version": 1, "producers": [{"producer_name": "bp1"}, {"producer_name": "bp2"}]},
-                "pending": null, "proposed": null})
-        })))
+        Ok(self.shadow_schedule.borrow().clone())
     }
     fn source_producer_head(&self) -> Result<Option<String>, String> {
         if let Some(id) = self
@@ -984,7 +981,8 @@ impl ChainOps for MockOps {
                 summary["state"].as_str(),
                 summary["evidence"]["producer_gate_sha256"].as_str(),
             ) {
-                return Ok(Some(gate_ready_status(sha)));
+                let h = summary["evidence"]["h"].as_u64().unwrap_or(0);
+                return Ok(Some(gate_ready_status(sha, h)));
             }
             if self.status_fail_times.get() > 0 {
                 self.status_fail_times.set(self.status_fail_times.get() - 1);
@@ -2598,7 +2596,7 @@ fn upstream_backend_requires_upstream_section() {
 
 /// rc.33: the producer gate the production-profile test events carry: the mock schedule (active v1: bp1, bp2), each
 /// name its own roster member.
-fn test_gate() -> pulse_cutover::producer_gate::ProducerGate {
+fn test_gate(h: u64) -> pulse_cutover::producer_gate::ProducerGate {
     let mut g = pulse_cutover::producer_gate::ProducerGate {
         v: 1,
         required: vec!["bp1".into(), "bp2".into()],
@@ -2611,29 +2609,42 @@ fn test_gate() -> pulse_cutover::producer_gate::ProducerGate {
         proposed: None,
         standby: vec![],
         min_agent_version: pulse_cutover::producer_gate::MIN_AGENT_VERSION.into(),
+        event_id: "e1".into(),
+        h,
         sha256: String::new(),
     };
     g.sha256 = g.compute_sha256();
     g
 }
-fn test_gate_json() -> serde_json::Value {
-    serde_json::to_value(test_gate()).unwrap()
+fn test_gate_json(h: u64) -> serde_json::Value {
+    serde_json::to_value(test_gate(h)).unwrap()
+}
+/// rc.33 (opt-in): this world serves the test gate's schedule (bp1, bp2) unless the test set one, and a ready fleet
+/// while ARMED under a gate.
+fn gate_world(ops: &MockOps) {
+    ops.gate_ready.set(true);
+    if ops.shadow_schedule.borrow().is_none() {
+        *ops.shadow_schedule.borrow_mut() = Some(
+            serde_json::json!({"active": {"version": 1, "producers":
+            [{"producer_name": "bp1"}, {"producer_name": "bp2"}]}, "pending": null, "proposed": null}),
+        );
+    }
 }
 /// `[coordination.producer_gate]` for a config whose `[coordination]` (and roster) came just before.
-fn test_gate_toml() -> String {
-    let g = test_gate();
-    format!("\n[coordination.producer_gate]\nv = 1\nrequired = [\"bp1\", \"bp2\"]\nstandby = []\nmin_agent_version = \"{}\"\nsha256 = \"{}\"\n\
+fn test_gate_toml(h: u64) -> String {
+    let g = test_gate(h);
+    format!("\n[coordination.producer_gate]\nv = 1\nrequired = [\"bp1\", \"bp2\"]\nstandby = []\nmin_agent_version = \"{}\"\nevent_id = \"e1\"\nh = {h}\nsha256 = \"{}\"\n\
              [coordination.producer_gate.active]\nversion = 1\nproducers = [\"bp1\", \"bp2\"]\n",
         g.min_agent_version, g.sha256)
 }
 /// /api/status with members bp0..bp9 ARMED for e1 under gate `sha`, lock on and probed, on every test network.
-fn gate_ready_status(sha: &str) -> serde_json::Value {
+fn gate_ready_status(sha: &str, h: u64) -> serde_json::Value {
     let v = pulse_cutover::producer_gate::MIN_AGENT_VERSION;
     let producers: Vec<serde_json::Value> = (0..10).map(|i| serde_json::json!({"name": format!("bp{i}"), "beacons": [{
         "role": "producer", "age_ms": 1000, "silent": false, "conflict": false, "report": {"role": "producer",
         "instance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "agent_version": v, "coord": {"event_id": "e1"},
         "checks": [{"name": "admission_lock", "ok": true}, {"name": "admission_lock_probe", "ok": true}],
-        "ceremony": {"state": "ARMED", "evidence": {"producer_gate_sha256": sha, "agent_version": v}}}}]})).collect();
+        "ceremony": {"state": "ARMED", "evidence": {"h": h, "producer_gate_sha256": sha, "agent_version": v}}}}]})).collect();
     let nets: Vec<serde_json::Value> = ["rehearsal", "shadow-net", "testnet"]
         .iter()
         .map(|n| serde_json::json!({"id": n, "producers": producers.clone()}))
@@ -6552,7 +6563,7 @@ fn upstream_production_config(dir: &std::path::Path) -> Result<Config, String> {
 fn mainnet_event(h: u64) -> serde_json::Value {
     signed(
         serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "chain_id": MAINNET, "h": h,
-        "roster": [{"producer": "bp1"}, {"producer": "bp2"}], "quorum": 2, "producer_gate": test_gate_json()}),
+        "roster": [{"producer": "bp1"}, {"producer": "bp2"}], "quorum": 2, "producer_gate": test_gate_json(h)}),
     )
 }
 
@@ -6568,7 +6579,7 @@ fn upstream_mainnet_coordinated_config(dir: &std::path::Path) -> Config {
         + &format!("\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nevent_hash = \"{}\"\nfleet_quorum = 2\nfleet_timeout_secs = 5\nreport_max_age_secs = 60\n",
             hex::encode(coord_key().verifying_key().to_bytes()), ev_hash)
         + "\n[[coordination.roster]]\nproducer = \"bp1\"\n\n[[coordination.roster]]\nproducer = \"bp2\"\n"
-        + &test_gate_toml()
+        + &test_gate_toml(h)
         + &format!("\n[beacon]\nurl = \"https://mc.example/api/report\"\nproducer = \"bp1\"\nnetwork = \"rehearsal\"\ntoken_file = \"{}/beacon.token\"\n", dir.display());
     load_toml(dir, "mainnet-coord.toml", &text).unwrap()
 }
@@ -6583,6 +6594,7 @@ fn upstream_ignite_is_refused_for_mainnet_while_gaps_remain() {
     let ops = upstream_ops(dir.path());
     ops.schedule_ok.set(true);
     *ops.chain_id.borrow_mut() = MAINNET.into();
+    gate_world(&ops);
     *ops.coord_doc.borrow_mut() =
         Some(serde_json::json!({"event": mainnet_event(cfg.ceremony.freeze_height)}));
     *ops.status_doc.borrow_mut() = Some(rc23_status(&[
@@ -6749,7 +6761,7 @@ fn d10_mainnet_arm_authenticates_and_binds_the_signed_event() {
     let h = cfg.ceremony.freeze_height;
     let ev = |chain: Option<&str>, hh: Option<u64>, roster: serde_json::Value, quorum: u64| {
         let mut p = serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "roster": roster, "quorum": quorum,
-            "producer_gate": test_gate_json()});
+            "producer_gate": test_gate_json(h)});
         if let Some(c) = chain {
             p["chain_id"] = serde_json::json!(c);
         }
@@ -9656,7 +9668,7 @@ fn shadow_event() -> serde_json::Value {
     signed(
         serde_json::json!({"type": "event", "network": "shadow-net", "event_id": "e1", "chain_id": MAINNET, "h": 120,
         "roster": [{"producer": "bp1", "instance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, {"producer": "bp2"}], "quorum": 2,
-        "producer_gate": test_gate_json()}),
+        "producer_gate": test_gate_json(120)}),
     )
 }
 
@@ -9665,7 +9677,7 @@ fn shadow_coordination(network: &str) -> String {
              fleet_quorum = 2\nfleet_timeout_secs = 5\nreport_max_age_secs = 60\n\n[[coordination.roster]]\nproducer = \"bp1\"\ninstance_id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\n\
              [[coordination.roster]]\nproducer = \"bp2\"\n{}",
         hex::encode(coord_key().verifying_key().to_bytes()), pulse_cutover::coord::payload_hash(&shadow_event()).unwrap(),
-        test_gate_toml())
+        test_gate_toml(120))
 }
 
 /// A status doc on the shadow board in which bp1 (us) and bp2 report `ceremony`.
@@ -9702,6 +9714,7 @@ fn shadow_ops(dir: &std::path::Path, keys: &[&str], network: Option<u64>) -> Moc
     *ops.shadow_schedule.borrow_mut() =
         Some(serde_json::json!({"active": {"version": 1, "producers": producers}}));
     *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"event": shadow_event()}));
+    gate_world(&ops);
     // Public mainnet answers, with its own (real) keys and its own blocks.
     *ops.public_mainnet.borrow_mut() =
         Some(serde_json::json!({"keys": ["PUB_K1_realproducerkey"], "same_blocks": false}));
@@ -10581,6 +10594,7 @@ fn r30r2_mainnet_event_binding_survives_crashes_and_config_edits() {
     let ops = upstream_ops(dir.path());
     ops.schedule_ok.set(true);
     *ops.chain_id.borrow_mut() = MAINNET.into();
+    gate_world(&ops);
     *ops.coord_doc.borrow_mut() =
         Some(serde_json::json!({"event": mainnet_event(cfg.ceremony.freeze_height)}));
     *ops.status_doc.borrow_mut() = Some(rc23_status(&[
@@ -10600,6 +10614,7 @@ fn r30r2_mainnet_event_binding_survives_crashes_and_config_edits() {
     let ops2 = upstream_ops(dir.path());
     ops2.schedule_ok.set(true);
     *ops2.chain_id.borrow_mut() = MAINNET.into();
+    gate_world(&ops2);
     *ops2.coord_doc.borrow_mut() =
         Some(serde_json::json!({"event": mainnet_event(cfg.ceremony.freeze_height + 1)}));
     assert!(run_machine_result(&cfg, &ops2).is_err());
@@ -10627,6 +10642,7 @@ fn r30r2_mainnet_event_binding_survives_crashes_and_config_edits() {
     .unwrap();
     let ops3 = upstream_ops(dir.path());
     *ops3.chain_id.borrow_mut() = MAINNET.into();
+    gate_world(&ops3);
     let err = run_machine_result(&cfg, &ops3).unwrap_err();
     assert!(err.contains("no `mainnet_event_verified`"), "{err}");
     let (j, rec) = open_journal(&cfg.journal_path);
@@ -10653,6 +10669,7 @@ fn r30r2_mainnet_event_binding_survives_crashes_and_config_edits() {
     let edited = load_toml(dir.path(), "mainnet-coord-edited.toml", &text).unwrap();
     let ops4 = upstream_ops(dir.path());
     *ops4.chain_id.borrow_mut() = MAINNET.into();
+    gate_world(&ops4);
     let err = run_machine_result(&edited, &ops4).unwrap_err();
     assert!(
         err.contains("not the XPR MAINNET event that was authenticated")
@@ -10674,6 +10691,7 @@ fn r30r2_mainnet_event_binding_survives_crashes_and_config_edits() {
     // The unchanged config continues past the check (whatever it does next, it is not refused for the binding).
     let ops5 = upstream_ops(dir.path());
     *ops5.chain_id.borrow_mut() = MAINNET.into();
+    gate_world(&ops5);
     let r = run_machine_result(&cfg, &ops5);
     assert!(
         !r.as_ref()
@@ -10800,6 +10818,7 @@ fn r30r3_mainnet_resume_cannot_authorize_another_h_than_the_journal_executes() {
     let ops = upstream_ops(dir.path());
     ops.schedule_ok.set(true);
     *ops.chain_id.borrow_mut() = MAINNET.into();
+    gate_world(&ops);
     *ops.coord_doc.borrow_mut() = Some(serde_json::json!({"event": mainnet_event(h1)}));
     *ops.status_doc.borrow_mut() = Some(rc23_status(&[
         (
@@ -10824,12 +10843,15 @@ fn r30r3_mainnet_resume_cannot_authorize_another_h_than_the_journal_executes() {
             &format!("freeze_height = {h1}"),
             &format!("freeze_height = {h2}"),
         )
-        .replace(&hash1, &hash2);
+        .replace(&hash1, &hash2)
+        // rc.33: the gate is bound to the event's H too.
+        .replace(&test_gate_toml(h1), &test_gate_toml(h2));
     let other = load_toml(dir.path(), "mainnet-coord-h2.toml", &text).unwrap();
     assert_eq!(other.ceremony.freeze_height, h2);
     let ops2 = upstream_ops(dir.path());
     ops2.schedule_ok.set(true);
     *ops2.chain_id.borrow_mut() = MAINNET.into();
+    gate_world(&ops2);
     *ops2.coord_doc.borrow_mut() = Some(serde_json::json!({"event": mainnet_event(h2)}));
     let err = run_machine_result(&other, &ops2).unwrap_err();
     assert!(err.contains("executes H = "), "{err}");
@@ -12768,6 +12790,7 @@ fn r30r9_a_frozen_armed_mainnet_journal_without_lock_dir_resumes() {
     let ops = upstream_ops(dir.path());
     ops.schedule_ok.set(true);
     *ops.chain_id.borrow_mut() = MAINNET.into();
+    gate_world(&ops);
     *ops.coord_doc.borrow_mut() =
         Some(serde_json::json!({"event": mainnet_event(cfg.ceremony.freeze_height)}));
     *ops.status_doc.borrow_mut() = Some(rc23_status(&[

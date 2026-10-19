@@ -141,7 +141,11 @@ it freezes. Code: `src/producer_gate.rs`, `control/coordlib.mjs`, `control/lib.m
 - `cover`: the roster member (beacon producer account) that runs each one's agent. By default the name itself (one
   producer, one agent). Rehearsals where one server signs for several schedule names map them (`--cover name:member`);
 - the bound `active`, `pending` and `proposed` schedules (version and order), `min_agent_version` (at least
-  `0.5.0-rc.33`), and a sha256 over a canonical text that both sides compute. A shared vector checks they agree:
+  `0.5.0-rc.33`), the event id and H, and a sha256 over a canonical text that both sides compute. Because the event
+  id and H are in the hash, a member whose journal is still ARMED for an aborted event never matches a re-issued event
+  with the same schedule, and the freeze-tick check also requires the member's journaled H to equal this event's H.
+- On XPR mainnet `cover` must be the identity (every producer runs its own agent): a mapping is refused by
+  `coord.mjs`, `await`, config load and the ARM check unless the ceremony is a rehearsal or a shadow. A shared vector checks they agree:
   `control/test/fixtures/producer-gate-vector.json`.
 
 The coordinator refuses to sign when a required producer has no roster member. The arm binds the event's hash, so it
@@ -155,19 +159,32 @@ includes its hash. `coord-state.json` (the beacon's `coord`) records the accepte
 `arm_ready`: `auto_arm`, or the operator's `confirm-<event>` file.
 
 **3. Mission control** refuses to relay the arm (409, not relayed, history `arm_refused`) until every required
-producer's member has a fresh (≤ 60 s) producer-role report that:
+producer's member has a fresh producer-role report that:
 
 - accepted this event under this gate;
 - will start on the arm (`arm_ready`);
 - runs an agent at least `min_agent_version`;
 - shows the `admission_lock` check and the new `admission_lock_probe` check green.
 
+Fresh means at most 45 s old (`GATE_MAX_REPORT_AGE_SECS`, the same on the relay, in `coord.mjs` and in every agent,
+whatever a member's own `report_max_age_secs`). 45 s is also the relay's silence floor (`silentAfterMs`: 3 × the beacon
+interval, never under 45 s), so a 5 s or 10 s beacon cannot count for longer anyway. Consequence: one required
+producer whose beacon is silent for more than 45 s at the freeze tick makes every agent abort before its freeze.
+
 The probe is a setup check: the beacon reads `get_whitelist_blacklist` on the producer API. It is a setup check so it
 never excludes a report from the ignition fleet gate. A schedule mission control has read that is not the bound one
 blocks the arm too. An unknown schedule does not, because the agents check the schedule themselves. The 409, the event
 log and `fleet.producer_gate` name each producer that is not ready, and why. After the arm, the board shows
 `PRODUCER GATE NOT READY (agents abort before the freeze)` while any member is not ARMED or FROZEN under the gate.
-`coord.mjs arm --source-rpc` also refuses to sign when the live schedule has changed since the event.
+`coord.mjs arm --source-rpc` also refuses to sign when the live schedule has changed since the event, and `coord.mjs
+arm` reads `/api/status` itself and refuses to sign while any bound producer is below `min_agent_version` or not
+ready: a second check on the coordinator's machine, independent of the relay's.
+
+**Downgrade, said plainly.** An agent older than rc.33 does not know the gate: it accepts a gated event and ignores
+`producer_gate` (it never runs the ARM or freeze-tick checks). Before the freeze, such a member is kept out only by the
+relay refusing the arm and by the coordinator's own `coord.mjs arm` check, both reading the member's self-reported
+version. The rc.33+ agents' freeze-tick check reads the same reports. A member that runs an old agent and reports a new
+version passes all three; burn-off is then the backstop (and an rc.32 agent still applies its own admission lock).
 
 **4. Each agent, at ARM and right before the freeze.**
 

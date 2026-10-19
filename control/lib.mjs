@@ -988,8 +988,9 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}, opts 
 }
 
 // ---- rc.33: the all-producers gate (src/producer_gate.rs) -----------------------------------------------------------
-/** Reports older than this never count for the gate (the agent's default `report_max_age_secs`). */
-export const GATE_MAX_AGE_MS = 60_000;
+/** Reports older than this never count for the gate: src/producer_gate.rs GATE_MAX_REPORT_AGE_SECS. 45 s is also the
+ *  floor of `silentAfterMs`, so a 5 s or 10 s beacon is silent (and never counts) past it anyway. */
+export const GATE_MAX_AGE_MS = 45_000;
 const GATE_STATES = ['ARMED', 'FROZEN'];
 const PAST_FREEZE = ['SNAPSHOTTED', 'VERIFIED', 'STRANDED', 'IGNITED', 'FLIPPED', 'LIVE', 'HALTED'];
 
@@ -1026,6 +1027,7 @@ export function producerGateView(ev, byProducer, { phase = 'arm', live = null, m
       } else {
         if (!GATE_STATES.includes(ce?.state)) why.push(`ceremony state ${ce?.state || 'none'} (needs ARMED or FROZEN)`);
         if (ce?.evidence?.producer_gate_sha256 !== g.sha256) why.push('its journal does not carry this event\'s producer gate');
+        if (ce?.evidence?.h !== g.h) why.push(`its journal is armed for H ${ce?.evidence?.h ?? 'unknown'} (this event cuts at ${g.h})`);
       }
       const ver = (phase === 'arm' ? null : ce?.evidence?.agent_version) || r.agent_version;
       if (!versionAtLeast(ver, g.min_agent_version)) why.push(`agent ${ver || 'unknown'} is older than ${g.min_agent_version}`);
@@ -1046,6 +1048,16 @@ export function producerGateView(ev, byProducer, { phase = 'arm', live = null, m
   const missing = members.filter((m) => !m.ok).map((m) => m.producer);
   return { sha256: g.sha256, phase, ready: !missing.length && !schedule_problems.length, required: members.length, members, missing,
     schedule_known: !!live, schedule_problems };
+}
+
+/** producer → [{report, silent, conflict, age_ms}] from one network of GET /api/status (for a reader outside the relay). */
+export function gateByProducerFromStatus(statusNet) {
+  const out = {};
+  for (const p of statusNet?.producers || []) {
+    if (typeof p?.name !== 'string') continue;
+    out[p.name] = (p.beacons || []).map((b) => ({ report: b.report, silent: !!b.silent, conflict: !!b.conflict, age_ms: b.age_ms }));
+  }
+  return out;
 }
 
 /** The gate's phase for an event: 'arm' before an arm is relayed, 'freeze' after, 'past' once any member is past the freeze. */

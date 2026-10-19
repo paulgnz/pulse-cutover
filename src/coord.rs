@@ -177,6 +177,20 @@ pub fn validate_event(
                 .map_err(|e| format!("event roster is malformed: {e}"))?
                 .unwrap_or_default();
             gate.check(&roster).map_err(|e| format!("event {e}"))?;
+            if let Some(p) = gate.mainnet_cover_problem(
+                ev["chain_id"].as_str().or(cfg.ceremony.chain_id.as_deref()),
+                cfg.ceremony.rehearsal || cfg.is_shadow(),
+            ) {
+                return Err(format!("event {p}"));
+            }
+            if ev["event_id"].as_str() != Some(gate.event_id.as_str())
+                || ev["h"].as_u64() != Some(gate.h)
+            {
+                return Err(format!(
+                    "event producer_gate is bound to event {} at H {}, not this event",
+                    gate.event_id, gate.h
+                ));
+            }
             if !crate::producer_gate::version_at_least(
                 env!("CARGO_PKG_VERSION"),
                 &gate.min_agent_version,
@@ -480,6 +494,14 @@ pub fn mainnet_event_problems(
         }
     }
     // rc.31 round 5 (review MEDIUM-2): the early abort is the signed event's decision.
+    if let Some(p) = co.producer_gate.as_ref().and_then(|g| {
+        g.mainnet_cover_problem(
+            Some(source_chain_id),
+            cfg.ceremony.rehearsal || cfg.is_shadow(),
+        )
+    }) {
+        out.push(p);
+    }
     // rc.33: the config's producer gate is the signed one.
     let signed_gate = ev["producer_gate"]["sha256"]
         .as_str()
@@ -1184,7 +1206,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("c.toml");
         std::fs::write(&src, "journal_path = \"/j\"\n[ceremony]\nfreeze_height = 0\n[snapshot]\nstaged_path = \"/s\"\n[coordination]\nurl = \"https://mc\"\nnetwork = \"testnet\"\n").unwrap();
-        let ev = json!({"type": "event", "event_id": "e8", "h": 900,
+        let ev = json!({"type": "event", "event_id": vector_gate()["event_id"], "h": vector_gate()["h"],
             "roster": [{"producer": "bp1"}, {"producer": "bp2"}, {"producer": "bp3"}], "producer_gate": vector_gate()});
         let out = dir.path().join("d.toml");
         derived_config(&src, &ev, Some("aa"), &out).unwrap();
@@ -1210,17 +1232,24 @@ mod tests {
         let cfg = readiness_cfg(dir.path());
         let roster = json!([{"producer": "bp1"}, {"producer": "bp2"}, {"producer": "bp3"}]);
         let ev = |gate: Option<Value>| {
-            let mut e =
-                json!({"type": "event", "network": "testnet", "h": 5000, "roster": roster.clone()});
+            let mut e = json!({"type": "event", "network": "testnet", "event_id": vector_gate()["event_id"],
+                "h": vector_gate()["h"], "roster": roster.clone()});
             if let Some(g) = gate {
                 e["producer_gate"] = g;
             }
             e
         };
+        let vh = vector_gate()["h"].as_u64().unwrap();
         assert_eq!(
             validate_event(&ev(Some(vector_gate())), &cfg, "testnet", Some(100), 10),
-            Ok(5000)
+            Ok(vh)
         );
+        // A gate bound to another event (an aborted one re-issued with the same schedule) is refused.
+        let mut other = ev(Some(vector_gate()));
+        other["event_id"] = json!("ev-other");
+        assert!(validate_event(&other, &cfg, "testnet", Some(100), 10)
+            .unwrap_err()
+            .contains("bound to event"));
         let e = validate_event(&ev(None), &cfg, "testnet", Some(100), 10).unwrap_err();
         assert!(e.contains("no producer_gate"), "{e}");
         let mut t = vector_gate();

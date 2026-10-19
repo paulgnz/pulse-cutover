@@ -1058,6 +1058,25 @@ impl Config {
             if let Some(g) = &co.producer_gate {
                 g.check(&co.roster)
                     .map_err(|e| format!("coordination.{e}"))?;
+                if co.event_id.as_deref().is_some_and(|id| id != g.event_id) {
+                    return Err(format!(
+                        "coordination.producer_gate is for event {}, not coordination.event_id {}",
+                        g.event_id,
+                        co.event_id.as_deref().unwrap_or("")
+                    ));
+                }
+                if let Some(p) = g.mainnet_cover_problem(
+                    config.ceremony.chain_id.as_deref(),
+                    config.ceremony.rehearsal || config.ceremony.shadow,
+                ) {
+                    return Err(format!("coordination.{p}"));
+                }
+                if config.ceremony.freeze_height > 0 && config.ceremony.freeze_height != g.h {
+                    return Err(format!(
+                        "coordination.producer_gate is for H {}, not ceremony.freeze_height {}",
+                        g.h, config.ceremony.freeze_height
+                    ));
+                }
             }
         }
         if enforce_production

@@ -34,6 +34,12 @@ use serde_json::{json, Value};
 /// The first agent version that runs this gate. An event's `min_agent_version` is at least this.
 pub const MIN_AGENT_VERSION: &str = "0.5.0-rc.33";
 
+/// Review fix 3: the freshness bound of a member's report for the gate, on every side (agent, relay, coord.mjs). Fixed,
+/// not each member's own `report_max_age_secs`: mission control already calls a 5 s / 10 s beacon silent after 45 s
+/// (`silentAfterMs`), so a longer bound would never apply, and a looser per-member one would split the fleet's verdict.
+/// One required beacon silent for longer than this at the freeze tick aborts every agent before its freeze.
+pub const GATE_MAX_REPORT_AGE_SECS: u64 = 45;
+
 /// The states a member may report at the freeze tick (a member a block ahead may already be FROZEN).
 pub const FREEZE_STATES: &[&str] = &["ARMED", "FROZEN"];
 
@@ -64,6 +70,10 @@ pub struct ProducerGate {
     #[serde(default)]
     pub standby: Vec<String>,
     pub min_agent_version: String,
+    /// Review fix 1: the event this gate belongs to and its H, so a member's ARMED journal of another event (an
+    /// aborted one re-issued with the same schedule) never matches this gate's hash.
+    pub event_id: String,
+    pub h: u64,
     /// sha256 (hex) of [`ProducerGate::canonical`].
     pub sha256: String,
 }
@@ -85,6 +95,29 @@ impl ProducerGate {
         self.cover.get(name).map(String::as_str).unwrap_or(name)
     }
 
+    /// Review fix 4: on XPR mainnet each scheduled name must be its own roster member (its own agent): a `cover` that maps
+    /// names onto another member (one box covering every name) is a rehearsal device, refused unless the ceremony is a
+    /// rehearsal or a shadow (a private network). None = allowed.
+    pub fn mainnet_cover_problem(
+        &self,
+        chain_id: Option<&str>,
+        rehearsal_or_shadow: bool,
+    ) -> Option<String> {
+        let mapped: Vec<String> = self
+            .cover
+            .iter()
+            .filter(|(n, m)| n != m)
+            .map(|(n, m)| format!("{n}→{m}"))
+            .collect();
+        (chain_id.is_some_and(crate::config::is_xpr_mainnet) && !rehearsal_or_shadow && !mapped.is_empty()).then(|| {
+            format!(
+                "producer_gate maps XPR MAINNET producers onto other members' agents ({}): on mainnet every producer runs \
+                 its own agent (a cover mapping is for rehearsals)",
+                mapped.join(", ")
+            )
+        })
+    }
+
     /// The text the sha256 covers. Kept byte-for-byte equal to `producerGateCanonical` in control/coordlib.mjs.
     pub fn canonical(&self) -> String {
         let mut req: Vec<&String> = self.required.iter().collect();
@@ -97,6 +130,8 @@ impl ProducerGate {
         standby.sort();
         [
             "pulse-cutover producer gate v1".to_string(),
+            format!("event_id={}", self.event_id),
+            format!("h={}", self.h),
             format!(
                 "required={}",
                 req.iter()
@@ -129,6 +164,21 @@ impl ProducerGate {
         }
         if !self.sha256.eq_ignore_ascii_case(&self.compute_sha256()) {
             return Err("producer_gate sha256 does not match its contents".into());
+        }
+        if self.event_id.is_empty()
+            || self.event_id.len() > 64
+            || !self
+                .event_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+        {
+            return Err(format!(
+                "producer_gate event_id {:?} is not an event id",
+                self.event_id
+            ));
+        }
+        if self.h == 0 {
+            return Err("producer_gate h is 0".into());
         }
         if parse_version(&self.min_agent_version).is_none() {
             return Err(format!(
@@ -170,6 +220,11 @@ impl ProducerGate {
         if let Some(bad) = req.iter().find(|n| !valid_name(n)) {
             return Err(format!(
                 "producer_gate names {bad:?}, which is not an account name"
+            ));
+        }
+        if let Some(bad) = self.cover.values().find(|m| !valid_name(m)) {
+            return Err(format!(
+                "producer_gate cover names member {bad:?}, which is not an account name"
             ));
         }
         if let Some(extra) = self.cover.keys().find(|k| !req.contains(k.as_str())) {
@@ -351,6 +406,17 @@ fn member_problem(
                 states.join(" or ")
             ));
         }
+        // Review fix 1: the journal must be armed for THIS cut (H), not an earlier event's.
+        if ce["evidence"]["h"].as_u64() != Some(gate.h) {
+            why.push(format!(
+                "its journal is armed for H {} (this event cuts at {})",
+                ce["evidence"]["h"]
+                    .as_u64()
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                gate.h
+            ));
+        }
         if !ce["evidence"]["producer_gate_sha256"]
             .as_str()
             .is_some_and(|s| s.eq_ignore_ascii_case(&gate.sha256))
@@ -419,6 +485,18 @@ pub fn parse_version(v: &str) -> Option<Version> {
     let [a, b, c] = nums.as_slice() else {
         return None;
     };
+    if core
+        .split('.')
+        .any(|x| x.is_empty() || !x.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    if pre.is_some_and(|p| {
+        !p.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    }) {
+        return None;
+    }
     let pre: Vec<String> = match pre {
         Some("") => return None,
         Some(p) => p.split('.').map(String::from).collect(),
@@ -483,6 +561,8 @@ mod tests {
             }),
             standby: vec!["sby".into()],
             min_agent_version: MIN_AGENT_VERSION.into(),
+            event_id: "ev-1".into(),
+            h: 5000,
             sha256: String::new(),
         };
         g.sha256 = g.compute_sha256();
@@ -593,6 +673,87 @@ mod tests {
         );
     }
 
+    /// Review fix 1: a member ARMED for an aborted event e0 is refused at the re-issued event e1's freeze tick, even when
+    /// the schedule (and so everything else in the gate) is the same.
+    #[test]
+    fn a_member_armed_for_an_earlier_event_does_not_pass_the_next_one() {
+        let e0 = gate();
+        let mut e1 = gate();
+        e1.event_id = "ev-2".into();
+        e1.h = 5600;
+        e1.sha256 = e1.compute_sha256();
+        assert_ne!(e0.sha256, e1.sha256, "event and H are in the hash");
+        let doc = |m: Value| json!({"networks": [{"id": "testnet", "producers": [m]}]});
+        // The member's journal is still ARMED from e0 (its agent died there): e0's hash and e0's H.
+        let mut stale = report("bpa", "ARMED", &e0.sha256, MIN_AGENT_VERSION, true, 1000);
+        stale["beacons"][0]["report"]["coord"]["event_id"] = json!("ev-2");
+        let p = e1.relay_problems(
+            &doc(stale.clone()),
+            "testnet",
+            "ev-2",
+            45_000,
+            FREEZE_STATES,
+        );
+        let why = p.iter().find(|x| x["producer"] == "bpa").unwrap()["why"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            why.contains("armed for H 5000")
+                && why.contains("does not carry this event's producer gate"),
+            "{why}"
+        );
+        // Same hash but another H (a hand-edited journal): still refused on H alone.
+        let mut wrong_h = report("bpa", "ARMED", &e1.sha256, MIN_AGENT_VERSION, true, 1000);
+        wrong_h["beacons"][0]["report"]["coord"]["event_id"] = json!("ev-2");
+        let p = e1.relay_problems(&doc(wrong_h), "testnet", "ev-2", 45_000, FREEZE_STATES);
+        assert!(p
+            .iter()
+            .any(|x| x["producer"] == "bpa"
+                && x["why"].as_str().unwrap().contains("armed for H 5000")));
+    }
+
+    #[test]
+    fn check_validates_cover_members_event_id_and_versions_like_the_relay() {
+        let roster4 = roster(&["bpa", "bpb", "bpc", "sby"]);
+        let mut t = gate();
+        t.cover.insert("bpa".into(), "Not-A-Name".into());
+        t.sha256 = t.compute_sha256();
+        assert!(t
+            .check(&roster4)
+            .unwrap_err()
+            .contains("not an account name"));
+        let mut t = gate();
+        t.event_id = "bad id with spaces".into();
+        t.sha256 = t.compute_sha256();
+        assert!(t.check(&roster4).unwrap_err().contains("not an event id"));
+        for v in ["0.5.0-rc.33!", "0.5.x", "0.5.0-", "1.2", " 0.5.0-rc 33"] {
+            assert!(parse_version(v).is_none(), "{v}");
+        }
+        assert!(parse_version("v0.6.0-rc.1+build.7").is_some());
+    }
+
+    #[test]
+    fn mainnet_refuses_a_cover_mapping_unless_rehearsal_or_shadow() {
+        const MAINNET: &str = "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0";
+        let mut g = gate();
+        assert!(
+            g.mainnet_cover_problem(Some(MAINNET), false).is_none(),
+            "identity is fine"
+        );
+        g.cover.insert("bpa".into(), "bpb".into());
+        assert!(g
+            .mainnet_cover_problem(Some(MAINNET), false)
+            .unwrap()
+            .contains("bpa→bpb"));
+        assert!(g.mainnet_cover_problem(Some(MAINNET), true).is_none());
+        assert!(
+            g.mainnet_cover_problem(Some(&"ab".repeat(32)), false)
+                .is_none(),
+            "other chains may map"
+        );
+    }
+
     #[test]
     fn versions_compare_by_semver_precedence() {
         assert!(version_at_least("0.5.0-rc.33", "0.5.0-rc.33"));
@@ -612,7 +773,7 @@ mod tests {
         json!({"name": member, "beacons": [{"role": "producer", "age_ms": age, "silent": false, "conflict": false, "report": {
             "role": "producer", "agent_version": ver, "coord": {"event_id": "ev-1"},
             "checks": [{"name": "admission_lock", "ok": true}, {"name": "admission_lock_probe", "ok": probe}],
-            "ceremony": {"state": state, "evidence": {"producer_gate_sha256": sha, "agent_version": ver}}}}]})
+            "ceremony": {"state": state, "evidence": {"h": 5000, "producer_gate_sha256": sha, "agent_version": ver}}}}]})
     }
 
     #[test]

@@ -138,6 +138,9 @@ struct Member {
     stale_at: u64,
     /// The member's ceremony is ABORTED (it disarmed) once the chain reaches this block (0 = never).
     disarm_at: u64,
+    /// Review fix 1: the member's journal is still ARMED for an earlier event e0 (same schedule, H / 2; its agent
+    /// died there) while it reports the current event id.
+    armed_for_e0: bool,
 }
 
 impl Member {
@@ -150,6 +153,7 @@ impl Member {
             age_ms: 1000,
             stale_at: 0,
             disarm_at: 0,
+            armed_for_e0: false,
         }
     }
 }
@@ -504,6 +508,14 @@ impl ChainOps for Mempool {
             .map(|(i, m)| {
                 let mut ev = summary["evidence"].clone();
                 ev["agent_version"] = serde_json::json!(m.version);
+                if m.armed_for_e0 {
+                    let mut g0 = gate(r.members.len(), &[]);
+                    g0.event_id = "e0".into();
+                    g0.h = H / 2;
+                    g0.sha256 = g0.compute_sha256();
+                    ev["h"] = serde_json::json!(g0.h);
+                    ev["producer_gate_sha256"] = serde_json::json!(g0.sha256);
+                }
                 let state = if m.disarm_at > 0 && head >= m.disarm_at {
                     serde_json::json!("ABORTED")
                 } else {
@@ -1387,6 +1399,8 @@ fn gate(n: usize, standby: &[usize]) -> pulse_cutover::producer_gate::ProducerGa
         proposed: None,
         standby: standby.iter().map(|i| gname(*i)).collect(),
         min_agent_version: MIN_AGENT_VERSION.into(),
+        event_id: "e1".into(),
+        h: H,
         sha256: String::new(),
     };
     g.standby.sort();
@@ -1428,7 +1442,7 @@ fn gated_world(
         text += &format!("\n[[coordination.roster]]\nproducer = \"{}\"\n", gname(i));
     }
     text += &format!(
-        "\n[coordination.producer_gate]\nv = 1\nrequired = {:?}\nstandby = {:?}\nmin_agent_version = \"{}\"\nsha256 = \"{}\"\n\
+        "\n[coordination.producer_gate]\nv = 1\nrequired = {:?}\nstandby = {:?}\nmin_agent_version = \"{}\"\nevent_id = \"e1\"\nh = {H}\nsha256 = \"{}\"\n\
          [coordination.producer_gate.active]\nversion = 1\nproducers = {:?}\n",
         g.required, g.standby, g.min_agent_version, g.sha256, g.active.producers
     );
@@ -1877,4 +1891,30 @@ fn rc33_gate_a_check_that_ends_at_h_refuses_the_freeze() {
         .unwrap()
         .to_string();
     assert!(m.contains("at or past H 120"), "{m}");
+}
+
+/// Review fix 1: a member whose agent died ARMED for an aborted event e0 (same schedule) still shows ARMED and reports
+/// the new event's id; the gate's hash binds event and H, and its H is checked, so e1's freeze tick refuses it.
+#[test]
+fn rc33_gate_a_member_armed_for_an_earlier_event_refuses_the_freeze() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut members = vec![Member::ready(); 4];
+    members[1].armed_for_e0 = true;
+    let (cfg, w) = gated_world(dir.path(), 4, &[], vec![true; 4], members);
+    assert_eq!(run(&cfg, &w), State::Aborted);
+    assert!(!froze(&cfg));
+    let err = gate_abort(&cfg).unwrap();
+    let why = err["data"]["detail"]["producer_gate"]["missing"][0]["why"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        err["data"]["detail"]["producer_gate"]["missing"][0]["producer"],
+        "prodbb"
+    );
+    assert!(why.contains(&format!("armed for H {}", H / 2)), "{why}");
+    assert!(
+        why.contains("does not carry this event's producer gate"),
+        "{why}"
+    );
 }

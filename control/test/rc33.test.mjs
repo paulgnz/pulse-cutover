@@ -31,7 +31,8 @@ const sched = (v, names) => ({ version: v, producers: names.map((producer_name) 
 // bpa and bpb are scheduled, bpc is a standby.
 const SCHEDULE = { active: sched(5, ['bpa', 'bpb']), pending: null, proposed: null };
 const roster = BPS.map((producer) => ({ producer }));
-const GATE = producerGate(SCHEDULE, { roster, standby: ['bpc'] });
+const GATE = producerGate(SCHEDULE, { roster, standby: ['bpc'], eventId: 'ev-g', h: CUT });
+const G = { eventId: 'ev-g', h: CUT };
 
 test('rc.33 the canonical text and hash match the shared vector the agent checks (src/producer_gate.rs)', () => {
   const v = JSON.parse(readFileSync(join(HERE, 'fixtures', 'producer-gate-vector.json'), 'utf8'));
@@ -41,27 +42,37 @@ test('rc.33 the canonical text and hash match the shared vector the agent checks
 
 test('rc.33 producerGate binds active ∪ pending ∪ proposed ∪ standby and refuses an uncovered producer', () => {
   const g = producerGate({ active: sched(5, ['bpb', 'bpa']), pending: sched(6, ['bpa', 'bpd']), proposed: sched(7, ['bpe']) },
-    { roster: ['bpa', 'bpb', 'bpd', 'bpe', 'bpf'].map((producer) => ({ producer })), standby: ['bpf'] });
+    { roster: ['bpa', 'bpb', 'bpd', 'bpe', 'bpf'].map((producer) => ({ producer })), standby: ['bpf'], ...G });
   assert.deepEqual(g.required, ['bpa', 'bpb', 'bpd', 'bpe', 'bpf']);
   assert.deepEqual(g.active.producers, ['bpb', 'bpa'], 'schedule order is kept (it is part of the binding)');
   assert.equal(g.sha256, producerGateSha(g));
-  assert.throws(() => producerGate(SCHEDULE, { roster: [{ producer: 'bpa' }], standby: [] }), /no --roster member runs their agent: bpb/);
+  assert.throws(() => producerGate(SCHEDULE, { roster: [{ producer: 'bpa' }], standby: [], ...G }), /no --roster member runs their agent: bpb/);
   // one server signing for several names (rehearsals): --cover
-  const c = producerGate(SCHEDULE, { roster: [{ producer: 'box1' }], standby: ['bpc'], cover: parseCover('bpa:box1,bpb:box1,bpc:box1') });
+  const c = producerGate(SCHEDULE, { roster: [{ producer: 'box1' }], standby: ['bpc'], cover: parseCover('bpa:box1,bpb:box1,bpc:box1'), ...G });
   assert.deepEqual(c.cover, { bpa: 'box1', bpb: 'box1', bpc: 'box1' });
   assert.throws(() => parseCover('bpa'), /name:member/);
-  assert.throws(() => producerGate(SCHEDULE, { roster, cover: { zzz: 'bpa' } }), /not in the schedule/);
-  assert.throws(() => producerGate({ active: null }, { roster }), /no active schedule/);
-  assert.throws(() => producerGate(SCHEDULE, { roster, standby: ['bpc'], minAgentVersion: '0.5.0-rc.32' }), /at least/);
+  assert.throws(() => producerGate(SCHEDULE, { roster, cover: { zzz: 'bpa' }, ...G }), /not in the schedule/);
+  assert.throws(() => producerGate({ active: null }, { roster, ...G }), /no active schedule/);
+  assert.throws(() => producerGate(SCHEDULE, { roster, standby: ['bpc'] }), /event id/, 'review fix 1: bound to an event');
+  assert.throws(() => producerGate(SCHEDULE, { roster, standby: ['bpc'], cover: { bpa: 'Bad-Name' }, ...G }), /not an account name/);
+  const other = producerGate(SCHEDULE, { roster, standby: ['bpc'], eventId: 'ev-h', h: CUT + 600 });
+  assert.notEqual(other.sha256, GATE.sha256, 'a re-issued event with the same schedule hashes differently');
+  assert.throws(() => producerGate(SCHEDULE, { roster, standby: ['bpc'], minAgentVersion: '0.5.0-rc.32', ...G }), /at least/);
 });
 
 test('rc.33 eventPayload: --producer-gate needs the roster and the source schedule, and puts the gate in the signed payload', () => {
-  const a = { net: 'testnet', 'chain-id': CHAIN, h: String(CUT), roster: 'bpa,bpb,bpc', 'producer-gate': 'yes', standby: 'bpc' };
+  const a = { net: 'testnet', 'chain-id': CHAIN, h: String(CUT), roster: 'bpa,bpb,bpc', 'producer-gate': 'yes', standby: 'bpc', 'event-id': 'ev-g' };
   assert.throws(() => eventPayload(a, 1), /source schedule/);
   assert.throws(() => eventPayload({ ...a, roster: undefined }, 1, { schedule: SCHEDULE }), /needs --roster/);
   const p = eventPayload(a, 1, { schedule: SCHEDULE });
   assert.deepEqual(p.producer_gate, GATE);
   assert.equal(eventPayload({ ...a, 'producer-gate': undefined }, 1).producer_gate, undefined);
+  // Review fix 4: XPR mainnet refuses a cover mapping unless the event is a rehearsal (or shadow).
+  const MAIN = '384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0';
+  const m = { ...a, 'chain-id': MAIN, roster: 'bpa,box1', cover: 'bpb:box1,bpc:box1' };
+  assert.throws(() => eventPayload(m, 1, { schedule: SCHEDULE }), /XPR MAINNET.*bpb→box1/);
+  assert.ok(eventPayload({ ...m, rehearsal: 'yes' }, 1, { schedule: SCHEDULE }).producer_gate);
+  assert.ok(eventPayload({ ...a, roster: 'bpa,box1', cover: 'bpb:box1,bpc:box1' }, 1, { schedule: SCHEDULE }).producer_gate, 'testnet may map');
 });
 
 test('rc.33 versions compare by semver precedence (same rules as the agent)', () => {
@@ -89,6 +100,7 @@ const rep = (over = {}) => {
     checks: checks || [{ name: 'admission_lock', ok: true }, { name: 'admission_lock_probe', ok: true }], ceremony };
 };
 const armed = (over = {}) => rep({ ...over, ceremony: { state: 'ARMED', evidence: { h: CUT, producer_gate_sha256: GATE.sha256, agent_version: V } } });
+const armedE0 = () => rep({ ceremony: { state: 'ARMED', evidence: { h: CUT - 600, producer_gate_sha256: producerGate(SCHEDULE, { roster, standby: ['bpc'], eventId: 'ev-0', h: CUT - 600 }).sha256, agent_version: V } } });
 const by = (m) => Object.fromEntries(Object.entries(m).map(([p, r]) => [p, r ? [{ report: r, silent: false, conflict: false, age_ms: 1000 }] : []]));
 
 test('rc.33 producerGateView (arm phase): ready only when every bound producer is ready; each gap is named', () => {
@@ -129,6 +141,12 @@ test('rc.33 producerGateView (freeze phase): every member ARMED or FROZEN under 
   // (and every agent) can only read what the producer reports. The burn-off audit stays the backstop (DESIGN §2b).
   assert.equal(producerGateView(EV, by({ bpa: armed(), bpb: armed(), bpc: armed() }), { phase: 'freeze' }).ready, true);
   assert.equal(producerGatePhase(EV, true, by({ bpa: rep({ ceremony: { state: 'SNAPSHOTTED', evidence: { h: CUT } } }) })), 'past');
+  // Review fix 1: a member still ARMED from an aborted event (same schedule) is not ready for this one.
+  const e0 = producerGateView(EV, by({ bpa: armed(), bpb: armedE0(), bpc: armed() }), { phase: 'freeze' });
+  assert.deepEqual(e0.missing, ['bpb']);
+  // Review fix 3: the window is 45 s.
+  const old = producerGateView(EV, { ...all, bpc: [{ report: armed(), silent: false, conflict: false, age_ms: 46_000 }] }, { phase: 'freeze' });
+  assert.match(old.members.find((m) => m.producer === 'bpc').why, /older than 45 s/);
   assert.equal(producerGatePhase(EV, false, all), 'arm');
 });
 
@@ -287,4 +305,43 @@ test('rc.33 coord.mjs: event --producer-gate reads the source schedule; arm --so
   assert.equal(r.code, 0, r.stderr + r.stdout);
   proc.kill('SIGKILL');
   src.close();
+});
+
+test('rc.33 review fix 2: coord.mjs arm reads /api/status itself and refuses a member below min_agent_version even if the relay would relay', async () => {
+  const { createServer } = await import('node:http');
+  const { execFile } = await import('node:child_process');
+  const dir = setup();
+  const COORD = join(HERE, '..', 'coord.mjs');
+  const run = (args) => new Promise((ok) => execFile(process.execPath, [COORD, ...args], { cwd: dir }, (e, stdout, stderr) => ok({ code: e ? e.code : 0, stdout, stderr })));
+  await run(['keygen', '--out', join(dir, 'k.pem')]);
+  // A permissive (or compromised, or pre-rc.33) relay: it serves the event and accepts any arm.
+  const posts = [];
+  let event = null, beacons = {};
+  const relay = createServer(async (q, r) => {
+    let body = ''; for await (const c of q) body += c;
+    r.writeHead(200, { 'content-type': 'application/json' });
+    if (q.method === 'POST') { posts.push(JSON.parse(body)); if (!event) event = JSON.parse(body); return r.end(JSON.stringify({ ok: true, event_hash: sha(JSON.parse(body).payload) })); }
+    if (q.url.startsWith('/api/coord/')) return r.end(JSON.stringify({ event }));
+    return r.end(JSON.stringify({ networks: [{ id: 'testnet', producers: Object.entries(beacons).map(([name, report]) => ({ name, beacons: [{ role: 'producer', age_ms: 1000, silent: false, conflict: false, report }] })) }] }));
+  });
+  await new Promise((ok) => relay.listen(0, '127.0.0.1', ok));
+  const base = `http://127.0.0.1:${relay.address().port}`;
+  const src = createServer((q, r) => { r.writeHead(200); r.end(JSON.stringify(SCHEDULE)); });
+  await new Promise((ok) => src.listen(0, '127.0.0.1', ok));
+  const rpc = `http://127.0.0.1:${src.address().port}`;
+  const common = ['--url', base, '--net', 'testnet', '--key', join(dir, 'k.pem')];
+  let r = await run(['event', ...common, '--chain-id', CHAIN, '--h', String(CUT), '--roster', 'bpa,bpb,bpc', '--producer-gate', 'yes', '--source-rpc', rpc,
+    '--standby', 'bpc', '--event-id', 'ev-g']);
+  assert.equal(r.code, 0, r.stderr);
+  beacons = { bpa: rep(), bpb: rep({ agent_version: '0.5.0-rc.32' }), bpc: rep() };
+  r = await run(['arm', ...common, '--event-id', 'ev-g', '--event-file', join(dir, 'ev-g.event.json')]);
+  assert.notEqual(r.code, 0);
+  assert.match(r.stderr, /NOT READY.*\n.*not ready: bpb: .*older than 0\.5\.0-rc\.33/);
+  assert.equal(posts.length, 1, 'only the event was posted: the arm was never signed or sent');
+  beacons.bpb = rep();
+  r = await run(['arm', ...common, '--event-id', 'ev-g', '--event-file', join(dir, 'ev-g.event.json')]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(posts.length, 2);
+  assert.equal(JSON.parse(posts[1].payload).type, 'arm');
+  relay.close(); src.close();
 });

@@ -32,6 +32,7 @@
 import { generateKeyPairSync, createPrivateKey, createPublicKey, sign, createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { eventPayload, gateScheduleProblems } from './coordlib.mjs';
+import { producerGateView, gateByProducerFromStatus } from './lib.mjs';
 const [cmd, ...rest] = process.argv.slice(2);
 const a = {}; for (let i = 0; i < rest.length; i += 2) a[rest[i].replace(/^--/, '')] = rest[i + 1];
 const rawPub = (k) => createPublicKey(k).export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex');
@@ -78,6 +79,19 @@ if (cmd !== 'event') {
       if (probs.length) { console.error(`the source schedule is not the one event ${ev.event_id} binds: ${probs.join('; ')}. Refusing to sign: abort this event and publish a new one`); process.exit(1); }
       console.error(`producer gate: the source schedule is still the bound one (${ev.producer_gate.required.length} producers)`);
     } else console.error('warning: no --source-rpc: the schedule is not re-checked here (mission control and every agent still check it)');
+    // Review fix 2: a second check, independent of the relay's own refusal: read the members' reports and refuse to sign
+    // when any bound producer is below min_agent_version or not gate-ready. Before the freeze, an agent older than rc.33
+    // ignores the gate entirely, so only the relay and this check stop it.
+    let st;
+    try { st = await (await fetch(`${base}/api/status`, { signal: AbortSignal.timeout(10000) })).json(); } catch (e) { console.error(`cannot read ${base}/api/status (${e.message || e}): refusing to sign the arm`); process.exit(1); }
+    const netDoc = (st?.networks || []).find((x) => x.id === a.net);
+    const gv = producerGateView(ev, gateByProducerFromStatus(netDoc), { phase: 'arm' });
+    if (!gv.ready) {
+      console.error(`producer gate NOT READY: ${gv.missing.length} of ${gv.required} producers. Refusing to sign the arm:`);
+      for (const m of gv.members.filter((x) => !x.ok)) console.error(`  not ready: ${m.producer}${m.member !== m.producer ? ` (agent ${m.member})` : ''}: ${m.why}`);
+      process.exit(1);
+    }
+    console.error(`producer gate: all ${gv.required} producers report ready (checked here, independently of the relay's own check)`);
   }
   console.error(`signing ${cmd} for ${ev.event_id} (H ${ev.h}, event_hash ${eventHash.slice(0, 16)}…)`);
 }

@@ -58,7 +58,12 @@ export function eventPayload(a, now = Date.now(), { schedule } = {}) {
     if (!roster) throw new Error('--producer-gate needs --roster (the agents that cover the schedule)');
     if (!schedule) throw new Error('--producer-gate needs the source schedule (--source-rpc <nodeos /v1 base>)');
     gate = producerGate(schedule, { roster, standby: String(a.standby || '').split(',').map((s) => s.trim()).filter(Boolean),
-      cover: parseCover(a.cover), minAgentVersion: a['min-agent-version'] || PRODUCER_GATE_MIN_AGENT_VERSION });
+      cover: parseCover(a.cover), minAgentVersion: a['min-agent-version'] || PRODUCER_GATE_MIN_AGENT_VERSION,
+      eventId: a['event-id'] || `ev-${now.toString(36)}`, h: +a.h });
+    // Review fix 4: on XPR mainnet every scheduled producer runs its own agent; a cover mapping is a rehearsal device.
+    if (a['chain-id'].toLowerCase() === XPR_MAINNET_CHAIN_ID && Object.keys(gate.cover).length && a.rehearsal !== 'yes') {
+      throw new Error(`--cover maps XPR MAINNET producers onto other members (${Object.entries(gate.cover).map(([n, m]) => `${n}→${m}`).join(', ')}): on mainnet every producer runs its own agent (--rehearsal yes for a rehearsal or shadow)`);
+    }
   } else if (a['producer-gate'] !== undefined && a['producer-gate'] !== 'no') throw new Error('--producer-gate takes yes or no');
   return {
     v: 1, type: 'event', network: a.net, event_id: a['event-id'] || `ev-${now.toString(36)}`, chain_id: a['chain-id'].toLowerCase(), h: +a.h,
@@ -84,6 +89,7 @@ export function eventPayload(a, now = Date.now(), { schedule } = {}) {
 // the schedule and the members' reports right before it freezes.
 
 export const PRODUCER_GATE_MIN_AGENT_VERSION = '0.5.0-rc.33';
+export const XPR_MAINNET_CHAIN_ID = '384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0';
 const NAME = /^[a-z1-5.]{1,12}$/;
 
 /** One schedule of a get_producer_schedule answer → {version, producers: [names]} or null. */
@@ -118,7 +124,7 @@ const memberOf = (g, name) => (g.cover && Object.hasOwn(g.cover, name) ? g.cover
 /** The text the gate's sha256 covers; byte-for-byte equal to ProducerGate::canonical in src/producer_gate.rs. */
 export function producerGateCanonical(g) {
   const sched = (s) => (s ? `${s.version}:${s.producers.join(',')}` : '-');
-  return ['pulse-cutover producer gate v1',
+  return ['pulse-cutover producer gate v1', `event_id=${g.event_id}`, `h=${g.h}`,
     `required=${[...g.required].sort().map((n) => `${n}:${memberOf(g, n)}`).join(',')}`,
     `active=${sched(g.active)}`, `pending=${sched(g.pending)}`, `proposed=${sched(g.proposed)}`,
     `standby=${[...(g.standby || [])].sort().join(',')}`, `min_agent_version=${g.min_agent_version}`].join('\n');
@@ -141,7 +147,10 @@ export function parseCover(spec) {
  * Build the signed event's producer_gate from a get_producer_schedule answer. Throws when a producer that could produce
  * before the pause has no roster member running its agent.
  */
-export function producerGate(schedule, { roster, standby = [], cover = {}, minAgentVersion = PRODUCER_GATE_MIN_AGENT_VERSION } = {}) {
+export function producerGate(schedule, { roster, standby = [], cover = {}, minAgentVersion = PRODUCER_GATE_MIN_AGENT_VERSION, eventId, h } = {}) {
+  // Review fix 1: bound to the event and its H (a re-issued event with the same schedule hashes differently).
+  if (!/^[\w.:-]{1,64}$/.test(String(eventId ?? ''))) throw new Error('the producer gate needs the event id');
+  if (!Number.isSafeInteger(h) || h <= 0) throw new Error('the producer gate needs the event H');
   const active = scheduleOf(schedule?.active);
   if (!active || !active.producers.length) throw new Error('get_producer_schedule has no active schedule: cannot derive the producer gate');
   const pending = scheduleOf(schedule?.pending), proposed = scheduleOf(schedule?.proposed);
@@ -154,9 +163,11 @@ export function producerGate(schedule, { roster, standby = [], cover = {}, minAg
   const coverOut = {};
   for (const [name, member] of Object.entries(cover)) {
     if (!required.includes(name)) throw new Error(`--cover maps ${name}, which is not in the schedule or --standby`);
+    if (!NAME.test(member)) throw new Error(`--cover maps ${name} to "${member}", which is not an account name`);
     if (member !== name) coverOut[name] = member;
   }
-  const g = { v: 1, required, cover: coverOut, active, pending, proposed, standby: [...new Set(standby)].sort(), min_agent_version: minAgentVersion };
+  const g = { v: 1, required, cover: coverOut, active, pending, proposed, standby: [...new Set(standby)].sort(), min_agent_version: minAgentVersion,
+    event_id: eventId, h };
   const members = new Set((roster || []).map((m) => m.producer));
   const uncovered = required.filter((n) => !members.has(memberOf(g, n))).map((n) => (memberOf(g, n) === n ? n : `${n} (covered by ${memberOf(g, n)})`));
   if (uncovered.length) throw new Error(`these producers can produce before the pause but no --roster member runs their agent: ${uncovered.join(', ')} (add them to --roster, or map them with --cover name:member)`);

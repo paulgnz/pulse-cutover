@@ -38,7 +38,9 @@
    "bpecho"
   ],
   "min_agent_version": "0.5.0-rc.33",
-  "sha256": "afd75d34abf8259e9024a0528f63585952b166dffd08464794cd96f5ecf8c6c9"
+  "event_id": "ev-vector-1",
+  "h": 408500000,
+  "sha256": "037be23a4c87052785385463de48a3eb62e13cc5752cbeae66352776e6ffcae7"
  },
- "canonical": "pulse-cutover producer gate v1\nrequired=bpalpha:bp1,bpbravo:bp2,bpcharlie:bp3,bpdelta:bp1,bpecho:bp2\nactive=41:bpalpha,bpbravo,bpcharlie\npending=42:bpalpha,bpcharlie,bpdelta\nproposed=-\nstandby=bpdelta,bpecho\nmin_agent_version=0.5.0-rc.33"
+ "canonical": "pulse-cutover producer gate v1\nevent_id=ev-vector-1\nh=408500000\nrequired=bpalpha:bp1,bpbravo:bp2,bpcharlie:bp3,bpdelta:bp1,bpecho:bp2\nactive=41:bpalpha,bpbravo,bpcharlie\npending=42:bpalpha,bpcharlie,bpdelta\nproposed=-\nstandby=bpdelta,bpecho\nmin_agent_version=0.5.0-rc.33"
 }

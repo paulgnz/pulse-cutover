@@ -2702,7 +2702,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 d,
                 &co.network,
                 &event_id,
-                co.report_max_age_secs * 1000,
+                crate::producer_gate::GATE_MAX_REPORT_AGE_SECS * 1000,
                 crate::producer_gate::FREEZE_STATES,
             ),
             None => {
