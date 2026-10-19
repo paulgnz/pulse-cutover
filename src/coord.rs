@@ -163,6 +163,44 @@ pub fn validate_event(
             ));
         }
     }
+    // rc.33: the all-producers gate. Malformed, unhashed, uncovered or newer than this agent: refused. A real
+    // (non-rehearsal) producer ceremony needs one.
+    match ev.get("producer_gate").filter(|g| !g.is_null()) {
+        Some(g) => {
+            let gate: crate::producer_gate::ProducerGate = serde_json::from_value(g.clone())
+                .map_err(|e| format!("event producer_gate is malformed: {e}"))?;
+            let roster: Vec<crate::config::RosterMember> = ev
+                .get("roster")
+                .filter(|r| !r.is_null())
+                .map(|r| serde_json::from_value(r.clone()))
+                .transpose()
+                .map_err(|e| format!("event roster is malformed: {e}"))?
+                .unwrap_or_default();
+            gate.check(&roster).map_err(|e| format!("event {e}"))?;
+            if !crate::producer_gate::version_at_least(
+                env!("CARGO_PKG_VERSION"),
+                &gate.min_agent_version,
+            ) {
+                return Err(format!(
+                    "event producer_gate needs agent {} or newer; this agent is {}",
+                    gate.min_agent_version,
+                    env!("CARGO_PKG_VERSION")
+                ));
+            }
+            if cfg.ceremony.mode == crate::config::Mode::Producer && !cfg.ceremony.admission_lock {
+                return Err(
+                    "event producer_gate needs ceremony.admission_lock = true on every member"
+                        .into(),
+                );
+            }
+        }
+        None if cfg.ceremony.mode == crate::config::Mode::Producer && !cfg.ceremony.rehearsal => {
+            return Err("event has no producer_gate: a producer ceremony needs every producer that can produce before \
+                        the pause bound into the signed event (coord.mjs event --producer-gate yes)"
+                .into());
+        }
+        None => {}
+    }
     if let Some(want) = ev["release_sha256"].as_str() {
         if let Some(path) = &cfg.target.plugin_path {
             let (got, _) = crate::verify::sha256_file(path)
@@ -214,6 +252,8 @@ pub fn mainnet_binding(cfg: &Config, chain_id: &str) -> Value {
         "quorum": co.map(|c| c.fleet_quorum).unwrap_or(0),
         // rc.31 round 5 (review MEDIUM-2): the early-abort setting is part of what the signed event binds.
         "early_abort": co.map(|c| c.early_abort).unwrap_or(false),
+        // rc.33: the all-producers gate (null when the event has none).
+        "producer_gate_sha256": co.and_then(|c| c.producer_gate.as_ref().map(|g| g.sha256.to_lowercase())),
     })
 }
 
@@ -242,7 +282,8 @@ pub fn mainnet_binding_problem(
             .into()),
         Some(b) => {
             let now = mainnet_binding(cfg, chain);
-            let fields = ["event_id", "event_hash", "network", "chain_id", "h", "roster_sha256", "quorum", "early_abort"];
+            let fields = ["event_id", "event_hash", "network", "chain_id", "h", "roster_sha256", "quorum", "early_abort",
+                "producer_gate_sha256"];
             // A binding journaled before rc.31 has no early_abort: it was off.
             let off = json!(false);
             let get = |v: &Value, f: &str| -> Value {
@@ -439,6 +480,18 @@ pub fn mainnet_event_problems(
         }
     }
     // rc.31 round 5 (review MEDIUM-2): the early abort is the signed event's decision.
+    // rc.33: the config's producer gate is the signed one.
+    let signed_gate = ev["producer_gate"]["sha256"]
+        .as_str()
+        .map(str::to_lowercase);
+    let cfg_gate = co.producer_gate.as_ref().map(|g| g.sha256.to_lowercase());
+    if signed_gate != cfg_gate {
+        out.push(format!(
+            "the signed event's producer_gate ({}) is not coordination.producer_gate ({})",
+            signed_gate.as_deref().unwrap_or("none"),
+            cfg_gate.as_deref().unwrap_or("none")
+        ));
+    }
     let signed_early = ev["early_abort"].as_bool() == Some(true);
     if signed_early != co.early_abort {
         out.push(format!(
@@ -711,6 +764,20 @@ pub fn derived_config(
         "early_abort".into(),
         toml::Value::Boolean(ev["early_abort"].as_bool() == Some(true)),
     );
+    // rc.33: the signed producer gate (validated by `validate_event`), as [coordination.producer_gate].
+    match ev.get("producer_gate").filter(|g| !g.is_null()) {
+        Some(g) => {
+            let gate: crate::producer_gate::ProducerGate =
+                serde_json::from_value(g.clone()).map_err(|e| format!("producer_gate: {e}"))?;
+            co.insert(
+                "producer_gate".into(),
+                toml::Value::try_from(&gate).map_err(|e| format!("producer_gate: {e}"))?,
+            );
+        }
+        None => {
+            co.remove("producer_gate");
+        }
+    }
     if let Some(sha) = ev["snapshot_sha256"].as_str() {
         if let Some(snap) = doc.get_mut("snapshot").and_then(|v| v.as_table_mut()) {
             snap.insert("expected_sha256".into(), toml::Value::String(sha.into()));
@@ -936,7 +1003,9 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
                             accepted_ev = ev.clone();
                             write_state(
                                 cfg,
-                                &json!({"event_id": id, "h": h, "accepted": true, "armed": false, "at": chrono::Utc::now().to_rfc3339()}),
+                                &json!({"event_id": id, "h": h, "accepted": true, "armed": false, "at": chrono::Utc::now().to_rfc3339(),
+                                    // rc.33: the gate this node accepted (mission control checks it before relaying the arm).
+                                    "producer_gate_sha256": ev["producer_gate"]["sha256"]}),
                             );
                             note(
                                 &format!("accepted event {id}: cut at H = {h}"),
@@ -1013,7 +1082,8 @@ pub fn run_await(cfg: &Config, config_path: &Path) -> Result<i32, String> {
                     )?;
                     write_state(
                         cfg,
-                        &json!({"event_id": id, "h": h, "accepted": true, "armed": true, "at": chrono::Utc::now().to_rfc3339()}),
+                        &json!({"event_id": id, "h": h, "accepted": true, "armed": true, "at": chrono::Utc::now().to_rfc3339(),
+                            "producer_gate_sha256": accepted_ev["producer_gate"]["sha256"]}),
                     );
                     eprintln!("await: ARMED by signed coordinator message for {id}: running the ceremony at H = {h}");
                     // Recorded before the run starts: a restarted `await` never arms the same event
@@ -1099,6 +1169,83 @@ mod tests {
         assert_eq!(d["coordination"]["fleet_quorum"].as_integer(), Some(2));
         assert_eq!(d["coordination"]["roster"].as_array().unwrap().len(), 2);
         assert_eq!(d["snapshot"]["expected_sha256"].as_str(), Some("ff00"));
+    }
+
+    fn vector_gate() -> Value {
+        let v: Value = serde_json::from_str(include_str!(
+            "../control/test/fixtures/producer-gate-vector.json"
+        ))
+        .unwrap();
+        v["gate"].clone()
+    }
+
+    #[test]
+    fn rc33_derived_config_carries_the_signed_producer_gate_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("c.toml");
+        std::fs::write(&src, "journal_path = \"/j\"\n[ceremony]\nfreeze_height = 0\n[snapshot]\nstaged_path = \"/s\"\n[coordination]\nurl = \"https://mc\"\nnetwork = \"testnet\"\n").unwrap();
+        let ev = json!({"type": "event", "event_id": "e8", "h": 900,
+            "roster": [{"producer": "bp1"}, {"producer": "bp2"}, {"producer": "bp3"}], "producer_gate": vector_gate()});
+        let out = dir.path().join("d.toml");
+        derived_config(&src, &ev, Some("aa"), &out).unwrap();
+        let d: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let g: crate::producer_gate::ProducerGate = d["coordination"]["producer_gate"]
+            .clone()
+            .try_into()
+            .unwrap();
+        let want: crate::producer_gate::ProducerGate =
+            serde_json::from_value(vector_gate()).unwrap();
+        assert_eq!(g, want, "the TOML round trip keeps every bound field");
+        assert_eq!(g.compute_sha256(), want.sha256);
+        // An event without a gate removes a stale one from the base config.
+        let ev2 = json!({"type": "event", "event_id": "e9", "h": 901});
+        derived_config(&out, &ev2, None, &out).unwrap();
+        let d: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert!(d["coordination"].get("producer_gate").is_none());
+    }
+
+    #[test]
+    fn rc33_validate_event_refuses_a_missing_tampered_uncovered_or_too_new_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = readiness_cfg(dir.path());
+        let roster = json!([{"producer": "bp1"}, {"producer": "bp2"}, {"producer": "bp3"}]);
+        let ev = |gate: Option<Value>| {
+            let mut e =
+                json!({"type": "event", "network": "testnet", "h": 5000, "roster": roster.clone()});
+            if let Some(g) = gate {
+                e["producer_gate"] = g;
+            }
+            e
+        };
+        assert_eq!(
+            validate_event(&ev(Some(vector_gate())), &cfg, "testnet", Some(100), 10),
+            Ok(5000)
+        );
+        let e = validate_event(&ev(None), &cfg, "testnet", Some(100), 10).unwrap_err();
+        assert!(e.contains("no producer_gate"), "{e}");
+        let mut t = vector_gate();
+        t["active"]["producers"][0] = json!("bpzulu");
+        assert!(validate_event(&ev(Some(t)), &cfg, "testnet", Some(100), 10)
+            .unwrap_err()
+            .contains("sha256"));
+        let mut short = ev(Some(vector_gate()));
+        short["roster"] = json!([{"producer": "bp1"}, {"producer": "bp2"}]);
+        assert!(validate_event(&short, &cfg, "testnet", Some(100), 10)
+            .unwrap_err()
+            .contains("no roster member runs their agent"));
+        let mut g: crate::producer_gate::ProducerGate =
+            serde_json::from_value(vector_gate()).unwrap();
+        g.min_agent_version = "9.0.0".into();
+        g.sha256 = g.compute_sha256();
+        let e = validate_event(
+            &ev(Some(serde_json::to_value(&g).unwrap())),
+            &cfg,
+            "testnet",
+            Some(100),
+            10,
+        )
+        .unwrap_err();
+        assert!(e.contains("needs agent 9.0.0"), "{e}");
     }
 
     #[test]

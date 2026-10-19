@@ -1996,6 +1996,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     // gate of the early abort reads this, not the beacon's own version).
                     "agent_version": env!("CARGO_PKG_VERSION"),
                     "early_abort": early_abort,
+                    // rc.33: the all-producers gate this ceremony runs under (beacon evidence; peers and mission control
+                    // match it before the freeze).
+                    "producer_gate_sha256": self.cfg.coordination.as_ref()
+                        .and_then(|c| c.producer_gate.as_ref().map(|g| g.sha256.to_lowercase())),
                     "simulate_freeze": self.cfg.ceremony.simulate_freeze,
                     "chain_id": info.chain_id,
                     "head_at_arm": info.head_block_num,
@@ -2388,6 +2392,38 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 ));
             }
         }
+        // rc.33: the all-producers gate, at ARM (and on a run resumed before the freeze): the lock is on, this agent is
+        // new enough, and the live schedule is still the one the signed event bound.
+        if self.cfg.ceremony.mode == Mode::Producer && pre_freeze {
+            if let Some(g) = self
+                .cfg
+                .coordination
+                .as_ref()
+                .and_then(|c| c.producer_gate.clone())
+            {
+                let gp = self.producer_gate_arm_problems(&g);
+                if gp.is_empty() {
+                    self.journal.evidence(
+                        self.state,
+                        json!({"producer_gate": {"checked": "ARM", "ok": true, "sha256": g.sha256,
+                            "required": g.required.len(), "active_version": g.active.version,
+                            "pending_version": g.pending.as_ref().map(|p| p.version),
+                            "min_agent_version": g.min_agent_version}}),
+                    )?;
+                }
+                problems.extend(gp.into_iter().map(|p| format!("producer gate: {p}")));
+            } else if self
+                .cfg
+                .coordination
+                .as_ref()
+                .is_some_and(|c| c.event_id.is_some())
+                && !resumed
+            {
+                self.journal.evidence(State::Armed, json!({"WARNING": "no producer gate in the signed event: a producer \
+                    outside the ceremony (no agent, an older one, the lock off) is caught only by the burn-off audit",
+                    "check": "producer_gate"}))?;
+            }
+        }
         if let Some(dir) = self.cfg.snapshot.staged_path.parent() {
             if !dir.exists() {
                 problems.push(format!("staged_path dir {} missing", dir.display()));
@@ -2584,6 +2620,135 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             json!({"production_profile": "met (checked before the freeze)"}),
         )?;
         Ok(true)
+    }
+
+    /// rc.33 (src/producer_gate.rs): what stops ARM under the event's producer gate. Empty = go.
+    fn producer_gate_arm_problems(&self, g: &crate::producer_gate::ProducerGate) -> Vec<String> {
+        let mut out = vec![];
+        if !self.cfg.ceremony.admission_lock {
+            out.push("ceremony.admission_lock = false: every member of a producer gate must lock admission".into());
+        }
+        if !crate::producer_gate::version_at_least(env!("CARGO_PKG_VERSION"), &g.min_agent_version)
+        {
+            out.push(format!(
+                "this agent ({}) is older than the event's min_agent_version {}",
+                env!("CARGO_PKG_VERSION"),
+                g.min_agent_version
+            ));
+        }
+        match self.ops.source_producer_schedule() {
+            Ok(Some(v)) => out.extend(g.schedule_problems(&v)),
+            Ok(None) => out.push(
+                "the source did not answer get_producer_schedule (unknown is never yes)".into(),
+            ),
+            Err(e) => out.push(format!(
+                "get_producer_schedule failed ({e}): unknown is never yes"
+            )),
+        }
+        out
+    }
+
+    /// rc.33: right before the freeze, the live schedule must still be the bound one and every required producer's
+    /// agent must report, fresh on the relay, ARMED (or FROZEN) for this event under this gate, at least the minimum
+    /// version, with the lock on and its probe green. Reads are retried briefly; unknown is never yes. Ok(false) after
+    /// aborting (nothing frozen yet).
+    fn producer_gate_before_freeze(&mut self) -> Result<bool, String> {
+        if self.cfg.ceremony.mode != Mode::Producer {
+            return Ok(true);
+        }
+        let Some(co) = self.cfg.coordination.clone() else {
+            return Ok(true);
+        };
+        let Some(g) = co.producer_gate.clone() else {
+            return Ok(true);
+        };
+        let event_id = co.event_id.clone().unwrap_or_default();
+        let mut problems = vec![];
+        let mut sched = Err("no answer".to_string());
+        for attempt in 0..3 {
+            sched = match self.ops.source_producer_schedule() {
+                Ok(Some(v)) => Ok(v),
+                Ok(None) => Err("no answer".into()),
+                Err(e) => Err(e),
+            };
+            if sched.is_ok() {
+                break;
+            }
+            if attempt < 2 {
+                self.ops.sleep_ms(1000);
+            }
+        }
+        match &sched {
+            Ok(v) => problems.extend(g.schedule_problems(v)),
+            Err(e) => problems.push(format!(
+                "cannot read get_producer_schedule ({e}): unknown is never yes"
+            )),
+        }
+        let url = format!("{}/api/status", co.url.trim_end_matches('/'));
+        let mut doc = None;
+        for attempt in 0..3 {
+            if let Ok(Some(d)) = self.ops.get_json(&url) {
+                if d.is_object() {
+                    doc = Some(d);
+                    break;
+                }
+            }
+            if attempt < 2 {
+                self.ops.sleep_ms(1000);
+            }
+        }
+        let missing = match &doc {
+            Some(d) => g.relay_problems(
+                d,
+                &co.network,
+                &event_id,
+                co.report_max_age_secs * 1000,
+                crate::producer_gate::FREEZE_STATES,
+            ),
+            None => {
+                problems.push("mission control did not answer /api/status: the members' readiness is unknown \
+                               (unknown is never yes)"
+                    .into());
+                vec![]
+            }
+        };
+        if problems.is_empty() && missing.is_empty() {
+            self.journal.evidence(
+                State::Armed,
+                json!({"producer_gate": {"checked": "before the freeze", "ok": true, "sha256": g.sha256,
+                    "required": g.required.len(), "members": g.required.iter().map(|n| g.member_of(n)).collect::<std::collections::BTreeSet<_>>().len()}}),
+            )?;
+            return Ok(true);
+        }
+        let mut names: Vec<String> = missing
+            .iter()
+            .filter_map(|m| m["producer"].as_str().map(String::from))
+            .collect();
+        names.sort();
+        let mut why = vec![];
+        if !names.is_empty() {
+            let shown: Vec<&str> = names.iter().take(12).map(String::as_str).collect();
+            why.push(format!(
+                "not armed: {}{}",
+                shown.join(", "),
+                if names.len() > 12 {
+                    format!(" (+{} more)", names.len() - 12)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        why.extend(problems.iter().cloned());
+        self.abort(
+            &format!(
+                "producer gate not met before the freeze ({}): a producer outside the ceremony could add transactions after H",
+                why.join("; ")
+            ),
+            json!({"producer_gate": {"sha256": g.sha256, "missing": missing, "problems": problems,
+                "fix": "every producer that can produce before the pause must run an armed agent for this event with the \
+                        admission lock on; a schedule change needs a new event"}}),
+        )?;
+        Ok(false)
     }
 
     /// Coordinated ceremonies: has the coordinator published a SIGNED abort for this event?
@@ -4474,6 +4639,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(());
         }
         if !self.production_gate()? {
+            return Ok(());
+        }
+        // rc.33: every producer that could produce before the pause is armed with the lock on, and the schedule is still
+        // the bound one; otherwise abort before anything is frozen.
+        if !self.producer_gate_before_freeze()? {
             return Ok(());
         }
         // The write freeze — the moment the write gap starts (R2: an

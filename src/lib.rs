@@ -14,6 +14,7 @@ pub mod live_watch;
 pub mod looper;
 pub mod machine;
 pub mod ops;
+pub mod producer_gate;
 pub mod report;
 pub mod sanitize;
 pub mod scan;

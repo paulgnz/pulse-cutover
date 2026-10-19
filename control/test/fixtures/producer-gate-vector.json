@@ -1,0 +1,44 @@
+{
+ "description": "rc.33 producer gate: the canonical text and sha256 both sides compute (control/coordlib.mjs producerGateCanonical, src/producer_gate.rs ProducerGate::canonical). Do not edit by hand.",
+ "gate": {
+  "v": 1,
+  "required": [
+   "bpalpha",
+   "bpbravo",
+   "bpcharlie",
+   "bpdelta",
+   "bpecho"
+  ],
+  "cover": {
+   "bpalpha": "bp1",
+   "bpbravo": "bp2",
+   "bpcharlie": "bp3",
+   "bpdelta": "bp1",
+   "bpecho": "bp2"
+  },
+  "active": {
+   "version": 41,
+   "producers": [
+    "bpalpha",
+    "bpbravo",
+    "bpcharlie"
+   ]
+  },
+  "pending": {
+   "version": 42,
+   "producers": [
+    "bpalpha",
+    "bpcharlie",
+    "bpdelta"
+   ]
+  },
+  "proposed": null,
+  "standby": [
+   "bpdelta",
+   "bpecho"
+  ],
+  "min_agent_version": "0.5.0-rc.33",
+  "sha256": "afd75d34abf8259e9024a0528f63585952b166dffd08464794cd96f5ecf8c6c9"
+ },
+ "canonical": "pulse-cutover producer gate v1\nrequired=bpalpha:bp1,bpbravo:bp2,bpcharlie:bp3,bpdelta:bp1,bpecho:bp2\nactive=41:bpalpha,bpbravo,bpcharlie\npending=42:bpalpha,bpcharlie,bpdelta\nproposed=-\nstandby=bpdelta,bpecho\nmin_agent_version=0.5.0-rc.33"
+}

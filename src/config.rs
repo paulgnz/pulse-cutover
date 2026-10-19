@@ -157,6 +157,13 @@ pub struct Coordination {
     /// (`early_abort: true`) so the whole fleet runs one setting; a hand-written config must match on every member.
     #[serde(default)]
     pub early_abort: bool,
+    /// rc.33: the all-producers gate (src/producer_gate.rs), written by `await` from the SIGNED event's `producer_gate`:
+    /// every producer that could produce before the pause, the roster member running each one's agent, the bound
+    /// schedule and the minimum agent version. With it, the agent checks the live schedule at ARM and, right before the
+    /// freeze, the schedule again and every member's beacon report (ARMED for this event, lock on, lock probe green);
+    /// any gap aborts before anything is frozen.
+    #[serde(default)]
+    pub producer_gate: Option<crate::producer_gate::ProducerGate>,
 }
 
 fn default_degraded_patience() -> u64 {
@@ -1045,6 +1052,14 @@ impl Config {
         }
         crate::shadow::check_config(&config)?;
         config.check_rehearsal_overrides()?;
+        // rc.33: a producer gate in the config must be the one a signed event carries: well formed, hash intact, every
+        // name covered by a roster member.
+        if let Some(co) = &config.coordination {
+            if let Some(g) = &co.producer_gate {
+                g.check(&co.roster)
+                    .map_err(|e| format!("coordination.{e}"))?;
+            }
+        }
         if enforce_production
             && config
                 .ceremony
@@ -1352,6 +1367,15 @@ impl Config {
             if !c.admission_lock {
                 out.push("ceremony.admission_lock = false (the producer must refuse transactions from the freeze on, whatever their expiry)".into());
             }
+            // rc.33: a coordinated producer cut runs from an event that binds every producer that can produce before the
+            // pause (an uncoordinated config has no event; D-10 covers XPR mainnet).
+            if self
+                .coordination
+                .as_ref()
+                .is_some_and(|co| co.event_id.is_some() && co.producer_gate.is_none())
+            {
+                out.push("coordination.producer_gate is not set (the signed event must bind every producer that can produce before the pause: coord.mjs event --producer-gate yes)".into());
+            }
         }
         match c.import_backend {
             ImportBackend::Upstream => {
@@ -1420,6 +1444,10 @@ impl Config {
                     "an XPR MAINNET producer ceremony needs a fleet quorum of at least 2 (coordination.fleet_quorum = {})",
                     co.fleet_quorum
                 ));
+            }
+            if co.producer_gate.is_none() {
+                out.push("an XPR MAINNET producer ceremony needs the event's producer gate (coordination.producer_gate: \
+                          every producer that can produce before the pause must be armed with the admission lock)".into());
             }
         }
         out

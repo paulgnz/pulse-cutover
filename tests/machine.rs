@@ -146,6 +146,9 @@ struct MockOps {
     fleet_polls: Cell<u32>,
     /// Override for GET /api/status (roster fleet-gate tests).
     status_doc: RefCell<Option<serde_json::Value>>,
+    /// rc.33: while this node's journal is ARMED under a producer gate, /api/status shows every member (bp0..bp9)
+    /// ARMED for e1 under the same gate, lock on and probed (default true: the fleet is ready at the freeze tick).
+    gate_ready: Cell<bool>,
     /// rc.31: generated (agreeing) relay docs carry a durable exit mark for event e1 on these producers.
     exit_marked: RefCell<Vec<String>>,
     /// rc.31 round 3: the relay serves those marks only up to this poll (0 = always); later it "forgets" them.
@@ -345,6 +348,7 @@ impl MockOps {
             scheduled_h: Cell::new(0),
             freeze_head: Cell::new(0),
             coord_doc: RefCell::new(None),
+            gate_ready: Cell::new(true),
             coord_down: Cell::new(false),
             public_stale_source: Cell::new(false),
             fleet_agree: Cell::new(0),
@@ -507,7 +511,11 @@ impl ChainOps for MockOps {
         }
     }
     fn source_producer_schedule(&self) -> Result<Option<serde_json::Value>, String> {
-        Ok(self.shadow_schedule.borrow().clone())
+        // rc.33: unless a test sets one, the schedule the test producer gate binds (bp1, bp2).
+        Ok(Some(self.shadow_schedule.borrow().clone().unwrap_or_else(|| {
+            serde_json::json!({"active": {"version": 1, "producers": [{"producer_name": "bp1"}, {"producer_name": "bp2"}]},
+                "pending": null, "proposed": null})
+        })))
     }
     fn source_producer_head(&self) -> Result<Option<String>, String> {
         if let Some(id) = self
@@ -969,6 +977,14 @@ impl ChainOps for MockOps {
         if url.ends_with("/api/status") {
             if self.coord_down.get() {
                 return Err("mission control unreachable".into());
+            }
+            let summary = pulse_cutover::beacon::journal_summary(&self.dir.join("journal.jsonl"));
+            if let (true, Some("ARMED"), Some(sha)) = (
+                self.gate_ready.get(),
+                summary["state"].as_str(),
+                summary["evidence"]["producer_gate_sha256"].as_str(),
+            ) {
+                return Ok(Some(gate_ready_status(sha)));
             }
             if self.status_fail_times.get() > 0 {
                 self.status_fail_times.set(self.status_fail_times.get() - 1);
@@ -2579,6 +2595,51 @@ fn upstream_backend_requires_upstream_section() {
 }
 
 // ---- coordinated arming ---------------------------------------------------------------------------
+
+/// rc.33: the producer gate the production-profile test events carry: the mock schedule (active v1: bp1, bp2), each
+/// name its own roster member.
+fn test_gate() -> pulse_cutover::producer_gate::ProducerGate {
+    let mut g = pulse_cutover::producer_gate::ProducerGate {
+        v: 1,
+        required: vec!["bp1".into(), "bp2".into()],
+        cover: Default::default(),
+        active: pulse_cutover::producer_gate::Sched {
+            version: 1,
+            producers: vec!["bp1".into(), "bp2".into()],
+        },
+        pending: None,
+        proposed: None,
+        standby: vec![],
+        min_agent_version: pulse_cutover::producer_gate::MIN_AGENT_VERSION.into(),
+        sha256: String::new(),
+    };
+    g.sha256 = g.compute_sha256();
+    g
+}
+fn test_gate_json() -> serde_json::Value {
+    serde_json::to_value(test_gate()).unwrap()
+}
+/// `[coordination.producer_gate]` for a config whose `[coordination]` (and roster) came just before.
+fn test_gate_toml() -> String {
+    let g = test_gate();
+    format!("\n[coordination.producer_gate]\nv = 1\nrequired = [\"bp1\", \"bp2\"]\nstandby = []\nmin_agent_version = \"{}\"\nsha256 = \"{}\"\n\
+             [coordination.producer_gate.active]\nversion = 1\nproducers = [\"bp1\", \"bp2\"]\n",
+        g.min_agent_version, g.sha256)
+}
+/// /api/status with members bp0..bp9 ARMED for e1 under gate `sha`, lock on and probed, on every test network.
+fn gate_ready_status(sha: &str) -> serde_json::Value {
+    let v = pulse_cutover::producer_gate::MIN_AGENT_VERSION;
+    let producers: Vec<serde_json::Value> = (0..10).map(|i| serde_json::json!({"name": format!("bp{i}"), "beacons": [{
+        "role": "producer", "age_ms": 1000, "silent": false, "conflict": false, "report": {"role": "producer",
+        "instance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "agent_version": v, "coord": {"event_id": "e1"},
+        "checks": [{"name": "admission_lock", "ok": true}, {"name": "admission_lock_probe", "ok": true}],
+        "ceremony": {"state": "ARMED", "evidence": {"producer_gate_sha256": sha, "agent_version": v}}}}]})).collect();
+    let nets: Vec<serde_json::Value> = ["rehearsal", "shadow-net", "testnet"]
+        .iter()
+        .map(|n| serde_json::json!({"id": n, "producers": producers.clone()}))
+        .collect();
+    serde_json::json!({ "networks": nets })
+}
 
 fn coord_key() -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&[42u8; 32])
@@ -6491,7 +6552,7 @@ fn upstream_production_config(dir: &std::path::Path) -> Result<Config, String> {
 fn mainnet_event(h: u64) -> serde_json::Value {
     signed(
         serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "chain_id": MAINNET, "h": h,
-        "roster": [{"producer": "bp1"}, {"producer": "bp2"}], "quorum": 2}),
+        "roster": [{"producer": "bp1"}, {"producer": "bp2"}], "quorum": 2, "producer_gate": test_gate_json()}),
     )
 }
 
@@ -6507,6 +6568,7 @@ fn upstream_mainnet_coordinated_config(dir: &std::path::Path) -> Config {
         + &format!("\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nevent_hash = \"{}\"\nfleet_quorum = 2\nfleet_timeout_secs = 5\nreport_max_age_secs = 60\n",
             hex::encode(coord_key().verifying_key().to_bytes()), ev_hash)
         + "\n[[coordination.roster]]\nproducer = \"bp1\"\n\n[[coordination.roster]]\nproducer = \"bp2\"\n"
+        + &test_gate_toml()
         + &format!("\n[beacon]\nurl = \"https://mc.example/api/report\"\nproducer = \"bp1\"\nnetwork = \"rehearsal\"\ntoken_file = \"{}/beacon.token\"\n", dir.display());
     load_toml(dir, "mainnet-coord.toml", &text).unwrap()
 }
@@ -6686,7 +6748,8 @@ fn d10_mainnet_arm_authenticates_and_binds_the_signed_event() {
     let cfg = upstream_mainnet_coordinated_config(dir.path());
     let h = cfg.ceremony.freeze_height;
     let ev = |chain: Option<&str>, hh: Option<u64>, roster: serde_json::Value, quorum: u64| {
-        let mut p = serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "roster": roster, "quorum": quorum});
+        let mut p = serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "roster": roster, "quorum": quorum,
+            "producer_gate": test_gate_json()});
         if let Some(c) = chain {
             p["chain_id"] = serde_json::json!(c);
         }
@@ -6737,6 +6800,17 @@ fn d10_mainnet_arm_authenticates_and_binds_the_signed_event() {
             "other quorum",
             ev(Some(MAINNET), Some(h), two.clone(), 1),
             "quorum 1 is not",
+        ),
+        (
+            "no producer gate (rc.33)",
+            {
+                let m = ev(Some(MAINNET), Some(h), two.clone(), 2);
+                let mut p: serde_json::Value =
+                    serde_json::from_str(m["payload"].as_str().unwrap()).unwrap();
+                p.as_object_mut().unwrap().remove("producer_gate");
+                signed(p)
+            },
+            "producer_gate",
         ),
     ] {
         let mut c = cfg.clone();
@@ -9581,15 +9655,17 @@ fn shadow_config(dir: &std::path::Path, edit: impl Fn(String) -> String) -> Resu
 fn shadow_event() -> serde_json::Value {
     signed(
         serde_json::json!({"type": "event", "network": "shadow-net", "event_id": "e1", "chain_id": MAINNET, "h": 120,
-        "roster": [{"producer": "bp1", "instance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, {"producer": "bp2"}], "quorum": 2}),
+        "roster": [{"producer": "bp1", "instance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, {"producer": "bp2"}], "quorum": 2,
+        "producer_gate": test_gate_json()}),
     )
 }
 
 fn shadow_coordination(network: &str) -> String {
     format!("\n[coordination]\nurl = \"http://mc\"\nnetwork = \"{network}\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nevent_hash = \"{}\"\n\
              fleet_quorum = 2\nfleet_timeout_secs = 5\nreport_max_age_secs = 60\n\n[[coordination.roster]]\nproducer = \"bp1\"\ninstance_id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\n\
-             [[coordination.roster]]\nproducer = \"bp2\"\n",
-        hex::encode(coord_key().verifying_key().to_bytes()), pulse_cutover::coord::payload_hash(&shadow_event()).unwrap())
+             [[coordination.roster]]\nproducer = \"bp2\"\n{}",
+        hex::encode(coord_key().verifying_key().to_bytes()), pulse_cutover::coord::payload_hash(&shadow_event()).unwrap(),
+        test_gate_toml())
 }
 
 /// A status doc on the shadow board in which bp1 (us) and bp2 report `ceremony`.
@@ -9608,6 +9684,12 @@ fn shadow_ops(dir: &std::path::Path, keys: &[&str], network: Option<u64>) -> Moc
     ops.schedule_ok.set(true);
     *ops.chain_id.borrow_mut() = MAINNET.into();
     ops.shadow_network_id.set(network);
+    // rc.33: the schedule has the roster's two producers (the test producer gate binds bp1, bp2); one key = both.
+    let keys: Vec<&str> = if keys.len() == 1 {
+        vec![keys[0], keys[0]]
+    } else {
+        keys.to_vec()
+    };
     let producers: Vec<serde_json::Value> = keys
         .iter()
         .enumerate()
@@ -11001,7 +11083,7 @@ fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
     // Round-4 review (F3): scan EVERY src/*.rs (outside its #[cfg(test)] module) for EVERY mutating ChainOps call,
     // through any receiver (`self.ops.x(`, `ops.x(`, `o.x(` after a rebinding, `ChainOps::x(`). Each one must carry an
     // explicit `// ungated: <reason>` marker, or (src/drill.rs, owned by the drill's own guard) be listed exactly below.
-    let files: [(&str, &str); 23] = [
+    let files: [(&str, &str); 24] = [
         ("beacon.rs", include_str!("../src/beacon.rs")),
         ("config.rs", include_str!("../src/config.rs")),
         ("coord.rs", include_str!("../src/coord.rs")),
@@ -11025,6 +11107,7 @@ fn r30r3_every_source_mutation_goes_through_the_shadow_gate() {
         ("stop.rs", include_str!("../src/stop.rs")),
         ("upstream.rs", include_str!("../src/upstream.rs")),
         ("verify.rs", include_str!("../src/verify.rs")),
+        ("producer_gate.rs", include_str!("../src/producer_gate.rs")),
     ];
     // The drill's own guarded calls (DrillGuard forwards only the request it scheduled; tests/drill.rs proves it).
     let drill_allowed = [

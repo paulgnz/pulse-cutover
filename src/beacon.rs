@@ -509,6 +509,9 @@ pub const SETUP_CHECKS: &[&str] = &[
     "producer_api_private",
     "rehearsal_overrides",
     "shadow",
+    // rc.33: preparation (a failing probe never excludes a report from the ignition fleet gate); the all-producers gate
+    // reads it by name before the arm is relayed and before every agent freezes.
+    "admission_lock_probe",
 ];
 
 /// A report with any failing HEALTH check (a failing setup check does not count).
@@ -688,6 +691,8 @@ fn apply_line(acc: &mut Acc, v: &Value) {
                     put(ev, "agent_version", &d["agent_version"]);
                     put(ev, "early_abort", &d["early_abort"]);
                     put(ev, "chain_id", &d["chain_id"]);
+                    // rc.33: the all-producers gate this ceremony runs under (peers and mission control match it).
+                    put(ev, "producer_gate_sha256", &d["producer_gate_sha256"]);
                 }
                 Some("FROZEN") => put(ev, "freeze_at", &d["freeze_at"]),
                 Some("SNAPSHOTTED") => {
@@ -791,7 +796,66 @@ fn coord_public(cfg: &Config) -> Value {
     if let Some(r) = c.get("reason").and_then(|r| r.as_str()).map(sanitize_short) {
         c["reason"] = json!(r);
     }
+    // rc.33: will a signed arm start this node's ceremony (auto_arm, or the operator's confirm file for this event)?
+    // Mission control relays an arm under a producer gate only when every member says yes.
+    if let (Some(id), Some(co)) = (
+        c.get("event_id").and_then(|v| v.as_str()).map(String::from),
+        cfg.coordination.as_ref(),
+    ) {
+        let confirm = cfg
+            .journal_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(format!("confirm-{id}"));
+        c["arm_ready"] = json!(co.auto_arm || confirm.exists());
+    }
     c
+}
+
+/// rc.33: can this agent apply the admission lock? A read of `/v1/producer/get_whitelist_blacklist` (what the lock
+/// reads and then sets). None when not probed (not producer mode, or past verification: the old chain may be stopped).
+fn admission_lock_probe(cfg: &Config, b: &Budget, past_verify: bool) -> Option<Value> {
+    if cfg.ceremony.mode != crate::config::Mode::Producer || past_verify {
+        return None;
+    }
+    let r = match b.agent(Duration::from_secs(2)) {
+        Some(a) => post_json(
+            &a,
+            &format!(
+                "{}/v1/producer/get_whitelist_blacklist",
+                cfg.source.producer_api_url.trim_end_matches('/')
+            ),
+            json!({}),
+        ),
+        None => Err("skipped (collection time budget exhausted)".into()),
+    };
+    Some(match r {
+        Ok(v) if v.is_object() => {
+            let wl: Vec<&str> = v["actor_whitelist"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            let locked = wl == [crate::config::ADMISSION_LOCK_SENTINEL];
+            check(
+                "admission_lock_probe",
+                true,
+                if locked {
+                    "get_whitelist_blacklist answers: the admission lock is ON".to_string()
+                } else {
+                    format!(
+                        "get_whitelist_blacklist answers: the lock can be applied ({} whitelisted actor{})",
+                        wl.len(),
+                        if wl.len() == 1 { "" } else { "s" }
+                    )
+                },
+            )
+        }
+        Ok(_) | Err(_) => check(
+            "admission_lock_probe",
+            false,
+            "get_whitelist_blacklist does not answer locally: the admission lock cannot be applied",
+        ),
+    })
 }
 
 pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
@@ -876,6 +940,9 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
                 Err(_) => "not reachable locally".into(),
             },
         ));
+    }
+    if let Some(c) = admission_lock_probe(cfg, &budget, past_verify) {
+        checks.push(c);
     }
     // Anyone who can reach /v1/producer can `resume` a producer the ceremony paused at H. Visible even when
     // unknown: an untested exposure is not a private one.
