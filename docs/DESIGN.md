@@ -255,6 +255,19 @@ So finality narrows the harmful window to H+1 … LIB-at-pause (the LIB advance 
 and it explains why the after-pause tail is benign. It does not let the burn-off rule relax (unchanged: any
 transaction in H+1…pause aborts), and it does not help before the pause, which is where the gate works.
 
+## 2c. A new chain_id, pinned in the signed event (rc.33)
+
+Decision 2026-10-19: the XPR → PulseVM cutover moves to a **new chain_id**. The coordinator names it in the signed
+event (`target_chain_id`, part of the event hash; `coord.mjs event --target-chain-id`). `await` writes it into the
+derived config as `ceremony.target_chain_id`. XPR mainnet refuses an event or config without it, or with the source's
+own id (shadows excepted: they keep the mainnet id on a private network). After ignition, created or joined, the target
+must report exactly that id or the ceremony halts; a join is refused earlier when the LIVE quorum reports another id;
+the API-mode flip waits until the edge and the target serve it. Without a pin (rehearsals, other chains) the previous
+rule stays: the target keeps the source id unless `rehearsal_allow_chain_id_change`, so rehearsals keep their unique
+ids. The chain_id is the replay protection across the cut: nothing signed for the old chain executes on the new one.
+Open upstream (RISK-REGISTER A-9): PulseVM v1.0.0 uses metalgo's blockchain id, known only after the chain is created,
+so a real pin needs upstream to create the chain with an id chosen in advance.
+
 ## 3. State machine
 
 ```mermaid

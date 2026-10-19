@@ -1,6 +1,6 @@
 # pulse-cutover
 
-<p align="center"><img src="docs/media/cutover-hero.svg" alt="One block, one cut, same chain: 5 block producers on 5 continents cut the same block H; a verified snapshot of exactly H is imported 1:1 into PulseVM, which continues at H+1 with the same chain_id. Results: 5/5 same block, 0 transactions after the cut, identical state on the sampled accounts and tables, replay canary passed, 71–114 s write pause in unattended runs." width="100%"></p>
+<p align="center"><img src="docs/media/cutover-hero.svg" alt="One block, one cut, same chain: 5 block producers on 5 continents cut the same block H; a verified snapshot of exactly H is imported 1:1 into PulseVM, which continues at H+1 (rehearsal image: those runs kept the chain_id; the mainnet cutover moves to a new chain_id). Results: 5/5 same block, 0 transactions after the cut, identical state on the sampled accounts and tables, replay canary passed, 71–114 s write pause in unattended runs." width="100%"></p>
 
 [![How the cutover works — 106s explainer](https://pulsevm.dev/media/cutover-explainer.png)](https://pulsevm.dev/guide/migrate-antelope-chain)
 
@@ -9,8 +9,10 @@
 > **Status: proposed — community project.** This is a **proposed** migration approach, built and rehearsed by XPR Network block producer **protonnz** ([github.com/paulgnz](https://github.com/paulgnz)). It is **not an official Metallicus product and not an announced migration plan.** Core pieces are being contributed upstream to [MetalBlockchain/pulsevm](https://github.com/MetalBlockchain/pulsevm), and the **authoritative migration plan and documentation will come from Metallicus** — this repo is for demonstration, testing, and contribution in the meantime. Any production migration is subject to Metallicus and the relevant network's governance.
 
 pulse-cutover moves a running Antelope chain (XPR Network) onto the PulseVM
-engine while keeping the **same public URL, the same chain_id and the same
-account state**. One binary drives the ceremony — freeze, snapshot, verify,
+engine while keeping the **same public URL and the same account state**. The new
+chain gets a **new chain_id** (decision 2026-10-19), pinned in the coordinator's signed
+event: wallets and SDKs sign for it from LIVE on, and that change is what stops any
+transaction from replaying across the cut. One binary drives the ceremony — freeze, snapshot, verify,
 ignite, flip — and records every step, with evidence, in a journal you can hand
 to anyone. Writes pause for the cut: 71–114 s in the unattended rehearsals on a small
 chain, about 15 minutes for XPR mainnet (its state conversion alone measured 9.6 min, 2026-10-13);
@@ -86,7 +88,7 @@ flowchart LR
 
 | What stays the same for users | How it is proven |
 |---|---|
-| **chain_id** — signatures, wallets and keys keep working | target must report the source chain_id, a height ≥ H and the same block id at H before anything flips (rc.6) |
+| **Keys** — the same keys sign on the new chain; the **chain_id is new** (pinned in the signed event), so clients switch it at LIVE and nothing signed for the old chain replays | target must report exactly the event's pinned chain_id (rc.33; any other id halts), a height ≥ H and the same block id at H before anything flips |
 | **Accounts, permissions, contracts and table rows** | snapshot imported twice by the same importer; 19–21 table fingerprints must match. `state-diff` compares a discovered sample against the old chain; a whole-state commitment is still open |
 | **The URL** | producer mode: the edge swaps its backend at `on_live`. API mode: the flip happens before the FLIPPED/LIVE transitions |
 | **Nothing is lost at the boundary** | burn-off audit: zero transactions allowed after the cut, or this producer's ceremony aborts and resumes its old chain (not fleet-wide) |
@@ -298,7 +300,7 @@ ARMED-READY banner — this one is from our rehearsal box:
    1. agent watches the source chain to the freeze height
    2. snapshot via your nodeos producer_api at ~finality
    3. sha256 + dual-import 19-table fingerprint verification
-   4. PulseVM ignites from the verified snapshot (same chain_id)
+   4. PulseVM ignites from the verified snapshot (the event's NEW chain_id)
    5. /v1 URL flips to PulseVM + health check   <- only visible step
    6. YOUR stop command retires nodeos (reads never gapped)
 ============================================================
@@ -335,9 +337,9 @@ ceremony starting — journal: /root/api-cutover/journal.jsonl
 [FROZEN]      the freeze height is final on the source chain — taking the state snapshot next.
 [SNAPSHOTTED] state snapshot cut + pinned to one exact block.
 [VERIFIED]    snapshot hash + state fingerprints check out; staged for PulseVM.
-[IGNITED]     PulseVM is up, serving the SAME chain_id, continuing at the cut block.
+[IGNITED]     PulseVM is up, serving the event's NEW chain_id, continuing at the cut block.
 [FLIPPED]     public /v1 now answered by PulseVM — this was the only user-visible change.
-[LIVE]        ceremony complete. Source retired. Same URL, same chain, new engine.
+[LIVE]        ceremony complete. Source retired. Same URL and state, new engine, new chain_id.
 
 LIVE. Evidence journal: /root/api-cutover/journal.jsonl
 ```
@@ -478,7 +480,7 @@ Plain-English versions of every term this repo uses:
   accepting writes. Everything before H migrates; H is the last migrated
   block.
 - **The cut** — the exact block (number *and* id) the snapshot was taken at.
-  The new chain continues from the cut: same numbering, same chain_id.
+  The new chain continues from the cut: same numbering, a new chain_id (named in the signed event).
 - **Snapshot** — nodeos' own binary export of the full chain state (every
   account, balance, contract, table) at one block.
 - **Goldens / fingerprints** — checksums of the snapshot's state, computed
@@ -664,7 +666,7 @@ exercised by the rehearsal bots.
 - [x] **Use `expireSeconds` ≥ 120**, and don't derive expiration from an old block (finding 4).
 - [x] **Confirm inclusion, not just acceptance.** On PulseVM a gateway "admitted" response means accepted into the mempool; read your state back (or check the block) before treating it as final.
 - [x] **Oracle-driven apps**: the chain clock jumps forward by the freeze length at the first new block. Contracts with a staleness window (e.g. 120 s) will see the last pre-freeze price as stale until a fresh one lands, so **push a fresh oracle update as the first post-cut write**. Liquidations and funding that are gated on freshness pause safely in the meantime.
-- [ ] **The head block number goes back once, at the flip.** The source keeps producing empty burn-off blocks past H (about 330 in the rehearsals) until it pauses; they are discarded and the new chain reuses those heights from H+1 with different block ids. Indexers and deposit pollers must treat H as the end of the old chain and key blocks by id, not height alone ([docs/EXCHANGES.md](docs/EXCHANGES.md)). The chain_id and keys are unchanged.
+- [ ] **The head block number goes back once, at the flip.** The source keeps producing empty burn-off blocks past H (about 330 in the rehearsals) until it pauses; they are discarded and the new chain reuses those heights from H+1 with different block ids. Indexers and deposit pollers must treat H as the end of the old chain and key blocks by id, not height alone ([docs/EXCHANGES.md](docs/EXCHANGES.md)). The keys are unchanged; the chain_id is new from LIVE (sign for it).
 - [x] **Contracts move as-is.** The perps contract, its oracle and token were deployed on the old chain with plain `cleos set contract` and kept working on PulseVM after the cut: orders placed, cranked and cancelled with no contract or bot changes.
 - [x] **Expect a short, bumpy restart.** Budget for about 1–2 minutes of 503s plus up to a minute of slow confirmations right after the flip (field note 10), and make your bot's retry loop tolerate both.
 

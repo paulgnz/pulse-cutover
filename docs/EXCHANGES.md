@@ -49,6 +49,21 @@ So `get_info.head_block_num` drops by roughly 330 at the moment your endpoint st
 - `total.relation: "gte"` is a lower bound. Positional `/v1/history/get_actions` sequence numbers are
   synthesized across the cut: page by `global_action_seq`, not by `account_action_seq`.
 
+## 2b. The chain_id changes at LIVE
+
+The XPR → PulseVM cutover moves to a **new chain_id** (decision 2026-10-19). It is announced with H, in
+the coordinator's signed event, and every producer refuses to go live on a chain with any other id.
+
+- **Before H**: configure the new chain_id next to the old one; do not switch yet.
+- **From LIVE** (the edge serves the new chain; `get_info.chain_id` is the new id): sign everything for the
+  new chain_id. Keys, accounts and permissions are the same.
+- **Replay protection is the chain_id.** A transaction signed for the old chain_id is rejected by the new
+  chain, and one signed for the new id cannot execute on the old chain. So nothing replays across the cut,
+  and a transaction signed before the cut that did not execute by H is simply void: reconcile it (section 3)
+  and sign a replacement for the new chain_id.
+- Wallets and SDKs that pin a chain_id per network (or check it against `get_info`) must take the new one for
+  XPR at LIVE; one that silently keeps the old id will have every transaction rejected (safe, but broken).
+
 ## 3. Withdrawals and retries: reconcile before you re-sign
 
 A timeout, a dropped connection or a 5xx after you sent a transaction is an **ambiguous** outcome: it may have
@@ -64,9 +79,8 @@ transfer.
 4. An HTTP 503 from the edge **during the write freeze** means the write was not accepted: safe to retry
    later, still under the same operation id.
 
-Do not rely on re-sending the identical signed bytes across the cut: whether the new chain rejects them as
-duplicates, or accepts a transaction signed before the cut, depends on the chain-id / TAPOS / dedupe policy
-of the target, which is not final yet (ATOMICITY Known limits).
+Do not re-send signed bytes across the cut: a transaction signed for the old chain_id is rejected by the new
+chain (section 2b). Reconcile, then sign a replacement for the new chain_id.
 
 `send_transaction2` with `retry_trx: true` is refused by the edge (it does not track inclusion); a successful
 send is an admission, not an execution receipt.
@@ -101,5 +115,5 @@ On the old chain, the active schedule's 21 producers take turns in alphabetical 
   chain it can be minutes old while the chain is healthy (use the head **and** a recent transaction of your own to
   judge liveness, see section 2).
 
-Nothing here changes how you sign, verify or credit transactions; it changes what you can infer from block
-headers.
+Apart from the chain_id you sign for (section 2b), nothing here changes how you sign, verify or credit
+transactions; it changes what you can infer from block headers.
