@@ -6,6 +6,7 @@ import dns from 'node:dns/promises';
 import http from 'node:http';
 import https from 'node:https';
 import { readFileSync } from 'node:fs';
+import { versionAtLeast, gateScheduleProblems } from './coordlib.mjs';
 
 // Beacon check names that are PREPARATION ("setup") checks; every other name, including ones this
 // version does not know, is a HEALTH check. One shared list (check-kinds.json) for the agent's fleet
@@ -272,7 +273,9 @@ export const PROFILES = ['readiness', 'ceremony'];
 export const ROLES = ['producer', 'history', 'api', 'seed', 'query'];
 export const EVIDENCE_ALLOW = ['h', 'chain_id', 'freeze_at', 'cut_height', 'cut_block_id', 'burnoff_transactions', 'snapshot_sha256',
   'fingerprints_digest', 'target_head_id', 'write_gap_ms', 'state_diff_identical', 'state_digest', 'state_diff_b_head', 'lineage_at_cut',
-  'boot_genesis_sha256', 'head_at_pause', 'compare_allowed_digest', 'protocol_schedule_hash', 'agent_version', 'early_abort'];
+  'boot_genesis_sha256', 'head_at_pause', 'compare_allowed_digest', 'protocol_schedule_hash', 'agent_version', 'early_abort',
+  // rc.33: the all-producers gate the ceremony runs under (ARMED evidence).
+  'producer_gate_sha256'];
 
 class Bad extends Error {}
 const bad = (path, what) => { throw new Bad(`${path}: ${what}`); };
@@ -464,7 +467,10 @@ export function projectReport(r) {
     out.coord = { event_id: str(co.event_id, 'coord.event_id', { max: 64, nullable: true, re: /^[\w.:-]+$/ }), h: int(co.h, 'coord.h'),
       accepted: bool(co.accepted, 'coord.accepted'), armed: bool(co.armed, 'coord.armed'), aborted: bool(co.aborted, 'coord.aborted'),
       reason: co.reason == null ? null : (typeof co.reason === 'string' ? redact(co.reason, 120) : bad('coord.reason', 'must be a string')),
-      at: tsStr(co.at, 'coord.at') };
+      at: tsStr(co.at, 'coord.at'),
+      // rc.33: the producer gate this node accepted, and whether a signed arm will start its ceremony.
+      producer_gate_sha256: co.producer_gate_sha256 == null ? null : str(co.producer_gate_sha256, 'coord.producer_gate_sha256', { max: 64, re: /^[0-9a-f]{64}$/ }),
+      arm_ready: bool(co.arm_ready, 'coord.arm_ready') };
   }
   const m = r.metal ?? null;
   if (m === null) out.metal = null;
@@ -979,4 +985,72 @@ export function fleetVerdict(ev, byProducer, eventMax = {}, evidence = {}, opts 
     members: members.map(({ producer, state, fresh, missing, conflict, resumed, past: p, degraded, joined, target, exited, reentered }) =>
       ({ producer, state, fresh, missing, conflict, resumed, past_create: p, degraded, joined, exited, reentered,
         target_chain: target ? (target.blockchain_id || target.chain_id) : null, head: target?.head ?? null, after_cut_id: target?.after_cut_id ?? null })) };
+}
+
+// ---- rc.33: the all-producers gate (src/producer_gate.rs) -----------------------------------------------------------
+/** Reports older than this never count for the gate (the agent's default `report_max_age_secs`). */
+export const GATE_MAX_AGE_MS = 60_000;
+const GATE_STATES = ['ARMED', 'FROZEN'];
+const PAST_FREEZE = ['SNAPSHOTTED', 'VERIFIED', 'STRANDED', 'IGNITED', 'FLIPPED', 'LIVE', 'HALTED'];
+
+/**
+ * Is every producer the event's signed `producer_gate` binds ready? Pure.
+ * - phase 'arm' (no arm relayed yet): each member's fresh producer report accepted THIS event under THIS gate, will start
+ *   on the arm (`coord.arm_ready`), runs an agent >= min_agent_version, and shows the `admission_lock` and
+ *   `admission_lock_probe` checks green. The relay refuses the arm until this holds.
+ * - phase 'freeze' (armed): each member's journal is ARMED or FROZEN for this event under this gate (what every agent
+ *   checks right before it freezes), same version and checks.
+ * `byProducer`: producer → [{report, silent, conflict, age_ms}]; `live`: the source's get_producer_schedule (or null when
+ * unknown: the relay does not block on what it cannot see; the agents check the schedule themselves).
+ * Returns {sha256, phase, ready, members: [{producer, member, ok, why}], missing: [names], schedule_problems}.
+ */
+export function producerGateView(ev, byProducer, { phase = 'arm', live = null, maxAgeMs = GATE_MAX_AGE_MS } = {}) {
+  const g = ev?.producer_gate;
+  if (!g || !Array.isArray(g.required)) return null;
+  const memberOf = (n) => (g.cover && Object.hasOwn(g.cover, n) ? g.cover[n] : n);
+  const judge = (member) => {
+    const reps = (byProducer?.[member] || []).filter((s) => (s.report?.role || 'producer') === 'producer');
+    if (!reps.length) return 'no beacon report on mission control';
+    let best = null;
+    for (const s of reps) {
+      const r = s.report, why = [];
+      if (s.conflict) why.push('identity conflict (one token, two machines)');
+      if (s.silent || !(Number.isFinite(s.age_ms) && s.age_ms <= maxAgeMs)) why.push(`stale report (older than ${maxAgeMs / 1000} s)`);
+      if (r.coord?.event_id !== ev.event_id) why.push('not reporting this event');
+      const ce = ceremonyFor(r, ev);
+      if (phase === 'arm') {
+        if (r.coord?.accepted !== true) why.push('has not accepted the event');
+        if (r.coord?.producer_gate_sha256 !== g.sha256) why.push('accepted it without this producer gate (older agent, or another payload)');
+        if (r.coord?.arm_ready !== true) why.push('will not start on the arm (auto_arm off and no confirm file)');
+        if (ce?.state === 'ABORTED' && r.coord?.event_id === ev.event_id) why.push('its ceremony for this event ABORTED');
+      } else {
+        if (!GATE_STATES.includes(ce?.state)) why.push(`ceremony state ${ce?.state || 'none'} (needs ARMED or FROZEN)`);
+        if (ce?.evidence?.producer_gate_sha256 !== g.sha256) why.push('its journal does not carry this event\'s producer gate');
+      }
+      const ver = (phase === 'arm' ? null : ce?.evidence?.agent_version) || r.agent_version;
+      if (!versionAtLeast(ver, g.min_agent_version)) why.push(`agent ${ver || 'unknown'} is older than ${g.min_agent_version}`);
+      for (const c of ['admission_lock', 'admission_lock_probe']) if (!(r.checks || []).some((x) => x.name === c && x.ok === true)) why.push(`check ${c} is not green`);
+      if (!why.length) return null;
+      if (!best || why.length < best.length) best = why;
+    }
+    return best.join('; ');
+  };
+  const byMember = new Map();
+  const members = [...g.required].sort().map((producer) => {
+    const member = memberOf(producer);
+    if (!byMember.has(member)) byMember.set(member, judge(member));
+    const why = byMember.get(member);
+    return { producer, member, ok: !why, why };
+  });
+  const schedule_problems = live ? gateScheduleProblems(g, live) : [];
+  const missing = members.filter((m) => !m.ok).map((m) => m.producer);
+  return { sha256: g.sha256, phase, ready: !missing.length && !schedule_problems.length, required: members.length, members, missing,
+    schedule_known: !!live, schedule_problems };
+}
+
+/** The gate's phase for an event: 'arm' before an arm is relayed, 'freeze' after, 'past' once any member is past the freeze. */
+export function producerGatePhase(ev, armed, byProducer) {
+  if (!armed) return 'arm';
+  const past = Object.values(byProducer || {}).flat().some((s) => s.report?.coord?.event_id === ev.event_id && PAST_FREEZE.includes(ceremonyFor(s.report, ev)?.state));
+  return past ? 'past' : 'freeze';
 }

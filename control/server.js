@@ -18,7 +18,9 @@ import { readFileSync, existsSync, watchFile, renameSync, mkdirSync, openSync, w
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isPublicIp, normIp, resolvePublic, limiter, safeRequest, probeProducerApi, safeJson, safeDecode, RE, UA, endpointId, endpointRef, reservedKey,
-  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, ceremonyFor, pastCreate, nextEvidence, EVIDENCE_MAX, STATE_RANK, drillComparison, shadowBoardProblem } from './lib.mjs';
+  isAppRoute, projectReport, isBad, silentAfterMs, redact, hasFailingHealth, fleetVerdict, movementArmed, nextEventMark, ceremonyFor, pastCreate, nextEvidence, EVIDENCE_MAX, STATE_RANK, drillComparison, shadowBoardProblem,
+  producerGateView, producerGatePhase } from './lib.mjs';
+import { scheduleOf } from './coordlib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = +(process.env.PORT ?? 8787);
@@ -109,7 +111,11 @@ async function pollNetwork(n) {
         try {
           const s = await rpc(url, 'get_producer_schedule');
           const list = (s.active?.producers || []).map((p) => p.producer_name).filter((x) => RE.producer.test(x));
-          if (list.length) { c.schedule = list; c.scheduleTs = Date.now(); c.schedule_version = s.active?.version; }
+          if (list.length) {
+            c.schedule = list; c.scheduleTs = Date.now(); c.schedule_version = s.active?.version;
+            // rc.33: the whole schedule (active, pending, proposed) for the producer gate's schedule check.
+            c.schedule_live = { active: scheduleOf(s.active), pending: scheduleOf(s.pending), proposed: scheduleOf(s.proposed) };
+          }
         } catch {}
       }
       return;
@@ -815,6 +821,26 @@ function latchForward(n, ev, check) {
   if (commitCoord(next)) pushEvent(n.id, 'coordinator', `event ${ev.event_id} went forward (${check.reason}): recorded durably; a later signed abort is refused (409) even if reports go stale`);
   else console.error('coord: could not record the forward latch (retried on the next report or status)');
 }
+// ---- rc.33: the all-producers gate ------------------------------------------------------------------------------
+/** producer → [{report, silent, conflict, age_ms}] for every server, as the gate judges them. */
+function gateByProducer(n) {
+  const now = Date.now(); const out = dict();
+  for (const p of Object.keys(nodes[n.id] || {})) {
+    out[p] = servers(n.id, p).map((s) => ({ report: s.report, silent: isSilent(s, now), conflict: !!s.conflict, age_ms: reportAge(s, now) }));
+  }
+  return out;
+}
+/** The gate view for the current event (null when the event has no producer_gate). */
+function producerGateFor(n, ev, phase = null) {
+  if (!ev?.producer_gate) return null;
+  const by = gateByProducer(n);
+  const c = chain[n.id];
+  // The schedule is used only while it is fresh (polled every 30 s); otherwise unknown (the agents check it themselves).
+  const live = c?.schedule_live && Date.now() - (c.scheduleTs || 0) < 120e3 ? c.schedule_live : null;
+  return producerGateView(ev, by, { phase: phase || producerGatePhase(ev, !!coord[n.id]?.arm, by), live });
+}
+const lastGateNote = dict();
+
 const lastQuorumAlarm = dict();
 function fleet(n) {
   const c = coord[n.id];
@@ -832,6 +858,19 @@ function fleet(n) {
     v.warnings.push(`event ${ev.event_id} went forward (recorded ${latched.at}: ${latched.verdict}): a signed abort is refused; close it with complete`);
   }
   v.forward_latched = latched ? { at: latched.at, verdict: latched.verdict } : null;
+  // rc.33: the fleet is NOT READY while any producer the event's gate binds is not armed with the lock (before the arm:
+  // not ready to arm, and the relay refuses the arm; after it: every agent aborts at its freeze tick).
+  const gate = !c.abort && !c.complete ? producerGateFor(n, ev) : null;
+  v.producer_gate = gate;
+  if (gate && gate.phase !== 'past' && !gate.ready) {
+    const what = [gate.missing.length ? `not armed: ${gate.missing.slice(0, 12).join(', ')}${gate.missing.length > 12 ? ` (+${gate.missing.length - 12} more)` : ''}` : null,
+      ...gate.schedule_problems].filter(Boolean).join('; ');
+    v.warnings.unshift(`PRODUCER GATE NOT READY (${gate.phase === 'arm' ? 'the arm is refused' : 'agents abort before the freeze'}): ${what}`);
+    const sig = `${ev.event_id}|${gate.phase}|${what}`;
+    if (lastGateNote[n.id] !== sig) { lastGateNote[n.id] = sig; pushEvent(n.id, 'fleet', `producer gate NOT READY for ${ev.event_id}: ${what}`.slice(0, 400)); }
+  } else if (gate?.ready && lastGateNote[n.id] && !lastGateNote[n.id].endsWith('|ready')) {
+    lastGateNote[n.id] = `${ev.event_id}|ready`; pushEvent(n.id, 'fleet', `producer gate READY for ${ev.event_id} (${gate.required} producers)`);
+  }
   // rc.31: a signed abort refused (or accepted only with an explicit acknowledgement) because members were already
   // past chain creation stays visible on the event as a warning.
   for (const h of (c.history || []).filter((x) => x.event_id === ev.event_id && (x.type === 'abort_refused' || x.after_creation === true))) {
@@ -1103,6 +1142,20 @@ async function handle(req, res) {
       if (c.abort) return send(res, 409, { error: 'event already aborted' });
       if (c.complete && p.type !== 'complete') return send(res, 409, { error: 'event already complete' });
       if (own(c, p.type) && c[p.type]) return send(res, 200, { ok: true, type: p.type, event_id: p.event_id, unchanged: true });
+      // rc.33: an arm for an event with a producer gate is relayed only when every producer it binds is ready (fresh report,
+      // accepted under this gate, will start on the arm, agent new enough, lock on and probed) and the schedule mission
+      // control sees (when it sees one) is still the bound one. The relay is not an authority: every agent checks again.
+      if (p.type === 'arm' && cur.producer_gate) {
+        const gv = producerGateFor(n, cur, 'arm');
+        if (!gv.ready) {
+          const rec = clone(coord);
+          rec[n.id].history = [...(rec[n.id].history || []), { type: 'arm_refused', event_id: p.event_id, at, missing: gv.missing.slice(0, 50), schedule_problems: gv.schedule_problems }].slice(-100);
+          commitCoord(rec);
+          pushEvent(n.id, 'coordinator', `arm for ${p.event_id} REFUSED: producer gate not ready (not ready: ${gv.missing.join(', ') || 'none'}${gv.schedule_problems.length ? `; ${gv.schedule_problems.join('; ')}` : ''})`.slice(0, 400));
+          return send(res, 409, { error: `producer gate not ready: ${gv.missing.length} of ${gv.required} producers not ready${gv.schedule_problems.length ? `; ${gv.schedule_problems.join('; ')}` : ''}: the arm is NOT relayed`,
+            missing: gv.members.filter((m) => !m.ok), schedule_problems: gv.schedule_problems });
+        }
+      }
       // rc.31 (fleet run h2: an abort landed after the event was 5/5 LIVE, was accepted, and the verdict stayed LIVE
       // with no alarm). An abort is also the VETO every agent checks before creating and igniting, so it is refused
       // only when the fleet has demonstrably gone forward: verdict LIVE / STALLED, or at least `quorum` roster members'
