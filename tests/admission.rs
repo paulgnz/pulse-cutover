@@ -1855,3 +1855,26 @@ fn rc33_gate_model_never_freezes_with_a_visible_gap_and_never_goes_live_with_a_l
     );
     eprintln!("rc.33 gate model: clean ({outcomes:?})");
 }
+
+/// A gate check that passes only at or past H (here: a one-block freeze lead, the check's own head read is H) aborts
+/// before the freeze instead of freezing after the cut.
+#[test]
+fn rc33_gate_a_check_that_ends_at_h_refuses_the_freeze() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, w) = gated_world(dir.path(), 4, &[], vec![true; 4], vec![Member::ready(); 4]);
+    let p = dir.path().join("gated.toml");
+    let text = std::fs::read_to_string(&p).unwrap().replace(
+        &format!("freeze_lead_blocks = {LEAD}"),
+        "freeze_lead_blocks = 1",
+    );
+    std::fs::write(&p, text).unwrap();
+    let cfg = Config::load(&p).unwrap();
+    assert_eq!(run(&cfg, &w), State::Aborted);
+    assert!(!froze(&cfg));
+    assert!(w.whitelist_sets.borrow().is_empty());
+    let m = gate_abort(&cfg).unwrap()["data"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(m.contains("at or past H 120"), "{m}");
+}

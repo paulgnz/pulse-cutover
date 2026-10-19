@@ -185,6 +185,8 @@ log and `fleet.producer_gate` name each producer that is not ready, and why. Aft
   - from an agent at least the minimum version;
   - with `admission_lock` and `admission_lock_probe` green.
 - Each read is retried briefly (3 tries, 1 s apart), and an unanswered one counts as a failure: unknown is never yes.
+  A check that passes only at or after H (slow reads) aborts too, since freezing then would admit transactions up to
+  the cut.
 - On any gap the agent aborts before it freezes or locks anything. The journal names the missing producers and why
   (`producer gate not met before the freeze`), with the schedule problems. A pass is journaled
   (`producer_gate: checked before the freeze`).

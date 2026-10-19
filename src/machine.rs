@@ -2712,6 +2712,17 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 vec![]
             }
         };
+        // The reads above are retried and can be slow: a check that ends at or past H would freeze after the cut (the
+        // producer admitting until then). Abort instead, before anything is frozen.
+        if problems.is_empty() && missing.is_empty() {
+            let head = self.ops.source_info()?.head_block_num;
+            if head >= self.h() {
+                problems.push(format!(
+                    "the gate check ended at head {head}, at or past H {}: freezing now would admit transactions up to the cut",
+                    self.h()
+                ));
+            }
+        }
         if problems.is_empty() && missing.is_empty() {
             self.journal.evidence(
                 State::Armed,
