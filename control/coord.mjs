@@ -7,6 +7,7 @@
 //        (--cpu-scale none omits import_cpu_scale: use it for import_backend = "upstream", where it does nothing)
 //        [--roster bp1,bp2,…|producer:instance_id,…] [--quorum N] [--release-sha256 <hex>] [--snapshot-sha256 <hex>] [--metal-network-id N]
 //        [--early-abort yes]  (rc.31: agents stop early on a provably unreachable quorum; OFF unless signed on)
+//        [--target-chain-id <64 hex>]  (rc.33: the NEW chain_id the target must have; required for XPR mainnet)
 //        [--producer-gate yes --source-rpc <nodeos /v1 base> [--standby a,b,…] [--cover name:member,…] [--min-agent-version V]]
 //        (rc.33: bind every producer that could produce before the pause — get_producer_schedule's active, pending and
 //         proposed, plus the standbys — and the roster member running each one's agent; mission control refuses the arm

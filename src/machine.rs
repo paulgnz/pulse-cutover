@@ -6486,6 +6486,44 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let status = self.fleet_status();
         let (bid, sid, members) = crate::fleet::join_view(status.as_ref(), co, &ours)
             .map_err(|e| format!("join refused: {e}"))?;
+        // rc.33: a pinned new chain_id: a LIVE member that reports its target with another id is not the agreed chain.
+        if let Some(pin) = &self.cfg.ceremony.target_chain_id {
+            let other: Vec<String> = status
+                .as_ref()
+                .and_then(|d| d["networks"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter(|n| n["id"].as_str() == Some(co.network.as_str()))
+                .flat_map(|n| n["producers"].as_array().cloned().unwrap_or_default())
+                .filter(|p| {
+                    p["name"]
+                        .as_str()
+                        .is_some_and(|x| members.iter().any(|m| m == x))
+                })
+                .flat_map(|p| {
+                    p["beacons"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|b| b["report"].clone())
+                        .chain(std::iter::once(p["report"].clone()))
+                        .collect::<Vec<_>>()
+                })
+                .filter_map(|r| {
+                    r["ceremony"]["target"]["chain_id"]
+                        .as_str()
+                        .map(String::from)
+                })
+                .filter(|c| !c.eq_ignore_ascii_case(pin))
+                .collect();
+            if !other.is_empty() {
+                return Err(format!(
+                    "join refused: the LIVE quorum reports target chain_id {} but the signed event pins {pin}",
+                    other[0]
+                ));
+            }
+        }
         let info = self
             .ops
             .source_info()
@@ -6776,7 +6814,43 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             self.ops.sleep_ms(self.cfg.poll_ms);
         };
-        if let Some(chain_id) = self.chain_id.clone() {
+        // rc.33 (decision 2026-10-19): the cutover moves to a NEW chain_id, pinned in the signed event. The target this
+        // agent created or joined must have exactly that id; an unpinned target on XPR mainnet is refused.
+        if let Some(pin) = self.cfg.ceremony.target_chain_id.clone() {
+            if !info.chain_id.eq_ignore_ascii_case(&pin) {
+                self.abort(
+                    "target chain_id != the event's pinned target_chain_id",
+                    json!({"target": info.chain_id, "pinned": pin, "source": self.chain_id,
+                           "note": "the signed event names the new chain's id; a target with any other id is not the agreed chain"}),
+                )?;
+                return Ok(());
+            }
+            if self
+                .chain_id
+                .as_deref()
+                .is_some_and(|c| !c.eq_ignore_ascii_case(&info.chain_id))
+            {
+                self.journal.evidence(
+                    State::Verified,
+                    json!({"accepted_target_chain_id": info.chain_id,
+                        "target_chain_id_pinned": {"source_chain_id": self.chain_id, "target_chain_id": info.chain_id,
+                            "pinned_by": "the signed event (ceremony.target_chain_id)",
+                            "note": "a NEW chain_id: transactions must be signed for it from LIVE on"}}),
+                )?;
+                self.accepted_target_chain_id = Some(info.chain_id.clone());
+            }
+        } else if self
+            .chain_id
+            .as_deref()
+            .is_some_and(crate::config::is_xpr_mainnet)
+            && !self.cfg.is_shadow()
+        {
+            self.abort(
+                "XPR MAINNET target without a pinned target_chain_id",
+                json!({"target": info.chain_id, "note": "a mainnet cutover moves to the NEW chain_id named in the signed event"}),
+            )?;
+            return Ok(());
+        } else if let Some(chain_id) = self.chain_id.clone() {
             if !info.chain_id.eq_ignore_ascii_case(&chain_id) {
                 if self.cfg.ceremony.rehearsal_allow_chain_id_change {
                     // REHEARSAL ONLY (refused for mainnet at load and at ARM): PulseVM v1.0.0 signs
@@ -7178,11 +7252,20 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let public = self.ops.public_info(&flip.public_url)?;
             let proof = match (&target, &public) {
                 (Some(t), Some(p)) => {
-                    let chain_ok = self
-                        .accepted_target_chain_id
+                    // rc.33: a pinned new chain_id first; the public edge and the target must both serve it.
+                    let want = self
+                        .cfg
+                        .ceremony
+                        .target_chain_id
                         .as_ref()
-                        .or(self.chain_id.as_ref())
-                        .map(|c| p.chain_id.eq_ignore_ascii_case(c))
+                        .or(self.accepted_target_chain_id.as_ref())
+                        .or(self.chain_id.as_ref());
+                    let chain_ok = want
+                        .map(|c| {
+                            p.chain_id.eq_ignore_ascii_case(c)
+                                && (self.cfg.ceremony.target_chain_id.is_none()
+                                    || t.chain_id.eq_ignore_ascii_case(c))
+                        })
                         .unwrap_or(false);
                     let common = t.head_block_num.min(p.head_block_num);
                     if !chain_ok {

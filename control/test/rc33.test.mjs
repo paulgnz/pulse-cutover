@@ -69,7 +69,12 @@ test('rc.33 eventPayload: --producer-gate needs the roster and the source schedu
   assert.equal(eventPayload({ ...a, 'producer-gate': undefined }, 1).producer_gate, undefined);
   // Review fix 4: XPR mainnet refuses a cover mapping unless the event is a rehearsal (or shadow).
   const MAIN = '384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0';
-  const m = { ...a, 'chain-id': MAIN, roster: 'bpa,box1', cover: 'bpb:box1,bpc:box1' };
+  // rc.33 decision: XPR mainnet pins a NEW target chain_id in the signed event.
+  assert.throws(() => eventPayload({ ...a, 'chain-id': MAIN }, 1, { schedule: SCHEDULE }), /must pin the new chain_id/);
+  assert.throws(() => eventPayload({ ...a, 'chain-id': MAIN, 'target-chain-id': MAIN }, 1, { schedule: SCHEDULE }), /NEW chain_id/);
+  assert.throws(() => eventPayload({ ...a, 'target-chain-id': 'xyz' }, 1, { schedule: SCHEDULE }), /64 hex/);
+  assert.equal(eventPayload({ ...a, 'chain-id': MAIN, 'target-chain-id': 'C0'.repeat(32) }, 1, { schedule: SCHEDULE }).target_chain_id, 'c0'.repeat(32));
+  const m = { ...a, 'chain-id': MAIN, 'target-chain-id': 'c0'.repeat(32), roster: 'bpa,box1', cover: 'bpb:box1,bpc:box1' };
   assert.throws(() => eventPayload(m, 1, { schedule: SCHEDULE }), /XPR MAINNET.*bpb→box1/);
   assert.ok(eventPayload({ ...m, rehearsal: 'yes' }, 1, { schedule: SCHEDULE }).producer_gate);
   assert.ok(eventPayload({ ...a, roster: 'bpa,box1', cover: 'bpb:box1,bpc:box1' }, 1, { schedule: SCHEDULE }).producer_gate, 'testnet may map');

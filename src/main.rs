@@ -1032,7 +1032,7 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         println!("target_subnet_id: {s}");
     }
     if let Some(c) = &recovered.accepted_target_chain_id {
-        println!("target_chain_id: {c} (differs from the source: accepted by rehearsal_allow_chain_id_change)");
+        println!("target_chain_id: {c} (differs from the source: pinned by the signed event, or a rehearsal override)");
     }
     // After LIVE: is the target still producing? (reporting only; never an action)
     let summary = pulse_cutover::beacon::journal_summary(&cfg.journal_path);

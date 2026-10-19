@@ -9,6 +9,8 @@
 //     --snapshot-sha256 <hex>       the expected cut snapshot hash, once known
 //     --metal-network-id N          the Metal network the target runs on (a private rehearsal network); every agent's
 //                                   target.metal_network_id (or the network its chain moves to) must equal it
+//     --target-chain-id <hex>       rc.33: the NEW chain's id; every agent requires its target to have exactly it (required
+//                                   for XPR mainnet unless --rehearsal yes)
 //     --producer-gate yes           rc.33: bind every producer that could produce before the pause (needs `schedule`, the
 //                                   source's get_producer_schedule answer, which coord.mjs reads from --source-rpc), with
 //     [--standby a,b] [--cover name:member,…] [--min-agent-version 0.5.0-rc.33]   (see producerGate below)
@@ -53,6 +55,12 @@ export function eventPayload(a, now = Date.now(), { schedule } = {}) {
     if (a[f] !== undefined && !HEX64.test(a[f])) throw new Error(`--${f} must be 64 hex characters`);
   }
   if (a['metal-network-id'] !== undefined && !/^[1-9]\d{0,9}$/.test(String(a['metal-network-id']))) throw new Error('--metal-network-id must be a positive integer');
+  // rc.33 (decision 2026-10-19): the cutover moves to a NEW chain_id, pinned here and bound into the event hash.
+  if (a['target-chain-id'] !== undefined && !HEX64.test(a['target-chain-id'])) throw new Error('--target-chain-id must be the new chain_id (64 hex characters)');
+  if (a['chain-id'].toLowerCase() === XPR_MAINNET_CHAIN_ID && a.rehearsal !== 'yes') {
+    if (!a['target-chain-id']) throw new Error('an XPR MAINNET event must pin the new chain_id: --target-chain-id <64 hex>');
+    if (a['target-chain-id'].toLowerCase() === XPR_MAINNET_CHAIN_ID) throw new Error('--target-chain-id is the source chain_id: the cutover moves to a NEW chain_id');
+  }
   let gate = null;
   if (a['producer-gate'] === 'yes') {
     if (!roster) throw new Error('--producer-gate needs --roster (the agents that cover the schedule)');
@@ -75,6 +83,7 @@ export function eventPayload(a, now = Date.now(), { schedule } = {}) {
     ...(a['metal-network-id'] !== undefined ? { metal_network_id: Number(a['metal-network-id']) } : {}),
     // rc.31: the fleet-wide early-abort setting (off unless the coordinator signs it on).
     ...(a['early-abort'] === 'yes' ? { early_abort: true } : {}),
+    ...(a['target-chain-id'] ? { target_chain_id: a['target-chain-id'].toLowerCase() } : {}),
     // rc.33: the all-producers gate (src/producer_gate.rs).
     ...(gate ? { producer_gate: gate } : {}),
     issued_at_ms: now,

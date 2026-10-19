@@ -77,6 +77,9 @@ quiescence_timeout_secs = 120   # abort if the source never stops producing afte
                              # "upstream" (the official MetalBlockchain/pulsevm#61 pipeline; needs [upstream])
 # rehearsal_allow_chain_id_change = false   # REHEARSAL ONLY, upstream backend: the target may sign with
                              # metalgo's blockchain id instead of the source chain_id. Refused for mainnet.
+# target_chain_id = "<64 hex>"     # rc.33: the NEW chain's id, written by `await` from the SIGNED event (never typed in).
+                             # The target created or joined must have exactly this id; required for XPR mainnet,
+                             # where it must differ from the source chain_id (decision 2026-10-19: a new chain_id).
 # boundary_path = "/etc/pulse-cutover/boundary.json"   # producer mode (or api without [hyperion]): where the
                              # history boundary file for a federating router is written before LIVE
 

@@ -364,6 +364,14 @@ pub struct Ceremony {
     /// mission control.
     #[serde(default)]
     pub rehearsal_allow_chain_id_change: bool,
+    /// rc.33 (decision 2026-10-19: the XPR→PulseVM cutover uses a NEW chain_id): the chain_id the target chain must
+    /// have, written by `await` from the SIGNED event's `target_chain_id` (bound into the event hash). When set, the
+    /// target this agent creates or joins must have exactly this id (otherwise the ceremony aborts before ignition
+    /// completes, or halts after it), and the flip waits for it. XPR mainnet requires it at ARM, and it must differ
+    /// from the source chain_id there. Unset (rehearsals, other chains): the target must keep the source chain_id
+    /// unless `rehearsal_allow_chain_id_change`. 64 hex characters.
+    #[serde(default)]
+    pub target_chain_id: Option<String>,
     /// REHEARSAL ceremony (default false). Without it every ceremony config must pass the
     /// PRODUCTION PROFILE (`Config::production_problems`): exact cut, real freeze, lineage check,
     /// the required hooks, a sustained LIVE window, the post-LIVE watch and probe, a state
@@ -1052,6 +1060,24 @@ impl Config {
         }
         crate::shadow::check_config(&config)?;
         config.check_rehearsal_overrides()?;
+        if let Some(t) = &config.ceremony.target_chain_id {
+            if t.len() != 64 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "ceremony.target_chain_id {t:?} is not a chain_id (64 hex characters)"
+                ));
+            }
+            if !config.ceremony.shadow
+                && config
+                    .ceremony
+                    .chain_id
+                    .as_deref()
+                    .is_some_and(|c| is_xpr_mainnet(c) && c.eq_ignore_ascii_case(t))
+            {
+                return Err("ceremony.target_chain_id equals the XPR MAINNET source chain_id: the cutover moves to a NEW \
+                            chain_id (decision 2026-10-19)"
+                    .into());
+            }
+        }
         // rc.33: a producer gate in the config must be the one a signed event carries: well formed, hash intact, every
         // name covered by a roster member.
         if let Some(co) = &config.coordination {
@@ -1453,6 +1479,12 @@ impl Config {
                  written by `pulse-cutover await`; run the config it derived"
                     .into(),
             );
+        }
+        // rc.33: the new chain's id is pinned in the signed event (producers create or join it, API nodes flip to it).
+        if self.ceremony.target_chain_id.is_none() && !self.is_shadow() {
+            out.push("an XPR MAINNET ceremony needs the new chain's id pinned in the signed event (ceremony.target_chain_id, \
+                      written by `await` from the event's target_chain_id: coord.mjs event --target-chain-id)"
+                .into());
         }
         if self.ceremony.mode == Mode::Producer {
             if co.roster.is_empty() {

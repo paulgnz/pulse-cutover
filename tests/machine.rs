@@ -2596,6 +2596,9 @@ fn upstream_backend_requires_upstream_section() {
 
 /// rc.33: the producer gate the production-profile test events carry: the mock schedule (active v1: bp1, bp2), each
 /// name its own roster member.
+/// rc.33: the NEW chain_id a mainnet test event pins (decision 2026-10-19).
+const NEW_CHAIN: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
+
 fn test_gate(h: u64) -> pulse_cutover::producer_gate::ProducerGate {
     let mut g = pulse_cutover::producer_gate::ProducerGate {
         v: 1,
@@ -6321,6 +6324,123 @@ fn stage2_chain_config_producer_key_must_be_the_genesis_initial_key() {
         .contains("no producer_name"));
 }
 
+/// rc.33 (decision 2026-10-19: a NEW chain_id). With the id pinned in the signed event (ceremony.target_chain_id), a
+/// target with exactly that id goes LIVE without any rehearsal override, both ids journaled; a target with another id
+/// (including the source's own) halts, never resuming the source.
+#[test]
+fn rc33_a_pinned_target_chain_id_goes_live_and_any_other_id_halts() {
+    let pin = |dir: &std::path::Path| {
+        let p = dir.join("ceremony-upstream-ignite.toml");
+        let t = std::fs::read_to_string(&p).unwrap().replacen(
+            "[ceremony]\n",
+            &format!("[ceremony]\ntarget_chain_id = \"{TARGET_CHAIN_ID}\"\n"),
+            1,
+        );
+        std::fs::write(&p, t).unwrap();
+        Config::load(&p).unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let _ = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let cfg = pin(dir.path());
+    assert!(!cfg.ceremony.rehearsal_allow_chain_id_change);
+    let ops = upstream_ops(dir.path());
+    *ops.target_chain_id.borrow_mut() = Some(TARGET_CHAIN_ID.into());
+    assert_eq!(run_machine(&cfg, &ops), State::Live);
+    let e = journal_entries(&cfg);
+    let rec = e
+        .iter()
+        .find(|v| !v["data"]["target_chain_id_pinned"].is_null())
+        .expect("pinned id journaled");
+    assert_eq!(rec["data"]["accepted_target_chain_id"], TARGET_CHAIN_ID);
+    let live = &transition(&e, "LIVE").unwrap()["data"];
+    assert_eq!(live["target_chain_id"], TARGET_CHAIN_ID);
+    assert_eq!(live["source_chain_id_changed"], true);
+
+    // The target came up with the SOURCE id (or any id but the pinned one): halt.
+    for other in [None, Some("ab".repeat(32))] {
+        let dir = tempfile::tempdir().unwrap();
+        stage_fake_upstream_tools(dir.path(), 0);
+        let _ = upstream_ignite_config(dir.path(), "", "").unwrap();
+        let cfg = pin(dir.path());
+        let ops = upstream_ops(dir.path());
+        *ops.target_chain_id.borrow_mut() = other.clone();
+        let err = run_machine_result(&cfg, &ops).unwrap_err();
+        assert!(
+            err.starts_with("HALTED") && err.contains("pinned target_chain_id"),
+            "{other:?}: {err}"
+        );
+        assert_eq!(ops.resumes.get(), 0);
+    }
+    // A malformed pin is refused at load.
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let _ = upstream_ignite_config(dir.path(), "", "").unwrap();
+    let p = dir.path().join("ceremony-upstream-ignite.toml");
+    let t = std::fs::read_to_string(&p).unwrap().replacen(
+        "[ceremony]\n",
+        "[ceremony]\ntarget_chain_id = \"nothex\"\n",
+        1,
+    );
+    std::fs::write(&p, t).unwrap();
+    assert!(Config::load(&p).unwrap_err().contains("64 hex"));
+}
+
+/// rc.33: the pin travels in the signed event: `await` refuses an XPR mainnet event without one or with the source's
+/// own id, and the derived config carries it; mainnet ARM compares it with the signed event.
+#[test]
+fn rc33_mainnet_events_must_pin_a_new_target_chain_id() {
+    let dir = tempfile::tempdir().unwrap();
+    stage_fake_upstream_tools(dir.path(), 0);
+    let cfg = upstream_mainnet_coordinated_config(dir.path());
+    let h = cfg.ceremony.freeze_height;
+    let ev = |t: Option<&str>| {
+        let mut e = serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "chain_id": MAINNET, "h": h,
+            "roster": [{"producer": "bp1"}, {"producer": "bp2"}], "quorum": 2, "producer_gate": test_gate_json(h)});
+        if let Some(t) = t {
+            e["target_chain_id"] = serde_json::json!(t);
+        }
+        e
+    };
+    let v = |e: &serde_json::Value| {
+        pulse_cutover::coord::validate_event(e, &cfg, "rehearsal", Some(1), 1)
+    };
+    assert_eq!(v(&ev(Some(NEW_CHAIN))), Ok(h));
+    assert!(v(&ev(None)).unwrap_err().contains("must pin the new chain"));
+    let mut unpinned = cfg.clone();
+    unpinned.ceremony.target_chain_id = None;
+    assert!(pulse_cutover::coord::validate_event(
+        &ev(Some(MAINNET)),
+        &unpinned,
+        "rehearsal",
+        Some(1),
+        1
+    )
+    .unwrap_err()
+    .contains("NEW chain_id"));
+    assert!(v(&ev(Some(&"ab".repeat(32))))
+        .unwrap_err()
+        .contains("differs from this node"));
+    // ARM: the signed event without the pin (config pinned) does not bind.
+    let mut c = cfg.clone();
+    let msg = signed(ev(None));
+    c.coordination.as_mut().unwrap().event_hash = pulse_cutover::coord::payload_hash(&msg);
+    let p = pulse_cutover::coord::mainnet_event_problems(
+        Some(&serde_json::json!({"event": msg})),
+        &c,
+        MAINNET,
+    );
+    assert!(p.iter().any(|x| x.contains("target_chain_id")), "{p:?}");
+    // derived config
+    let src = dir.path().join("await-base.toml");
+    std::fs::write(&src, "journal_path = \"/j\"\n[ceremony]\nfreeze_height = 0\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\n").unwrap();
+    let out = dir.path().join("derived.toml");
+    pulse_cutover::coord::derived_config(&src, &ev(Some(NEW_CHAIN)), None, &out).unwrap();
+    assert!(std::fs::read_to_string(&out)
+        .unwrap()
+        .contains(&format!("target_chain_id = \"{NEW_CHAIN}\"")));
+}
+
 #[test]
 fn upstream_target_chain_id_change_halts_without_the_override_and_passes_with_it() {
     // Without the override: the chain_id check runs after ignite_started, so it SEALS.
@@ -6563,7 +6683,8 @@ fn upstream_production_config(dir: &std::path::Path) -> Result<Config, String> {
 fn mainnet_event(h: u64) -> serde_json::Value {
     signed(
         serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "chain_id": MAINNET, "h": h,
-        "roster": [{"producer": "bp1"}, {"producer": "bp2"}], "quorum": 2, "producer_gate": test_gate_json(h)}),
+        "roster": [{"producer": "bp1"}, {"producer": "bp2"}], "quorum": 2, "producer_gate": test_gate_json(h),
+        "target_chain_id": NEW_CHAIN}),
     )
 }
 
@@ -6575,7 +6696,9 @@ fn upstream_mainnet_coordinated_config(dir: &std::path::Path) -> Config {
         .freeze_height;
     std::fs::write(dir.join("beacon.token"), "tok\n").unwrap();
     let ev_hash = pulse_cutover::coord::payload_hash(&mainnet_event(h)).unwrap();
-    let text = std::fs::read_to_string(dir.join("ceremony-upstream-ignite.toml")).unwrap()
+    let text = std::fs::read_to_string(dir.join("ceremony-upstream-ignite.toml"))
+        .unwrap()
+        .replace("[ceremony]\n", &format!("[ceremony]\ntarget_chain_id = \"{NEW_CHAIN}\"\n"))
         + &format!("\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nevent_hash = \"{}\"\nfleet_quorum = 2\nfleet_timeout_secs = 5\nreport_max_age_secs = 60\n",
             hex::encode(coord_key().verifying_key().to_bytes()), ev_hash)
         + "\n[[coordination.roster]]\nproducer = \"bp1\"\n\n[[coordination.roster]]\nproducer = \"bp2\"\n"
@@ -6761,7 +6884,7 @@ fn d10_mainnet_arm_authenticates_and_binds_the_signed_event() {
     let h = cfg.ceremony.freeze_height;
     let ev = |chain: Option<&str>, hh: Option<u64>, roster: serde_json::Value, quorum: u64| {
         let mut p = serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "roster": roster, "quorum": quorum,
-            "producer_gate": test_gate_json(h)});
+            "producer_gate": test_gate_json(h), "target_chain_id": NEW_CHAIN});
         if let Some(c) = chain {
             p["chain_id"] = serde_json::json!(c);
         }
@@ -6862,9 +6985,15 @@ fn d10_mainnet_api_ceremony_needs_the_signed_event_but_no_roster() {
         .iter()
         .any(|p| p.contains("must be coordinated")));
     c.coordination = coord_config(dir.path(), 120, 0, 5).coordination;
+    // rc.33: and the new chain's id, pinned in the signed event.
+    assert!(c
+        .mainnet_coordination_problems(true)
+        .iter()
+        .any(|p| p.contains("target_chain_id")));
+    c.ceremony.target_chain_id = Some(NEW_CHAIN.into());
     assert!(
         c.mainnet_coordination_problems(true).is_empty(),
-        "api: event id + hash suffice, no roster or quorum"
+        "api: event id + hash + the pinned new chain_id suffice, no roster or quorum"
     );
     c.coordination.as_mut().unwrap().event_hash = None;
     assert!(c

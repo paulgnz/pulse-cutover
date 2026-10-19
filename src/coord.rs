@@ -163,6 +163,38 @@ pub fn validate_event(
             ));
         }
     }
+    // rc.33: the new chain's id, pinned and signed (decision 2026-10-19: a NEW chain_id for the cutover).
+    match ev.get("target_chain_id").filter(|t| !t.is_null()) {
+        Some(t) => {
+            let t = t
+                .as_str()
+                .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or("event target_chain_id is not a chain_id (64 hex characters)")?;
+            if let Some(local) = &cfg.ceremony.target_chain_id {
+                if !local.eq_ignore_ascii_case(t) {
+                    return Err(
+                        "event target_chain_id differs from this node's ceremony.target_chain_id"
+                            .into(),
+                    );
+                }
+            }
+            if !cfg.is_shadow()
+                && ev["chain_id"]
+                    .as_str()
+                    .is_some_and(|c| crate::config::is_xpr_mainnet(c) && c.eq_ignore_ascii_case(t))
+            {
+                return Err("event target_chain_id equals the XPR MAINNET source chain_id: the cutover moves to a NEW chain_id".into());
+            }
+        }
+        None if ev["chain_id"]
+            .as_str()
+            .is_some_and(crate::config::is_xpr_mainnet)
+            && !cfg.is_shadow() =>
+        {
+            return Err("an XPR MAINNET event must pin the new chain's id (target_chain_id; coord.mjs event --target-chain-id)".into());
+        }
+        None => {}
+    }
     // rc.33: the all-producers gate. Malformed, unhashed, uncovered or newer than this agent: refused. A real
     // (non-rehearsal) producer ceremony needs one.
     match ev.get("producer_gate").filter(|g| !g.is_null()) {
@@ -266,6 +298,8 @@ pub fn mainnet_binding(cfg: &Config, chain_id: &str) -> Value {
         "quorum": co.map(|c| c.fleet_quorum).unwrap_or(0),
         // rc.31 round 5 (review MEDIUM-2): the early-abort setting is part of what the signed event binds.
         "early_abort": co.map(|c| c.early_abort).unwrap_or(false),
+        // rc.33: the pinned new chain_id (null when none).
+        "target_chain_id": cfg.ceremony.target_chain_id.as_ref().map(|t| t.to_lowercase()),
         // rc.33: the all-producers gate (null when the event has none).
         "producer_gate_sha256": co.and_then(|c| c.producer_gate.as_ref().map(|g| g.sha256.to_lowercase())),
     })
@@ -297,7 +331,7 @@ pub fn mainnet_binding_problem(
         Some(b) => {
             let now = mainnet_binding(cfg, chain);
             let fields = ["event_id", "event_hash", "network", "chain_id", "h", "roster_sha256", "quorum", "early_abort",
-                "producer_gate_sha256"];
+                "producer_gate_sha256", "target_chain_id"];
             // A binding journaled before rc.31 has no early_abort: it was off.
             let off = json!(false);
             let get = |v: &Value, f: &str| -> Value {
@@ -501,6 +535,30 @@ pub fn mainnet_event_problems(
         )
     }) {
         out.push(p);
+    }
+    // rc.33: the pinned new chain_id is the signed one, and it is new.
+    let signed_target = ev["target_chain_id"].as_str().map(str::to_lowercase);
+    let cfg_target = cfg
+        .ceremony
+        .target_chain_id
+        .as_ref()
+        .map(|t| t.to_lowercase());
+    if signed_target != cfg_target {
+        out.push(format!(
+            "the signed event's target_chain_id ({}) is not ceremony.target_chain_id ({})",
+            signed_target.as_deref().unwrap_or("none"),
+            cfg_target.as_deref().unwrap_or("none")
+        ));
+    }
+    if signed_target.is_none() && !cfg.is_shadow() {
+        out.push("the signed event pins no target_chain_id: a mainnet cutover moves to a NEW chain_id, named in the event".into());
+    }
+    if !cfg.is_shadow()
+        && signed_target
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case(source_chain_id))
+    {
+        out.push("the signed event's target_chain_id is the source chain_id: the cutover moves to a NEW chain_id".into());
     }
     // rc.33: the config's producer gate is the signed one.
     let signed_gate = ev["producer_gate"]["sha256"]
@@ -759,6 +817,18 @@ pub fn derived_config(
         .ok_or("config has no [ceremony]")?;
     cer.insert("freeze_height".into(), toml::Value::Integer(h as i64));
     cer.remove("derive_h_at_arm");
+    // rc.33: the pinned new chain_id (validated by `validate_event`).
+    match ev["target_chain_id"].as_str() {
+        Some(t) => {
+            cer.insert(
+                "target_chain_id".into(),
+                toml::Value::String(t.to_lowercase()),
+            );
+        }
+        None => {
+            cer.remove("target_chain_id");
+        }
+    }
     let co = doc["coordination"]
         .as_table_mut()
         .ok_or("config has no [coordination]")?;
