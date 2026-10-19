@@ -16,6 +16,12 @@
 //!   their own agents reaching the same freeze height); a non-participating producer never locks.
 //!
 //! The REAL `Machine` drives this world from ARM to LIVE or ABORTED.
+//!
+//! rc.33 adds a coordinated variant (`gated_world`): a signed event with a producer gate, a source schedule that can
+//! change at a given block, and mission control's `/api/status` with each gate member's report (present or not, agent
+//! version, lock and probe checks, age, a later disarm), independent of whether that member's node really locks (a
+//! member can lie). Directed tests and a seeded model (`rc33_gate_model_*`, invariants I10a–d) check that the agent
+//! never freezes with a gap the gate can see, and that the burn-off audit still catches what it cannot.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -112,6 +118,48 @@ struct Mempool {
     external_whitelist_on_audit: RefCell<Option<Vec<String>>>,
     /// Once this node is paused, someone else sets the whitelist to this list.
     external_whitelist_on_pause: RefCell<Option<Vec<String>>>,
+    /// rc.33: the coordinated world of the all-producers gate (None: uncoordinated, as in the rc.32 tests).
+    relay: RefCell<Option<Relay>>,
+    /// rc.33: the source's get_producer_schedule answer, and changes applied when a block is produced.
+    schedule: RefCell<serde_json::Value>,
+    schedule_changes: RefCell<Vec<(u64, serde_json::Value)>>,
+}
+
+/// rc.33: what one gate member's beacon shows on mission control. A member's REPORT and its node's real behaviour
+/// (`Mempool::participating`) are independent: a member can lie.
+#[derive(Clone, Debug)]
+struct Member {
+    present: bool,
+    version: String,
+    lock_check: bool,
+    probe: bool,
+    age_ms: u64,
+    /// The report goes stale (age 120 s) once the chain reaches this block (0 = never).
+    stale_at: u64,
+    /// The member's ceremony is ABORTED (it disarmed) once the chain reaches this block (0 = never).
+    disarm_at: u64,
+}
+
+impl Member {
+    fn ready() -> Self {
+        Member {
+            present: true,
+            version: pulse_cutover::producer_gate::MIN_AGENT_VERSION.into(),
+            lock_check: true,
+            probe: true,
+            age_ms: 1000,
+            stale_at: 0,
+            disarm_at: 0,
+        }
+    }
+}
+
+struct Relay {
+    journal: PathBuf,
+    event: serde_json::Value,
+    members: Vec<Member>,
+    /// /api/status and /api/coord fail from this block on (0 = never).
+    down_at: u64,
 }
 
 impl Mempool {
@@ -151,6 +199,23 @@ impl Mempool {
             external_whitelist_on_pause: RefCell::new(None),
             external_whitelist_on_audit: RefCell::new(None),
             lock_drop_when_paused: Cell::new(false),
+            relay: RefCell::new(None),
+            schedule: RefCell::new(schedule_json(
+                1,
+                &(0..producers).collect::<Vec<_>>(),
+                None,
+                None,
+            )),
+            schedule_changes: RefCell::new(vec![]),
+        }
+    }
+
+    /// The account that signs block `b` (rc.33 gated worlds use real account names: prodaa, prodbb, …).
+    fn name_of(&self, i: usize) -> String {
+        if self.relay.borrow().is_some() {
+            gname(i)
+        } else {
+            format!("prod{i}")
         }
     }
 
@@ -179,6 +244,15 @@ impl Mempool {
     /// Produce block `b`: its producer includes (or, when locked, drops) every transaction it holds that was
     /// admitted before `b` and has not expired by `b`'s time.
     fn produce(&self, b: u64) {
+        let due: Vec<serde_json::Value> = {
+            let mut ch = self.schedule_changes.borrow_mut();
+            let (now, later): (Vec<_>, Vec<_>) = ch.drain(..).partition(|(at, _)| *at <= b);
+            *ch = later;
+            now.into_iter().map(|(_, v)| v).collect()
+        };
+        if let Some(v) = due.into_iter().last() {
+            *self.schedule.borrow_mut() = v;
+        }
         if self.restart_at.get() == b {
             self.whitelist.borrow_mut().clear();
             self.locked.borrow_mut()[0] = false;
@@ -312,7 +386,7 @@ impl ChainOps for Mempool {
         _rpc: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         Ok(
-            serde_json::json!({"block_num": block_num, "producer": format!("prod{}", self.producer_of(block_num))}),
+            serde_json::json!({"block_num": block_num, "producer": self.name_of(self.producer_of(block_num))}),
         )
     }
     fn producer_paused(&self) -> Result<bool, String> {
@@ -405,8 +479,49 @@ impl ChainOps for Mempool {
         }
         Ok(format!("ran {cmd}"))
     }
-    fn get_json(&self, _url: &str) -> Result<Option<serde_json::Value>, String> {
-        Ok(None)
+    fn get_json(&self, url: &str) -> Result<Option<serde_json::Value>, String> {
+        let relay = self.relay.borrow();
+        let Some(r) = relay.as_ref() else {
+            return Ok(None);
+        };
+        let head = self.head.get();
+        if r.down_at > 0 && head >= r.down_at {
+            return Err("mission control unreachable".into());
+        }
+        if url.contains("/api/coord/") {
+            return Ok(Some(serde_json::json!({"event": r.event})));
+        }
+        if !url.ends_with("/api/status") {
+            return Ok(None);
+        }
+        // Every present member mirrors this node's journal (state and evidence), with its own version, checks and age.
+        let summary = pulse_cutover::beacon::journal_summary(&r.journal);
+        let producers: Vec<serde_json::Value> = r
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.present)
+            .map(|(i, m)| {
+                let mut ev = summary["evidence"].clone();
+                ev["agent_version"] = serde_json::json!(m.version);
+                let state = if m.disarm_at > 0 && head >= m.disarm_at {
+                    serde_json::json!("ABORTED")
+                } else {
+                    summary["state"].clone()
+                };
+                let age = if m.stale_at > 0 && head >= m.stale_at { 120_000 } else { m.age_ms };
+                serde_json::json!({"name": gname(i), "beacons": [{"role": "producer", "age_ms": age, "silent": false, "conflict": false,
+                    "report": {"role": "producer", "agent_version": m.version, "coord": {"event_id": "e1"},
+                        "checks": [{"name": "admission_lock", "ok": m.lock_check}, {"name": "admission_lock_probe", "ok": m.probe}],
+                        "ceremony": {"state": state, "evidence": ev}}}]})
+            })
+            .collect();
+        Ok(Some(
+            serde_json::json!({"networks": [{"id": "rehearsal", "producers": producers}]}),
+        ))
+    }
+    fn source_producer_schedule(&self) -> Result<Option<serde_json::Value>, String> {
+        Ok(Some(self.schedule.borrow().clone()))
     }
     fn now_ms(&self) -> u64 {
         self.now.set(self.now.get() + 25);
@@ -1224,4 +1339,519 @@ fn rc32_a_nodeos_exception_500_is_not_transient() {
         r#"http://x/v1/producer/set_whitelist_blacklist: HTTP 500: {"code":500,"message":"Internal Service Error","error":{"code":3010001,"name":"name_type_exception","what":"Invalid name","details":[]}}"#
     ));
     assert!(!t("http://x/v1/chain/get_block: HTTP 400: bad request"));
+}
+
+// ---- rc.33: the all-producers gate ------------------------------------------------------------------------------
+//
+// The rc.32 residual above (a producer outside the ceremony is caught only by the burn-off audit, which fails the cut)
+// closed procedurally: the signed event binds every producer that could produce before the pause, and the agent refuses
+// to freeze unless each one's agent reports ARMED under that gate with the lock on, and the schedule is still the bound
+// one. In this world each producer index `i` signs as `gname(i)` and is its own roster member.
+
+fn gname(i: usize) -> String {
+    let c = (b'a' + i as u8) as char;
+    format!("prod{c}{c}")
+}
+
+fn schedule_json(
+    version: u64,
+    active: &[usize],
+    pending: Option<(u64, &[usize])>,
+    proposed: Option<(u64, &[usize])>,
+) -> serde_json::Value {
+    let s = |v: u64, ps: &[usize]| serde_json::json!({"version": v, "producers": ps.iter().map(|i| serde_json::json!({"producer_name": gname(*i)})).collect::<Vec<_>>()});
+    serde_json::json!({"active": s(version, active), "pending": pending.map(|(v, p)| s(v, p)),
+        "proposed": proposed.map(|(v, p)| s(v, p))})
+}
+
+fn coord_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[33u8; 32])
+}
+
+/// The gate for `n` producers on schedule v1 (each its own member), plus `standby` indices.
+fn gate(n: usize, standby: &[usize]) -> pulse_cutover::producer_gate::ProducerGate {
+    use pulse_cutover::producer_gate::{ProducerGate, Sched, MIN_AGENT_VERSION};
+    let active: Vec<String> = (0..n).map(gname).collect();
+    let mut required = active.clone();
+    required.extend(standby.iter().map(|i| gname(*i)));
+    required.sort();
+    let mut g = ProducerGate {
+        v: 1,
+        required,
+        cover: Default::default(),
+        active: Sched {
+            version: 1,
+            producers: active,
+        },
+        pending: None,
+        proposed: None,
+        standby: standby.iter().map(|i| gname(*i)).collect(),
+        min_agent_version: MIN_AGENT_VERSION.into(),
+        sha256: String::new(),
+    };
+    g.standby.sort();
+    g.sha256 = g.compute_sha256();
+    g
+}
+
+/// A gated world: `n` producers (indices also the roster), every member's report given, `participating` = whose node
+/// really locks.
+fn gated_world(
+    dir: &Path,
+    n: usize,
+    standby: &[usize],
+    participating: Vec<bool>,
+    members: Vec<Member>,
+) -> (Config, Mempool) {
+    use ed25519_dalek::Signer;
+    let g = gate(n, standby);
+    let roster: Vec<serde_json::Value> = (0..n + standby.len())
+        .map(|i| serde_json::json!({"producer": gname(i)}))
+        .collect();
+    let payload =
+        serde_json::json!({"type": "event", "network": "rehearsal", "event_id": "e1", "h": H,
+        "roster": roster, "quorum": 1, "producer_gate": g})
+        .to_string();
+    let sk = coord_key();
+    let event = serde_json::json!({"payload": payload, "sig": hex::encode(sk.sign(payload.as_bytes()).to_bytes()),
+        "key": hex::encode(sk.verifying_key().to_bytes())});
+    let base = config(dir, true);
+    let _ = base;
+    let mut text = std::fs::read_to_string(dir.join("ceremony.toml")).unwrap();
+    text += &format!(
+        "\n[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\ncoordinator_keys = [\"{}\"]\nevent_id = \"e1\"\nevent_hash = \"{}\"\n\
+         fleet_quorum = 1\nfleet_timeout_secs = 5\nreport_max_age_secs = 60\n",
+        hex::encode(sk.verifying_key().to_bytes()),
+        pulse_cutover::coord::payload_hash(&event).unwrap()
+    );
+    for i in 0..n + standby.len() {
+        text += &format!("\n[[coordination.roster]]\nproducer = \"{}\"\n", gname(i));
+    }
+    text += &format!(
+        "\n[coordination.producer_gate]\nv = 1\nrequired = {:?}\nstandby = {:?}\nmin_agent_version = \"{}\"\nsha256 = \"{}\"\n\
+         [coordination.producer_gate.active]\nversion = 1\nproducers = {:?}\n",
+        g.required, g.standby, g.min_agent_version, g.sha256, g.active.producers
+    );
+    let path = dir.join("gated.toml");
+    std::fs::write(&path, text).unwrap();
+    let cfg = Config::load(&path).unwrap();
+    let w = Mempool::new(dir, n, participating, 60);
+    *w.relay.borrow_mut() = Some(Relay {
+        journal: cfg.journal_path.clone(),
+        event,
+        members,
+        down_at: 0,
+    });
+    (cfg, w)
+}
+
+/// Like `run`, for a ceremony refused at ARM (`run` returns the preflight error after journaling ABORTED).
+fn run_refused_at_arm(cfg: &Config, world: &Mempool) -> String {
+    let (journal, recovered) = Journal::open(&cfg.journal_path).unwrap();
+    let mut m = Machine::new(cfg, world, journal, recovered);
+    let e = m.run().expect_err("refused at ARM");
+    assert!(e.starts_with("preflight failed"), "{e}");
+    assert!(entries(cfg)
+        .iter()
+        .any(|v| v["kind"] == "transition" && v["state"] == "ABORTED"));
+    e
+}
+
+fn gate_abort(cfg: &Config) -> Option<serde_json::Value> {
+    entries(cfg).into_iter().find(|v| {
+        v["kind"] == "error"
+            && v["data"]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("producer gate not met before the freeze"))
+    })
+}
+
+fn froze(cfg: &Config) -> bool {
+    entries(cfg)
+        .iter()
+        .any(|v| v["kind"] == "transition" && v["state"] == "FROZEN")
+}
+
+/// Happy path: every producer is armed with the lock, the schedule is the bound one: the gate passes at ARM and right
+/// before the freeze, and the cut goes LIVE with nothing after H (a producer holding long-expiry transfers included).
+#[test]
+fn rc33_gate_every_producer_armed_goes_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, w) = gated_world(dir.path(), 4, &[], vec![true; 4], vec![Member::ready(); 4]);
+    w.admit(3, 95, 3_600, 3);
+    assert_eq!(run(&cfg, &w), State::Live);
+    assert_eq!(w.landed_after(H), 0);
+    let e = entries(&cfg);
+    assert!(e
+        .iter()
+        .any(|v| v["data"]["producer_gate"]["checked"] == "ARM"
+            && v["data"]["producer_gate"]["ok"] == true));
+    assert!(e.iter().any(
+        |v| v["data"]["producer_gate"]["checked"] == "before the freeze"
+            && v["data"]["producer_gate"]["ok"] == true
+    ));
+    let armed = e
+        .iter()
+        .find(|v| v["kind"] == "transition" && v["state"] == "ARMED")
+        .unwrap();
+    assert_eq!(armed["data"]["producer_gate_sha256"], gate(4, &[]).sha256);
+    assert_eq!(
+        pulse_cutover::beacon::journal_summary(&cfg.journal_path)["evidence"]
+            ["producer_gate_sha256"],
+        gate(4, &[]).sha256,
+        "the beacon reports the gate this ceremony runs under"
+    );
+}
+
+/// The rc.32 residual, now closed before the freeze: a producer with no agent (no report). Nothing is frozen, nothing is
+/// locked, the abort names it.
+#[test]
+fn rc33_gate_a_producer_without_an_agent_refuses_the_freeze() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut members = vec![Member::ready(); 4];
+    members[2].present = false;
+    let (cfg, w) = gated_world(dir.path(), 4, &[], vec![true, true, false, true], members);
+    w.admit(2, 95, 3_600, 3);
+    assert_eq!(run(&cfg, &w), State::Aborted);
+    assert!(!froze(&cfg), "never froze");
+    assert!(w.whitelist_sets.borrow().is_empty(), "never locked");
+    assert!(w.writes_open.get());
+    let err = gate_abort(&cfg).expect("gate abort");
+    assert!(
+        err["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not armed: prodcc"),
+        "{err}"
+    );
+    assert_eq!(
+        err["data"]["detail"]["producer_gate"]["missing"][0]["producer"],
+        "prodcc"
+    );
+    assert!(err["data"]["detail"]["producer_gate"]["missing"][0]["why"]
+        .as_str()
+        .unwrap()
+        .contains("no beacon report"));
+}
+
+/// A standby the schedule could bring in is bound too: without its agent, no freeze.
+#[test]
+fn rc33_gate_a_standby_without_an_agent_refuses_the_freeze() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut members = vec![Member::ready(); 5];
+    members[4].present = false;
+    let (cfg, w) = gated_world(dir.path(), 4, &[4], vec![true; 4], members);
+    assert_eq!(run(&cfg, &w), State::Aborted);
+    assert!(!froze(&cfg));
+    assert!(gate_abort(&cfg).unwrap()["data"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not armed: prodee"));
+}
+
+/// A schedule change after ARM (a pending schedule appears that brings in a producer outside the armed set) aborts at
+/// the freeze tick; one already there at ARM refuses ARM.
+#[test]
+fn rc33_gate_a_schedule_change_after_arm_refuses_the_freeze() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, w) = gated_world(dir.path(), 4, &[], vec![true; 4], vec![Member::ready(); 4]);
+    w.schedule_changes.borrow_mut().push((
+        80,
+        schedule_json(1, &[0, 1, 2, 3], Some((2, &[0, 1, 2, 5])), None),
+    ));
+    assert_eq!(run(&cfg, &w), State::Aborted);
+    assert!(!froze(&cfg));
+    let m = gate_abort(&cfg).unwrap()["data"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        m.contains("prodff (pending)") && m.contains("pending schedule changed"),
+        "{m}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, w) = gated_world(dir.path(), 4, &[], vec![true; 4], vec![Member::ready(); 4]);
+    *w.schedule.borrow_mut() = schedule_json(2, &[0, 1, 2], None, None);
+    let e = run_refused_at_arm(&cfg, &w);
+    assert!(
+        e.contains("producer gate: the active schedule changed"),
+        "{e}"
+    );
+    assert!(!froze(&cfg));
+    // A proposal among armed producers only is tolerated: it cannot bring in anyone outside the set.
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, w) = gated_world(dir.path(), 4, &[], vec![true; 4], vec![Member::ready(); 4]);
+    w.schedule_changes.borrow_mut().push((
+        80,
+        schedule_json(1, &[0, 1, 2, 3], None, Some((2, &[3, 2, 1, 0]))),
+    ));
+    assert_eq!(run(&cfg, &w), State::Live);
+}
+
+/// A member whose beacon went stale after ARM, one that disarmed (its ceremony aborted), one on an older agent and one
+/// whose lock probe is red: each refuses the freeze, named with its reason.
+#[test]
+fn rc33_gate_stale_disarmed_old_or_unprobed_members_refuse_the_freeze() {
+    type Edit = Box<dyn Fn(&mut Member)>;
+    let cases: Vec<(&str, Edit)> = vec![
+        ("stale report", Box::new(|m: &mut Member| m.stale_at = 85)),
+        (
+            "ceremony state ABORTED",
+            Box::new(|m: &mut Member| m.disarm_at = 85),
+        ),
+        (
+            "older than",
+            Box::new(|m: &mut Member| m.version = "0.5.0-rc.32".into()),
+        ),
+        (
+            "admission_lock_probe",
+            Box::new(|m: &mut Member| m.probe = false),
+        ),
+        (
+            "check admission_lock is",
+            Box::new(|m: &mut Member| m.lock_check = false),
+        ),
+    ];
+    for (needle, edit) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let mut members = vec![Member::ready(); 4];
+        edit(&mut members[1]);
+        let (cfg, w) = gated_world(dir.path(), 4, &[], vec![true; 4], members);
+        assert_eq!(run(&cfg, &w), State::Aborted, "{needle}");
+        assert!(!froze(&cfg), "{needle}");
+        let err = gate_abort(&cfg).expect(needle);
+        let why = err["data"]["detail"]["producer_gate"]["missing"][0]["why"]
+            .as_str()
+            .unwrap();
+        assert!(why.contains(needle), "{needle}: {why}");
+        assert_eq!(
+            err["data"]["detail"]["producer_gate"]["missing"][0]["producer"],
+            "prodbb"
+        );
+    }
+}
+
+/// Mission control unreachable at the freeze tick: the members' readiness is unknown, and unknown is never yes.
+#[test]
+fn rc33_gate_an_unreachable_relay_at_the_freeze_tick_refuses_the_freeze() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, w) = gated_world(dir.path(), 4, &[], vec![true; 4], vec![Member::ready(); 4]);
+    w.relay.borrow_mut().as_mut().unwrap().down_at = 90;
+    assert_eq!(run(&cfg, &w), State::Aborted);
+    assert!(!froze(&cfg));
+    assert!(gate_abort(&cfg).unwrap()["data"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("did not answer /api/status"));
+}
+
+/// The honest limits. A producer that LIES (its report says ARMED, lock on, probe green) cannot be told apart by the
+/// gate. If its node is in fact locked, the lie is harmless and the cut goes LIVE. If it is not, the gate passes and the
+/// burn-off audit, still the final backstop, aborts and names it.
+#[test]
+fn rc33_gate_a_lying_producer_passes_the_gate_and_burn_off_stays_the_backstop() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut members = vec![Member::ready(); 4];
+    members[3].version = "0.5.0-rc.40".into(); // says anything it likes
+    let (cfg, w) = gated_world(dir.path(), 4, &[], vec![true; 4], members);
+    w.admit(3, 95, 3_600, 3);
+    assert_eq!(run(&cfg, &w), State::Live, "lying but locked: harmless");
+    assert_eq!(w.landed_after(H), 0);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, w) = gated_world(
+        dir.path(),
+        4,
+        &[],
+        vec![true, true, true, false],
+        vec![Member::ready(); 4],
+    );
+    w.admit(3, 95, 3_600, 3);
+    let st = run(&cfg, &w);
+    assert_ne!(st, State::Live);
+    assert!(froze(&cfg), "the gate could not see the lie");
+    let err = burnoff_error(&cfg).expect("burn-off backstop");
+    assert_eq!(err["data"]["detail"]["blocks"][0]["producer"], "proddd");
+}
+
+/// ARM refuses a member config with the lock off under a gate (the event is refused at await; ARM too, for a config
+/// written by hand).
+#[test]
+fn rc33_gate_needs_the_admission_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, _) = gated_world(dir.path(), 3, &[], vec![true; 3], vec![Member::ready(); 3]);
+    let text = std::fs::read_to_string(dir.path().join("gated.toml"))
+        .unwrap()
+        .replace("admission_lock = true", "admission_lock = false");
+    std::fs::write(dir.path().join("gated.toml"), text).unwrap();
+    let cfg2 = Config::load(&dir.path().join("gated.toml")).unwrap();
+    let _ = cfg;
+    let w = Mempool::new(dir.path(), 3, vec![true; 3], 60);
+    let e = run_refused_at_arm(&cfg2, &w);
+    assert!(
+        e.contains("producer gate: ceremony.admission_lock = false"),
+        "{e}"
+    );
+    assert!(!froze(&cfg2));
+}
+
+// ---- rc.33 model: seeded random worlds, the gate's invariants ---------------------------------------------------
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// One random gated world. Returns the invariant violations (empty = clean) and a one-line description.
+fn gate_model_scenario(seed: u64) -> (Vec<String>, String) {
+    let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let n = 3 + r.below(3) as usize; // 3..=5 scheduled
+    let standby: Vec<usize> = if r.below(3) == 0 { vec![n] } else { vec![] };
+    let total = n + standby.len();
+    let mut members = vec![Member::ready(); total];
+    let mut participating = vec![true; n];
+    let mut desc = vec![format!("n={n} standby={}", standby.len())];
+    // Who is not ready (as the gate can see it), and who lies.
+    let mut visible_gap = false;
+    for (i, m) in members.iter_mut().enumerate() {
+        match r.below(14) {
+            0 => {
+                m.present = false;
+                visible_gap = true;
+                if i < n {
+                    participating[i] = false;
+                }
+                desc.push(format!("{}:absent", gname(i)));
+            }
+            1 => {
+                m.stale_at = 70 + r.below(26); // before the freeze tick (96)
+                visible_gap = true;
+                desc.push(format!("{}:stale@{}", gname(i), m.stale_at));
+            }
+            2 => {
+                m.version = "0.5.0-rc.32".into();
+                visible_gap = true;
+                desc.push(format!("{}:old", gname(i)));
+            }
+            3 => {
+                m.probe = false;
+                visible_gap = true;
+                desc.push(format!("{}:probe-red", gname(i)));
+            }
+            4 => {
+                m.disarm_at = 70 + r.below(26);
+                visible_gap = true;
+                desc.push(format!("{}:disarm@{}", gname(i), m.disarm_at));
+            }
+            5 if i < n => {
+                participating[i] = false; // lies: reports ready, never locks
+                desc.push(format!("{}:liar", gname(i)));
+            }
+            _ => {}
+        }
+    }
+    // A schedule change: none, one bringing in an outsider (pending), an active change, or a harmless proposal.
+    let all: Vec<usize> = (0..n).collect();
+    let change_at = 62 + r.below(34); // between ARM (60) and the freeze tick (96)
+    let (sched_change, bad_change) = match r.below(6) {
+        0 => (Some(schedule_json(1, &all, Some((2, &[0, 7])), None)), true),
+        1 => (Some(schedule_json(2, &all[..n - 1], None, None)), true),
+        2 => (Some(schedule_json(1, &all, None, Some((2, &all)))), false),
+        _ => (None, false),
+    };
+    if sched_change.is_some() {
+        desc.push(format!("schedule@{change_at} bad={bad_change}"));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, w) = gated_world(dir.path(), n, &standby, participating.clone(), members);
+    if let Some(s) = sched_change {
+        w.schedule_changes.borrow_mut().push((change_at, s));
+    }
+    // Long-expiry transfers held by random producers before the freeze.
+    for _ in 0..r.below(4) {
+        w.admit(r.below(n as u64) as usize, 90 + r.below(6), 3_600, 1);
+    }
+    let st = run(&cfg, &w);
+    desc.push(format!(
+        "=> {st:?}{}",
+        if froze(&cfg) { " (froze)" } else { "" }
+    ));
+    let mut bad = vec![];
+    let froze = froze(&cfg);
+    // I10a: a gap the gate can see, or a disallowed schedule change before the freeze tick: never frozen, nothing locked.
+    if (visible_gap || bad_change) && (froze || !w.whitelist_sets.borrow().is_empty()) {
+        bad.push("I10a: froze despite a visible gate gap or a schedule change".into());
+    }
+    if (visible_gap || bad_change) && st != State::Aborted {
+        bad.push(format!(
+            "I10a: ended {st:?}, expected ABORTED before the freeze"
+        ));
+    }
+    // I10b: nothing lands after H in a LIVE cut (the burn-off backstop, whatever the gate saw).
+    if st == State::Live && w.landed_after(H) > 0 {
+        bad.push(format!(
+            "I10b: LIVE with {} transactions after H",
+            w.landed_after(H)
+        ));
+    }
+    // I10c: everyone ready, honest, schedule fine: LIVE with nothing after H.
+    let all_honest = participating.iter().all(|p| *p);
+    if !visible_gap && !bad_change && all_honest && (st != State::Live || w.landed_after(H) > 0) {
+        bad.push(format!("I10c: a ready honest fleet ended {st:?}"));
+    }
+    // I10d: a freeze always followed a passed gate check, journaled before the FROZEN transition.
+    if froze {
+        let e = entries(&cfg);
+        let passed = e
+            .iter()
+            .position(|v| v["data"]["producer_gate"]["checked"] == "before the freeze");
+        let frozen = e
+            .iter()
+            .position(|v| v["kind"] == "transition" && v["state"] == "FROZEN");
+        if !matches!((passed, frozen), (Some(p), Some(f)) if p < f) {
+            bad.push("I10d: FROZEN without a passed gate check before it".into());
+        }
+    }
+    (bad, desc.join(" "))
+}
+
+/// rc.33 invariants I10a–d over seeded random gated worlds (missing, stale, disarmed, old and unprobed members, liars,
+/// standbys, schedule changes after ARM, long-expiry transfers). `PGATE_MODEL_SCENARIOS` (default 40),
+/// `PGATE_MODEL_SEED` replays one.
+#[test]
+fn rc33_gate_model_never_freezes_with_a_visible_gap_and_never_goes_live_with_a_late_transaction() {
+    let seeds: Vec<u64> = match std::env::var("PGATE_MODEL_SEED") {
+        Ok(s) => vec![s.parse().unwrap()],
+        Err(_) => (1..=std::env::var("PGATE_MODEL_SCENARIOS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40u64))
+            .collect(),
+    };
+    let mut failures = vec![];
+    let mut outcomes = std::collections::BTreeMap::<String, u64>::new();
+    for seed in seeds {
+        let (bad, desc) = gate_model_scenario(seed);
+        let end = desc.rsplit("=> ").next().unwrap_or("").to_string();
+        *outcomes.entry(end).or_default() += 1;
+        if !bad.is_empty() {
+            failures.push(format!("seed {seed} [{desc}]: {}", bad.join("; ")));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} violation(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    eprintln!("rc.33 gate model: clean ({outcomes:?})");
 }
