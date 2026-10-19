@@ -1606,9 +1606,31 @@ token_file = "{t}/beacon.token"
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             for mut st in listener.incoming().flatten() {
-                let mut buf = [0u8; 4096];
-                let n = st.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                // Read the whole request (headers and body) before answering: closing a socket with unread bytes
+                // resets it, and the client's read of our answer can fail.
+                let mut buf = vec![0u8; 16384];
+                let mut got = 0;
+                while let Ok(n) = st.read(&mut buf[got..]) {
+                    if n == 0 {
+                        break;
+                    }
+                    got += n;
+                    let t = String::from_utf8_lossy(&buf[..got]).to_string();
+                    if let Some(end) = t.find("\r\n\r\n") {
+                        let len = t[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if got >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf[..got]).to_string();
                 let body = if req.contains("get_whitelist_blacklist") {
                     r#"{"actor_whitelist":["pulse.frozen1"],"actor_blacklist":[]}"#
                 } else {

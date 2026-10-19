@@ -286,7 +286,8 @@ on_abort = "echo 'page the operator'"                    # on ABORT after rollba
 # instance_id = "<32-hex beacon.instance>"     #   else by producer account. Each member once.
 # [[coordination.roster]]
 # producer = "bp2"
-# [coordination.producer_gate]                 # rc.33 (docs/DESIGN.md §2b): every producer that could produce before
+# producer_gate = { ... }                      # (a [coordination.producer_gate] table, written by await)
+#                                              # rc.33 (docs/DESIGN.md §2b): every producer that could produce before
 #                                              #   the pause (schedule + standbys), the roster member running each
 #                                              #   one's agent, the bound schedule, min_agent_version and a sha256.
 #                                              #   From `coord.mjs event --producer-gate yes`. Required for a real
