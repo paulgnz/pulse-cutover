@@ -3,6 +3,40 @@
 Release notes per tag. Earlier releases are described in their tag messages and in
 [docs/EVIDENCE.md](docs/EVIDENCE.md).
 
+## v0.5.0-rc.33 (unreleased)
+
+From the rc.32 fleet review and the 7-box gate runs g1–g5.
+
+**All-producers gate** (`producer_gate` in the signed event, `coord.mjs event --producer-gate yes`; docs/DESIGN.md §2b,
+RISK-REGISTER A-24)
+
+- The coordinator derives the required set from the source's `get_producer_schedule` (active ∪ pending ∪ proposed) plus
+  `--standby` names, maps each to the roster member that runs its agent (`--cover` for rehearsals only), and binds the
+  set, the schedules, the event id, H and `min_agent_version` into the signed event (`producer_gate_sha256`;
+  `control/coordlib.mjs` computes the same canonical text, checked by a shared vector).
+- `await` refuses a malformed or mismatched gate, members not on the roster, or a `min_agent_version` newer than itself.
+- ARM refuses when the admission lock is off, the agent is too old, or the live schedule is not the bound one (active
+  or pending changed, or any active/pending/proposed name is outside the set).
+- Right before the freeze the agent re-checks the schedule, refuses **any** proposed schedule (the cut state would
+  carry it in `global_property` and the import drops it: fleet run g3b failed at the state compare after freezing), and
+  needs a fresh (≤ 45 s) relay report from every required member: ARMED or FROZEN for this event under this gate, at
+  least `min_agent_version`, `admission_lock` and `admission_lock_probe` green. A check that ends at or past H aborts.
+  Otherwise it aborts with nothing frozen, naming the producers.
+- Mission control refuses the arm (HTTP 409, `arm_refused`) until the gate is ready, and `coord.mjs arm` reads
+  `/api/status` and refuses to sign before relaying. The board shows the gate (`fleet.producer_gate`).
+- Mainnet requires the gate (each scheduled name runs its own agent; no cover map).
+- Limits: the relay is unsigned and each producer's report is self-declared; the burn-off audit remains the backstop.
+
+**New target chain_id**
+
+- `target_chain_id` is pinned in the signed event; on mainnet the agent refuses a target equal to the source id.
+  ATOMICITY, PROCESS, README, EXCHANGES and DESIGN §2c rewritten for a new chain_id.
+
+**Fleet runs (7 boxes):** g1 gated happy path to LIVE (46 producers gated, identical state root, 0 transactions after
+H); g2a producer without an agent and g5 lock-off member refused at the arm; g2b agent stopped after the arm, g4 stale
+beacon and g3a schedule change outside the set aborted every agent before the freeze; g3b led to the proposed-schedule
+refusal above.
+
 ## v0.5.0-rc.32 (2026-10-16)
 
 From the 8-BP rehearsal (fleet-step3, runs s1, s1b, s1c) and its review.
