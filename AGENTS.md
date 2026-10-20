@@ -5,8 +5,8 @@ cutover. Read this section in full before running any command.
 
 Human-oriented docs: **[docs/PROCESS.md](docs/PROCESS.md)** (the process, step by step, with diagrams),
 [ATOMICITY.md](ATOMICITY.md) (what "atomic" means, what the evidence shows so far, and what is still open),
-[README.md](README.md) (operator walkthrough and field notes), [TESTING.md](TESTING.md),
-[docs/DESIGN.md](docs/DESIGN.md) (design, review findings, failure table), [docs/EVIDENCE.md](docs/EVIDENCE.md) (every recorded run)
+[README.md](README.md) (operator walkthrough), [docs/REFERENCE.md](docs/REFERENCE.md) (commands and config), [TESTING.md](TESTING.md),
+[docs/DESIGN.md](docs/DESIGN.md) (design, review findings, failure table), [docs/EVIDENCE.md](docs/EVIDENCE.md) (every recorded run, field notes)
 and [docs/EXCHANGES.md](docs/EXCHANGES.md) (what exchanges, wallets and indexers must do at the cut).
 
 ---

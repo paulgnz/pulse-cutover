@@ -386,4 +386,4 @@ The cutover is atomic when five properties hold. A1 and A2 are gates; A3 and A4 
 | A5 | all or nothing | **open**: per-producer abort only; no fleet-wide authority boundary |
 
 Full definitions and the recorded proof: **[ATOMICITY.md](../ATOMICITY.md)**.
-Lessons from the real-world runs: **[README → Field notes](../README.md#field-notes-what-real-world-rehearsals-taught-us)**.
+Lessons from the real-world runs: **[EVIDENCE.md → Field notes](EVIDENCE.md#field-notes-from-the-rehearsals)**.
