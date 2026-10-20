@@ -10,7 +10,9 @@ what is implemented and rehearsed today is marked where it differs, and the full
 status is in [ATOMICITY.md](../ATOMICITY.md).
 
 > [!IMPORTANT]
-> **Implemented vs intended (v0.5.0-rc.32).** Rehearsed: same cut on every producer, zero transactions
+> **Implemented vs intended (v0.5.0-rc.33, 2026-10-20).** rc.33 adds the all-producers gate, rehearsed on a 7-box fleet
+> (every blocked case stopped before anything froze; the proposed-schedule refusal is unit-tested only); the same
+> fleet found per-validator state roots on PulseVM v1.0.0 ([EVIDENCE.md](EVIDENCE.md#target-chain-checks-on-the-7-box-fleet-2026-10-19)). Rehearsed: same cut on every producer, zero transactions
 > after H, a symmetric abort (September, fork plugin); the exact-H scheduled cut, the block-id-at-H
 > lineage check and the upstream import + ignition on PulseVM v1.0.0 (2026-10-06 fleet runs, private
 > Metal network, both rehearsal overrides on; those runs ended with mixed LIVE/HALTED nodes on one chain

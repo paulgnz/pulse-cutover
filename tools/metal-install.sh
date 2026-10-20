@@ -31,7 +31,7 @@
 #   --check                re-test port 9651 and print the LIVE identity (changes nothing)
 #   --open-port            also add the 9651 rule to this server's own firewall (ufw / firewalld / iptables)
 #   --metal tahoe|mainnet  which Metal network (default: from this box's XPR chain id)
-#   --manifest-url URL     manifest to use (default: mission control)
+#   --manifest-url URL     manifest to use (default: <PULSE_CONTROL_URL>/api/manifest/<network>; required when unset)
 #   --no-manifest          manifest unreachable: install from this script's pins without the PulseVM subnet ids
 #                          (the node syncs the Metal primary network only; testnet only). --allow-unpinned = same
 #   --metalgo-version TAG  with --metalgo-sha256 HEX: install THIS metalgo release instead of the script's pin, with
@@ -44,7 +44,8 @@
 #   --uninstall            remove the service this script installed (keys and chain data are kept)
 set -euo pipefail
 
-CONTROL="https://control-rehearsal.protonnz.com"
+# Mission control of the current rehearsal or cutover; none runs between them (then --manifest-url is required).
+CONTROL="${PULSE_CONTROL_URL:-}"
 DATA=/var/lib/metalgo; ETC=/etc/metalgo; BIN=/usr/local/bin/metalgo; UNIT=/etc/systemd/system/metalgo.service
 MARKER=$ETC/.installed-by-pulse-cutover
 MAINNET_CHAIN=384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0
@@ -357,6 +358,7 @@ version_matches() { local got want; got=$(printf '%s' "$1" | sed -n 's|^metalgo/
 # inspection is a heuristic: it names the most likely layer, not a proof.
 port_diag() {
   REACH=""
+  [ -n "$CONTROL" ] || return 0   # no mission control to dial back: skip the reachability probe
   for _ in 1 2; do   # one retry: mission control rate-limits to one probe per 5 s per IP
     REACH=$(curl -4 -fsS -m10 "$CONTROL/api/reach" 2>/dev/null | jget reachable || true)
     [ -n "$REACH" ] && break; sleep 6
@@ -829,7 +831,8 @@ main() {
   # ---- manifest: fetched, structurally validated, bound to this chain. Used for the network mapping and the
   #      PulseVM ids only; versions and checksums come from this script's pins (pins_resolve). Fail closed. ----
   TMP=$(mktemp -d); trap on_exit EXIT
-  [ -n "$MANIFEST_URL" ] || MANIFEST_URL="$CONTROL/api/manifest/$XPR"
+  [ -n "$MANIFEST_URL" ] || { [ -n "$CONTROL" ] && MANIFEST_URL="$CONTROL/api/manifest/$XPR"; } || true
+  [ -n "$MANIFEST_URL" ] || [ "$NO_MANIFEST" = 1 ] || die "no manifest source: pass --manifest-url <url> or set PULSE_CONTROL_URL (no public mission control is running)"
   if curl -fsS -m10 -o "$TMP/manifest.json" "$MANIFEST_URL" 2>/dev/null; then say "manifest: $MANIFEST_URL (network mapping + PulseVM ids; checksums come from this script)"
   elif [ "$NO_MANIFEST" = 1 ] && [ "$XPR" = testnet ]; then warn "manifest unreachable: installing from this script's pins without the PulseVM subnet ids (--no-manifest)"; builtin_manifest > "$TMP/manifest.json"
   else die "could not fetch the network manifest from $MANIFEST_URL: refusing to install without it (testnet only: --no-manifest installs this script's pinned metalgo without the PulseVM subnet ids)"; fi

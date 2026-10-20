@@ -6,7 +6,7 @@ PulseVM validator. That can be the same box as your producer nodeos if it has ro
 Get the script from a **release tag**, read it, run it:
 
 ```bash
-V=v0.5.0-rc.32
+V=v0.5.0-rc.33
 git clone --branch "$V" --depth 1 https://github.com/paulgnz/pulse-cutover && cd pulse-cutover
 less tools/metal-install.sh        # you are about to run this as root: read it (the pins are near the top)
 sudo bash tools/metal-install.sh
@@ -133,8 +133,8 @@ it, or until you take responsibility with the override below.
 
 Mission control publishes which Metal network, subnet, blockchain and VM each XPR network maps to:
 
-- all networks: <https://control-rehearsal.protonnz.com/api/manifest>
-- one network: `https://control-rehearsal.protonnz.com/api/manifest/testnet` (or `mainnet`, `rehearsal`)
+- all networks: `<mission-control-url>/api/manifest` (none runs between rehearsals: pass `--manifest-url`)
+- one network: `<mission-control-url>/api/manifest/testnet` (or `mainnet`, `rehearsal`)
 
 | Field | What the installer does with it |
 |---|---|
