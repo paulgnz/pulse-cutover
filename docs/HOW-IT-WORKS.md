@@ -28,14 +28,16 @@ Avalanche-family network), at **one block, H**. What it is designed to achieve:
 - everything up to and including block H is carried over: accounts, keys, permissions, balances, contracts
   and table rows;
 - block H+1 is the first block PulseVM produces;
-- the chain keeps its **chain_id**, so keys and wallets keep the same signing domain (whether a given signed
-  transaction is accepted still depends on TAPOS, expiry, permissions and replay protection);
+- the chain gets a **new chain_id**, pinned in the signed event: keys and accounts carry over, but a signature
+  made for the old chain is never valid on the new one, so nothing signed on a leftover old chain can be replayed
+  onto it (wallets and services switch to the new id; see [EXCHANGES](EXCHANGES.md));
 - public URLs keep working; the API edge in front of each node switches its backend.
 
 The goal is an **atomic** cut: every transaction ends up on exactly one side, exactly once, and the network
 as a whole either moves or does not. **That is the requirement, not today's state**: section 5 and the
-[risk register](RISK-REGISTER.md) say how far the evidence goes. In particular, PulseVM v1.0.0 does not yet
-sign with the source chain_id or enforce TAPOS, and the agent refuses to ignite XPR mainnet until it does.
+[risk register](RISK-REGISTER.md) say how far the evidence goes. In particular, PulseVM v1.0.0 cannot yet
+take a chain_id fixed in advance (its chain_id is the Metal blockchain ID, known only once the chain is created), and
+the agent refuses to ignite XPR mainnet with the source chain_id ([upstream asks](UPSTREAM-ASKS.md)).
 
 It is **not instant**. Writes pause for the switch (section 3). Reads stay available during the cut: an
 external probe measured 99.8% read availability through an API-mode flip on real testnet state, with a
@@ -72,7 +74,7 @@ Times are for XPR mainnet. Numbers in *italics* are defaults that the config can
 | 2 | SNAPSHOTTED | Leap writes the snapshot once H is final. Producers pause. Every block after H up to the pause must be empty. | snapshot is exactly H (height **and** block id); **0 transactions after H** | see "stopping after the freeze" below | finality: 2 min 56 s in fleet run g1b (testnet state); mainnet not measured. Snapshot write on a mainnet producer: not measured |
 | 3 | VERIFIED | The snapshot is converted to PulseVM's format and checked (section 4). Then the fleet gate: wait until a quorum of the roster reports the **same** snapshot hash, fingerprints and protocol schedule. | 21-table compare passes; state root computed; quorum agrees; for XPR mainnet, the built-in list of unmet PulseVM prerequisites must be empty (today it is not, so mainnet stops here) | see "stopping after the freeze" | conversion **9.6 min, measured** on mainnet state (6-vCPU host); gate 20 s in g1b |
 | — | *point of no return* | The agent journals that it is about to **create the chain** (upstream backend) or **start ignition** (fork backend). From this record on it never resumes the old chain. | the relay positively confirms "no abort" for this signed event; boot artifacts unchanged | halt; a human decides | — |
-| 4 | IGNITED | The chain is created on Metal and started from the converted state. | new chain shows the source chain_id and the cut's block id at H | halt | create 11 s + ignite 31 s in g1b |
+| 4 | IGNITED | The chain is created on Metal and started from the converted state. | new chain shows the event's target chain_id and the cut's block id at H | halt | create 11 s + ignite 31 s in g1b |
 | 5 | LIVE | The head passes H, keeps advancing with no gap over *20 s* for *60 s*, the `on_live` hook flips the edge and reopens writes. | sustained progress; `on_live` succeeds | coordinated: wait as **degraded** while a quorum reports the same chain, then halt if it does not recover; otherwise halt | 1–2 min in healthy fleet runs, up to ~10 min in degraded ones |
 
 After LIVE the beacon keeps checking the new chain (new blocks, a probe transaction if configured) and reports
@@ -189,8 +191,8 @@ approach: many rehearsals on real mainnet state (shadow forks), then real public
 
 The full list, with owners and evidence, is the [risk register](RISK-REGISTER.md). The short version:
 
-1. **Upstream PulseVM:** the compare passes on mainnet state (#109); the new chain signs with the source chain_id
-   and enforces TAPOS (#108); CPU is billed in the units imported accounts expect (#106); each producer signs
+1. **Upstream PulseVM:** the compare passes on mainnet state (#109); the new chain's chain_id can be fixed and
+   published before H, and TAPOS is enforced for Leap parity (#108); CPU is billed in the units imported accounts expect (#106); each producer signs
    with its own key (#107); a sealed start exists (#113); a producer election can no longer halt the chain (#122).
    The agent's built-in mainnet refusal names these.
 2. **Metal:** mainnet validators run a MetalGo that speaks PulseVM v1.0.0's plugin protocol (45; MetalGo

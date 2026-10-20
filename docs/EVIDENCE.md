@@ -12,7 +12,8 @@ Design context (state machine, R-numbers, failure table): [DESIGN.md](DESIGN.md)
 
 Every run below used a **fork build** of the PulseVM plugin (the `feat/arena-snapshot-import`
 branch; the multi-producer runs used the `v0.0.0-arena-mempoolfix.1` lineage) on **metalgo
-1.13.5, plugin protocol 43**. None ran upstream PulseVM **v1.0.0** (protocol 45, metalgo 1.14.x).
+1.13.5, plugin protocol 43**. None ran upstream PulseVM **v1.0.0** (protocol 45, metalgo 1.14.x). The exception is the [upstream-stack fleet runs](#upstream-stack-fleet-runs-october-2026) of October 2026
+and the [target-chain checks](#target-chain-checks-on-the-7-box-fleet-2026-10-19), which ran upstream v1.0.0 on metalgo 1.14.2.
 The multi-producer runs used a **private** Metal network, not Tahoe, and every validator
 **shared one producer name and key**. No mainnet event has run. The re-qualification list for
 the intended stack is in [ATOMICITY.md](../ATOMICITY.md#upstream-stack-re-qualification).
