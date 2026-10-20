@@ -2679,7 +2679,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
         }
         match &sched {
-            Ok(v) => problems.extend(g.schedule_problems(v)),
+            Ok(v) => {
+                problems.extend(g.schedule_problems(v));
+                problems.extend(crate::producer_gate::ProducerGate::freeze_schedule_problems(v));
+            }
             Err(e) => problems.push(format!(
                 "cannot read get_producer_schedule ({e}): unknown is never yes"
             )),

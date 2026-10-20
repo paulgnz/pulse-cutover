@@ -1593,14 +1593,22 @@ fn rc33_gate_a_schedule_change_after_arm_refuses_the_freeze() {
         "{e}"
     );
     assert!(!froze(&cfg));
-    // A proposal among armed producers only is tolerated: it cannot bring in anyone outside the set.
+    // A proposal among armed producers only cannot bring in anyone outside the set, but at the freeze tick it is still
+    // refused: the cut state would carry it and the import drops it (rehearsal g3b failed at the global_property
+    // compare after freezing). Nothing is frozen.
     let dir = tempfile::tempdir().unwrap();
     let (cfg, w) = gated_world(dir.path(), 4, &[], vec![true; 4], vec![Member::ready(); 4]);
     w.schedule_changes.borrow_mut().push((
         80,
         schedule_json(1, &[0, 1, 2, 3], None, Some((2, &[3, 2, 1, 0]))),
     ));
-    assert_eq!(run(&cfg, &w), State::Live);
+    assert_eq!(run(&cfg, &w), State::Aborted);
+    assert!(!froze(&cfg));
+    let m = gate_abort(&cfg).unwrap()["data"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(m.contains("proposed producer schedule (v2)"), "{m}");
 }
 
 /// A member whose beacon went stale after ARM, one that disarmed (its ceremony aborted), one on an older agent and one

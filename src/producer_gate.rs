@@ -16,7 +16,8 @@
 //!   or whose `min_agent_version` is newer than this agent;
 //! - ARM (preflight): the lock must be on, and the live schedule must still be the bound one (active and pending
 //!   unchanged, every name in active, pending and proposed inside the required set);
-//! - right before the freeze: the same schedule check, AND every required name's member must have a FRESH beacon
+//! - right before the freeze: the same schedule check, AND no proposed schedule at all (a proposal in the cut state
+//!   fails the later `global_property` compare: the import does not carry it), AND every required name's member must have a FRESH beacon
 //!   report on the relay for this event, in ARMED or FROZEN, journaled with this gate's hash, run by an agent at least
 //!   `min_agent_version`, with the `admission_lock` and `admission_lock_probe` checks green. Otherwise the agent
 //!   aborts before it freezes anything.
@@ -304,6 +305,20 @@ impl ProducerGate {
             ));
         }
         out
+    }
+
+    /// Right before the freeze only: a proposed schedule (even one among armed producers, which ARM tolerates) would
+    /// be in the cut state, and the import does not carry it, so the cut would fail later at the `global_property`
+    /// compare after everything is frozen (rehearsal g3b: 1211 vs 143 bytes). Refuse it while nothing is frozen yet.
+    pub fn freeze_schedule_problems(live: &Value) -> Vec<String> {
+        match sched_of(&live["proposed"]) {
+            Some(p) if !p.producers.is_empty() => vec![format!(
+                "a proposed producer schedule (v{}) is pending promotion: the cut state would carry it and the import \
+                 drops it (global_property compare); wait until it is promoted, then re-issue the event",
+                p.version
+            )],
+            _ => vec![],
+        }
     }
 
     /// The members whose reports on the relay's `/api/status` do not show them ready, one entry per required name:
@@ -670,6 +685,26 @@ mod tests {
         assert!(
             !g.schedule_problems(&json!({})).is_empty(),
             "unknown is never yes"
+        );
+    }
+
+    #[test]
+    fn freeze_tick_refuses_any_proposed_schedule() {
+        let s = |v: u64, p: &[&str]| json!({"version": v, "producers": p.iter().map(|n| json!({"producer_name": n, "authority": [0, {}]})).collect::<Vec<_>>()});
+        assert!(ProducerGate::freeze_schedule_problems(
+            &json!({"active": s(7, &["bpa"]), "pending": null, "proposed": null})
+        )
+        .is_empty());
+        assert!(ProducerGate::freeze_schedule_problems(
+            &json!({"active": s(7, &["bpa"]), "proposed": s(8, &[])})
+        )
+        .is_empty());
+        let p = ProducerGate::freeze_schedule_problems(
+            &json!({"active": s(7, &["bpa", "bpb"]), "proposed": s(8, &["bpa", "bpb"])}),
+        );
+        assert!(
+            p.len() == 1 && p[0].contains("proposed producer schedule (v8)"),
+            "{p:?}"
         );
     }
 

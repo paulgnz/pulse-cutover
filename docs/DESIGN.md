@@ -195,7 +195,9 @@ version passes all three; burn-off is then the backstop (and an rc.32 agent stil
     proposed schedule is outside `required`. A proposal among required producers only is tolerated, because it cannot
     bring in anyone else.
 - At the freeze tick (head ≥ H − `freeze_lead_blocks`, after the production profile check, before the lock and
-  `on_freeze`), the agent re-reads the schedule against the same rules. It then reads `/api/status` and needs every
+  `on_freeze`), the agent re-reads the schedule against the same rules, and additionally refuses ANY proposed
+  schedule: the cut state would carry it in `global_property`, the import drops it, and the cut would fail at the
+  state compare after the freeze (rehearsal g3b). It then reads `/api/status` and needs every
   required producer's member to have a fresh report for this event:
   - in ARMED or FROZEN;
   - journaled under this gate (`producer_gate_sha256` in the ARMED evidence);
