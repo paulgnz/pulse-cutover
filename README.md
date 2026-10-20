@@ -21,7 +21,12 @@ existing node; a fleet-wide rollback guarantee is **not yet implemented** (see
 the status box below).
 
 > [!IMPORTANT]
-> **Status (2026-10-16, v0.5.0-rc.32)**
+> **Status (2026-10-20, v0.5.0-rc.33)**
+> - **New in rc.33**: an all-producers gate (the freeze is refused unless every producer that can produce before the
+>   pause runs an armed agent with the admission lock on; 6 of 7 gate scenarios passed on a 7-box fleet, the 7th fixed in
+>   code), and two target-chain findings on PulseVM v1.0.0: state roots differ per validator under load, and a CPU=0
+>   freeze cannot be undone on-chain ([EVIDENCE.md](docs/EVIDENCE.md#target-chain-checks-on-the-7-box-fleet-2026-10-19),
+>   [UPSTREAM-ASKS.md](docs/UPSTREAM-ASKS.md)).
 > - **Proven in rehearsal** (September, 5 BPs on a private Metal network, fork plugin): same cut block, snapshot hash and
 >   fingerprints on every BP; zero transactions after H; a symmetric abort where every BP resumed the old chain.
 > - **Demonstrated on a sample**: state equality on 19 accounts / 5 contracts / 32 table scopes; a replay canary
@@ -1192,6 +1197,7 @@ binaries are static musl builds made by `.github/workflows/release.yml`.
   injection), with what each proves and does not, and findings R13–R23.
 - [docs/DESIGN-authority-boundary.md](docs/DESIGN-authority-boundary.md): the
   fleet-wide commit-or-abort design (not implemented).
+- [docs/UPSTREAM-ASKS.md](docs/UPSTREAM-ASKS.md): what the cutover needs from PulseVM and MetalGo, each with an acceptance test.
 - [docs/PROCESS.md](docs/PROCESS.md) and [ATOMICITY.md](ATOMICITY.md): the
   process step by step, and what "atomic" means and how far the evidence goes.
 

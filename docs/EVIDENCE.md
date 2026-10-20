@@ -39,7 +39,8 @@ The agent has also changed since most of these runs. The main differences, noted
 | [Hyperion and bp mode](#hyperion-mode-and-bp-mode-2026-08-21-second-session) | 2026-08-21 | same | Tahoe (hyperion), local 1-node network (bp, loop) | hyperion, producer (`schedule_at_h`) | hyperion: 1 correct abort, 1 LIVE; bp: LIVE at exactly H; loop 22/22 |
 | [Multi-producer rehearsal](#multi-producer-rehearsal-5-bps-september-2026) | 2026-09-28/29 | Leap 5.0.3, 5 producers | private 5-validator Metal network | producer, 5 BPs | run 1 aborted on all 5; runs 2–6 LIVE on all 5 |
 | [Linux fault injection](#linux-fault-injection-rc9-and-rc10) | 2026-09-29/30 | stubbed nodeos | stubbed metalgo | producer and api | rc.9: 83/83 with a shim, critical BUG-1 found; rc.10: 49/49 with no shim |
-| [Upstream-stack fleet runs](#upstream-stack-fleet-runs-october-2026) | 2026-10-06 to 10-10 | XPR testnet state (rewritten test keys), 5-BP Leap 5.0.3 mesh, 21 scheduled names | upstream PulseVM v1.0.0, metalgo 1.14.2, private 5-validator Metal network | producer, 5 BPs, signed events, rc.22–rc.27 | 18 runs: happy paths, split (r4), stranding, join, partition, crash, schedule checks |
+| [Upstream-stack fleet runs](#upstream-stack-fleet-runs-october-2026) | 2026-10-06 to 10-19 | XPR testnet state (rewritten test keys), 5-BP Leap 5.0.3 mesh, 21 scheduled names | upstream PulseVM v1.0.0, metalgo 1.14.2, private 5-validator Metal network | producer, 5 BPs, signed events, rc.22–rc.27; then 8 BPs (rc.31, rc.32) and 7 BPs (rc.33) through 2026-10-19 | 18 five-BP runs: happy paths, split (r4), stranding, join, partition, crash, schedule checks; rc.32: admission lock 0 after H, slowest box halted on #128 in 6 of 7 LIVE runs; rc.33: gate 6 of 7 scenarios PASS, g3b fixed in code |
+| [Target-chain checks](#target-chain-checks-on-the-7-box-fleet-2026-10-19) | 2026-10-19 | rekeyed XPR testnet state, 7-BP Leap 5.0.3 mesh | upstream PulseVM v1.0.0, private 7-validator Metal network | state roots under load; CPU=0 `setparams` freeze | roots diverge across validators without restarts; CPU=0 freeze has no on-chain unfreeze |
 | [Mainnet conversion](#mainnet-conversion-2026-10-13) | 2026-10-13 | a real XPR mainnet snapshot | none (conversion only) | the upstream pipeline, timed per stage | 9.6 min, 13.7 GB peak; compare fails on 3 tables |
 
 ---
@@ -444,7 +445,127 @@ v1.0.0 plugin, a private Metal network, signed events with a roster of 8 and quo
 rc.32 answers the three findings: the producer admission lock (RISK-REGISTER A-22; `tests/admission.rs` reproduces s1
 and shows the lock holding for expiries up to 24 h), the durable forward record behind the D-14 veto, the quorum alarm
 moved to `alarms` and resolved by the signed abort (D-17), and a 900 s fleet-timeout default with a drill-based
-warning (E-4). None of rc.32 has run on the fleet yet.
+warning (E-4). rc.32 then ran on the fleet on 2026-10-16 (next section).
+
+### 8-BP fleet, rc.32 (fleet-step3, 2026-10-16)
+
+The same eight boxes, mesh and plugin as rc.31, quorum 8. The agent binaries were built from rc.32 development commits
+on a fleet box, not the tagged release binary. Every run used a direct-to-nodeos pusher with a 3,600 s expiry on every
+box (traffic the edge freeze does not close), so the admission lock was exercised on every run.
+
+| Run | Scenario | Result |
+|---|---|---|
+| r1 | happy path | 7/8 LIVE on one target chain; burn-off 0 and 0 transactions after H on all 8; about 179 pusher transactions per box refused by the lock after the freeze. The slowest box (bp7) **HALTED** about 110 s after the post-ignition metalgo restart: its PulseVM plugin missed the rpcchainvm keepalive ("keepalive ping failed to receive ACK"), PulseVM #128. Not lock related; its source stayed sealed and paused, no split |
+| r1b | held queue: a pusher every 25 ms from 5 s before the freeze | 49 transactions held in producers' unapplied queues at the lock (1 h expiry); none appeared in any block from the freeze to the pause. 7/8 LIVE; bp7 HALTED again on the #128 keepalive |
+| r1c | r1b repeated on a later commit | 147 held at the lock; 4 landed, all in the block in flight when one producer locked, 23 blocks **before** H (in the migrated state, correct). 0 after H. **8/8 LIVE** |
+| r2 | signed coordinator abort once all 8 were FROZEN | 8/8 ABORTED within 15 s; every journal records the whitelist restored before writes reopened; all 8 sources producing again |
+| r3 | one source nodeos restarted 2 s after FROZEN | **finding:** that BP's agent exited on the restart (`get_info`: connection reset) and nothing re-locked its producer; the other 7 refused creation ("the source head moved past the pause head") and aborted. Safe (no target created, the lone producer's blocks empty), but a failed ceremony. Fixed in rc.32 by the source-RPC retry (RISK-REGISTER A-23) |
+| r3b | restart 234 ms after the pause | the agent survived but only journaled the lost pause and lock; all 8 refused creation and aborted. Fixed: every tick from the pause to creation re-pauses and re-locks |
+| r3c | r3b on the fix | the restarted producer was re-paused and re-locked 1.6 s after the restart (one empty block in between); burn-off 0. The run then halted on a harness fault (a chain-name collision on the persistent P-Chain with an earlier run at the same H): no split, all sources paused, nothing after H |
+| r3v2 | restart at FROZEN+2 s on the fix | the agent retried, recovered in 0.76 s and re-applied the lock 4 ms later; burn-off 0, 0 after H. 7/8 LIVE; bp7 HALTED on #128 |
+| r4 | admission lock off on one BP (rehearsal only) | 110 transactions after H, all in that BP's blocks; every journal names only that BP's producers; **8/8 ABORTED** at the burn-off audit |
+| f1 | `kill -9` of one agent at FROZEN+5 s, under a restarting systemd unit | the unit restarted it 5 s later; it resumed from its journal in FROZEN, the lock was never lost; 7/8 LIVE (bp7 HALTED on #128) |
+| f2 | graceful agent stop at a safe point, operator resume | 7/8 LIVE (bp7 HALTED on #128) |
+| f3 | final regression with queued transactions at the lock | 293 held at the lock, burn-off 0 and 0 after H on all 8; 7/8 LIVE (bp7 HALTED on #128) |
+
+**Proves (measured):** the admission lock holds a producer's queued transactions out of every block after H (up to 293
+held, 1 h expiry); a lock-off producer is named and the whole fleet aborts; a nodeos restart in the freeze window and
+an agent crash are survived and re-locked within about 1.7 s (after the r3/r3b fixes); a signed abort after the freeze
+resumes all 8 with the whitelist restored. No member resumed the old chain while a peer ignited in any of these runs.
+
+**Does not prove:** fleet-wide all-or-nothing ("no split" is observed, not enforced: every guard still reads unsigned
+relay reports); a producer outside the ceremony that owns slots; a p2p pusher. And it shows a target-chain defect:
+the slowest box HALTED on the rpcchainvm keepalive in **6 of the 7 LIVE runs** (r1, r1b, r3v2, f1, f2, f3; r1c was the
+exception). The LIVE gate's 20 s maximum gap cannot be met on a box that halts. Upstream ask U-3 in
+[UPSTREAM-ASKS.md](UPSTREAM-ASKS.md).
+
+### 7-BP fleet, rc.33 all-producers gate (2026-10-19)
+
+The rc.32 fleet minus one box (seven boxes, bp1–bp6 and bp8, quorum 7), the released PulseVM v1.0.0 plugin, every
+event published with `--producer-gate yes`. The binary was built on a fleet box from the rc.33 branch with the crates
+vendored and no network; before deploying it passed **476 debug-mode cargo tests and 267 node tests** (1 more skipped).
+Scenarios and what stopped each one (RISK-REGISTER A-24):
+
+| Run | Scenario | Result |
+|---|---|---|
+| g1 | gated happy path, pusher on all 7 | **PASS.** 46 producers gated (21 active + 25 standby); `coord.mjs arm` refused once before signing (two members' confirmations not yet reported), then signed and relayed; every journal records the gate checked at ARM and again before the freeze, the same `producer_gate_sha256` on 7/7. **7/7 LIVE, identical state root**; 0 transactions after H on every view |
+| g2a | one producer's agent and beacon stopped before the arm | **PASS.** `coord.mjs arm` refused to sign 9 times, naming that box's 6 producers ("stale report"); a test-only raw signed arm was refused by the relay (409) 3 times with the same names. No agent left ARMED; nothing frozen |
+| g2b | one agent stopped about 98 s before the freeze tick, after the arm | **PASS.** The other 6 aborted at the freeze tick naming the 6 producers with a stale report; the stopped agent, restarted, aborted at its own gate. Nothing frozen or locked; no write gap |
+| g4 | one beacon stopped about 77 s before the tick (agent still running) | **PASS.** All 7, that box included, aborted at the tick on its stale report. Nothing frozen or locked |
+| g3a | a producer removed after the arm (`rmvproducer`), so the next producer by votes, **outside** the armed set, is proposed (about 22 s later) and becomes active before the tick | **PASS.** A second `coord.mjs arm` refused to sign ("producers in the live schedule that are not in the event's armed set"); all 7 aborted at the tick (the active schedule changed since the event). Nothing frozen |
+| g5 | admission lock off on one member | **PASS.** That member's `await` rejected the gated event; `coord.mjs arm` refused 9 times, the relay refused a raw arm 3 times (409), naming its 6 producers. Nothing armed |
+| g3b | as g3a, but the replacement producer **inside** the armed set | **Gate PASS, run FAILED.** The gate tolerated the proposal as designed; 7/7 FROZEN and locked, burn-off 0, 0 transactions after H; then **all 7 aborted at verification**: the 21-table compare found `global_property` 1,211 bytes in nodeos vs 143 bytes in the converted state (the cut state carried the *proposed* schedule, which the import does not reproduce; normal runs differ by the known 14 bytes only). Every source resumed |
+
+**rc.33 answer to g3b.** Right before the freeze the agent now refuses **any** proposed producer schedule, even one
+among armed producers (the cut state would carry it in `global_property`). Covered by unit and integration tests
+(477 debug-mode cargo tests); **not yet run on the fleet**. A governance freeze on schedule changes before the window
+avoids the case in production.
+
+**Proves (measured):** the gate refuses the arm, or aborts every agent before anything freezes, for a producer with no
+agent, an agent stopped after the arm, a stale beacon, a schedule change outside the armed set and a lock-off member,
+and each refusal names the producers. **Does not prove:** anything against a member that lies (reports are
+self-declared and the relay is unsigned; the burn-off audit stays the backstop); backup or failover nodes the gate
+cannot see; g4b (a beacon stopped about 20 s before the tick); the g3b fix on the fleet.
+
+---
+
+## Target-chain checks on the 7-box fleet (2026-10-19)
+
+Two tests of the target chain and of the freeze mechanism itself, on the same seven boxes, the released PulseVM v1.0.0
+plugin and the rekeyed testnet source (Leap 5.0.3). Tags: **measured** (seen in a run), **source-read** (read in the
+code at the named release, not run), **inferred** (reasoned, not observed). Rehearsal evidence is held privately.
+
+### Cross-validator state roots on PulseVM v1.0.0: roots diverge under load
+
+**Setup.** One cutover to LIVE (quorum 7), then light load: about 2.6 transactions/s of transfers through each box's
+local endpoint, including two new token-balance rows (12,324 of 12,328 sends succeeded). PulseVM exposes no per-height
+root over RPC; v1.0.0 logs `arena state root at block N` at debug level on every accept (the logger is forced to
+the most verbose level, see U-3), and those lines were collected from all seven nodes: **946 heights × 7 nodes**, in
+three phases of 310 heights.
+
+| Phase | Measured |
+|---|---|
+| normal running, no restarts | the 7 roots agree only on the first 5 heights, before load started. **First divergence at 408462166** (two nodes each with their own root); by **408462200 every node has its own root**, and none converge again. No restart was needed |
+| after restarting one node, then a second | each caught up in about **64 s**; 0 of 310 heights agree in either later phase (already diverged). Both restarted nodes logged "skipping state sync: no acceptable summaries found" (consistent with per-node roots; cause not proven) |
+| content vs layout | at equal heights the table **contents are identical** across nodes; only the arena layout, and so the raw-arena hash, differs. Consensus did not split: blocks kept being accepted on all 7 |
+
+**Mechanism, reproduced in unit tests on v1.0.0 (measured).** (1) Undoing a trial (speculative) execution leaves its
+bytes in reused free space and **reverses the order of the free list**, so the next block's write lands at a different
+offset on a node that ran the trial than on one that did not (producer and validator paths differ). (2) A **restart
+loses the free list** (it is not persisted), so new data is appended instead of reusing freed space (arena 48 vs 40
+bytes in the test). Source-read: the root hashes every table's rows and then the whole blob arena, dead spans included
+(`pulsevm_arena` `table.rs` `hash_state`).
+
+**Consequences.** The state root is not a cross-node fact on v1.0.0. State sync, a follower-based cut, attested roots
+and any root-based go/no-go check cannot rely on it until the root is computed from content (upstream ask U-2;
+RISK-REGISTER B-15). The fleet gate is not affected: it compares the converted checkpoint, which all members compute
+from the same snapshot (g1: identical root on 7/7). The mechanism is in v1.0.0's arena code, so any running v1.0.0
+chain has per-node roots already (inferred). Caveats: roots taken from debug logs; arena sizes not visible on the fleet.
+
+### CPU=0 freeze with `setparams` on the rekeyed testnet: a one-way door
+
+**Setup.** `eosio::setparams` with `max_transaction_cpu_usage = min_transaction_cpu_usage = 0` on the rekeyed testnet
+source, all seven producers on Leap 5.0.3. **Authority substitution:** on the test chain `eosio@active` is a single key,
+so `setparams` was signed directly; on XPR mainnet it needs the `eosio.prods` msig (15 of 21). The `eosio.msig`
+propose / approve / exec path was exercised with accounts the rehearsal controls. The freeze acts in transaction
+initialization, after authorization, so the substitution does not change what was measured.
+
+| Check | Result |
+|---|---|
+| the freeze lands | **measured.** Freeze block F = 408462916 with `setparams` its only transaction; all 7 accepted it, all 7 read the limits as 0/0, and F became irreversible |
+| every user transaction fails | **measured.** A probe transfer, a restoring `setparams`, `exec` of a restoring msig proposed **and approved before** the freeze, a fresh `propose`, and read-only `compute_transaction` all failed with `tx_cpu_usage_exceeded` (3080004: "estimated CPU time (0 us) is not less than the maximum billable CPU time … (0 us)"). Failed inputs were dropped, not queued |
+| the chain keeps running empty | **measured.** 404 blocks after F with 0 transactions; producers kept rotating, LIB passed F, and `onblock` kept executing (the system contract's unpaid-blocks counter kept rising). No reject or invalid-block lines on any node |
+| recovery | **measured.** No on-chain unfreeze exists: every path back (a restoring `setparams`, an msig `exec`, a deferred transaction) is itself a user transaction and fails at initialization. All 7 were rolled back to a common pre-freeze snapshot and resumed normally (limits restored, same block ids, LIB advancing). On mainnet that means every producer rewinding together |
+| a block carrying a > 0-CPU receipt is rejected by validators | **not shown** (needs a patched producer). Source-read (Leap v5.0.3): validation checks each receipt's billed CPU against the zero limit, so a block with any user transaction is invalid on every full-validating node; the 404 empty blocks are consistent with it |
+| deferred transactions across the freeze | **not shown.** Leap 5.0.3 refused a test transaction with `delay_sec > 0` ("transaction cannot be delayed") although the disable-deferred features are not active on that chain, and the chain held no scheduled transactions; a contract calling `send_deferred` is needed. XPR mainnet had 34 pending deferred transactions on 2026-10-13 (RISK-REGISTER A-12) |
+
+**Consequences.** A plain CPU=0 `setparams` msig is a **one-way door**: usable only as an irreversible final step,
+never as a rehearsal or abortable form. Like any protocol freeze it binds honest nodes only: a producer, or 15 of 21
+colluding, can keep the old chain alive by rolling back to a pre-freeze snapshot, which took minutes here. A
+reversible form would be a `setfreeze` action in the system contract applied from `onblock` with an automatic
+dead-man unfreeze (a proposal, not built). A migrated target imports the frozen `global_property` row verbatim, so it
+would be born frozen unless the import rewrites it (source-read; the CPU rescale, U-4, has to rewrite it anyway).
+RISK-REGISTER A-25 and A-26.
 
 ---
 

@@ -14,7 +14,9 @@ Status words used on this page, and nowhere loosely:
 | **Estimate** | arithmetic from measured parts; not itself measured |
 | **Not built** | a design or a requirement only |
 
-*Last updated 2026-10-16, pulse-cutover v0.5.0-rc.32, PulseVM v1.0.0.*
+*Last updated 2026-10-20, pulse-cutover v0.5.0-rc.33, PulseVM v1.0.0. rc.33 adds the all-producers gate (fleet-tested on
+7 boxes); the 2026-10-19 fleet runs also found per-validator state roots on v1.0.0 and showed that a CPU=0 freeze has no
+on-chain unfreeze ([EVIDENCE.md](EVIDENCE.md#target-chain-checks-on-the-7-box-fleet-2026-10-19)).*
 
 ---
 
@@ -206,6 +208,7 @@ The full list, with owners and evidence, is the [risk register](RISK-REGISTER.md
 | [../ATOMICITY.md](../ATOMICITY.md) | the five atomicity properties, the evidence for each, known limits |
 | [DESIGN.md](DESIGN.md) | state machine, review findings (R-numbers), failure table |
 | [DESIGN-authority-boundary.md](DESIGN-authority-boundary.md) | the fleet-wide commit point (not built) |
+| [UPSTREAM-ASKS.md](UPSTREAM-ASKS.md) | what the cutover needs from PulseVM and MetalGo, with acceptance tests |
 | [EVIDENCE.md](EVIDENCE.md) | every recorded run, with what it proves and what it does not |
 | [EXCHANGES.md](EXCHANGES.md) | for exchanges, wallets and indexers |
 | [OPERATOR-QUICKSTART.md](OPERATOR-QUICKSTART.md) | running it as a producer |
