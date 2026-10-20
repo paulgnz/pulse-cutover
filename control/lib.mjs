@@ -99,7 +99,7 @@ export function withDeadline(p, ms) {
   if (!(ms > 0)) { p.catch(() => {}); return Promise.reject(to()); }
   let t; return Promise.race([p, new Promise((_, ko) => { t = setTimeout(() => ko(to()), ms); })]).finally(() => clearTimeout(t));
 }
-export const UA = 'pulse-cutover-mission-control/1.0 (+https://control-rehearsal.protonnz.com)';
+export const UA = 'pulse-cutover-mission-control/1.0 (+https://github.com/paulgnz/pulse-cutover)';
 
 /**
  * One HTTP(S) exchange with the connection PINNED to `ip` (already validated as public): the socket's DNS

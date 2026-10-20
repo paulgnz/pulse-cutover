@@ -48,7 +48,7 @@ the status box below).
 > ```bash
 > V=v0.5.0-rc.33   # a release tag: the script's pins arrive with it (never main, never "latest")
 > curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
-> less beacon-install.sh && sudo bash beacon-install.sh
+> less beacon-install.sh && sudo bash beacon-install.sh --url <mission-control-url>
 > ```
 > The running beacon only observes; installing it writes a binary, a readiness-only config, a token and a systemd
 > service (it never touches nodeos). It detects your network and account and prints one line to send us.
@@ -59,7 +59,7 @@ the status box below).
 
 **How atomic is the cut today? → [ATOMICITY.md](ATOMICITY.md)**: five properties, the gate or tool for each, the recorded evidence, and what is still open.
 
-**Watch it live → [Cutover Mission Control](control/README.md)**: readiness of every producer on mainnet, testnet and the rehearsal network, the ceremony as it happens, and cross-producer agreement on the evidence (live at [control-rehearsal.protonnz.com](https://control-rehearsal.protonnz.com)).
+**Watch it live → [Cutover Mission Control](control/README.md)**: readiness of every producer on mainnet, testnet and the rehearsal network, the ceremony as it happens, and cross-producer agreement on the evidence (the rehearsal deployment was retired on 2026-10-21; the next coordinator publishes its URL).
 
 **Want to help test? → [TESTING.md](TESTING.md)** — rehearsals never touch
 production, take about 40 minutes, and give you operational familiarity before
@@ -144,8 +144,8 @@ arrive with it), read it, try it with `--dry-run` first; it changes nothing:
 V=v0.5.0-rc.33
 curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 less beacon-install.sh                  # you are about to run it as root: read it
-sudo bash beacon-install.sh --dry-run   # shows what it detected; changes nothing
-sudo bash beacon-install.sh             # detects network + producer from your node
+sudo bash beacon-install.sh --url <mission-control-url> --dry-run   # shows what it detected; changes nothing
+sudo bash beacon-install.sh --url <mission-control-url>             # detects network + producer from your node
 ```
 
 From v0.5.0-rc.29 every release also attaches the operator scripts and lists them in its `sha256sums.txt`, so the

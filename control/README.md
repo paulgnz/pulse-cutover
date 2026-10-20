@@ -1,7 +1,8 @@
 # Cutover Mission Control
 
 A live readiness and ceremony board for every network you care about: XPR mainnet (first), testnet, and
-rehearsal networks. Deployed for the rehearsals at **https://control-rehearsal.protonnz.com**.
+rehearsal networks. A deployment ran for the 2026 rehearsals and was retired on 2026-10-21; the next rehearsal or
+cutover coordinator runs one and publishes its URL.
 
 ![Mission control, mainnet view](../docs/media/mission-control-mainnet.png)
 

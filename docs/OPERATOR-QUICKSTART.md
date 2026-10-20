@@ -3,7 +3,7 @@
 **For block producers. Takes about 2 minutes. Safe on a live producing node.**
 
 This installs a small reporter (the *beacon*) that tells
-[Cutover Mission Control](https://control-rehearsal.protonnz.com) whether your node is ready for a future
+[Cutover Mission Control](../control/README.md) (the coordinator publishes its URL; none runs between rehearsals) whether your node is ready for a future
 PulseVM cutover. The running beacon only reads local state; it **does not** touch nodeos, its config, your keys or
 block production, and it opens no ports. (Installing it writes the binary, a config, a token and a systemd
 service; see below.)
@@ -25,7 +25,7 @@ read it, then run it:
 V=v0.5.0-rc.33
 curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 less beacon-install.sh          # you are about to run this as root: read it
-sudo bash beacon-install.sh
+sudo bash beacon-install.sh --url <mission-control-url>   # the coordinator publishes it
 ```
 
 It works out everything itself: mainnet or testnet (from your chain), your producer account (from
@@ -60,7 +60,7 @@ again unless you change the producer or network.
 ## 3. Watch your node
 
 Once you're approved, your node appears on the dashboard with its readiness checks:
-`https://control-rehearsal.protonnz.com/testnet/youraccount`
+`<mission-control-url>/testnet/youraccount`
 
 Until then (or without sending anything at all) you can see the same report locally:
 `sudo pulse-cutover beacon --config /etc/pulse-cutover/beacon.toml --once` prints one report instead of sending it,

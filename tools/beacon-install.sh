@@ -26,12 +26,13 @@
 # the previous binary and config.
 #
 # Options: --network <mainnet|testnet> --producer <account> --node <label> --role <producer|api|history>
-#          [--url https://control-rehearsal.protonnz.com] [--version vX.Y.Z] [--api http://127.0.0.1:8888]
+#          --url <mission-control-url> [--version vX.Y.Z] [--api http://127.0.0.1:8888]
 #          [--producer-api <url>] [--snapshots-dir <dir>] [--interval 10] [--force] [--dry-run] [--yes] [--uninstall]
 set -euo pipefail
 
 VERSION_DEFAULT="v0.5.0-rc.33"
-URL_DEFAULT="https://control-rehearsal.protonnz.com"
+# No public mission control runs between rehearsals: --url (or PULSE_CONTROL_URL) names the coordinator's.
+URL_DEFAULT="${PULSE_CONTROL_URL:-}"
 ETC=/etc/pulse-cutover; VAR=/var/lib/pulse-cutover; STATE=/var/lib/pulse-beacon; BIN=/usr/local/bin/pulse-cutover
 # Version of an installed pulse-cutover binary: rc.16+ prints it; older builds only embed the string.
 bin_version() {
@@ -240,6 +241,7 @@ main() {
   fi
   HASH_BEFORE=$(token_hash "$ETC/beacon.token")
   URL=${URL:-$URL_DEFAULT}; VERSION=${VERSION:-$VERSION_DEFAULT}; INTERVAL=${INTERVAL:-10}
+  [ -n "$URL" ] || die "--url <mission-control-url> is required: no public mission control is running (the coordinator of the next rehearsal or cutover publishes it)"
   JOURNAL=${JOURNAL:-$VAR/journal.jsonl}; STAGED=${STAGED:-$VAR/snapshot-cut.bin}
   TARGET_RPC=${TARGET_RPC:-http://127.0.0.1:9650/ext/bc/NOT-CONFIGURED/rpc}
   check_url "$URL"
