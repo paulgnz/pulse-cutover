@@ -20,7 +20,7 @@ use pulse_cutover::{
 
 const USAGE: &str = "\
 pulse-cutover — drives an Antelope -> PulseVM cutover ceremony: same URL,
-same chain_id, same state, zero read downtime. Operator walkthrough: README.md.
+same state under a new chain_id, zero read downtime. Operator walkthrough: README.md.
 
 usage: pulse-cutover <command> [options]   (pulse-cutover <command> --help for examples)
 

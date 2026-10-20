@@ -1281,7 +1281,7 @@ echo " What happens at H (run: ./cutover.sh --manifest ceremony.json):"
 echo "   1. agent watches the source chain to the freeze height"
 echo "   2. snapshot via your nodeos producer_api at ~finality"
 echo "   3. sha256 + dual-import 19-table fingerprint verification"
-echo "   4. PulseVM ignites from the verified snapshot (same chain_id)"
+echo "   4. PulseVM ignites from the verified snapshot (the event's NEW chain_id)"
 if [ "$MODE" = "hyperion" ]; then
   echo "   5. hyperion-rs starts + hydrates against the new chain's SHiP"
   echo "   6. /v1 flips to PulseVM AND /v2 flips to the federating router"

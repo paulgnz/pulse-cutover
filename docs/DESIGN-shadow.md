@@ -9,7 +9,7 @@ real mainnet chain_id. It is the closest thing to a mainnet cut that leaves main
 repeated until it is boring.
 
 Without this mode the agent refuses it: every rehearsal relaxation is refused for the mainnet chain_id, and
-an ignition is refused for mainnet while the same-chain-id prerequisites are open. Those refusals protect a
+an ignition is refused for mainnet while the mainnet prerequisites (UPSTREAM-ASKS) are open. Those refusals protect a
 real cut and stay exactly as they are. Shadow mode is a separate, explicit path with its own checks.
 
 ## 1. Threat model

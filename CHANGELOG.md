@@ -3,7 +3,7 @@
 Release notes per tag. Earlier releases are described in their tag messages and in
 [docs/EVIDENCE.md](docs/EVIDENCE.md).
 
-## v0.5.0-rc.33 (unreleased)
+## v0.5.0-rc.33 (2026-10-21)
 
 From the rc.32 fleet review and the 7-box gate runs g1–g5.
 

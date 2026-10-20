@@ -154,7 +154,7 @@ Always, LIVE or ABORTED:
 | `tools/capture-static.mjs` | captures the source chain's activated protocol features + consensus parameters for the edge (run before the source nodeos stops) |
 | `examples/` | `ceremony.json` (the documented install.sh manifest), `ceremony.toml` (every config field) and commented configs per mode + the reference loop deployment + the containerized haproxy test rig (`haproxy-test/`) |
 | `tools/state-diff.mjs` | byte-exact state comparison of two `/v1/chain` endpoints (atomicity A3) |
-| `tools/replay-canary.mjs` | exactly-once test across a same-chain_id cutover (atomicity A4) |
+| `tools/replay-canary.mjs` | exactly-once test across a same-chain_id cutover (atomicity A4) *(same-chain_id era)* |
 | `docs/PROCESS.md` | the process, step by step, with diagrams |
 | `docs/V1-COVERAGE.md` | every Leap 5 `/v1` endpoint after the cut: native, polyfill, federator or 501, plus the upstream asks |
 | `docs/DESIGN.md` | the design as of rc.28: review findings R1–R12, state machine, config format, failure/rollback table, v2 sketch |
@@ -407,7 +407,7 @@ stateDiagram-v2
 | ABORTED: "fleet quorum unreachable …" (rc.31) | enough roster members ended the event without verifying (mission control holds their durable exit marks) that the quorum cannot be reached: the journal's `quorum_unreachable` names them. Expected and safe (before the freeze nothing was frozen; after it the resume guard decided). Tell the human; a new attempt needs a NEW event id from the coordinator. `early_abort: deferred` = the proof held but the resume guard would have stranded this node: it kept waiting as before |
 | preflight refused: "already exited event … without verifying" (rc.31) | this producer ended the event earlier (any journal); its peers may have stopped on that. Do NOT move the journal aside and retry: ask the coordinator for a NEW event id |
 | agent process died mid-run | re-run the same `pulse-cutover run --config …` — it resumes from the journal |
-| ceremony LIVE | verify: public URL serves the same chain_id, head advancing; report bundle for the record |
+| ceremony LIVE | verify: public URL serves the event's pinned target_chain_id, head advancing; report bundle for the record |
 | stuck at IGNITED, target head == H | the new chain has no transactions: check the `post_ignite` hook ran (journal `post_ignite_hook`; `Permission denied` = missing execute bit). Tell the human; with approval, run the hook by hand |
 | ABORTED: "transactions landed after the cut" | writes were not closed early enough: check `on_freeze` really closes every write path (API edge, other public endpoints); raise `freeze_lead_blocks` for the next attempt |
 | clients see timeouts / "expired" right after LIVE | expected briefly after ignite (validators re-peer); tell the human if it lasts > 2 min. Clients must reconcile the original transaction id before re-signing (rule 7) |

@@ -28,7 +28,7 @@ pub enum State {
     /// and verified (against goldens, or captured with provenance).
     Verified,
     /// Verified snapshot staged; target metalgo (re)started; target RPC
-    /// answered with the source chain_id at the cut height.
+    /// answered with the event's pinned target_chain_id at the cut height.
     Ignited,
     /// (api mode only) The public /v1 endpoint has been swapped to the
     /// PulseVM side and health-checked; the source nodeos is still serving

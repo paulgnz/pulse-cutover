@@ -20,6 +20,8 @@ Writes pause for the cut: 71–114 s in the unattended rehearsals on a small cha
 
 > [!IMPORTANT]
 > **Status (2026-10-21, v0.5.0-rc.33)**
+> - **Testing is paused pending upstream.** The rehearsal fleet was torn down on 2026-10-21; no mission control runs
+>   between rehearsals.
 > - **rc.33: all-producers gate.** The freeze is refused unless every producer that can produce before the pause runs
 >   an armed agent with the admission lock on. On a 7-box fleet 6 of 7 gate scenarios passed; the 7th (a proposed
 >   schedule inside the armed set) is fixed in code, not yet re-run
@@ -28,10 +30,8 @@ Writes pause for the cut: 71–114 s in the unattended rehearsals on a small cha
 >   every run with the lock on, 8/8 LIVE in one run and 7/8 in six, where the slowest box halted on the rpcchainvm keepalive
 >   ([EVIDENCE](docs/EVIDENCE.md#8-bp-fleet-rc32-fleet-step3-2026-10-16)).
 > - **Blocked upstream** ([docs/UPSTREAM-ASKS.md](docs/UPSTREAM-ASKS.md)): a genesis-settable chain_id; a
->   content-based state root (roots diverge per node under load on v1.0.0); the #128 keepalive halts; CPU rescale at
->   import; schedule-gated, per-producer signing. Until those land, an upstream ignite is refused for XPR mainnet.
-> - **Testing is paused pending upstream.** The rehearsal fleet was torn down on 2026-10-21; no mission control runs
->   between rehearsals.
+>   content-based state root (roots diverge per node under load on v1.0.0); slow accepts that trip the rpcchainvm keepalive (#128);
+>   CPU rescale at import; schedule-gated, per-producer signing. Until those land, any XPR mainnet ignite is refused.
 > - **Not done yet**: fleet-wide all-or-nothing (no authority boundary; a partial abort can still split the network),
 >   exact H in API mode and on restart under a real freeze, crash recovery on a fleet, validator registration and
 >   funding, any run on Tahoe (the public Metal testnet) and any mainnet event. Earlier proof (September, 5 BPs on a
@@ -48,7 +48,7 @@ Writes pause for the cut: 71–114 s in the unattended rehearsals on a small cha
 
 ## Block producers
 
-Connect your node to the coordinator's Cutover Mission Control in two minutes. Download the installer from a
+Connect your node to the coordinator's [Cutover Mission Control](control/README.md) in two minutes. Download the installer from a
 **release tag** (never `main` or `latest`: the tag is what was reviewed, and its pins arrive with it), read it, and
 run it with the mission-control URL the coordinator publishes for the event (none runs between rehearsals; you can
 also set `PULSE_CONTROL_URL`):
@@ -248,14 +248,10 @@ Rehearsals only, never mainnet. Every run, with what it proves **and does not**,
 
 ![5-BP cutover, recorded live (run 4, 6× speed)](docs/media/multibp-cutover.gif)
 
-Things apps and operators must know, from the [field notes](docs/EVIDENCE.md#field-notes-from-the-rehearsals):
+Things operators must know, from the [field notes](docs/EVIDENCE.md#field-notes-from-the-rehearsals) (the app-facing
+ones are in the checklist below):
 
-- **Head time is frozen at the cut** until the first new block: use `expireSeconds ≥ 120` and don't derive
-  expiration from an old block.
-- **Expect a short, bumpy restart**: a ~50 s finality stall followed LIVE under load (open).
-- **Send dependent transactions only after the first is included**: back-to-back sends can reach different producers
-  out of order.
-- **Reconcile against a final chain read**, not a short read-back timer, or you will report phantom drops.
+- **Head time is frozen at the cut** until the first new block.
 - **Persist an edge flip in the config**: a runtime-only HAProxy flip was undone by a later routine reload.
 - **The producer schedule after import is seeded from node config** (open upstream): today every validator must run
   the same producer name and key.
@@ -267,13 +263,13 @@ exchanges, wallets and indexers: [docs/EXCHANGES.md](docs/EXCHANGES.md).
 
 - [x] **Treat HTTP 503 during a migration as "hold", not "failed"**. A 503 at the edge means the write was not accepted: retry later, under the same application-level operation id. **Reconcile before you re-sign.** After an ambiguous outcome (timeout, lost response, 5xx), look up the ORIGINAL transaction id first and keep an application-level operation id for every business action; build and sign a replacement only once the original is found (done) or provably expired and absent. A re-signed transaction has a new id, so id-based deduplication cannot stop it from executing the same transfer twice.
 - [x] **Fail over across several BP endpoints.** During the rehearsals every edge answered reads throughout; writes resumed on all of them at the same moment.
-- [x] **Use `expireSeconds` ≥ 120**, and don't derive expiration from an old block ([field note 4](docs/EVIDENCE.md#field-notes-from-the-rehearsals)).
-- [x] **Confirm inclusion, not just acceptance.** An "admitted" response means accepted into the mempool; read your state back (or check the block) before treating it as final.
+- [x] **Use `expireSeconds` ≥ 120**, and don't derive expiration from an old block: head time is frozen at the cut until the first new block ([field note 4](docs/EVIDENCE.md#field-notes-from-the-rehearsals)).
+- [x] **Confirm inclusion, not just acceptance.** An "admitted" response means accepted into the mempool; read your state back (or check the block) before treating it as final. Reconcile against a final chain read, not a short read-back timer, or you will report phantom drops; send a dependent transaction only after the first is included, since back-to-back sends can reach different producers out of order.
 - [x] **Oracle-driven apps**: the chain clock jumps forward by the freeze length at the first new block. Contracts with a staleness window (e.g. 120 s) will see the last pre-freeze price as stale until a fresh one lands, so **push a fresh oracle update as the first post-cut write**. Liquidations and funding that are gated on freshness pause safely in the meantime.
 - [ ] **The head block number goes back once, at the flip.** The source keeps producing empty burn-off blocks past H (about 330 in the rehearsals) until it pauses; they are discarded and the new chain reuses those heights from H+1 with different block ids. Indexers and deposit pollers must treat H as the end of the old chain and key blocks by id, not height alone.
 - [ ] **Sign for the new chain_id from LIVE.** The keys are unchanged; the chain_id is new (published with the signed event).
 - [x] **Contracts move as-is.** A perps contract, its oracle and token deployed with plain `cleos set contract` kept working on PulseVM after the cut with no contract or bot changes.
-- [x] **Expect a short, bumpy restart.** Budget for about 1–2 minutes of 503s plus up to a minute of slow confirmations right after the flip, and make your retry loop tolerate both.
+- [x] **Expect a short, bumpy restart.** Budget for about 1–2 minutes of 503s plus up to a minute of slow confirmations right after the flip (a ~50 s finality stall followed LIVE under load; open), and make your retry loop tolerate both.
 
 Measured across the cut for three bots: [EVIDENCE.md, run 4](docs/EVIDENCE.md#multi-producer-rehearsal-5-bps-september-2026).
 
@@ -311,6 +307,12 @@ Plain-English versions of every term this repo uses:
   section). Lets the flip enable/disable backend servers instantly, transactionally, with zero reloads.
 - **Admission lock** — from the freeze, the producer's own nodeos refuses transactions (its actor whitelist is set to
   a name no account can have), so nothing queued before the freeze lands after H.
+- **Burn-off audit** — after the freeze the source keeps producing (empty) blocks past H until it pauses; the agent
+  reads every block from H+1 to the pause head and aborts on any transaction or unreadable block, naming the
+  producer of each offending block. The backstop behind the admission lock ([docs/DESIGN.md](docs/DESIGN.md), R2).
+- **rpcchainvm keepalive** — MetalGo pings each VM plugin over gRPC every 30 s with a 10 s timeout (fixed, not
+  configurable) and stops a plugin that misses one; a slow block accept can trip it and halt that validator
+  (#128; [UPSTREAM-ASKS U-8](docs/UPSTREAM-ASKS.md#u-8-configurable-rpcchainvm-keepalive)).
 - **Federator** — a small router that keeps one `/v2` history URL answering across the migration: old rows from the
   old archive, new rows from the new indexer.
 - **Journal** — an append-only file (`journal.jsonl`) the agent writes every step to, with timestamps and evidence.

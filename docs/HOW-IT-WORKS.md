@@ -37,7 +37,8 @@ The goal is an **atomic** cut: every transaction ends up on exactly one side, ex
 as a whole either moves or does not. **That is the requirement, not today's state**: section 5 and the
 [risk register](RISK-REGISTER.md) say how far the evidence goes. In particular, PulseVM v1.0.0 cannot yet
 take a chain_id fixed in advance (its chain_id is the Metal blockchain ID, known only once the chain is created), and
-the agent refuses to ignite XPR mainnet with the source chain_id ([upstream asks](UPSTREAM-ASKS.md)).
+the agent refuses to ignite XPR mainnet until the new id can be pinned and the upstream items are closed
+([UPSTREAM-ASKS](UPSTREAM-ASKS.md)).
 
 It is **not instant**. Writes pause for the switch (section 3). Reads stay available during the cut: an
 external probe measured 99.8% read availability through an API-mode flip on real testnet state, with a
