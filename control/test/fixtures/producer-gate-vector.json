@@ -1,0 +1,46 @@
+{
+ "description": "rc.33 producer gate: the canonical text and sha256 both sides compute (control/coordlib.mjs producerGateCanonical, src/producer_gate.rs ProducerGate::canonical). Do not edit by hand.",
+ "gate": {
+  "v": 1,
+  "required": [
+   "bpalpha",
+   "bpbravo",
+   "bpcharlie",
+   "bpdelta",
+   "bpecho"
+  ],
+  "cover": {
+   "bpalpha": "bp1",
+   "bpbravo": "bp2",
+   "bpcharlie": "bp3",
+   "bpdelta": "bp1",
+   "bpecho": "bp2"
+  },
+  "active": {
+   "version": 41,
+   "producers": [
+    "bpalpha",
+    "bpbravo",
+    "bpcharlie"
+   ]
+  },
+  "pending": {
+   "version": 42,
+   "producers": [
+    "bpalpha",
+    "bpcharlie",
+    "bpdelta"
+   ]
+  },
+  "proposed": null,
+  "standby": [
+   "bpdelta",
+   "bpecho"
+  ],
+  "min_agent_version": "0.5.0-rc.33",
+  "event_id": "ev-vector-1",
+  "h": 408500000,
+  "sha256": "037be23a4c87052785385463de48a3eb62e13cc5752cbeae66352776e6ffcae7"
+ },
+ "canonical": "pulse-cutover producer gate v1\nevent_id=ev-vector-1\nh=408500000\nrequired=bpalpha:bp1,bpbravo:bp2,bpcharlie:bp3,bpdelta:bp1,bpecho:bp2\nactive=41:bpalpha,bpbravo,bpcharlie\npending=42:bpalpha,bpcharlie,bpdelta\nproposed=-\nstandby=bpdelta,bpecho\nmin_agent_version=0.5.0-rc.33"
+}

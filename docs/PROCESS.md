@@ -3,8 +3,9 @@
 <p align="center"><img src="media/cutover-hero.svg" alt="One block, one cut, same chain" width="100%"></p>
 
 How a running Antelope chain is meant to move onto PulseVM **in one atomic step**, with every
-block producer cutting the same block, the chain keeping its chain_id, and users
-keeping their keys, balances and URLs. This page describes the intended protocol;
+block producer cutting the same block, and users keeping their keys, balances and
+URLs. The new chain has a **new chain_id**, named in the signed event (decision 2026-10-19):
+wallets and SDKs sign for it from LIVE on, and old signatures cannot replay across the cut. This page describes the intended protocol;
 what is implemented and rehearsed today is marked where it differs, and the full
 status is in [ATOMICITY.md](../ATOMICITY.md).
 
@@ -42,7 +43,7 @@ flowchart LR
     classDef new fill:#5b21b6,stroke:#a78bfa,color:#fff
     classDef user fill:#065f46,stroke:#34d399,color:#fff
 
-    U["👤 Users, wallets, bots, exchanges<br/>same keys · same URL · same chain_id"]:::user
+    U["👤 Users, wallets, bots, exchanges<br/>same keys · same URL · NEW chain_id from LIVE"]:::user
 
     subgraph OLD["Old engine: Leap nodeos"]
         direction LR
@@ -147,10 +148,23 @@ gantt
 | **H** | **The cut.** Every producer's nodeos has been told in advance to snapshot exactly this block. |
 | **H final** (≈ 35–50 s later) | The snapshot file lands (Leap writes it once H is irreversible). Producers pause. |
 | **+1 s** | Verified: imported twice, fingerprints must match, no transactions after H. |
-| **+10–20 s** | Ignited: PulseVM boots from the snapshot and reports the same chain_id at a height ≥ H. |
+| **+10–20 s** | Ignited: PulseVM boots from the snapshot and reports the event's pinned new chain_id (any other id halts) at a height ≥ H. |
 | **+5 s** | LIVE: this producer's view of the new chain is past H. In producer mode the URL flips now. |
 
 ---
+
+### The chain_id changes at LIVE (decision 2026-10-19)
+
+- **Before the event**: the coordinator names the new chain_id in the signed event (`coord.mjs event
+  --target-chain-id`). Wallet, SDK and exchange teams get it with H, ahead of time.
+- **At ignition**: every producer checks that the chain it created or joined has exactly that id; any
+  other id (the old one included) halts that producer before LIVE. API nodes flip only when the edge
+  serves that id.
+- **From LIVE**: clients sign for the new chain_id (`get_info` returns it). A transaction signed for the
+  old chain_id is rejected by the new chain (wrong signature domain), and a transaction signed for the
+  new id is meaningless on the old chain: the chain_id is the replay protection. A transaction signed
+  before the cut that did not execute by H must be reconciled and re-signed (EXCHANGES.md §3).
+- **Rehearsals** use their own unique chain_ids (never mainnet's or the real new one).
 
 ## 4. Phase by phase
 

@@ -90,6 +90,22 @@ node --test control/test/*.test.mjs   # offline test suite (MC_OFFLINE=1, random
   the signed payload (validated before signing: account names, each member once, an instance id that is a beacon's
   32-hex `beacon.instance`, 1 ≤ quorum ≤ roster size, 64-hex hashes). Without `--roster` the agents' fleet gate has no
   roster and counts whoever reports, and mission control has no fleet verdict for the event.
+- **Producer gate (rc.33):** `coord.mjs event … --producer-gate yes --source-rpc <nodeos /v1 base> [--standby a,b]
+  [--cover name:member,…] [--min-agent-version 0.5.0-rc.33]` reads `get_producer_schedule` and signs, as
+  `producer_gate`, every producer that could produce before the pause (active ∪ pending ∪ proposed ∪ standbys), the
+  roster member that runs each one's agent (itself, or `--cover`), the bound schedule, the minimum agent version and a
+  sha256 over a canonical text (vector: `control/test/fixtures/producer-gate-vector.json`, shared with the agent). It
+  refuses to sign when a producer has no roster member. The relay then **refuses the arm** (409, not relayed, history
+  `arm_refused`) until every bound producer's fresh (≤ 45 s, the gate's fixed bound) producer-role report accepted this event under this gate,
+  says it will start on the arm (`coord.arm_ready`: `auto_arm` or the confirm file), runs an agent ≥ the minimum, and has
+  `admission_lock` and `admission_lock_probe` green; the 409 names each one and why. After the arm, `fleet.producer_gate`
+  and a `PRODUCER GATE NOT READY` warning show any member that is not ARMED/FROZEN under the gate (every agent aborts
+  before its freeze in that case). `arm --source-rpc …` also refuses to sign when the live schedule is not the bound one, and `arm` reads `/api/status`
+  itself and refuses to sign while any bound producer is not ready (a check independent of the relay's own refusal).
+  The gate is bound to the event id and H (in its hash), so a re-issued event never matches an older journal. On XPR
+  mainnet a `--cover` mapping is refused unless `--rehearsal yes`.
+  The relay is unsigned and producers' reports are self-reported: the agents re-check everything, and the burn-off audit
+  stays the backstop (docs/DESIGN.md §2b).
 - **Server state** (`STATE_FILE`, default `servers.json` next to `COORD_FILE`): the replay watermark (last accepted
   report timestamp per server) and every server entry (latest report, first seen, instance id, conflict flag) are
   written synchronously (fsync + rename + directory fsync) **before** a report or an operator change is acknowledged.

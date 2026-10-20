@@ -157,6 +157,13 @@ pub struct Coordination {
     /// (`early_abort: true`) so the whole fleet runs one setting; a hand-written config must match on every member.
     #[serde(default)]
     pub early_abort: bool,
+    /// rc.33: the all-producers gate (src/producer_gate.rs), written by `await` from the SIGNED event's `producer_gate`:
+    /// every producer that could produce before the pause, the roster member running each one's agent, the bound
+    /// schedule and the minimum agent version. With it, the agent checks the live schedule at ARM and, right before the
+    /// freeze, the schedule again and every member's beacon report (ARMED for this event, lock on, lock probe green);
+    /// any gap aborts before anything is frozen.
+    #[serde(default)]
+    pub producer_gate: Option<crate::producer_gate::ProducerGate>,
 }
 
 fn default_degraded_patience() -> u64 {
@@ -357,6 +364,14 @@ pub struct Ceremony {
     /// mission control.
     #[serde(default)]
     pub rehearsal_allow_chain_id_change: bool,
+    /// rc.33 (decision 2026-10-19: the XPR→PulseVM cutover uses a NEW chain_id): the chain_id the target chain must
+    /// have, written by `await` from the SIGNED event's `target_chain_id` (bound into the event hash). When set, the
+    /// target this agent creates or joins must have exactly this id (otherwise the ceremony aborts before ignition
+    /// completes, or halts after it), and the flip waits for it. XPR mainnet requires it at ARM, and it must differ
+    /// from the source chain_id there. Unset (rehearsals, other chains): the target must keep the source chain_id
+    /// unless `rehearsal_allow_chain_id_change`. 64 hex characters.
+    #[serde(default)]
+    pub target_chain_id: Option<String>,
     /// REHEARSAL ceremony (default false). Without it every ceremony config must pass the
     /// PRODUCTION PROFILE (`Config::production_problems`): exact cut, real freeze, lineage check,
     /// the required hooks, a sustained LIVE window, the post-LIVE watch and probe, a state
@@ -1045,6 +1060,51 @@ impl Config {
         }
         crate::shadow::check_config(&config)?;
         config.check_rehearsal_overrides()?;
+        if let Some(t) = &config.ceremony.target_chain_id {
+            if t.len() != 64 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "ceremony.target_chain_id {t:?} is not a chain_id (64 hex characters)"
+                ));
+            }
+            if !config.ceremony.shadow
+                && config
+                    .ceremony
+                    .chain_id
+                    .as_deref()
+                    .is_some_and(|c| is_xpr_mainnet(c) && c.eq_ignore_ascii_case(t))
+            {
+                return Err("ceremony.target_chain_id equals the XPR MAINNET source chain_id: the cutover moves to a NEW \
+                            chain_id (decision 2026-10-19)"
+                    .into());
+            }
+        }
+        // rc.33: a producer gate in the config must be the one a signed event carries: well formed, hash intact, every
+        // name covered by a roster member.
+        if let Some(co) = &config.coordination {
+            if let Some(g) = &co.producer_gate {
+                g.check(&co.roster)
+                    .map_err(|e| format!("coordination.{e}"))?;
+                if co.event_id.as_deref().is_some_and(|id| id != g.event_id) {
+                    return Err(format!(
+                        "coordination.producer_gate is for event {}, not coordination.event_id {}",
+                        g.event_id,
+                        co.event_id.as_deref().unwrap_or("")
+                    ));
+                }
+                if let Some(p) = g.mainnet_cover_problem(
+                    config.ceremony.chain_id.as_deref(),
+                    config.ceremony.rehearsal || config.ceremony.shadow,
+                ) {
+                    return Err(format!("coordination.{p}"));
+                }
+                if config.ceremony.freeze_height > 0 && config.ceremony.freeze_height != g.h {
+                    return Err(format!(
+                        "coordination.producer_gate is for H {}, not ceremony.freeze_height {}",
+                        g.h, config.ceremony.freeze_height
+                    ));
+                }
+            }
+        }
         if enforce_production
             && config
                 .ceremony
@@ -1352,6 +1412,15 @@ impl Config {
             if !c.admission_lock {
                 out.push("ceremony.admission_lock = false (the producer must refuse transactions from the freeze on, whatever their expiry)".into());
             }
+            // rc.33: a coordinated producer cut runs from an event that binds every producer that can produce before the
+            // pause (an uncoordinated config has no event; D-10 covers XPR mainnet).
+            if self
+                .coordination
+                .as_ref()
+                .is_some_and(|co| co.event_id.is_some() && co.producer_gate.is_none())
+            {
+                out.push("coordination.producer_gate is not set (the signed event must bind every producer that can produce before the pause: coord.mjs event --producer-gate yes)".into());
+            }
         }
         match c.import_backend {
             ImportBackend::Upstream => {
@@ -1411,6 +1480,12 @@ impl Config {
                     .into(),
             );
         }
+        // rc.33: the new chain's id is pinned in the signed event (producers create or join it, API nodes flip to it).
+        if self.ceremony.target_chain_id.is_none() && !self.is_shadow() {
+            out.push("an XPR MAINNET ceremony needs the new chain's id pinned in the signed event (ceremony.target_chain_id, \
+                      written by `await` from the event's target_chain_id: coord.mjs event --target-chain-id)"
+                .into());
+        }
         if self.ceremony.mode == Mode::Producer {
             if co.roster.is_empty() {
                 out.push("an XPR MAINNET producer ceremony needs the event's roster (coordination.roster is empty)".into());
@@ -1420,6 +1495,10 @@ impl Config {
                     "an XPR MAINNET producer ceremony needs a fleet quorum of at least 2 (coordination.fleet_quorum = {})",
                     co.fleet_quorum
                 ));
+            }
+            if co.producer_gate.is_none() {
+                out.push("an XPR MAINNET producer ceremony needs the event's producer gate (coordination.producer_gate: \
+                          every producer that can produce before the pause must be armed with the admission lock)".into());
             }
         }
         out

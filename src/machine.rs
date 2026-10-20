@@ -1996,6 +1996,10 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                     // gate of the early abort reads this, not the beacon's own version).
                     "agent_version": env!("CARGO_PKG_VERSION"),
                     "early_abort": early_abort,
+                    // rc.33: the all-producers gate this ceremony runs under (beacon evidence; peers and mission control
+                    // match it before the freeze).
+                    "producer_gate_sha256": self.cfg.coordination.as_ref()
+                        .and_then(|c| c.producer_gate.as_ref().map(|g| g.sha256.to_lowercase())),
                     "simulate_freeze": self.cfg.ceremony.simulate_freeze,
                     "chain_id": info.chain_id,
                     "head_at_arm": info.head_block_num,
@@ -2388,6 +2392,38 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 ));
             }
         }
+        // rc.33: the all-producers gate, at ARM (and on a run resumed before the freeze): the lock is on, this agent is
+        // new enough, and the live schedule is still the one the signed event bound.
+        if self.cfg.ceremony.mode == Mode::Producer && pre_freeze {
+            if let Some(g) = self
+                .cfg
+                .coordination
+                .as_ref()
+                .and_then(|c| c.producer_gate.clone())
+            {
+                let gp = self.producer_gate_arm_problems(&g);
+                if gp.is_empty() {
+                    self.journal.evidence(
+                        self.state,
+                        json!({"producer_gate": {"checked": "ARM", "ok": true, "sha256": g.sha256,
+                            "required": g.required.len(), "active_version": g.active.version,
+                            "pending_version": g.pending.as_ref().map(|p| p.version),
+                            "min_agent_version": g.min_agent_version}}),
+                    )?;
+                }
+                problems.extend(gp.into_iter().map(|p| format!("producer gate: {p}")));
+            } else if self
+                .cfg
+                .coordination
+                .as_ref()
+                .is_some_and(|c| c.event_id.is_some())
+                && !resumed
+            {
+                self.journal.evidence(State::Armed, json!({"WARNING": "no producer gate in the signed event: a producer \
+                    outside the ceremony (no agent, an older one, the lock off) is caught only by the burn-off audit",
+                    "check": "producer_gate"}))?;
+            }
+        }
         if let Some(dir) = self.cfg.snapshot.staged_path.parent() {
             if !dir.exists() {
                 problems.push(format!("staged_path dir {} missing", dir.display()));
@@ -2584,6 +2620,149 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             json!({"production_profile": "met (checked before the freeze)"}),
         )?;
         Ok(true)
+    }
+
+    /// rc.33 (src/producer_gate.rs): what stops ARM under the event's producer gate. Empty = go.
+    fn producer_gate_arm_problems(&self, g: &crate::producer_gate::ProducerGate) -> Vec<String> {
+        let mut out = vec![];
+        if !self.cfg.ceremony.admission_lock {
+            out.push("ceremony.admission_lock = false: every member of a producer gate must lock admission".into());
+        }
+        if !crate::producer_gate::version_at_least(env!("CARGO_PKG_VERSION"), &g.min_agent_version)
+        {
+            out.push(format!(
+                "this agent ({}) is older than the event's min_agent_version {}",
+                env!("CARGO_PKG_VERSION"),
+                g.min_agent_version
+            ));
+        }
+        match self.ops.source_producer_schedule() {
+            Ok(Some(v)) => out.extend(g.schedule_problems(&v)),
+            Ok(None) => out.push(
+                "the source did not answer get_producer_schedule (unknown is never yes)".into(),
+            ),
+            Err(e) => out.push(format!(
+                "get_producer_schedule failed ({e}): unknown is never yes"
+            )),
+        }
+        out
+    }
+
+    /// rc.33: right before the freeze, the live schedule must still be the bound one and every required producer's
+    /// agent must report, fresh on the relay, ARMED (or FROZEN) for this event under this gate, at least the minimum
+    /// version, with the lock on and its probe green. Reads are retried briefly; unknown is never yes. Ok(false) after
+    /// aborting (nothing frozen yet).
+    fn producer_gate_before_freeze(&mut self) -> Result<bool, String> {
+        if self.cfg.ceremony.mode != Mode::Producer {
+            return Ok(true);
+        }
+        let Some(co) = self.cfg.coordination.clone() else {
+            return Ok(true);
+        };
+        let Some(g) = co.producer_gate.clone() else {
+            return Ok(true);
+        };
+        let event_id = co.event_id.clone().unwrap_or_default();
+        let mut problems = vec![];
+        let mut sched = Err("no answer".to_string());
+        for attempt in 0..3 {
+            sched = match self.ops.source_producer_schedule() {
+                Ok(Some(v)) => Ok(v),
+                Ok(None) => Err("no answer".into()),
+                Err(e) => Err(e),
+            };
+            if sched.is_ok() {
+                break;
+            }
+            if attempt < 2 {
+                self.ops.sleep_ms(1000);
+            }
+        }
+        match &sched {
+            Ok(v) => {
+                problems.extend(g.schedule_problems(v));
+                problems.extend(crate::producer_gate::ProducerGate::freeze_schedule_problems(v));
+            }
+            Err(e) => problems.push(format!(
+                "cannot read get_producer_schedule ({e}): unknown is never yes"
+            )),
+        }
+        let url = format!("{}/api/status", co.url.trim_end_matches('/'));
+        let mut doc = None;
+        for attempt in 0..3 {
+            if let Ok(Some(d)) = self.ops.get_json(&url) {
+                if d.is_object() {
+                    doc = Some(d);
+                    break;
+                }
+            }
+            if attempt < 2 {
+                self.ops.sleep_ms(1000);
+            }
+        }
+        let missing = match &doc {
+            Some(d) => g.relay_problems(
+                d,
+                &co.network,
+                &event_id,
+                crate::producer_gate::GATE_MAX_REPORT_AGE_SECS * 1000,
+                crate::producer_gate::FREEZE_STATES,
+            ),
+            None => {
+                problems.push("mission control did not answer /api/status: the members' readiness is unknown \
+                               (unknown is never yes)"
+                    .into());
+                vec![]
+            }
+        };
+        // The reads above are retried and can be slow: a check that ends at or past H would freeze after the cut (the
+        // producer admitting until then). Abort instead, before anything is frozen.
+        if problems.is_empty() && missing.is_empty() {
+            let head = self.ops.source_info()?.head_block_num;
+            if head >= self.h() {
+                problems.push(format!(
+                    "the gate check ended at head {head}, at or past H {}: freezing now would admit transactions up to the cut",
+                    self.h()
+                ));
+            }
+        }
+        if problems.is_empty() && missing.is_empty() {
+            self.journal.evidence(
+                State::Armed,
+                json!({"producer_gate": {"checked": "before the freeze", "ok": true, "sha256": g.sha256,
+                    "required": g.required.len(), "members": g.required.iter().map(|n| g.member_of(n)).collect::<std::collections::BTreeSet<_>>().len()}}),
+            )?;
+            return Ok(true);
+        }
+        let mut names: Vec<String> = missing
+            .iter()
+            .filter_map(|m| m["producer"].as_str().map(String::from))
+            .collect();
+        names.sort();
+        let mut why = vec![];
+        if !names.is_empty() {
+            let shown: Vec<&str> = names.iter().take(12).map(String::as_str).collect();
+            why.push(format!(
+                "not armed: {}{}",
+                shown.join(", "),
+                if names.len() > 12 {
+                    format!(" (+{} more)", names.len() - 12)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        why.extend(problems.iter().cloned());
+        self.abort(
+            &format!(
+                "producer gate not met before the freeze ({}): a producer outside the ceremony could add transactions after H",
+                why.join("; ")
+            ),
+            json!({"producer_gate": {"sha256": g.sha256, "missing": missing, "problems": problems,
+                "fix": "every producer that can produce before the pause must run an armed agent for this event with the \
+                        admission lock on; a schedule change needs a new event"}}),
+        )?;
+        Ok(false)
     }
 
     /// Coordinated ceremonies: has the coordinator published a SIGNED abort for this event?
@@ -4476,6 +4655,11 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         if !self.production_gate()? {
             return Ok(());
         }
+        // rc.33: every producer that could produce before the pause is armed with the lock on, and the schedule is still
+        // the bound one; otherwise abort before anything is frozen.
+        if !self.producer_gate_before_freeze()? {
+            return Ok(());
+        }
         // The write freeze — the moment the write gap starts (R2: an
         // explicit reject at the API edge, never just a producer pause).
         self.check_mainnet_h()?;
@@ -6305,6 +6489,44 @@ impl<'a, O: ChainOps> Machine<'a, O> {
         let status = self.fleet_status();
         let (bid, sid, members) = crate::fleet::join_view(status.as_ref(), co, &ours)
             .map_err(|e| format!("join refused: {e}"))?;
+        // rc.33: a pinned new chain_id: a LIVE member that reports its target with another id is not the agreed chain.
+        if let Some(pin) = &self.cfg.ceremony.target_chain_id {
+            let other: Vec<String> = status
+                .as_ref()
+                .and_then(|d| d["networks"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter(|n| n["id"].as_str() == Some(co.network.as_str()))
+                .flat_map(|n| n["producers"].as_array().cloned().unwrap_or_default())
+                .filter(|p| {
+                    p["name"]
+                        .as_str()
+                        .is_some_and(|x| members.iter().any(|m| m == x))
+                })
+                .flat_map(|p| {
+                    p["beacons"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|b| b["report"].clone())
+                        .chain(std::iter::once(p["report"].clone()))
+                        .collect::<Vec<_>>()
+                })
+                .filter_map(|r| {
+                    r["ceremony"]["target"]["chain_id"]
+                        .as_str()
+                        .map(String::from)
+                })
+                .filter(|c| !c.eq_ignore_ascii_case(pin))
+                .collect();
+            if !other.is_empty() {
+                return Err(format!(
+                    "join refused: the LIVE quorum reports target chain_id {} but the signed event pins {pin}",
+                    other[0]
+                ));
+            }
+        }
         let info = self
             .ops
             .source_info()
@@ -6595,7 +6817,43 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             self.ops.sleep_ms(self.cfg.poll_ms);
         };
-        if let Some(chain_id) = self.chain_id.clone() {
+        // rc.33 (decision 2026-10-19): the cutover moves to a NEW chain_id, pinned in the signed event. The target this
+        // agent created or joined must have exactly that id; an unpinned target on XPR mainnet is refused.
+        if let Some(pin) = self.cfg.ceremony.target_chain_id.clone() {
+            if !info.chain_id.eq_ignore_ascii_case(&pin) {
+                self.abort(
+                    "target chain_id != the event's pinned target_chain_id",
+                    json!({"target": info.chain_id, "pinned": pin, "source": self.chain_id,
+                           "note": "the signed event names the new chain's id; a target with any other id is not the agreed chain"}),
+                )?;
+                return Ok(());
+            }
+            if self
+                .chain_id
+                .as_deref()
+                .is_some_and(|c| !c.eq_ignore_ascii_case(&info.chain_id))
+            {
+                self.journal.evidence(
+                    State::Verified,
+                    json!({"accepted_target_chain_id": info.chain_id,
+                        "target_chain_id_pinned": {"source_chain_id": self.chain_id, "target_chain_id": info.chain_id,
+                            "pinned_by": "the signed event (ceremony.target_chain_id)",
+                            "note": "a NEW chain_id: transactions must be signed for it from LIVE on"}}),
+                )?;
+                self.accepted_target_chain_id = Some(info.chain_id.clone());
+            }
+        } else if self
+            .chain_id
+            .as_deref()
+            .is_some_and(crate::config::is_xpr_mainnet)
+            && !self.cfg.is_shadow()
+        {
+            self.abort(
+                "XPR MAINNET target without a pinned target_chain_id",
+                json!({"target": info.chain_id, "note": "a mainnet cutover moves to the NEW chain_id named in the signed event"}),
+            )?;
+            return Ok(());
+        } else if let Some(chain_id) = self.chain_id.clone() {
             if !info.chain_id.eq_ignore_ascii_case(&chain_id) {
                 if self.cfg.ceremony.rehearsal_allow_chain_id_change {
                     // REHEARSAL ONLY (refused for mainnet at load and at ARM): PulseVM v1.0.0 signs
@@ -6997,11 +7255,20 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             let public = self.ops.public_info(&flip.public_url)?;
             let proof = match (&target, &public) {
                 (Some(t), Some(p)) => {
-                    let chain_ok = self
-                        .accepted_target_chain_id
+                    // rc.33: a pinned new chain_id first; the public edge and the target must both serve it.
+                    let want = self
+                        .cfg
+                        .ceremony
+                        .target_chain_id
                         .as_ref()
-                        .or(self.chain_id.as_ref())
-                        .map(|c| p.chain_id.eq_ignore_ascii_case(c))
+                        .or(self.accepted_target_chain_id.as_ref())
+                        .or(self.chain_id.as_ref());
+                    let chain_ok = want
+                        .map(|c| {
+                            p.chain_id.eq_ignore_ascii_case(c)
+                                && (self.cfg.ceremony.target_chain_id.is_none()
+                                    || t.chain_id.eq_ignore_ascii_case(c))
+                        })
                         .unwrap_or(false);
                     let common = t.head_block_num.min(p.head_block_num);
                     if !chain_ok {

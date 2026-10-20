@@ -107,6 +107,16 @@ node tools/capture-static.mjs http://127.0.0.1:8888 /etc/pulse-cutover/static
 > `coord.mjs event` requires `--chain-id` and `--h`. `pulse-cutover doctor` reports a
 > host whose memory or chain cannot be read instead of passing it.
 
+> [!IMPORTANT]
+> **rc.33: every producer that can produce before the pause must be armed** (docs/DESIGN.md §2b). A real event binds
+> the producer schedule (active, pending, proposed) and the standbys. The arm is not relayed, and every agent aborts
+> before its freeze, unless each of those producers runs pulse-cutover rc.33 or newer with its beacon reporting. Each
+> one needs to have accepted the event and to start on the arm (`auto_arm = true`, or `touch confirm-<event_id>` next to
+> the journal BEFORE the coordinator arms). `admission_lock` must be on, and the `admission_lock_probe` check must be
+> green (the agent can read `/v1/producer/get_whitelist_blacklist` locally). Mission control names each producer that
+> is not ready and why. Coordinators: `coord.mjs event --producer-gate yes --source-rpc <nodeos>` (with `--standby` and,
+> for servers that sign for several names, `--cover`); `coord.mjs arm --source-rpc <nodeos>` refuses a changed schedule.
+
 Each agent decides from its own observations, so one event can end with different states on different BPs (the
 5-BP rehearsal on the upstream stack ended every run with some BPs LIVE and some HALTED on the same new chain).
 Since rc.23 mission control shows one **fleet verdict** for the current event, under the network switch, computed

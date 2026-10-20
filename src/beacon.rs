@@ -509,6 +509,9 @@ pub const SETUP_CHECKS: &[&str] = &[
     "producer_api_private",
     "rehearsal_overrides",
     "shadow",
+    // rc.33: preparation (a failing probe never excludes a report from the ignition fleet gate); the all-producers gate
+    // reads it by name before the arm is relayed and before every agent freezes.
+    "admission_lock_probe",
 ];
 
 /// A report with any failing HEALTH check (a failing setup check does not count).
@@ -688,6 +691,8 @@ fn apply_line(acc: &mut Acc, v: &Value) {
                     put(ev, "agent_version", &d["agent_version"]);
                     put(ev, "early_abort", &d["early_abort"]);
                     put(ev, "chain_id", &d["chain_id"]);
+                    // rc.33: the all-producers gate this ceremony runs under (peers and mission control match it).
+                    put(ev, "producer_gate_sha256", &d["producer_gate_sha256"]);
                 }
                 Some("FROZEN") => put(ev, "freeze_at", &d["freeze_at"]),
                 Some("SNAPSHOTTED") => {
@@ -791,7 +796,66 @@ fn coord_public(cfg: &Config) -> Value {
     if let Some(r) = c.get("reason").and_then(|r| r.as_str()).map(sanitize_short) {
         c["reason"] = json!(r);
     }
+    // rc.33: will a signed arm start this node's ceremony (auto_arm, or the operator's confirm file for this event)?
+    // Mission control relays an arm under a producer gate only when every member says yes.
+    if let (Some(id), Some(co)) = (
+        c.get("event_id").and_then(|v| v.as_str()).map(String::from),
+        cfg.coordination.as_ref(),
+    ) {
+        let confirm = cfg
+            .journal_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(format!("confirm-{id}"));
+        c["arm_ready"] = json!(co.auto_arm || confirm.exists());
+    }
     c
+}
+
+/// rc.33: can this agent apply the admission lock? A read of `/v1/producer/get_whitelist_blacklist` (what the lock
+/// reads and then sets). None when not probed (not producer mode, or past verification: the old chain may be stopped).
+fn admission_lock_probe(cfg: &Config, b: &Budget, past_verify: bool) -> Option<Value> {
+    if cfg.ceremony.mode != crate::config::Mode::Producer || past_verify {
+        return None;
+    }
+    let r = match b.agent(Duration::from_secs(2)) {
+        Some(a) => post_json(
+            &a,
+            &format!(
+                "{}/v1/producer/get_whitelist_blacklist",
+                cfg.source.producer_api_url.trim_end_matches('/')
+            ),
+            json!({}),
+        ),
+        None => Err("skipped (collection time budget exhausted)".into()),
+    };
+    Some(match r {
+        Ok(v) if v.is_object() => {
+            let wl: Vec<&str> = v["actor_whitelist"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            let locked = wl == [crate::config::ADMISSION_LOCK_SENTINEL];
+            check(
+                "admission_lock_probe",
+                true,
+                if locked {
+                    "get_whitelist_blacklist answers: the admission lock is ON".to_string()
+                } else {
+                    format!(
+                        "get_whitelist_blacklist answers: the lock can be applied ({} whitelisted actor{})",
+                        wl.len(),
+                        if wl.len() == 1 { "" } else { "s" }
+                    )
+                },
+            )
+        }
+        Ok(_) | Err(_) => check(
+            "admission_lock_probe",
+            false,
+            "get_whitelist_blacklist does not answer locally: the admission lock cannot be applied",
+        ),
+    })
 }
 
 pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
@@ -876,6 +940,9 @@ pub fn build_report(cfg: &Config, producer: &str, network: &str) -> Value {
                 Err(_) => "not reachable locally".into(),
             },
         ));
+    }
+    if let Some(c) = admission_lock_probe(cfg, &budget, past_verify) {
+        checks.push(c);
     }
     // Anyone who can reach /v1/producer can `resume` a producer the ceremony paused at H. Visible even when
     // unknown: an untested exposure is not a private one.
@@ -1528,6 +1595,97 @@ token_file = "{t}/beacon.token"
         ));
         std::fs::write(&p, text).unwrap();
         Config::load_for_report(&p).unwrap()
+    }
+
+    /// rc.33: the beacon reports what the all-producers gate reads: the lock probe (a setup check, from the producer API),
+    /// the gate hash of an ARMED journal, and whether a signed arm would start this node (`coord.arm_ready`).
+    #[test]
+    fn rc33_report_carries_the_lock_probe_the_gate_hash_and_arm_ready() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut st in listener.incoming().flatten() {
+                // Read the whole request (headers and body) before answering: closing a socket with unread bytes
+                // resets it, and the client's read of our answer can fail.
+                let mut buf = vec![0u8; 16384];
+                let mut got = 0;
+                while let Ok(n) = st.read(&mut buf[got..]) {
+                    if n == 0 {
+                        break;
+                    }
+                    got += n;
+                    let t = String::from_utf8_lossy(&buf[..got]).to_string();
+                    if let Some(end) = t.find("\r\n\r\n") {
+                        let len = t[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if got >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf[..got]).to_string();
+                let body = if req.contains("get_whitelist_blacklist") {
+                    r#"{"actor_whitelist":["pulse.frozen1"],"actor_blacklist":[]}"#
+                } else {
+                    "{}"
+                };
+                let _ = write!(st, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let j = dir.path().join("run");
+        std::fs::create_dir_all(&j).unwrap();
+        let cfg = beacon_cfg(dir.path(), &j, &dir.path().join("etc"), "");
+        let probe = |cfg: &Config| {
+            build_report(cfg, "bp1", "rehearsal")["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == "admission_lock_probe")
+                .cloned()
+                .unwrap()
+        };
+        let c = probe(&cfg);
+        assert_eq!(c["ok"], false, "nothing answers on port 9: {c}");
+        assert!(SETUP_CHECKS.contains(&"admission_lock_probe"));
+        let p = dir.path().join("b-run.toml");
+        let t = std::fs::read_to_string(&p).unwrap().replace(
+            "producer_api_url = \"http://127.0.0.1:9\"",
+            &format!("producer_api_url = \"http://127.0.0.1:{port}\""),
+        ) + "[coordination]\nurl = \"http://mc\"\nnetwork = \"rehearsal\"\n";
+        std::fs::write(&p, t).unwrap();
+        let cfg = Config::load_for_report(&p).unwrap();
+        let c = probe(&cfg);
+        assert_eq!(c["ok"], true, "{c}");
+        assert!(c["detail"].as_str().unwrap().contains("lock is ON"));
+        // An ARMED journal under a gate; coord state for the event, without and with the confirm file.
+        std::fs::write(
+            j.join("journal.jsonl"),
+            r#"{"seq":1,"kind":"transition","state":"ARMED","ts":"2026-10-19T00:00:00Z","ts_ms":1,"data":{"resolved_h":500,"agent_version":"0.5.0-rc.33","producer_gate_sha256":"ab"}}
+"#,
+        )
+        .unwrap();
+        crate::coord::try_write_state(
+            &cfg,
+            &json!({"event_id": "e1", "accepted": true, "producer_gate_sha256": "ab"}),
+        )
+        .unwrap();
+        let r = build_report(&cfg, "bp1", "rehearsal");
+        assert_eq!(r["ceremony"]["evidence"]["producer_gate_sha256"], "ab");
+        assert_eq!(r["coord"]["producer_gate_sha256"], "ab");
+        assert_eq!(r["coord"]["arm_ready"], false);
+        std::fs::write(j.join("confirm-e1"), "").unwrap();
+        assert_eq!(
+            build_report(&cfg, "bp1", "rehearsal")["coord"]["arm_ready"],
+            true
+        );
     }
 
     /// Fleet rehearsal §4.1: each new run directory created a new instance id for the same token

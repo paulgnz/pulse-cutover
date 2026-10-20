@@ -1191,6 +1191,7 @@ mod tests {
             degraded_retry_secs: 10,
             fleet_stall_secs: 300,
             early_abort: true,
+            producer_gate: None,
         }
     }
     fn rep(state: &str, extra: Value) -> Value {
