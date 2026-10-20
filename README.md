@@ -41,7 +41,7 @@ the status box below).
 
 > **Block producer? Connect your node in 2 minutes → [docs/OPERATOR-QUICKSTART.md](docs/OPERATOR-QUICKSTART.md) · set up your Metal validator and get your NodeID → [docs/METAL-QUICKSTART.md](docs/METAL-QUICKSTART.md)**
 > ```bash
-> V=v0.5.0-rc.32   # a release tag: the script's pins arrive with it (never main, never "latest")
+> V=v0.5.0-rc.33   # a release tag: the script's pins arrive with it (never main, never "latest")
 > curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 > less beacon-install.sh && sudo bash beacon-install.sh
 > ```
@@ -136,7 +136,7 @@ from a **release tag** (never `main`: the tag is what was reviewed and released,
 arrive with it), read it, try it with `--dry-run` first; it changes nothing:
 
 ```sh
-V=v0.5.0-rc.32
+V=v0.5.0-rc.33
 curl -fsSLO https://raw.githubusercontent.com/paulgnz/pulse-cutover/$V/tools/beacon-install.sh
 less beacon-install.sh                  # you are about to run it as root: read it
 sudo bash beacon-install.sh --dry-run   # shows what it detected; changes nothing
@@ -157,7 +157,7 @@ mission control authenticates it. See [control/README.md](control/README.md).
 producing node**: compiling takes minutes of full CPU.
 
 ```sh
-V=v0.5.0-rc.32   # an exact release tag. Never "latest": GitHub's alias skips pre-releases and resolves to an old build
+V=v0.5.0-rc.33   # an exact release tag. Never "latest": GitHub's alias skips pre-releases and resolves to an old build
 curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/download/$V/pulse-cutover-x86_64-unknown-linux-musl
 curl -fsSLO https://github.com/paulgnz/pulse-cutover/releases/download/$V/sha256sums.txt
 sha256sum -c sha256sums.txt --ignore-missing
@@ -1083,7 +1083,7 @@ are ignored). The shape, abridged:
                 "staking_dir": "/var/lib/metalgo/staking", "post_live_probe_cmd": "…" },
   "flip":     { "public_host": "<public-ip-or-domain>", "edge": "auto" },
   "gateway":  { "mode": "edge" },
-  "artifacts": { "agent_release_tag": "v0.5.0-rc.32",      // or "agent": {"url", "sha256"}, which wins
+  "artifacts": { "agent_release_tag": "v0.5.0-rc.33",      // or "agent": {"url", "sha256"}, which wins
                  "plugin":    {"url": "…", "sha256": "…"},
                  "metalgo":   {"url": "…", "sha256": "…"},
                  "edge":      {"url": "…", "sha256": "…"},    // gateway.mode = edge

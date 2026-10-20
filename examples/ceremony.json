@@ -70,7 +70,7 @@
 
   "artifacts": {
     "_about": "Everything determinism-critical is pinned by URL + sha256 and verified before anything is installed (fail closed). The edge and federator pins below are the files of this repository at the release tag; recompute with: git show <tag>:gateway/server.js | sha256sum",
-    "agent_release_tag": "v0.5.0-rc.32",
+    "agent_release_tag": "v0.5.0-rc.33",
     "_agent_release_tag": "The pulse-cutover release to install: static musl binary + sha256sums.txt from that GitHub release. Never 'latest' (refused). Alternatively pin artifacts.agent = {url, sha256} to a coordinator-hosted binary; that wins.",
     "plugin": {
       "url": "REPLACE-ME-https-url-of-the-coordinator-pinned-pulsevm-plugin-binary",
