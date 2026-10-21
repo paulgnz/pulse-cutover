@@ -476,9 +476,9 @@ pub struct Source {
 
 /// api mode: the /v1 URL swap. `cmd` performs the swap (e.g. rewrite the
 /// nginx upstream + reload); the agent then polls `public_url` until it
-/// serves the TARGET chain (same chain_id — that's the whole point — so the
-/// discriminator is head agreement with the target RPC within
-/// `head_tolerance` blocks, `health_polls` consecutive times).
+/// serves the TARGET chain. The chain_id is checked at ignition (the event's
+/// pinned target_chain_id); the flip's discriminator is head agreement with the
+/// target RPC within `head_tolerance` blocks, `health_polls` consecutive times.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Flip {

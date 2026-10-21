@@ -4,7 +4,7 @@ This is the design of `pulse-cutover`, the agent each producer and API operator 
 their nodeos to move a running Antelope chain onto PulseVM at one block, H. It records why the
 ceremony is shaped the way it is: the adversarial review that changed the design (the
 **R-numbers** that appear in log messages, config comments and the README), the state machine,
-the config format, the failure and rollback table, and a sketch of a faster v2.
+the config format, the failure and rollback table, and a sketch of a faster v2, and (§8) how the import backends line up with upstream.
 
 It describes the code as of **v0.5.0-rc.33** (§2b is the rc.33 all-producers gate; §3 and §5 carry the rc.21–rc.28 changes; rc.29's guard, authorization and
 relay changes are summarised in docs/OPERATOR-QUICKSTART.md §6 and ATOMICITY.md known limit 17; the
@@ -29,7 +29,7 @@ Other documents cover the rest, and this one does not repeat them:
 `pulse-cutover` is one Rust binary. Its fork-backend verification imports the snapshot through
 the same crates a PulseVM node boots with (`pulsevm_snapshot`, `pulsevm_snapshot_import`,
 `pulsevm_chaindb`), so the agent's check and the node's import cannot drift apart. The upstream
-backend runs the official MetalBlockchain/pulsevm#61 tools instead (README, "Import backends").
+backend runs the official MetalBlockchain/pulsevm#61 tools instead ([§8](#8-upstream-alignment-and-import-backends)).
 
 The rules the design keeps to:
 
@@ -59,7 +59,7 @@ behaviour.
 | **R2** | Writes "into the void" around the freeze | A paused nodeos still accepts and acknowledges pushed transactions that are never included: silent write loss. | The freeze is an explicit reject at the API edge (HTTP 503 / tx-acceptance off). Pause alone is never the freeze. | `hooks.on_freeze` closes writes `freeze_lead_blocks` (default 24) before H; a failing hook aborts. rc.32: at the same moment the producer itself stops admitting transactions (the **admission lock**, §2a); rc.33: the freeze is refused unless every producer that can produce before the pause has an armed agent with that lock (the **all-producers gate**, §2b). The **burn-off audit** reads every block from H+1 to the pause head and aborts on any transaction or unreadable block (the backstop). |
 | **R3** | nodeos version skew | Snapshot file bytes depend on the snapshot format version (Leap 5 writes v6, later versions v7+), so sha256 goldens are version-fragile. Table fingerprints over imported state are not. | Two tiers: fingerprints are the binding cross-node check; sha256 is a strict extra bound to the pinned nodeos version. | `snapshot.expected_sha256` (optional) and `snapshot.golden_roots`; either mismatch aborts. In the upstream backend the whole-state root from `xpr_state_fingerprint` can be compared to `[upstream] golden_state_root`. |
 | **R4** | Microforks and late blocks at H | "Snapshot the current head" is ambiguous: a straggler block or an unpaused producer moves head; a node on a microfork snapshots a different block H. | Pin the cut by height **and** block id; after the pause, require a quiescence window of unchanged-head polls; assert the snapshot's block id equals the chain's block id at that height. | As designed. `quiescence_polls` (default 6); late blocks are journaled (first 10) and reset the window; since rc.12 the wait is bounded by `quiescence_timeout_secs` (default 120) and aborts on expiry. *Differs from the August design:* the cut is not re-pinned on late blocks (it is always the scheduled H). |
-| **R5** | Partial quorum; the flip racing the target | Half the validators ignite and quorum never forms, or a gateway flips before the target produces. | Ratchet: the user-visible flip happens only after the target serves the source chain_id at the cut **and** its head advances past it. `quorum_timeout` bounds the wait. | LIVE now also needs `live_sustain_secs` (60) of progress with no gap over `live_max_gap_secs` (20). *Corrected since August:* "the source stays authoritative until LIVE" holds only before ignition. From `ignite_started` on, every failure HALTS instead of resuming the source (§3). Fleet-wide, the point of no return is target authorization, which is not implemented ([DESIGN-authority-boundary.md](DESIGN-authority-boundary.md)). |
+| **R5** | Partial quorum; the flip racing the target | Half the validators ignite and quorum never forms, or a gateway flips before the target produces. | Ratchet: the user-visible flip happens only after the target serves the source chain_id at the cut (now the event's pinned target_chain_id, §2c) **and** its head advances past it. `quorum_timeout` bounds the wait. | LIVE now also needs `live_sustain_secs` (60) of progress with no gap over `live_max_gap_secs` (20). *Corrected since August:* "the source stays authoritative until LIVE" holds only before ignition. From `ignite_started` on, every failure HALTS instead of resuming the source (§3). Fleet-wide, the point of no return is target authorization, which is not implemented ([DESIGN-authority-boundary.md](DESIGN-authority-boundary.md)). |
 | **R6** | Where H and goldens come from | An agent must not take H from a chat message, and goldens cannot exist before H. | Two phases: parameters declared before the freeze, goldens co-signed after the snapshot. Each node's trust anchor is its own snapshot. | *The on-chain msig declaration was never built.* H and parameters come from the config or from a signed coordinator event (`pulse-cutover await`: ed25519 keys listed in each node's own config, event/arm/abort messages, optional roster, quorum and plugin hash, arm bound to the event by hash). Goldens are a file (`golden_roots`) or captured with provenance (`capture_roots`). Co-signed goldens are not implemented; the fleet gate compares beacon reports through the relay. |
 | **R7** | In-flight transactions at H | Do transactions not included by H replay? Can they be taken cross-chain? | The importer carries the unexpired-transaction dedupe set, so a transaction included at or before H cannot execute again; an unincluded signed transaction can be resubmitted after the cut. | The fork importer carries the dedupe set from the `.bin`; the upstream backend refuses to verify without the `deferred-transactions.json` sidecar that carries it. **TAPOS is not enforced by PulseVM**; enforcement is one of the upstream ignition prerequisites (`upstream::ignite_pending_reasons`). |
 | **R8** | Clock assumptions | PulseVM's first block must be timestamped after H's. | NTP is a node requirement; the invariant is recorded, not assumed. | The journal records `last_source_block_time` and `first_post_cut_block_time`. |
@@ -307,7 +307,7 @@ stateDiagram-v2
 - **Per mode.** Producer: ARMED → FROZEN → SNAPSHOTTED → VERIFIED → IGNITED → LIVE. API mode
   adds FLIPPED, because the source nodeos keeps serving reads until after the public flip.
   Hyperion mode is API mode plus a hydration gate inside IGNITED and a `/v2` flip in the same
-  stage. The README's "How it works" section has the per-state detail.
+  stage. [REFERENCE.md](REFERENCE.md#the-state-machine) has the per-state detail.
 - **Upstream backend.** SNAPSHOTTED → VERIFIED runs the #61 pipeline (export, import, 19-table
   compare, state fingerprint) and, when ignition is configured, builds the boot artifacts:
   the boot manifest anchored on the FULL packed cut block (its computed id must equal the cut
@@ -545,7 +545,7 @@ today the same failures halt.
 ## 4. Config format (the ceremony manifest)
 
 On a single node the TOML config is the ceremony manifest. `install.sh` generates it from
-`ceremony.json` (README, "The ceremony.json manifest"). The shape, abridged; every field is
+`ceremony.json` ([REFERENCE.md](REFERENCE.md#the-ceremonyjson-manifest)). The shape, abridged; every field is
 documented in `src/config.rs` and the example files:
 
 ```toml
@@ -562,7 +562,7 @@ freeze_lead_blocks = 24            # writes close this many blocks before H
 admission_lock = true              # producer mode (rc.32): the producer refuses transactions from the freeze on (§2a)
 quiescence_polls = 6               # R4
 quiescence_timeout_secs = 120      # R4: abort if head never stops after the pause
-import_backend = "fork"            # | "upstream" (ignites from the #61 checkpoint when configured, see README)
+import_backend = "fork"            # | "upstream" (ignites from the #61 checkpoint when configured, see §8)
 # allow_inexact_cut / simulate_freeze: rehearsal-only escapes from exact H, journaled loudly
 
 [source]
@@ -995,3 +995,154 @@ on that producer from any journal directory. `pulse-cutover drill --clear-marker
 producer, removes such an orphan only when the drill process, its pipeline group and its export container (asked
 through the pinned docker CLI on the local socket) are all proven gone, and records the removal; anything unknown
 refuses with nothing changed. `status` and the beacon show the marker before an event.
+
+
+## 8. Upstream alignment and import backends
+
+In short: **`upstream`** is the official migration path (MetalBlockchain/pulsevm#61, merged and shipped in PulseVM
+v1.0.0) and the target; **`fork`** is the interim bridge and still the code default until it flips to `upstream`.
+The detail follows. (Moved here from the README, 2026-10-21.)
+
+> **Cross-validated:** the two verification stacks agree in practice — upstream's #61 pipeline and this project's importer were run against the same XPR testnet snapshot and produced byte-identical state (including row order) on every table both carry, measured with upstream's own `xpr_state_fingerprint` / `xpr_19_table_compare` ([results](https://github.com/MetalBlockchain/pulsevm/pull/61#issuecomment-5485633926)). The upstream tools are the spec. That was a one-time cross-check on one snapshot; it supports using the interim fork path in rehearsals, not a standing guarantee for other snapshots or releases.
+
+#61 (Chainbase→Arena conversion via a pinned Leap node's SHiP full-state export) and its companion PRs are merged
+and shipped in PulseVM v1.0.0. pulse-cutover is the operator ceremony *around* a migration, so the two stacks map
+onto each other rather than competing:
+
+| Upstream (#61, shipped in v1.0.0) | pulse-cutover | Relationship |
+|---|---|---|
+| `tools/xpr-chainbase-export/export.sh` (nodeos→SHiP full-state export) | freeze + snapshot stages (nodeos `create_snapshot` → portable `.bin`) — and `import_backend = "upstream"` drives export.sh itself from that `.bin` | The ceremony feeds the official pipeline |
+| `xpr_state_fingerprint` / `xpr_19_table_compare` (whole-state root + per-table SHA-256) | `verify` — dual fresh-arena import + 19-table `DefaultHasher` (64-bit) goldens (fork backend only) | Same goal; equivalence was checked once by the published cross-check above — in upstream mode the ceremony verifies with the official tools |
+| `host-function-audit.sh` (Leap registry ↔ PulseVM import map, source-based) | `scan-contracts` (wasm imports of every *deployed* code object vs the served set) | Complementary: theirs finds surface gaps, ours finds real-world exposure |
+| five-node runner / EC2 scripts | ignite + flip + hyperion federation (endpoint keeps its memory) | Upstream boots the network; the ceremony keeps operators' public surfaces alive across the cut |
+
+### Import backends
+
+The ceremony has two ways to turn the cut snapshot into PulseVM state,
+selected by `[ceremony] import_backend = "fork" | "upstream"`:
+
+- **`upstream` — the official path (#61), the target.** The export must write the `deferred-transactions.json` sidecar (`export.sh --deferred-sidecar`); the agent refuses to verify without it, because it carries the transaction dedupe set that stops pre-cut transactions replaying after the cut. The ceremony drives
+  the core team's own pipeline for SNAPSHOTTED → VERIFIED: `export.sh` (a
+  pinned Leap replays the cut `.bin` into a SHiP full-state
+  `chain_state_history.log`) → `xpr_import_check` (SHiP → Arena checkpoint +
+  a manifest binding checkpoint bytes to the source block id) — and
+  **verification is upstream's own tooling**: `xpr_19_table_compare` (a
+  wire-level nodeos-vs-Arena comparison of all 19 tables; any mismatch fails
+  the ceremony; since rc.21 `compare_bin` is **required** (no VERIFIED without it), an exit 0
+  must show a matching line for every required table, and the rehearsal allowlist accepts only
+  each table's known v1.0.0 difference) plus `xpr_state_fingerprint` (whole-state root, which
+  must be non-empty —
+  journaled, and golden-comparable across operators via `[upstream] golden_state_root`).
+  Every artifact is bound back to the ceremony's pinned cut: the export
+  manifest's `INPUT_SNAPSHOT_SHA256` must equal the cut snapshot's hash, and
+  the checkpoint manifest's `source_block_id`/`checkpoint_revision` must
+  equal the pinned cut block id/height. Config: `[upstream]` (work_dir, export_cmd, import_bin,
+  compare_bin, fingerprint_bin) — see `src/config.rs` for the documented
+  fields and `examples/ceremony-upstream.toml` for a verify-only shape.
+  `[ceremony] import_cpu_scale` does **nothing** on this backend: PulseVM v1.0.0 has no import
+  CPU scale, and the checkpoint carries the source's CPU limits unchanged. A non-default value
+  is accepted (a coordinator event that carries the field must still match it on every
+  producer) but warned about at load and journaled at ARM as `config_warning`, with
+  `import_cpu_scale_effective: false` in the ARMED record. Publish upstream events with
+  `coord.mjs event --cpu-scale none` and leave the setting at its default.
+
+  **Ignition from the checkpoint** (PulseVM v1.0.0 + metalgo v1.14.2-tahoe) is on when
+  `[upstream] genesis_base` and `[target] create_chain_cmd` are both set (without them the
+  ceremony is verify-only and stops after VERIFIED, source resumed). It follows how the
+  node actually boots a migrated chain, as found on the stage-2 rig:
+  1. *Before VERIFIED* (abortable), the agent fetches the **full** cut block (every
+     transaction receipt) from the source with `get_block` (or `upstream.source_block_rpc_url`),
+     packs it into the wire `signed_block` itself and requires its computed id to equal the
+     pinned cut block id. Upstream's `xpr_attach_source_block` refuses a boundary block with
+     transactions and a block emptied of them fails the controller's `transaction_mroot`
+     check; the controller accepts the complete block (the Rust packer reproduces the rig's
+     accepted anchor byte for byte). It then writes `boot-<cut>.manifest.json` (checkpoint
+     manifest + `source_block`), `migration-genesis-<cut>.json` (`genesis_base` +
+     `migration_checkpoint_sha256`) and `chain-config-<cut>.json` (`chain_config_base` +
+     `migration_checkpoint` + `migration_manifest`), and journals their hashes. The chain
+     config carries this node's `producer_key`: it is created 0600 from the first byte (and
+     installed 0600 into a 0700 per-chain directory), only in directories nobody else can write
+     (checked at ARM); `{chain_config}` is per-node and must not be copied anywhere shared. The
+     genesis and manifest are shared and refuse anything that looks like a private key.
+  1b. *Producer mode: the signing key must be the registered one.* At ARM and again right
+     before ignition, the agent reads the producer's row from the source's `eosio/producers`
+     (`get_table_rows`) and requires the key the target will sign with (the public key of
+     `chain_config_base`'s `producer_key`, which must also be `genesis_base`'s `initial_key`;
+     without a `producer_key` there, the `initial_key`) to be its `producer_authority` (or
+     `producer_key`), and the producer (`chain_config_base`'s `producer_name`) to be registered
+     and active. Otherwise it aborts before anything freezes (ARM) or before the chain is created
+     (VERIFIED). The migrated system contract re-elects the schedule from that table at the first
+     `onblock`; on the stage-2 rig a node signing with a different key stopped building blocks
+     four blocks after the cut, without any error. The private key is never journaled.
+  2. *After the fleet gate, before `ignite_started`*, the hashes are re-checked and
+     the coordinator relay must answer with no abort (an unreachable relay refuses the step), and
+     `create_chain_cmd` runs (`{genesis}`, `{chain_config}`, `{manifest}`, `{checkpoint}`,
+     `{genesis_sha256}`, `{cut_height}`). It creates the subnet + blockchain on Metal (the
+     coordinator's / validators' job in production, a helper with the local network key on a
+     rig) and prints `BLOCKCHAIN_ID=<id>` (and `SUBNET_ID=<id>`); the id is journaled at once
+     and a resumed agent never creates a second chain. **Its intent record is the point of no
+     return (rc.21)**: a creation hook can submit a chain that validators already tracking the
+     subnet start, so any failure from then on (an error, no id printed, a lost answer, a
+     restart without a journaled id) HALTS for a fleet decision instead of resuming the source.
+  3. From then on `{blockchain_id}`, `{subnet_id}`, `{chain_config}`, … expand in
+     `target.rpc_url` (`…/ext/bc/{blockchain_id}/rpc`), `ignite_cmd` and every hook.
+     `target.chain_config_dir` (metalgo `--chain-config-dir`) gets `<id>/config.json`;
+     `ignite_cmd` makes metalgo track `{subnet_id}` and restarts it. `ignite_started` is
+     journaled before it runs, so any failure from here HALTS (sealed), as for the fork backend.
+  4. The target must come up at the cut height with the cut block id (lineage) and the event's
+     pinned `target_chain_id` ([§2c](#2c-a-new-chain_id-pinned-in-the-signed-event-rc33)). The edge reaches the node as `/ext/bc/<id>/v1/chain?route=/v1/chain/<m>`.
+
+  An upstream ignite is **refused for XPR mainnet** while the upstream items in
+  [UPSTREAM-ASKS.md](UPSTREAM-ASKS.md) are open (`upstream::ignite_pending_reasons()` is non-empty: a pinnable
+  chain_id, TAPOS, CPU rescale, per-producer signing, a fleet commit point, election safety); on any other chain those
+  reasons are journaled as warnings at every ignite.
+
+  **Rehearsal-only overrides** for the known v1.0.0 gaps (refused at config load for the XPR
+  mainnet chain_id and again at ARM if the source turns out to be mainnet; listed by
+  `status`, journaled at ARMED/VERIFIED/LIVE, reported by the beacon as the failing setup
+  check `rehearsal_overrides`, labeled on mission control):
+  - `[upstream] rehearsal_allow_compare_mismatch = ["contract_index_double", "global_property"]`:
+    v1.0.0's `xpr_19_table_compare` fails on those two tables (an upstream regression in
+    `crates/pulsevm_chaindb/src/history.rs`). The compare still runs and its full output is
+    journaled; it passes only if every failing table it names is listed, and any other
+    failing table (or a failure naming none) still aborts.
+  - `[ceremony] rehearsal_allow_chain_id_change = true` (only without a pinned `target_chain_id`; a pinned event
+    supersedes it): the target signs with metalgo's
+    blockchain id, not the source chain_id; the post-ignition check accepts the different id
+    and journals both (without it, that check HALTS). Clients must sign for the target id.
+
+  `examples/ceremony-upstream-rehearsal.toml` is the full rehearsal shape (api mode against the
+  live testnet, both overrides).
+
+- **`fork` — the interim bridge (still the code default).** Our
+  `feat/arena-snapshot-import` branch reads the Leap `.bin` directly and the
+  target chain boots via `snapshot_path`; verification is the dual
+  fresh-arena import + 19-table fingerprints. It is the default **only
+  until the upstream ignition above is rehearsed end to end and the mainnet
+  gaps close** (the [upstream asks](UPSTREAM-ASKS.md), the v1.0.0 compare regression); then
+  the default flips to `upstream` and the fork path is slated for retirement. Its correctness was established by a **one-time
+  published cross-check** against the #61 pipeline — byte-identical state,
+  row order included, on every table both implementations carry, measured
+  with upstream's own tools
+  ([results](https://github.com/MetalBlockchain/pulsevm/pull/61#issuecomment-5485633926)).
+  That cross-check is why the fork path needs no standing in-ceremony
+  shadow: `[upstream] fork_audit = true` can journal the fork fingerprints
+  as a labeled dev/audit extra, but it is off by default, never a gate, and
+  documented as a release-validation tool — not an operator step.
+
+Fidelity notes. SHiP alone carries neither the transaction **dedupe set** nor the per-account **sequence
+counters** that the `.bin` carries; both now come from the export's `deferred-transactions.json` sidecar, which the
+upstream backend requires and checks (identity, cut block, exact sequence sums; `upstream::check_sidecar`). Still
+open upstream: PulseVM does not require the sidecar itself (#101), and onblock traces are absent from SHiP (ATOMICITY
+Known limits #10; original finding in the
+[cross-check comment](https://github.com/MetalBlockchain/pulsevm/pull/61#issuecomment-5485633926));
+`export.sh`'s completion probe uses `rg`, which minimal nodeos images lack —
+an `rg`→`grep` one-line patch is the validated workaround until it lands
+upstream.
+
+Legacy knob: `[snapshot] upstream_fingerprint_bin` still runs an
+`xpr_state_fingerprint`-compatible binary alongside the fork backend's check
+(journaled, advisory, clean no-op when absent) — superseded by the full
+upstream backend above, kept for configs that already carry it.
+`scan-contracts` (read-only wasm-import audit of deployed contracts) runs
+under both backends.

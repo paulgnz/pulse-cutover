@@ -67,7 +67,7 @@ flowchart LR
 Rehearsal setup: 5 BPs on 5 continents, each running a Leap 5.0.3 producer, a Metal
 validator and a public TLS API edge (nginx on three, HAProxy on two). Apps write through
 the edges the whole time: a 0.5 s transfer bot, a perps DEX order bot, an oracle feeder
-and a keeper. Full timelines are in the [README](README.md#multi-producer-cutover-5-bps-5-continents).
+and a keeper. Full timelines are in [docs/EVIDENCE.md](docs/EVIDENCE.md#multi-producer-rehearsal-5-bps-september-2026).
 
 ### Run 5: A1–A4 exercised in one ceremony (2026-09-28, cut at H = 6220)
 

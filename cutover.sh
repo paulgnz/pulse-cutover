@@ -154,9 +154,9 @@ pulse-cutover run --config "$CONFIG" 2>&1 | while IFS= read -r line; do
     *"-> FROZEN"*)      echo "[FROZEN]      $FROZEN_MSG" ;;
     *"-> SNAPSHOTTED"*) echo "[SNAPSHOTTED] state snapshot cut + pinned to one exact block." ;;
     *"-> VERIFIED"*)    echo "[VERIFIED]    snapshot hash + state fingerprints check out; staged for PulseVM." ;;
-    *"-> IGNITED"*)     echo "[IGNITED]     PulseVM is up, serving the SAME chain_id, continuing at the cut block." ;;
+    *"-> IGNITED"*)     echo "[IGNITED]     PulseVM is up, serving the event's NEW chain_id, continuing at the cut block." ;;
     *"-> FLIPPED"*)     echo "[FLIPPED]     public /v1 now answered by PulseVM — this was the only user-visible change." ;;
-    *"-> LIVE"*)        echo "[LIVE]        ceremony complete. Source retired. Same URL, same chain, new engine." ;;
+    *"-> LIVE"*)        echo "[LIVE]        ceremony complete. Source retired. Same URL and state, new engine, new chain_id." ;;
     *"-> ABORTED"*)     echo "[ABORTED]     ceremony stopped before ignition and rolled back — the source chain is still the real one. The journal has the reason." ;;
     *"-> HALTED"*)      echo "[HALTED]      SEALED: ignition may have started, so nothing was rolled back. The coordinator decides for the fleet." ;;
     *"-> STRANDED"*)    echo "[STRANDED]    SEALED: stopped before this node's chain creation, but peers may have ignited: the source was NOT resumed, writes stay frozen." ;;

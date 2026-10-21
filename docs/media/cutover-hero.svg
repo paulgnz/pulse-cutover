@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" width="1200" height="560" role="img" aria-labelledby="t d">
   <title id="t">pulse-cutover: moving a live Antelope chain onto PulseVM in one atomic step</title>
-  <desc id="d">Blocks on the old Leap chain lead to block H, the cut. A verified snapshot of exactly block H is imported into PulseVM, which continues at H+1 with the same chain_id. Five block producers on five continents cut the same block. Results: same block on 5 of 5 producers, zero transactions after the cut, identical state on the sampled accounts and tables, a passing replay canary, and 71 to 114 seconds of paused writes in the unattended runs. Rehearsal on a fork plugin, not upstream PulseVM.</desc>
+  <desc id="d">Blocks on the old Leap chain lead to block H, the cut. A verified snapshot of exactly block H is imported into PulseVM, which continues at H+1 with the same state (these rehearsals kept the chain_id; the mainnet cutover moves to a new chain_id). Five block producers on five continents cut the same block. Results: same block on 5 of 5 producers, zero transactions after the cut, identical state on the sampled accounts and tables, a passing replay canary, and 71 to 114 seconds of paused writes in the unattended runs. Rehearsal on a fork plugin, not upstream PulseVM.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0b1020"/><stop offset="1" stop-color="#140c24"/>
@@ -34,8 +34,8 @@
   </g>
 
   <!-- title -->
-  <text x="48" y="62" class="f" font-size="30" font-weight="700" fill="#f9fafb">One block. One cut. Same chain.</text>
-  <text x="48" y="92" class="f" font-size="16" fill="#9ca3af">A live Antelope chain moves onto PulseVM atomically: same chain_id, same accounts and keys, same URLs.</text>
+  <text x="48" y="62" class="f" font-size="30" font-weight="700" fill="#f9fafb">One block. One cut. Same state.</text>
+  <text x="48" y="92" class="f" font-size="16" fill="#9ca3af">A live Antelope chain moves onto PulseVM in one cut: same accounts and keys, same URLs, a new chain_id.</text>
 
   <!-- lane labels -->
   <text x="48" y="150" class="f" font-size="13" font-weight="600" letter-spacing="1.5" fill="#9ca3af">OLD ENGINE · LEAP NODEOS</text>

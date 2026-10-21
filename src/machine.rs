@@ -5951,7 +5951,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "note": "SHADOW: a real mainnet ignition is refused for these; the shadow goes on to find out what happens"}))?;
         } else if crate::config::is_xpr_mainnet(&source_chain) && !pending.is_empty() {
             self.abort(
-                "upstream ignite refused for XPR MAINNET: a same-chain-id mainnet cutover still has unsolved \
+                "upstream ignite refused for XPR MAINNET: a mainnet cutover still has unsolved \
                  prerequisites (verification completed with the official #61 tools)",
                 json!({"remaining": pending}),
             )?;
@@ -5978,11 +5978,14 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             }
             None => {}
         }
-        self.journal.evidence(State::Verified, json!({
-            "upstream_ignite_warnings": pending,
-            "note": "unsolved for a same-chain-id MAINNET cutover; acceptable only on a rehearsal/test chain",
-            "rehearsal_overrides": self.cfg.rehearsal_overrides(),
-        }))?;
+        self.journal.evidence(
+            State::Verified,
+            json!({
+                "upstream_ignite_warnings": pending,
+                "note": "unsolved for a MAINNET cutover; acceptable only on a rehearsal/test chain",
+                "rehearsal_overrides": self.cfg.rehearsal_overrides(),
+            }),
+        )?;
         eprintln!(
             "WARNING (upstream ignite, not mainnet-ready): {}",
             pending.join(" | ")
@@ -6689,7 +6692,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
             return Ok(()); // aborted inside, with evidence
         }
         if !upstream_backend {
-            // The same-chain-id gaps are PulseVM's, whatever imported the state: the fork backend
+            // The mainnet gaps are PulseVM's, whatever imported the state: the fork backend
             // gets the same hard XPR-mainnet refusal as the upstream one.
             let pending = upstream::ignite_pending_reasons();
             if self
@@ -6708,7 +6711,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 .is_some_and(crate::config::is_xpr_mainnet)
                 && !pending.is_empty()
             {
-                self.abort("ignite refused for XPR MAINNET (fork backend): a same-chain-id mainnet cutover still has unsolved prerequisites",
+                self.abort("ignite refused for XPR MAINNET (fork backend): a mainnet cutover still has unsolved prerequisites",
                     json!({"remaining": pending}))?;
                 return Ok(());
             }
@@ -6863,7 +6866,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                         "rehearsal_chain_id_change": {
                             "source_chain_id": chain_id, "target_chain_id": info.chain_id,
                             "allowed_by": "ceremony.rehearsal_allow_chain_id_change",
-                            "REHEARSAL_ONLY": "transactions must be signed for the TARGET chain_id; a real cut keeps the source chain_id",
+                            "REHEARSAL_ONLY": "transactions must be signed for the TARGET chain_id; a real cut uses the event's pinned target_chain_id",
                         }}))?;
                     eprintln!(
                         "WARNING (rehearsal override): target chain_id {} != source {chain_id}",
@@ -7234,7 +7237,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
     }
 
     /// Poll the PUBLIC URL until it demonstrably serves the TARGET chain, `health_polls`
-    /// consecutive times. chain_id cannot discriminate (a same-chain-id migration keeps it) and
+    /// consecutive times. chain_id cannot discriminate (an unpinned rehearsal keeps the source's) and
     /// a nearby head height cannot either (a leftover source has heights past the cut too), so the
     /// proof is a COMMON BLOCK ID above the cut: at min(target head, public head) > cut, the block
     /// the public endpoint serves must be the target's block (the source's block at that height,
@@ -7607,7 +7610,7 @@ impl<'a, O: ChainOps> Machine<'a, O> {
                 "rehearsal_overrides": self.cfg.rehearsal_overrides(),
                 "target_chain_id": self.accepted_target_chain_id.clone().or(self.chain_id.clone()),
                 "source_chain_id_changed": self.accepted_target_chain_id.is_some(),
-                "note": "api-node cutover complete: same URL, same chain_id, PulseVM serving; nodeos stopped LAST; the gap includes the sustain window and on_live",
+                "note": "api-node cutover complete: same URL and state, PulseVM serving; nodeos stopped LAST; the gap includes the sustain window and on_live",
             }),
         )?;
         Ok(())

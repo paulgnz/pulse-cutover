@@ -23,8 +23,8 @@
 //! gaps (`rehearsal_allow_compare_mismatch`, `rehearsal_allow_chain_id_change`).
 //!
 //! The fork importer plays NO verification role here (its equivalence to #61
-//! was established once, by the published cross-check — see the README's
-//! "Import backends"); `[upstream] fork_audit = true` can journal its
+//! was established once, by the published cross-check — see docs/DESIGN.md §8
+//! "Upstream alignment and import backends"); `[upstream] fork_audit = true` can journal its
 //! fingerprints as a clearly-labeled dev/audit extra, never a gate.
 
 use std::{
@@ -1161,17 +1161,16 @@ fn global_property_known_difference(output: &str, chain_id: &str) -> Result<Stri
     Ok(format!("known: global_property row {n} bytes on nodeos, {a} on Arena; equal over {len} printed bytes (of {a}: the tool prints 96 per row) once the 14 bytes v1.0.0 omits are removed"))
 }
 
-/// What still stands between an upstream ignition and a SAME-CHAIN-ID MAINNET cutover. Kept as
+/// What still stands between an upstream ignition and an XPR MAINNET cutover (docs/UPSTREAM-ASKS.md). Kept as
 /// data: an upstream ignite is refused for XPR mainnet while this is non-empty, and a rehearsal
 /// ignite journals it as warnings every time.
 pub fn ignite_pending_reasons() -> Vec<&'static str> {
     vec![
-        "same-chain-id cutover: the signing chain_id must be pinned to the source \
-         chain_id and enforced at node startup (PulseVM v1.0.0 signs with the blockchain id \
-         metalgo passes at initialize and only warns on a mismatch)",
-        "same-chain-id cutover: PulseVM must enforce TAPOS (block-summary ring seeded \
-         at the cut, checked at admission and block application) so transactions \
-         signed on a leftover source chain cannot replay onto the target",
+        "new chain_id: it must be settable at genesis and published before H (U-1: PulseVM \
+         v1.0.0 signs with the blockchain id metalgo derives at chain creation, so the id is \
+         only known after H and wallets, exchanges and the signed event cannot pin it)",
+        "PulseVM must enforce TAPOS (U-7: Leap parity; block-summary ring checked at admission \
+         and block application); with a new chain_id this is not the replay defence",
         "imported accounts must be billed CPU in the units their limits are in (#106: \
          PulseVM v1.0.0 bills metering points against microsecond limits, so accounts run \
          out of CPU within seconds of the cut)",

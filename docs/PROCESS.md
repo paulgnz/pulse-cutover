@@ -235,9 +235,9 @@ stateDiagram-v2
 
 | | |
 |---|---|
-| **Action** | Stages the verified snapshot where the PulseVM chain expects it and restarts the validator. The chain imports it and presents the source chain_id. |
+| **Action** | Stages the verified snapshot where the PulseVM chain expects it and restarts the validator. The chain imports it and presents the event's pinned target_chain_id. |
 | **Users see** | Still 503 on writes. |
-| **Gate** | Target chain_id == source chain_id, target head ≥ H, and the target's block id at H equals the cut's block id (rc.6; via `pulsevm.getBlock(H)` — not yet verified against upstream v1.0.0). Ignition start is journaled first: from then on any failure halts, it never resumes the source. |
+| **Gate** | target chain_id == the event's target_chain_id, target head ≥ H, and the target's block id at H equals the cut's block id (rc.6; via `pulsevm.getBlock(H)` — not yet verified against upstream v1.0.0). Ignition start is journaled first: from then on any failure halts, it never resumes the source. |
 | **Then** | The `post_ignite` hook sends a few transactions: PulseVM builds blocks on demand, so an idle new chain would never pass H. |
 
 ### ⑥ LIVE: the new chain is producing, URLs flip
@@ -386,4 +386,4 @@ The cutover is atomic when five properties hold. A1 and A2 are gates; A3 and A4 
 | A5 | all or nothing | **open**: per-producer abort only; no fleet-wide authority boundary |
 
 Full definitions and the recorded proof: **[ATOMICITY.md](../ATOMICITY.md)**.
-Lessons from the real-world runs: **[README → Field notes](../README.md#field-notes-what-real-world-rehearsals-taught-us)**.
+Lessons from the real-world runs: **[EVIDENCE.md → Field notes](EVIDENCE.md#field-notes-from-the-rehearsals)**.

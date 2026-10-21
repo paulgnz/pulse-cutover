@@ -115,7 +115,7 @@ metalgo_unit = "metalgo-pulse"     # systemd unit install.sh created           [
 # The new chain's local RPC. install.sh fills in the real blockchain ID.
 rpc_url = "http://127.0.0.1:9650/ext/bc/BLOCKCHAIN_ID_HERE/rpc"        # [installer fills this]
 
-# If the new chain hasn't come up serving the SAME chain_id at the cut block
+# If the new chain hasn't come up serving the expected chain_id at the cut block
 # within this many seconds, abort (and roll back automatically).       [LEAVE]
 quorum_timeout_secs = 900
 auto_rollback = true               # on any abort: revert whatever was changed  [LEAVE]
@@ -146,5 +146,5 @@ health_timeout_secs = 120    # health not green in time -> abort + auto-revert  
 # [hooks] — optional shell commands at key moments (notifications etc.).
 # ---------------------------------------------------------------------------
 [hooks]
-on_live = "echo 'same URL, same chain_id, new engine'"
+on_live = "echo 'same URL and state, new engine, new chain_id'"
 on_abort = "echo 'page the operator'"
